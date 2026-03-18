@@ -116,6 +116,36 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_explicit_whatsapp_display_label_resolves_via_channel_directory(self):
+        job = {
+            "deliver": "whatsapp:Alice (dm)",
+        }
+
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="12345678901234@lid",
+        ):
+            assert _resolve_delivery_target(job) == {
+                "platform": "whatsapp",
+                "chat_id": "12345678901234@lid",
+                "thread_id": None,
+            }
+
+    def test_explicit_whatsapp_jid_preserved_when_no_directory_match_exists(self):
+        job = {
+            "deliver": "whatsapp:12345678901234@lid",
+        }
+
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value=None,
+        ):
+            assert _resolve_delivery_target(job) == {
+                "platform": "whatsapp",
+                "chat_id": "12345678901234@lid",
+                "thread_id": None,
+            }
+
 
 class TestDeliverResultWrapping:
     """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
