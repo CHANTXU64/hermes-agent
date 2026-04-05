@@ -3519,6 +3519,124 @@ class HermesCLI:
         remaining = len(self.conversation_history)
         print(f"  {remaining} message(s) remaining in history.")
     
+    def _handle_model_switch(self, cmd_original: str):
+        """Handle /model command — switch model for this session.
+
+        Supports:
+          /model                     — show current model + usage hints
+          /model <name>              — switch for this session only
+          /model <name> --global     — switch and persist to config.yaml
+          /model provider:model      — switch provider + model
+        """
+        from hermes_cli.model_switch import switch_model, ModelSwitchResult
+        from hermes_cli.models import _PROVIDER_LABELS
+
+        # Parse args from the original command
+        parts = cmd_original.split(None, 1)  # split off '/model'
+        raw_args = parts[1].strip() if len(parts) > 1 else ""
+
+        # Check for --global flag
+        persist_global = "--global" in raw_args
+        if persist_global:
+            raw_args = raw_args.replace("--global", "").strip()
+
+        # No args: show current model info and usage
+        if not raw_args:
+            model_display = self.model or "unknown"
+            provider_display = _PROVIDER_LABELS.get(self.provider, self.provider) if self.provider else "unknown"
+            _cprint(f"  Current model: {model_display}")
+            _cprint(f"  Provider:      {provider_display} ({self.provider})")
+            if self.base_url:
+                _cprint(f"  Endpoint:      {self.base_url}")
+            _cprint("")
+            _cprint("  Aliases:   /model sonnet")
+            _cprint("             /model opus")
+            _cprint("             /model gpt5")
+            _cprint("             /model gemini")
+            _cprint("")
+            _cprint("  Full name: /model anthropic/claude-sonnet-4.5")
+            _cprint("  Provider:  /model anthropic:sonnet      (switch to native Anthropic)")
+            _cprint("             /model deepseek:deepseek-chat (switch to native DeepSeek)")
+            _cprint("  Persist:   /model sonnet --global        (save to config)")
+            _cprint("  Custom:    /model custom:my-local-model")
+            return
+
+        # Perform the switch
+        result = switch_model(
+            raw_input=raw_args,
+            current_provider=self.provider or "",
+            current_model=self.model or "",
+            current_base_url=self.base_url or "",
+            current_api_key=self.api_key or "",
+        )
+
+        if not result.success:
+            _cprint(f"  ✗ {result.error_message}")
+            return
+
+        # Apply to CLI state
+        old_model = self.model
+        self.model = result.new_model
+        self.provider = result.target_provider
+        if result.api_key:
+            self.api_key = result.api_key
+        if result.base_url:
+            self.base_url = result.base_url
+        if result.api_mode:
+            self.api_mode = result.api_mode
+
+        # Apply to running agent (in-place swap)
+        if self.agent is not None:
+            try:
+                self.agent.switch_model(
+                    new_model=result.new_model,
+                    new_provider=result.target_provider,
+                    api_key=result.api_key,
+                    base_url=result.base_url,
+                    api_mode=result.api_mode,
+                )
+            except Exception as exc:
+                _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
+
+        # Display confirmation
+        provider_label = result.provider_label or result.target_provider
+        _cprint(f"  ✓ Model switched: {result.new_model}")
+        _cprint(f"    Provider: {provider_label}")
+
+        # Show context window info
+        try:
+            from agent.model_metadata import get_model_context_length
+            ctx = get_model_context_length(
+                result.new_model,
+                base_url=result.base_url or self.base_url,
+                api_key=result.api_key or self.api_key,
+                provider=result.target_provider,
+            )
+            _cprint(f"    Context: {ctx:,} tokens")
+        except Exception:
+            pass
+
+        # Cache notice
+        cache_enabled = (
+            ("openrouter" in (result.base_url or "").lower() and "claude" in result.new_model.lower())
+            or result.api_mode == "anthropic_messages"
+        )
+        if cache_enabled:
+            _cprint("    Prompt caching: enabled")
+
+        # Warning from validation
+        if result.warning_message:
+            _cprint(f"    ⚠ {result.warning_message}")
+
+        # Persistence
+        if persist_global:
+            save_config_value("model.name", result.new_model)
+            if result.provider_changed:
+                save_config_value("model.provider", result.target_provider)
+            _cprint("    Saved to config.yaml (--global)")
+        else:
+            _cprint("    (session only — add --global to persist)")
+
     def _show_model_and_providers(self):
         """Show current model + provider and list all authenticated providers.
 
@@ -4134,6 +4252,8 @@ class HermesCLI:
             self.new_session()
         elif canonical == "resume":
             self._handle_resume_command(cmd_original)
+        elif canonical == "model":
+            self._handle_model_switch(cmd_original)
         elif canonical == "provider":
             self._show_model_and_providers()
         elif canonical == "prompt":
