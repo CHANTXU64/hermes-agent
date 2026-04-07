@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 _pending_create_keys: Dict[str, str] = {}
 _pending_create_keys_lock = threading.Lock()
 
-_BASE_URL = "https://api.browser-use.com/api/v2"
+_BASE_URL = "https://api.browser-use.com/api/v3"
 
 
 def _get_or_create_pending_create_key(task_id: str) -> str:
@@ -127,9 +127,7 @@ class BrowserUseProvider(CloudBrowserProvider):
             headers["X-Idempotency-Key"] = _get_or_create_pending_create_key(task_id)
 
         response = requests.post(
-            f"{config['base_url']}/browsers"
-            if not managed_mode
-            else f"{config['base_url']}/v1/sessions",
+            f"{config['base_url']}/browsers",
             headers=headers,
             json={},
             timeout=30,
@@ -169,21 +167,12 @@ class BrowserUseProvider(CloudBrowserProvider):
             return False
 
         try:
-            managed_mode = bool(config.get("managed_mode"))
-            if managed_mode:
-                response = requests.post(
-                    f"{config['base_url']}/v1/sessions/{session_id}",
-                    headers=self._headers(config),
-                    json={"status": "REQUEST_RELEASE"},
-                    timeout=10,
-                )
-            else:
-                response = requests.patch(
-                    f"{config['base_url']}/browsers/{session_id}",
-                    headers=self._headers(config),
-                    json={"action": "stop"},
-                    timeout=10,
-                )
+            response = requests.patch(
+                f"{config['base_url']}/browsers/{session_id}",
+                headers=self._headers(config),
+                json={"action": "stop"},
+                timeout=10,
+            )
             if response.status_code in (200, 201, 204):
                 logger.debug("Successfully closed Browser Use session %s", session_id)
                 return True
@@ -205,20 +194,11 @@ class BrowserUseProvider(CloudBrowserProvider):
             logger.warning("Cannot emergency-cleanup Browser Use session %s — missing credentials", session_id)
             return
         try:
-            managed_mode = bool(config.get("managed_mode"))
-            if managed_mode:
-                requests.post(
-                    f"{config['base_url']}/v1/sessions/{session_id}",
-                    headers=self._headers(config),
-                    json={"status": "REQUEST_RELEASE"},
-                    timeout=5,
-                )
-            else:
-                requests.patch(
-                    f"{config['base_url']}/browsers/{session_id}",
-                    headers=self._headers(config),
-                    json={"action": "stop"},
-                    timeout=5,
-                )
+            requests.patch(
+                f"{config['base_url']}/browsers/{session_id}",
+                headers=self._headers(config),
+                json={"action": "stop"},
+                timeout=5,
+            )
         except Exception as e:
             logger.debug("Emergency cleanup failed for Browser Use session %s: %s", session_id, e)
