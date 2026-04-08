@@ -464,7 +464,11 @@
       addToSystemPackages = mkOption {
         type = types.bool;
         default = false;
-        description = "Add hermes CLI to environment.systemPackages.";
+        description = ''
+          Add the hermes CLI to environment.systemPackages and export
+          HERMES_HOME system-wide (via environment.variables) so interactive
+          shells share state with the gateway service.
+        '';
       };
 
       # ── OCI Container (opt-in) ──────────────────────────────────────────
@@ -545,8 +549,12 @@
       })
 
       # ── Host CLI ──────────────────────────────────────────────────────
+      # Add the hermes CLI to system PATH and export HERMES_HOME system-wide
+      # so interactive shells share state (sessions, skills, cron) with the
+      # gateway service instead of creating a separate ~/.hermes/.
       (lib.mkIf cfg.addToSystemPackages {
         environment.systemPackages = [ cfg.package ];
+        environment.variables.HERMES_HOME = "${cfg.stateDir}/.hermes";
       })
 
       # ── Directories ───────────────────────────────────────────────────
