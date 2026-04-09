@@ -915,9 +915,18 @@ def _parse_iso_timestamp(value: Any) -> Optional[float]:
 
 
 def _is_expiring(expires_at_iso: Any, skew_seconds: int) -> bool:
+    """Check whether a token/key is expired or will expire within *skew_seconds*.
+
+    Returns ``False`` when *expires_at_iso* is ``None`` or unparseable — the
+    absence of expiry metadata is treated as "not expired" to avoid triggering
+    redundant refresh/mint cycles on every call when the portal simply didn't
+    include an ``expires_at`` field.  Callers that need the stricter "no expiry
+    means expired" semantics should check for ``None`` explicitly before calling
+    this helper (see ``_agent_key_is_usable``).
+    """
     expires_epoch = _parse_iso_timestamp(expires_at_iso)
     if expires_epoch is None:
-        return True
+        return False
     return expires_epoch <= (time.time() + skew_seconds)
 
 
@@ -1659,7 +1668,12 @@ def _agent_key_is_usable(state: Dict[str, Any], min_ttl_seconds: int) -> bool:
     key = state.get("agent_key")
     if not isinstance(key, str) or not key.strip():
         return False
-    return not _is_expiring(state.get("agent_key_expires_at"), min_ttl_seconds)
+    # Agent keys are short-lived — missing expiry metadata means we can't
+    # guarantee the key is still valid, so treat it as expired (needs re-mint).
+    expires_at = state.get("agent_key_expires_at")
+    if _parse_iso_timestamp(expires_at) is None:
+        return False
+    return not _is_expiring(expires_at, min_ttl_seconds)
 
 
 def resolve_nous_access_token(
