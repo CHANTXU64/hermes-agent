@@ -501,6 +501,17 @@ def _resolve_openrouter_runtime(
     # authentication — the OpenAI SDK requires a non-empty api_key string.
     effective_provider = "custom" if requested_norm == "custom" else "openrouter"
 
+    # When requested provider is "custom" and config has a model.base_url,
+    # use it as the custom endpoint rather than defaulting to OpenRouter.
+    # This fixes MOA calls where model.provider: custom with explicit base_url
+    # falls through to this function but loses the config credentials.
+    if effective_provider == "custom" and not base_url:
+        cfg_base = model_cfg.get("base_url") if isinstance(model_cfg.get("base_url"), str) else ""
+        cfg_base = cfg_base.strip().rstrip("/") if cfg_base else ""
+        if cfg_base:
+            base_url = cfg_base
+            _is_openrouter_url = False
+
     # For custom endpoints, check if a credential pool exists
     if effective_provider == "custom" and base_url:
         pool_result = _try_resolve_from_custom_pool(

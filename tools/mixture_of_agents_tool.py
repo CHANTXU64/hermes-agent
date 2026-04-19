@@ -558,27 +558,35 @@ async def mixture_of_agents_tool(
         
         # Resolve runtime provider dynamically
         try:
-            runtime = resolve_runtime_provider(requested="auto")
+            runtime = resolve_runtime_provider(requested=None)
         except Exception:
-            # Fallback for CLI mode: build runtime from config
+            runtime = None
+
+        # Strong fallback for custom provider: if resolve_runtime_provider returned
+        # an empty api_key or wrong base_url, pull directly from model config.
+        # This prevents the OpenRouter fallback path from sending requests without
+        # authentication when the user's primary provider is custom (e.g., Coding Plan).
+        if runtime is None or (runtime.get("provider") == "custom" and not runtime.get("api_key")):
             config = load_config()
             model_cfg = config.get("model", {})
-            if isinstance(model_cfg, dict) and model_cfg.get("base_url") and model_cfg.get("api_key"):
+            if isinstance(model_cfg, dict) and model_cfg.get("base_url"):
                 runtime = {
                     "provider": model_cfg.get("provider", "custom"),
-                    "base_url": model_cfg["base_url"],
-                    "api_key": model_cfg["api_key"],
+                    "base_url": model_cfg["base_url"].rstrip("/"),
+                    "api_key": model_cfg.get("api_key", "no-key-required"),
+                    "source": "model_config_fallback",
                 }
-            else:
-                # Try first provider from providers dict
+            elif runtime is None:
+                # Last resort: try providers dict
                 providers = config.get("providers", {})
                 if providers:
                     first_key = list(providers.keys())[0]
                     p = providers[first_key]
                     runtime = {
                         "provider": "custom",
-                        "base_url": p.get("api", ""),
-                        "api_key": p.get("api_key", ""),
+                        "base_url": p.get("api", "").rstrip("/"),
+                        "api_key": p.get("api_key", "no-key-required"),
+                        "source": "providers_dict_fallback",
                     }
                 else:
                     raise ValueError("No compatible runtime provider configured for Mixture of Agents")
@@ -715,7 +723,7 @@ def check_moa_requirements() -> bool:
         bool: True if requirements are met, False otherwise
     """
     try:
-        runtime = resolve_runtime_provider(requested="auto")
+        runtime = resolve_runtime_provider(requested=None)
         if runtime.get("api_key") and runtime.get("base_url"):
             return True
     except Exception:
@@ -748,7 +756,7 @@ def get_available_models() -> Dict[str, List[str]]:
         Dict[str, List[str]]: Dictionary with reference and aggregator models
     """
     try:
-        runtime = resolve_runtime_provider(requested="auto")
+        runtime = resolve_runtime_provider(requested=None)
         reference_models, aggregator_model = _resolve_default_models(runtime)
     except Exception:
         reference_models, aggregator_model = REFERENCE_MODELS, AGGREGATOR_MODEL
@@ -794,7 +802,7 @@ if __name__ == "__main__":
         exit(1)
     else:
         try:
-            runtime = resolve_runtime_provider(requested="auto")
+            runtime = resolve_runtime_provider(requested=None)
             print(f"✅ Runtime provider ready: {runtime.get('provider')} @ {runtime.get('base_url')}")
         except Exception:
             print("✅ Runtime provider available")
