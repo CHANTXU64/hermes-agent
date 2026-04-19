@@ -15,6 +15,8 @@ Key Features:
 - Intelligent aggregation and synthesis of diverse responses
 - Specialized for extremely difficult problems requiring intense reasoning
 - Optimized for coding, mathematics, and complex analytical tasks
+- **Runtime provider resolution** — works with any configured provider (OpenRouter,
+  Nous, Codex, GLM, Kimi, MiniMax, custom OpenAI-compatible endpoint)
 
 Available Tool:
 - mixture_of_agents_tool: Process complex queries using multiple frontier models
@@ -24,16 +26,20 @@ Architecture:
 2. Aggregator model synthesizes responses into a high-quality output
 3. Multiple layers can be used for iterative refinement (future enhancement)
 
-Models Used (via OpenRouter):
-- Reference Models: claude-opus-4.6, gemini-3-pro-preview, gpt-5.4-pro, deepseek-v3.2
-- Aggregator Model: claude-opus-4.6 (highest capability for synthesis)
-
 Configuration:
-    To customize the MoA setup, modify the configuration constants at the top of this file:
-    - REFERENCE_MODELS: List of models for generating diverse initial responses
-    - AGGREGATOR_MODEL: Model used to synthesize the final response
-    - REFERENCE_TEMPERATURE/AGGREGATOR_TEMPERATURE: Sampling temperatures
-    - MIN_SUCCESSFUL_REFERENCES: Minimum successful models needed to proceed
+    To customize the MoA setup, modify the configuration constants at the top of this file
+    or use `~/.hermes/config.yaml` under the `moa:` section:
+
+    moa:
+      reference_models:
+        - qwen3.6-plus
+        - kimi-k2.5
+        - glm-5
+      aggregator_model: qwen3.6-plus
+      providers:
+        custom:
+          reference_models: [qwen3.6-plus, kimi-k2.5]
+          aggregator_model: qwen3.6-plus
 
 Usage:
     from mixture_of_agents_tool import mixture_of_agents_tool
@@ -50,26 +56,31 @@ import logging
 import os
 import asyncio
 import datetime
-from typing import Dict, Any, List, Optional
-from tools.openrouter_client import get_async_client as _get_openrouter_client, check_api_key as check_openrouter_api_key
-from agent.auxiliary_client import extract_content_or_reasoning
+from typing import Dict, Any, List, Optional, Tuple
+
+from openai import AsyncOpenAI, OpenAI
+
+from agent.auxiliary_client import AsyncCodexAuxiliaryClient, CodexAuxiliaryClient, extract_content_or_reasoning
+from hermes_cli.auth import PROVIDER_REGISTRY, fetch_nous_models
+from hermes_cli.codex_models import get_codex_model_ids
+from hermes_cli.config import load_config
+from hermes_cli.runtime_provider import format_runtime_provider_error, resolve_runtime_provider
 from tools.debug_helpers import DebugSession
 
 logger = logging.getLogger(__name__)
 
 # Configuration for MoA processing
-# Reference models - these generate diverse initial responses in parallel.
-# Keep this list aligned with current top-tier OpenRouter frontier options.
+# Default OpenRouter reference models — these generate diverse initial responses in parallel.
+# Kept as fallback for when runtime provider resolution fails.
 REFERENCE_MODELS = [
-    "anthropic/claude-opus-4.6",
-    "google/gemini-3-pro-preview",
-    "openai/gpt-5.4-pro",
     "deepseek/deepseek-v3.2",
+    "qwen/qwen3.6-plus",
+    "z-ai/glm-5.1",
+    "moonshotai/kimi-k2.5",
 ]
 
-# Aggregator model - synthesizes reference responses into final output.
-# Prefer the strongest synthesis model in the current OpenRouter lineup.
-AGGREGATOR_MODEL = "anthropic/claude-opus-4.6"
+# Aggregator model — synthesizes reference responses into final output.
+AGGREGATOR_MODEL = "qwen/qwen3.6-plus"
 
 # Temperature settings optimized for MoA performance
 REFERENCE_TEMPERATURE = 0.6  # Balanced creativity for diverse perspectives
@@ -84,6 +95,244 @@ AGGREGATOR_SYSTEM_PROMPT = """You have been provided with a set of responses fro
 Responses from models:"""
 
 _debug = DebugSession("moa_tools", env_var="MOA_TOOLS_DEBUG")
+
+# ── Provider-aware MoA helpers (adapted from PR #653) ──────────────────
+
+_OPENROUTER_HEADERS = {
+    "HTTP-Referer": "https://github.com/NousResearch/hermes-agent",
+    "X-OpenRouter-Title": "Hermes Agent",
+    "X-OpenRouter-Categories": "productivity,cli-agent",
+}
+
+_NOUS_EXTRA_BODY = {"tags": ["product=hermes-agent"]}
+
+_PROVIDER_REFERENCE_DEFAULTS: Dict[str, List[str]] = {
+    "zai": ["glm-5", "glm-4.7", "glm-4.5", "glm-4.5-flash"],
+    "kimi-coding": ["kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"],
+    "minimax": ["MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1"],
+    "minimax-cn": ["MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1"],
+}
+
+
+def _dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    deduped: List[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        cleaned = item.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        deduped.append(cleaned)
+    return deduped
+
+
+def _configured_model() -> str:
+    for env_var in ("HERMES_MODEL", "LLM_MODEL", "OPENAI_MODEL"):
+        value = os.getenv(env_var, "").strip()
+        if value:
+            return value
+
+    model_cfg = load_config().get("model")
+    if isinstance(model_cfg, dict):
+        value = model_cfg.get("default")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    elif isinstance(model_cfg, str) and model_cfg.strip():
+        return model_cfg.strip()
+    return ""
+
+
+def _moa_config() -> Dict[str, Any]:
+    config = load_config().get("moa")
+    return dict(config) if isinstance(config, dict) else {}
+
+
+def _provider_moa_config(provider: str) -> Dict[str, Any]:
+    moa_cfg = _moa_config()
+    providers_cfg = moa_cfg.get("providers")
+    if not isinstance(providers_cfg, dict):
+        return {}
+    provider_cfg = providers_cfg.get(provider)
+    return dict(provider_cfg) if isinstance(provider_cfg, dict) else {}
+
+
+def _normalize_model_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return _dedupe_preserve_order([item for item in value if isinstance(item, str)])
+
+
+def _configured_moa_overrides(provider: str) -> Tuple[List[str], str]:
+    provider_cfg = _provider_moa_config(provider)
+    root_cfg = _moa_config()
+
+    reference_models = _normalize_model_list(provider_cfg.get("reference_models"))
+    if not reference_models:
+        reference_models = _normalize_model_list(root_cfg.get("reference_models"))
+
+    aggregator_model = ""
+    provider_aggregator = provider_cfg.get("aggregator_model")
+    root_aggregator = root_cfg.get("aggregator_model")
+    if isinstance(provider_aggregator, str) and provider_aggregator.strip():
+        aggregator_model = provider_aggregator.strip()
+    elif isinstance(root_aggregator, str) and root_aggregator.strip():
+        aggregator_model = root_aggregator.strip()
+
+    return reference_models, aggregator_model
+
+
+def _is_openrouter_runtime(runtime: Dict[str, Any]) -> bool:
+    return "openrouter.ai" in str(runtime.get("base_url", "")).lower()
+
+
+def _is_custom_openai_runtime(runtime: Dict[str, Any]) -> bool:
+    provider = runtime.get("provider", "")
+    base_url = str(runtime.get("base_url", "") or "")
+    # custom provider OR any provider with a non-OpenRouter base URL
+    if provider == "custom":
+        return True
+    if base_url and "openrouter.ai" not in base_url.lower():
+        if provider in ("zai", "kimi-coding", "minimax", "minimax-cn"):
+            return True
+    return False
+
+
+def _supports_temperature(model: str) -> bool:
+    slug = (model or "").strip().lower().split("/")[-1]
+    return not slug.startswith(("gpt-", "o1", "o3", "o4", "o5"))
+
+
+def _provider_extra_body(runtime: Dict[str, Any]) -> Dict[str, Any]:
+    if runtime.get("provider") == "nous":
+        return dict(_NOUS_EXTRA_BODY)
+    if _is_openrouter_runtime(runtime):
+        return {
+            "reasoning": {
+                "enabled": True,
+                "effort": "xhigh",
+            }
+        }
+    return {}
+
+
+def _build_async_client(runtime: Dict[str, Any]):
+    provider = runtime.get("provider", "")
+    api_key = str(runtime.get("api_key", "") or "")
+    base_url = str(runtime.get("base_url", "") or "").rstrip("/")
+
+    if not api_key or not base_url:
+        raise ValueError("Runtime provider did not supply a usable API key and base URL")
+
+    if provider == "openai-codex":
+        real_client = OpenAI(api_key=api_key, base_url=base_url)
+        return AsyncCodexAuxiliaryClient(CodexAuxiliaryClient(real_client, "gpt-5.2-codex"))
+
+    client_kwargs = {
+        "api_key": api_key,
+        "base_url": base_url,
+    }
+    if _is_openrouter_runtime(runtime):
+        client_kwargs["default_headers"] = dict(_OPENROUTER_HEADERS)
+    return AsyncOpenAI(**client_kwargs)
+
+
+def _resolve_default_models(runtime: Dict[str, Any]) -> Tuple[List[str], str]:
+    provider = str(runtime.get("provider", "openrouter") or "openrouter")
+    current_model = _configured_model()
+    config_reference_models, config_aggregator_model = _configured_moa_overrides(provider)
+
+    if _is_custom_openai_runtime(runtime):
+        # Custom OpenAI-compatible endpoint (e.g., Coding Plan / DashScope)
+        # Model names should NOT have provider prefixes for these endpoints
+        
+        # Known Coding Plan models (diverse set for MoA)
+        coding_plan_models = ["qwen3.6-plus", "kimi-k2.5", "glm-5", "MiniMax-M2.5", "qwen3.5-plus", "glm-4.7"]
+        
+        # Start with configured overrides
+        models = _normalize_model_list(config_reference_models)
+        
+        # If no config override, use Coding Plan defaults
+        if not models:
+            # Add current model first (if configured)
+            if current_model:
+                bare = current_model.split("/")[-1] if "/" in current_model else current_model
+                models = [bare]
+            # Add remaining Coding Plan models for diversity
+            for m in coding_plan_models:
+                if m not in models:
+                    models.append(m)
+        
+        aggregator = (config_aggregator_model or current_model).strip()
+        if aggregator:
+            aggregator = aggregator.split("/")[-1] if "/" in aggregator else aggregator
+        if not aggregator:
+            aggregator = models[0] if models else "qwen3.6-plus"
+        if aggregator not in models:
+            models = [aggregator] + models
+        models = _dedupe_preserve_order(models)
+        if not models:
+            raise ValueError(
+                "No model configured for the active OpenAI-compatible endpoint. "
+                "Set moa.reference_models / moa.aggregator_model or HERMES_MODEL / LLM_MODEL / OPENAI_MODEL."
+            )
+        return models, aggregator
+
+    if provider == "nous":
+        fetched_models: List[str] = []
+        try:
+            fetched_models = fetch_nous_models(
+                inference_base_url=str(runtime.get("base_url", "")),
+                api_key=str(runtime.get("api_key", "")),
+                timeout_seconds=10.0,
+            )
+        except Exception as exc:
+            logger.warning("Could not fetch Nous model list for MoA; falling back to configured model: %s", exc)
+        models = _dedupe_preserve_order(config_reference_models or (([current_model] if current_model else []) + fetched_models))
+        aggregator = (config_aggregator_model or current_model or (models[0] if models else "")).strip()
+        if aggregator and aggregator not in models:
+            models = [aggregator] + models
+        models = _dedupe_preserve_order(models)
+        if not models:
+            raise ValueError("No Nous models available for Mixture of Agents")
+        return models, aggregator or models[0]
+
+    if provider == "openai-codex":
+        models = _dedupe_preserve_order(
+            config_reference_models or (([current_model] if current_model else []) + get_codex_model_ids(access_token=str(runtime.get("api_key", ""))))
+        )
+        aggregator = (config_aggregator_model or current_model or (models[0] if models else "")).strip()
+        if aggregator and aggregator not in models:
+            models = [aggregator] + models
+        models = _dedupe_preserve_order(models)
+        if not models:
+            raise ValueError("No Codex models available for Mixture of Agents")
+        return models, aggregator or models[0]
+
+    if provider in _PROVIDER_REFERENCE_DEFAULTS:
+        models = _dedupe_preserve_order(
+            config_reference_models or (([current_model] if current_model else []) + _PROVIDER_REFERENCE_DEFAULTS[provider])
+        )
+        aggregator = (config_aggregator_model or current_model or (models[0] if models else "")).strip()
+        if aggregator and aggregator not in models:
+            models = [aggregator] + models
+        models = _dedupe_preserve_order(models)
+        if not models:
+            raise ValueError(f"No default models configured for provider '{provider}'")
+        return models, aggregator or models[0]
+
+    # Fallback: use hardcoded REFERENCE_MODELS (OpenRouter slugs)
+    models = _dedupe_preserve_order(config_reference_models or (([current_model] if current_model else []) + REFERENCE_MODELS))
+    aggregator = (config_aggregator_model or current_model or AGGREGATOR_MODEL).strip()
+    if aggregator and aggregator not in models:
+        models = [aggregator] + models
+    models = _dedupe_preserve_order(models)
+    if not models:
+        raise ValueError("No models available for Mixture of Agents")
+    return models, aggregator or models[0]
+
+# ── End provider-aware helpers ─────────────────────────────────────────
 
 
 def _construct_aggregator_prompt(system_prompt: str, responses: List[str]) -> str:
@@ -102,6 +351,8 @@ def _construct_aggregator_prompt(system_prompt: str, responses: List[str]) -> st
 
 
 async def _run_reference_model_safe(
+    client,
+    runtime: Dict[str, Any],
     model: str,
     user_prompt: str,
     temperature: float = REFERENCE_TEMPERATURE,
@@ -112,6 +363,8 @@ async def _run_reference_model_safe(
     Run a single reference model with retry logic and graceful failure handling.
     
     Args:
+        client: AsyncOpenAI client for the resolved provider
+        runtime: Runtime provider configuration dict
         model (str): Model identifier to use
         user_prompt (str): The user's query
         temperature (float): Sampling temperature for response generation
@@ -129,20 +382,18 @@ async def _run_reference_model_safe(
             api_params = {
                 "model": model,
                 "messages": [{"role": "user", "content": user_prompt}],
-                "extra_body": {
-                    "reasoning": {
-                        "enabled": True,
-                        "effort": "xhigh"
-                    }
-                }
             }
-            
-            # GPT models (especially gpt-4o-mini) don't support custom temperature values
-            # Only include temperature for non-GPT models
-            if not model.lower().startswith('gpt-'):
+
+            extra_body = _provider_extra_body(runtime)
+            if extra_body:
+                api_params["extra_body"] = extra_body
+            if _supports_temperature(model):
                 api_params["temperature"] = temperature
-            
-            response = await _get_openrouter_client().chat.completions.create(**api_params)
+
+            if max_tokens is not None:
+                api_params["max_tokens"] = max_tokens
+
+            response = await client.chat.completions.create(**api_params)
             
             content = extract_content_or_reasoning(response)
             if not content:
@@ -177,6 +428,9 @@ async def _run_reference_model_safe(
 
 
 async def _run_aggregator_model(
+    client,
+    runtime: Dict[str, Any],
+    aggregator_model: str,
     system_prompt: str,
     user_prompt: str,
     temperature: float = AGGREGATOR_TEMPERATURE,
@@ -186,6 +440,9 @@ async def _run_aggregator_model(
     Run the aggregator model to synthesize the final response.
     
     Args:
+        client: AsyncOpenAI client for the resolved provider
+        runtime: Runtime provider configuration dict
+        aggregator_model (str): Model identifier for aggregation
         system_prompt (str): System prompt with all reference responses
         user_prompt (str): Original user query
         temperature (float): Focused temperature for consistent aggregation
@@ -194,36 +451,34 @@ async def _run_aggregator_model(
     Returns:
         str: Synthesized final response
     """
-    logger.info("Running aggregator model: %s", AGGREGATOR_MODEL)
+    logger.info("Running aggregator model: %s", aggregator_model)
 
     # Build parameters for the API call
     api_params = {
-        "model": AGGREGATOR_MODEL,
+        "model": aggregator_model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        "extra_body": {
-            "reasoning": {
-                "enabled": True,
-                "effort": "xhigh"
-            }
-        }
     }
 
-    # GPT models (especially gpt-4o-mini) don't support custom temperature values
-    # Only include temperature for non-GPT models
-    if not AGGREGATOR_MODEL.lower().startswith('gpt-'):
+    extra_body = _provider_extra_body(runtime)
+    if extra_body:
+        api_params["extra_body"] = extra_body
+    if _supports_temperature(aggregator_model):
         api_params["temperature"] = temperature
 
-    response = await _get_openrouter_client().chat.completions.create(**api_params)
+    if max_tokens is not None:
+        api_params["max_tokens"] = max_tokens
+
+    response = await client.chat.completions.create(**api_params)
 
     content = extract_content_or_reasoning(response)
 
     # Retry once on empty content (reasoning-only response)
     if not content:
         logger.warning("Aggregator returned empty content, retrying once")
-        response = await _get_openrouter_client().chat.completions.create(**api_params)
+        response = await client.chat.completions.create(**api_params)
         content = extract_content_or_reasoning(response)
 
     logger.info("Aggregation complete (%s characters)", len(content))
@@ -251,6 +506,10 @@ async def mixture_of_agents_tool(
     1. Layer 1: Multiple reference models generate diverse responses in parallel (temp=0.6)
     2. Layer 2: Aggregator model synthesizes the best elements into final response (temp=0.4)
     
+    **Provider Resolution**: The tool automatically resolves the runtime provider
+    configured in Hermes (OpenRouter, Nous, Codex, GLM, Kimi, MiniMax, custom).
+    Model lists can be overridden in `~/.hermes/config.yaml` under `moa:`.
+    
     Args:
         user_prompt (str): The complex query or problem to solve
         reference_models (Optional[List[str]]): Custom reference models to use
@@ -269,15 +528,15 @@ async def mixture_of_agents_tool(
              }
     
     Raises:
-        Exception: If MoA processing fails or API key is not set
+        Exception: If MoA processing fails or no compatible provider is configured
     """
     start_time = datetime.datetime.now()
     
     debug_call_data = {
         "parameters": {
             "user_prompt": user_prompt[:200] + "..." if len(user_prompt) > 200 else user_prompt,
-            "reference_models": reference_models or REFERENCE_MODELS,
-            "aggregator_model": aggregator_model or AGGREGATOR_MODEL,
+            "reference_models": reference_models,
+            "aggregator_model": aggregator_model,
             "reference_temperature": REFERENCE_TEMPERATURE,
             "aggregator_temperature": AGGREGATOR_TEMPERATURE,
             "min_successful_references": MIN_SUCCESSFUL_REFERENCES
@@ -289,27 +548,65 @@ async def mixture_of_agents_tool(
         "failed_models": [],
         "final_response_length": 0,
         "processing_time_seconds": 0,
-        "models_used": {}
+        "models_used": {},
+        "provider": None,
     }
     
     try:
         logger.info("Starting Mixture-of-Agents processing...")
         logger.info("Query: %s", user_prompt[:100])
         
-        # Validate API key availability
-        if not os.getenv("OPENROUTER_API_KEY"):
-            raise ValueError("OPENROUTER_API_KEY environment variable not set")
+        # Resolve runtime provider dynamically
+        try:
+            runtime = resolve_runtime_provider(requested="auto")
+        except Exception:
+            # Fallback for CLI mode: build runtime from config
+            config = load_config()
+            model_cfg = config.get("model", {})
+            if isinstance(model_cfg, dict) and model_cfg.get("base_url") and model_cfg.get("api_key"):
+                runtime = {
+                    "provider": model_cfg.get("provider", "custom"),
+                    "base_url": model_cfg["base_url"],
+                    "api_key": model_cfg["api_key"],
+                }
+            else:
+                # Try first provider from providers dict
+                providers = config.get("providers", {})
+                if providers:
+                    first_key = list(providers.keys())[0]
+                    p = providers[first_key]
+                    runtime = {
+                        "provider": "custom",
+                        "base_url": p.get("api", ""),
+                        "api_key": p.get("api_key", ""),
+                    }
+                else:
+                    raise ValueError("No compatible runtime provider configured for Mixture of Agents")
         
-        # Use provided models or defaults
-        ref_models = reference_models or REFERENCE_MODELS
-        agg_model = aggregator_model or AGGREGATOR_MODEL
+        client = _build_async_client(runtime)
+
+        default_ref_models, default_agg_model = _resolve_default_models(runtime)
+
+        # Use provided models or provider-aware defaults
+        ref_models = _dedupe_preserve_order(reference_models or default_ref_models)
+        agg_model = (aggregator_model or default_agg_model).strip()
+
+        if not ref_models:
+            raise ValueError("No reference models available for Mixture of Agents")
+        if not agg_model:
+            raise ValueError("No aggregator model available for Mixture of Agents")
         
-        logger.info("Using %s reference models in 2-layer MoA architecture", len(ref_models))
+        logger.info(
+            "Using provider=%s base_url=%s with %s reference models in 2-layer MoA architecture",
+            runtime.get("provider"),
+            runtime.get("base_url"),
+            len(ref_models),
+        )
         
         # Layer 1: Generate diverse responses from reference models (with failure handling)
         logger.info("Layer 1: Generating reference responses...")
         model_results = await asyncio.gather(*[
-            _run_reference_model_safe(model, user_prompt, REFERENCE_TEMPERATURE)
+            _run_reference_model_safe(client, runtime, model, user_prompt, REFERENCE_TEMPERATURE)
             for model in ref_models
         ])
         
@@ -347,6 +644,9 @@ async def mixture_of_agents_tool(
         )
         
         final_response = await _run_aggregator_model(
+            client,
+            runtime,
+            agg_model,
             aggregator_system_prompt,
             user_prompt,
             AGGREGATOR_TEMPERATURE
@@ -372,6 +672,7 @@ async def mixture_of_agents_tool(
         debug_call_data["final_response_length"] = len(final_response)
         debug_call_data["processing_time_seconds"] = processing_time
         debug_call_data["models_used"] = result["models_used"]
+        debug_call_data["provider"] = runtime.get("provider")
         
         # Log debug information
         _debug.log_call("mixture_of_agents_tool", debug_call_data)
@@ -380,7 +681,7 @@ async def mixture_of_agents_tool(
         return json.dumps(result, indent=2, ensure_ascii=False)
         
     except Exception as e:
-        error_msg = f"Error in MoA processing: {str(e)}"
+        error_msg = f"Error in MoA processing: {format_runtime_provider_error(e)}"
         logger.error("%s", error_msg, exc_info=True)
         
         # Calculate processing time even for errors
@@ -413,8 +714,50 @@ def check_moa_requirements() -> bool:
     Returns:
         bool: True if requirements are met, False otherwise
     """
-    return check_openrouter_api_key()
+    try:
+        runtime = resolve_runtime_provider(requested="auto")
+        if runtime.get("api_key") and runtime.get("base_url"):
+            return True
+    except Exception:
+        pass
+    
+    # Fallback: check for any configured provider in config
+    try:
+        config = load_config()
+        model_cfg = config.get("model", {})
+        if isinstance(model_cfg, dict):
+            base_url = model_cfg.get("base_url", "")
+            api_key = model_cfg.get("api_key", "")
+            if base_url and api_key:
+                return True
+        # Check providers dict
+        providers = config.get("providers", {})
+        if providers:
+            return True
+    except Exception:
+        pass
+    
+    return False
 
+
+def get_available_models() -> Dict[str, List[str]]:
+    """
+    Get the currently available models for MoA based on the runtime provider.
+    
+    Returns:
+        Dict[str, List[str]]: Dictionary with reference and aggregator models
+    """
+    try:
+        runtime = resolve_runtime_provider(requested="auto")
+        reference_models, aggregator_model = _resolve_default_models(runtime)
+    except Exception:
+        reference_models, aggregator_model = REFERENCE_MODELS, AGGREGATOR_MODEL
+
+    return {
+        "reference_models": reference_models,
+        "aggregator_models": [aggregator_model],
+        "supported_models": _dedupe_preserve_order(reference_models + [aggregator_model])
+    }
 
 
 def get_moa_configuration() -> Dict[str, Any]:
@@ -424,14 +767,17 @@ def get_moa_configuration() -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: Dictionary containing all configuration parameters
     """
+    available = get_available_models()
+    reference_models = available["reference_models"]
+    aggregator_model = available["aggregator_models"][0]
     return {
-        "reference_models": REFERENCE_MODELS,
-        "aggregator_model": AGGREGATOR_MODEL,
+        "reference_models": reference_models,
+        "aggregator_model": aggregator_model,
         "reference_temperature": REFERENCE_TEMPERATURE,
         "aggregator_temperature": AGGREGATOR_TEMPERATURE,
         "min_successful_references": MIN_SUCCESSFUL_REFERENCES,
-        "total_reference_models": len(REFERENCE_MODELS),
-        "failure_tolerance": f"{len(REFERENCE_MODELS) - MIN_SUCCESSFUL_REFERENCES}/{len(REFERENCE_MODELS)} models can fail"
+        "total_reference_models": len(reference_models),
+        "failure_tolerance": f"{len(reference_models) - MIN_SUCCESSFUL_REFERENCES}/{len(reference_models)} models can fail"
     }
 
 
@@ -442,16 +788,16 @@ if __name__ == "__main__":
     print("🤖 Mixture-of-Agents Tool Module")
     print("=" * 50)
     
-    # Check if API key is available
-    api_available = check_openrouter_api_key()
-    
-    if not api_available:
-        print("❌ OPENROUTER_API_KEY environment variable not set")
-        print("Please set your API key: export OPENROUTER_API_KEY='your-key-here'")
-        print("Get API key at: https://openrouter.ai/")
+    if not check_moa_requirements():
+        print("❌ No compatible runtime provider configured for Mixture of Agents")
+        print("Configure Hermes with any supported provider (OpenRouter, Nous, Codex, GLM, Kimi, MiniMax, or a custom OpenAI-compatible endpoint).")
         exit(1)
     else:
-        print("✅ OpenRouter API key found")
+        try:
+            runtime = resolve_runtime_provider(requested="auto")
+            print(f"✅ Runtime provider ready: {runtime.get('provider')} @ {runtime.get('base_url')}")
+        except Exception:
+            print("✅ Runtime provider available")
     
     print("🛠️  MoA tools ready for use!")
     
@@ -496,31 +842,21 @@ if __name__ == "__main__":
     print("  - Parallel processing for efficiency")
     print(f"  - Optimized temperatures: {REFERENCE_TEMPERATURE} for reference models, {AGGREGATOR_TEMPERATURE} for aggregation")
     print("  - Token-efficient: only returns final aggregated response")
-    print("  - Resilient: continues with partial model failures")
-    print("  - Configurable: easy to modify models and settings at top of file")
-    print("  - State-of-the-art results on challenging benchmarks")
-    
-    print("\nDebug mode:")
-    print("  # Enable debug logging")
-    print("  export MOA_TOOLS_DEBUG=true")
-    print("  # Debug logs capture all MoA processing steps and metrics")
-    print("  # Logs saved to: ./logs/moa_tools_debug_UUID.json")
 
 
-# ---------------------------------------------------------------------------
-# Registry
-# ---------------------------------------------------------------------------
-from tools.registry import registry
+# ── Tool Registration ──────────────────────────────────────────────────
+
+from tools.registry import registry, tool_error
 
 MOA_SCHEMA = {
     "name": "mixture_of_agents",
-    "description": "Route a hard problem through multiple frontier LLMs collaboratively. Makes 5 API calls (4 reference models + 1 aggregator) with maximum reasoning effort — use sparingly for genuinely difficult problems. Best for: complex math, advanced algorithms, multi-step analytical reasoning, problems benefiting from diverse perspectives.",
+    "description": "Process a complex query using the Mixture-of-Agents methodology. Uses multiple LLMs in parallel to collaboratively solve extremely difficult problems requiring intense reasoning. Higher latency but significantly better quality for complex math, coding, and analytical tasks.",
     "parameters": {
         "type": "object",
         "properties": {
             "user_prompt": {
                 "type": "string",
-                "description": "The complex query or problem to solve using multiple AI models. Should be a challenging problem that benefits from diverse perspectives and collaborative reasoning."
+                "description": "The complex query or problem to solve using multiple models."
             }
         },
         "required": ["user_prompt"]
@@ -533,7 +869,6 @@ registry.register(
     schema=MOA_SCHEMA,
     handler=lambda args, **kw: mixture_of_agents_tool(user_prompt=args.get("user_prompt", "")),
     check_fn=check_moa_requirements,
-    requires_env=["OPENROUTER_API_KEY"],
+    requires_env=[],
     is_async=True,
-    emoji="🧠",
 )

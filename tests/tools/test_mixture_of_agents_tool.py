@@ -10,12 +10,12 @@ moa = importlib.import_module("tools.mixture_of_agents_tool")
 
 def test_moa_defaults_track_current_openrouter_frontier_models():
     assert moa.REFERENCE_MODELS == [
-        "anthropic/claude-opus-4.6",
-        "google/gemini-3-pro-preview",
-        "openai/gpt-5.4-pro",
         "deepseek/deepseek-v3.2",
+        "qwen/qwen3.6-plus",
+        "z-ai/glm-5.1",
+        "moonshotai/kimi-k2.5",
     ]
-    assert moa.AGGREGATOR_MODEL == "anthropic/claude-opus-4.6"
+    assert moa.AGGREGATOR_MODEL == "deepseek/deepseek-v3.2"
 
 
 @pytest.mark.asyncio
@@ -35,10 +35,10 @@ async def test_reference_model_retry_warnings_avoid_exc_info_until_terminal_fail
     monkeypatch.setattr(moa.logger, "error", err)
 
     model, message, success = await moa._run_reference_model_safe(
-        "openai/gpt-5.4-pro", "hello", max_retries=2
+        "deepseek/deepseek-v3.2", "hello", max_retries=2
     )
 
-    assert model == "openai/gpt-5.4-pro"
+    assert model == "deepseek/deepseek-v3.2"
     assert success is False
     assert "failed after 2 attempts" in message
     assert warn.call_count == 2
@@ -53,7 +53,7 @@ async def test_moa_top_level_error_logs_single_traceback_on_aggregator_failure(m
     monkeypatch.setattr(
         moa,
         "_run_reference_model_safe",
-        AsyncMock(return_value=("anthropic/claude-opus-4.6", "ok", True)),
+        AsyncMock(return_value=("deepseek/deepseek-v3.2", "ok", True)),
     )
     monkeypatch.setattr(
         moa,
@@ -72,7 +72,7 @@ async def test_moa_top_level_error_logs_single_traceback_on_aggregator_failure(m
     result = json.loads(
         await moa.mixture_of_agents_tool(
             "solve this",
-            reference_models=["anthropic/claude-opus-4.6"],
+            reference_models=["deepseek/deepseek-v3.2"],
         )
     )
 

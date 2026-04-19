@@ -683,6 +683,16 @@ DEFAULT_CONFIG = {
                                  # "low", "minimal", "none" (empty = inherit parent's level)
     },
 
+    # Mixture-of-Agents (MoA) — multi-model collaborative reasoning.
+    # The tool automatically resolves the runtime provider at execution time.
+    # Model lists below serve as fallbacks; provider-specific defaults are
+    # computed dynamically from _PROVIDER_REFERENCE_DEFAULTS in the tool module.
+    "moa": {
+        "reference_models": [],       # Override reference models globally (empty = provider defaults)
+        "aggregator_model": "",       # Override aggregator model globally (empty = provider defaults)
+        "providers": {},              # Per-provider overrides: {"custom": {"reference_models": [...], "aggregator_model": "..."}}
+    },
+
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.
