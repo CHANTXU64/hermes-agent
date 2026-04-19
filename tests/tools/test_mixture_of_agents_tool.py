@@ -15,7 +15,7 @@ def test_moa_defaults_track_current_openrouter_frontier_models():
         "z-ai/glm-5.1",
         "moonshotai/kimi-k2.5",
     ]
-    assert moa.AGGREGATOR_MODEL == "deepseek/deepseek-v3.2"
+    assert moa.AGGREGATOR_MODEL == "qwen/qwen3.6-plus"
 
 
 @pytest.mark.asyncio
@@ -30,15 +30,15 @@ async def test_reference_model_retry_warnings_avoid_exc_info_until_terminal_fail
     warn = MagicMock()
     err = MagicMock()
 
-    monkeypatch.setattr(moa, "_get_openrouter_client", lambda: fake_client)
     monkeypatch.setattr(moa.logger, "warning", warn)
     monkeypatch.setattr(moa.logger, "error", err)
 
+    runtime = {"provider": "custom", "base_url": "http://test", "api_key": "test"}
     model, message, success = await moa._run_reference_model_safe(
-        "deepseek/deepseek-v3.2", "hello", max_retries=2
+        fake_client, runtime, "deepseek-v3.2", "hello", max_retries=2
     )
 
-    assert model == "deepseek/deepseek-v3.2"
+    assert model == "deepseek-v3.2"
     assert success is False
     assert "failed after 2 attempts" in message
     assert warn.call_count == 2
@@ -49,11 +49,26 @@ async def test_reference_model_retry_warnings_avoid_exc_info_until_terminal_fail
 
 @pytest.mark.asyncio
 async def test_moa_top_level_error_logs_single_traceback_on_aggregator_failure(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    fake_runtime = {"provider": "custom", "base_url": "http://test", "api_key": "test"}
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=AsyncMock(side_effect=RuntimeError("aggregator boom"))
+            )
+        )
+    )
+
+    monkeypatch.setattr(moa, "resolve_runtime_provider", lambda requested="auto": fake_runtime)
+    monkeypatch.setattr(moa, "_build_async_client", lambda runtime: fake_client)
+    monkeypatch.setattr(
+        moa,
+        "_resolve_default_models",
+        lambda runtime: (["qwen3.6-plus"], "qwen3.6-plus"),
+    )
     monkeypatch.setattr(
         moa,
         "_run_reference_model_safe",
-        AsyncMock(return_value=("deepseek/deepseek-v3.2", "ok", True)),
+        AsyncMock(return_value=("qwen3.6-plus", "ok", True)),
     )
     monkeypatch.setattr(
         moa,
@@ -72,7 +87,7 @@ async def test_moa_top_level_error_logs_single_traceback_on_aggregator_failure(m
     result = json.loads(
         await moa.mixture_of_agents_tool(
             "solve this",
-            reference_models=["deepseek/deepseek-v3.2"],
+            reference_models=["qwen3.6-plus"],
         )
     )
 
