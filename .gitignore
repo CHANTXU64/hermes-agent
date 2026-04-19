@@ -63,3 +63,5 @@ mini-swe-agent/
 .nix-stamps/
 result
 website/static/api/skills-index.json
+/.playwright-cli
+/plugins/context_engine/lcm

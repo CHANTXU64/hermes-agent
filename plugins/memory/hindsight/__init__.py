@@ -729,7 +729,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"role": "assistant", "content": assistant_content, "timestamp": now},
         ]
 
-        turn = json.dumps(messages)
+        turn = json.dumps(messages, ensure_ascii=False)
         self._session_turns.append(turn)
         self._turn_counter += 1
 
