@@ -916,7 +916,7 @@ def text_to_speech_tool(
         out_dir.mkdir(parents=True, exist_ok=True)
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        if want_opus and provider in ("openai", "elevenlabs", "mistral", "gemini", "qwen"):
+        if want_opus and provider in ("openai", "elevenlabs", "mistral", "gemini"):
             file_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
@@ -1031,7 +1031,7 @@ def text_to_speech_tool(
         # Try Opus conversion for Telegram compatibility
         # Edge TTS outputs MP3, NeuTTS outputs WAV — both need ffmpeg conversion
         voice_compatible = False
-        if provider in ("edge", "neutts", "minimax", "xai") and not file_str.endswith(".ogg"):
+        if provider in ("edge", "neutts", "minimax", "xai", "qwen") and not file_str.endswith(".ogg"):
             opus_path = _convert_to_opus(file_str)
             if opus_path:
                 file_str = opus_path
