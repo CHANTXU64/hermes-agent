@@ -151,7 +151,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="gemini",
         name="Google AI Studio",
         auth_type="api_key",
-        inference_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        inference_base_url="https://generativelanguage.googleapis.com/v1beta",
         api_key_env_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY"),
         base_url_env_var="GEMINI_BASE_URL",
     ),
@@ -353,6 +353,9 @@ def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) ->
     """
     if env_override:
         return env_override
+    # No key → nothing to infer from.  Return default without inspecting.
+    if not api_key:
+        return default_url
     if api_key.startswith("sk-kimi-"):
         return KIMI_CODE_BASE_URL
     return default_url
@@ -479,6 +482,14 @@ def _resolve_zai_base_url(api_key: str, default_url: str, env_override: str) -> 
     """
     if env_override:
         return env_override
+
+    # No API key set → don't probe (would fire N×M HTTPS requests with an
+    # empty Bearer token, all returning 401).  This path is hit during
+    # auxiliary-client auto-detection when the user has no Z.AI credentials
+    # at all — the caller discards the result immediately, so the probe is
+    # pure latency for every AIAgent construction.
+    if not api_key:
+        return default_url
 
     # Check provider-state cache for a previously-detected endpoint.
     auth_store = _load_auth_store()
