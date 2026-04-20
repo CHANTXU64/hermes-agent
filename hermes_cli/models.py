@@ -16,6 +16,12 @@ from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+from hermes_cli import __version__ as _HERMES_VERSION
+
+# Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
+# Check (error 1010) don't reject the default ``Python-urllib/*`` signature.
+_HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
+
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
 COPILOT_EDITOR_VERSION = "vscode/1.104.1"
@@ -225,7 +231,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-5.4-pro",
         "gpt-5.4",
         "gpt-5.3-codex",
-        "gpt-5.3-codex-spark",
         "gpt-5.2",
         "gpt-5.2-codex",
         "gpt-5.1",
@@ -1769,7 +1774,7 @@ def probe_api_models(
         candidates.append((alternate_base, True))
 
     tried: list[str] = []
-    headers: dict[str, str] = {}
+    headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if normalized.startswith(COPILOT_BASE_URL):
@@ -2101,6 +2106,51 @@ def validate_requested_model(
                 "message": (
                     f"Model `{requested}` was not found in the OpenAI Codex model listing."
                     f"{suggestion_text}"
+                ),
+            }
+
+    # MiniMax providers don't expose a /models endpoint — validate against
+    # the static catalog instead, similar to openai-codex.
+    if normalized in ("minimax", "minimax-cn"):
+        try:
+            catalog_models = provider_model_ids(normalized)
+        except Exception:
+            catalog_models = []
+        if catalog_models:
+            # Case-insensitive lookup (catalog uses mixed case like MiniMax-M2.7)
+            catalog_lower = {m.lower(): m for m in catalog_models}
+            if requested_for_lookup.lower() in catalog_lower:
+                return {
+                    "accepted": True,
+                    "persist": True,
+                    "recognized": True,
+                    "message": None,
+                }
+            # Auto-correct close matches (case-insensitive)
+            catalog_lower_list = list(catalog_lower.keys())
+            auto = get_close_matches(requested_for_lookup.lower(), catalog_lower_list, n=1, cutoff=0.9)
+            if auto:
+                corrected = catalog_lower[auto[0]]
+                return {
+                    "accepted": True,
+                    "persist": True,
+                    "recognized": True,
+                    "corrected_model": corrected,
+                    "message": f"Auto-corrected `{requested}` → `{corrected}`",
+                }
+            suggestions = get_close_matches(requested_for_lookup.lower(), catalog_lower_list, n=3, cutoff=0.5)
+            suggestion_text = ""
+            if suggestions:
+                suggestion_text = "\n  Similar models: " + ", ".join(f"`{catalog_lower[s]}`" for s in suggestions)
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": False,
+                "message": (
+                    f"Note: `{requested}` was not found in the MiniMax catalog."
+                    f"{suggestion_text}"
+                    "\n  MiniMax does not expose a /models endpoint, so Hermes cannot verify the model name."
+                    "\n  The model may still work if it exists on the server."
                 ),
             }
 

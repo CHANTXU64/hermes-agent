@@ -20,6 +20,7 @@ import logging
 import os
 import shutil
 import shlex
+import ssl
 import stat
 import base64
 import hashlib
@@ -1663,7 +1664,7 @@ def _resolve_verify(
     insecure: Optional[bool] = None,
     ca_bundle: Optional[str] = None,
     auth_state: Optional[Dict[str, Any]] = None,
-) -> bool | str:
+) -> bool | ssl.SSLContext:
     tls_state = auth_state.get("tls") if isinstance(auth_state, dict) else {}
     tls_state = tls_state if isinstance(tls_state, dict) else {}
 
@@ -1683,13 +1684,12 @@ def _resolve_verify(
     if effective_ca:
         ca_path = str(effective_ca)
         if not os.path.isfile(ca_path):
-            import logging
-            logging.getLogger("hermes.auth").warning(
+            logger.warning(
                 "CA bundle path does not exist: %s — falling back to default certificates",
                 ca_path,
             )
             return True
-        return ca_path
+        return ssl.create_default_context(cafile=ca_path)
     return True
 
 
@@ -2731,6 +2731,17 @@ def _update_config_for_provider(
     else:
         # Clear stale base_url to prevent contamination when switching providers
         model_cfg.pop("base_url", None)
+
+    # Clear stale api_key/api_mode left over from a previous custom provider.
+    # When the user switches from e.g. a MiniMax custom endpoint
+    # (api_mode=anthropic_messages, api_key=mxp-...) to a built-in provider
+    # (e.g. OpenRouter), the stale api_key/api_mode would override the new
+    # provider's credentials and transport choice.  Built-in providers that
+    # need a specific api_mode (copilot, xai) set it at request-resolution
+    # time via `_copilot_runtime_api_mode` / `_detect_api_mode_for_url`, so
+    # removing the persisted value here is safe.
+    model_cfg.pop("api_key", None)
+    model_cfg.pop("api_mode", None)
 
     # When switching to a non-OpenRouter provider, ensure model.default is
     # valid for the new provider.  An OpenRouter-formatted name like
