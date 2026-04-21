@@ -140,6 +140,9 @@ from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
 )
 
+# Safe command rewrite — replaces destructive file ops with safe alternatives
+from tools.safe_cmd_rewrite import safe_command_rewrite
+
 
 def _check_all_guards(command: str, env_type: str) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
@@ -1556,6 +1559,10 @@ def terminal_tool(
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
+
+        # Rewrite destructive file operations to safe alternatives
+        # (rm → trash, mv → gmv -b, cp → gcp -b)
+        command = safe_command_rewrite(command, env_type)
 
         # Validate workdir against shell injection
         if workdir:
