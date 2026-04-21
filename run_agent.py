@@ -1514,10 +1514,19 @@ class AIAgent:
                     _existing_tool_names.add(_tname)
 
         # Skills config: nudge interval for skill creation reminders
+        skills_config = _agent_cfg.get("skills", {}) if isinstance(_agent_cfg, dict) else {}
         self._skill_nudge_interval = 10
         try:
-            skills_config = _agent_cfg.get("skills", {})
             self._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
+        except Exception:
+            pass
+
+        # Skill review prompt — configurable via config.yaml skills.skill_review_prompt
+        self._skill_review_prompt = self.__class__._SKILL_REVIEW_PROMPT
+        try:
+            _prompt = skills_config.get("skill_review_prompt")
+            if isinstance(_prompt, str) and _prompt.strip():
+                self._skill_review_prompt = _prompt.strip()
         except Exception:
             pass
 
@@ -2773,7 +2782,7 @@ class AIAgent:
         elif review_memory:
             prompt = self._MEMORY_REVIEW_PROMPT
         else:
-            prompt = self._SKILL_REVIEW_PROMPT
+            prompt = self._skill_review_prompt
 
         def _run_review():
             import contextlib
