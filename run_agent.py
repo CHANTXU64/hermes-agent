@@ -1530,6 +1530,24 @@ class AIAgent:
         except Exception:
             pass
 
+        # Memory review prompt — configurable via config.yaml skills.memory_review_prompt
+        self._memory_review_prompt = self.__class__._MEMORY_REVIEW_PROMPT
+        try:
+            _prompt = skills_config.get("memory_review_prompt")
+            if isinstance(_prompt, str) and _prompt.strip():
+                self._memory_review_prompt = _prompt.strip()
+        except Exception:
+            pass
+
+        # Combined review prompt — configurable via config.yaml skills.combined_review_prompt
+        self._combined_review_prompt = self.__class__._COMBINED_REVIEW_PROMPT
+        try:
+            _prompt = skills_config.get("combined_review_prompt")
+            if isinstance(_prompt, str) and _prompt.strip():
+                self._combined_review_prompt = _prompt.strip()
+        except Exception:
+            pass
+
         # Tool-use enforcement config: "auto" (default — matches hardcoded
         # model list), true (always), false (never), or list of substrings.
         _agent_section = _agent_cfg.get("agent", {})
@@ -2778,9 +2796,9 @@ class AIAgent:
 
         # Pick the right prompt based on which triggers fired
         if review_memory and review_skills:
-            prompt = self._COMBINED_REVIEW_PROMPT
+            prompt = self._combined_review_prompt
         elif review_memory:
-            prompt = self._MEMORY_REVIEW_PROMPT
+            prompt = self._memory_review_prompt
         else:
             prompt = self._skill_review_prompt
 
