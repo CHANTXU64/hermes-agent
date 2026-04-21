@@ -117,6 +117,7 @@ AUTHOR_MAP = {
     "alexazzjjtt@163.com": "alexzhu0",
     "1180176+Swift42@users.noreply.github.com": "Swift42",
     "ruzzgarcn@gmail.com": "Ruzzgar",
+    "yukipukikedy@gmail.com": "Yukipukii1",
     "alireza78.crypto@gmail.com": "alireza78a",
     "brooklyn.bb.nicholson@gmail.com": "brooklynnicholson",
     "withapurpose37@gmail.com": "StefanIsMe",
@@ -306,6 +307,7 @@ AUTHOR_MAP = {
     "anthhub@163.com": "anthhub",
     "shenuu@gmail.com": "shenuu",
     "xiayh17@gmail.com": "xiayh0107",
+    "zhujianxyz@gmail.com": "opriz",
     "asurla@nvidia.com": "anniesurla",
     "limkuan24@gmail.com": "WideLee",
     "aviralarora002@gmail.com": "AviArora02-commits",
@@ -320,6 +322,7 @@ AUTHOR_MAP = {
     "haileymarshall005@gmail.com": "haileymarshall",
     "aniruddhaadak80@users.noreply.github.com": "aniruddhaadak80",
     "zheng.jerilyn@gmail.com": "jerilynzheng",
+    "asslaenn5@gmail.com": "Aslaaen",
 }
 
 

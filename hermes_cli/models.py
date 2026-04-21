@@ -72,7 +72,7 @@ _openrouter_catalog_cache: list[tuple[str, str]] | None = None
 # OSS / open-weight models prioritized first, then closed-source by family.
 # Slugs match Vercel's actual /v1/models catalog (e.g. alibaba/ for Qwen,
 # zai/ and xai/ without hyphens).
-AI_GATEWAY_MODELS: list[tuple[str, str]] = [
+VERCEL_AI_GATEWAY_MODELS: list[tuple[str, str]] = [
     ("moonshotai/kimi-k2.6",                 "recommended"),
     ("alibaba/qwen3.6-plus",                 ""),
     ("zai/glm-5.1",                          ""),
@@ -300,20 +300,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "minimax-m2.7",
         "minimax-m2.5",
     ],
-    "ai-gateway": [
-        "anthropic/claude-opus-4.6",
-        "anthropic/claude-sonnet-4.6",
-        "anthropic/claude-sonnet-4.5",
-        "anthropic/claude-haiku-4.5",
-        "openai/gpt-5",
-        "openai/gpt-4.1",
-        "openai/gpt-4.1-mini",
-        "google/gemini-3-pro-preview",
-        "google/gemini-3-flash",
-        "google/gemini-2.5-pro",
-        "google/gemini-2.5-flash",
-        "deepseek/deepseek-v3.2",
-    ],
     "kilocode": [
         "anthropic/claude-opus-4.6",
         "anthropic/claude-sonnet-4.6",
@@ -365,6 +351,12 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "us.meta.llama4-scout-17b-instruct-v1:0",
     ],
 }
+
+# Vercel AI Gateway: derive the bare-model-id catalog from the curated
+# ``VERCEL_AI_GATEWAY_MODELS`` snapshot so both the picker (tuples with descriptions)
+# and the static fallback catalog (bare ids) stay in sync from a single
+# source of truth.
+_PROVIDER_MODELS["ai-gateway"] = [mid for mid, _ in VERCEL_AI_GATEWAY_MODELS]
 
 # ---------------------------------------------------------------------------
 # Nous Portal free-model filtering
@@ -523,8 +515,6 @@ def check_nous_free_tier() -> bool:
     Returns False (assume paid) on any error — never blocks paying users.
     """
     global _free_tier_cache
-    import time
-
     now = time.monotonic()
     if _free_tier_cache is not None:
         cached_result, cached_at = _free_tier_cache
@@ -777,7 +767,7 @@ def fetch_ai_gateway_models(
 
     from hermes_constants import AI_GATEWAY_BASE_URL
 
-    fallback = list(AI_GATEWAY_MODELS)
+    fallback = list(VERCEL_AI_GATEWAY_MODELS)
     preferred_ids = [mid for mid, _ in fallback]
 
     try:
@@ -1267,7 +1257,6 @@ def detect_provider_for_model(
             from hermes_cli.auth import PROVIDER_REGISTRY
             pconfig = PROVIDER_REGISTRY.get(direct_match)
             if pconfig:
-                import os
                 for env_var in pconfig.api_key_env_vars:
                     if os.getenv(env_var, "").strip():
                         has_creds = True

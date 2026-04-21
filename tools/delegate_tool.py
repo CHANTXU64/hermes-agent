@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
+from utils import base_url_hostname
 
 
 # Tools that children must never have access to
@@ -1024,10 +1025,13 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         base_lower = configured_base_url.lower()
         provider = "custom"
         api_mode = "chat_completions"
-        if "chatgpt.com/backend-api/codex" in base_lower:
+        if (
+            base_url_hostname(configured_base_url) == "chatgpt.com"
+            and "/backend-api/codex" in base_lower
+        ):
             provider = "openai-codex"
             api_mode = "codex_responses"
-        elif "api.anthropic.com" in base_lower:
+        elif base_url_hostname(configured_base_url) == "api.anthropic.com":
             provider = "anthropic"
             api_mode = "anthropic_messages"
 

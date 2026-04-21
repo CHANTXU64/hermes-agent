@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 import requests
 import yaml
 
+from utils import base_url_host_matches, base_url_hostname
+
 from hermes_constants import OPENROUTER_MODELS_URL
 
 logger = logging.getLogger(__name__)
@@ -168,6 +170,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     "Qwen/Qwen3.5-35B-A3B": 131072,
     "deepseek-ai/DeepSeek-V3.2": 65536,
     "moonshotai/Kimi-K2.5": 262144,
+    "moonshotai/Kimi-K2.6": 262144,
     "moonshotai/Kimi-K2-Thinking": 262144,
     "MiniMaxAI/MiniMax-M2.5": 204800,
     "XiaomiMiMo/MiMo-V2-Flash": 256000,
@@ -218,7 +221,7 @@ def _auth_headers(api_key: str = "") -> Dict[str, str]:
 
 
 def _is_openrouter_base_url(base_url: str) -> bool:
-    return "openrouter.ai" in _normalize_base_url(base_url).lower()
+    return base_url_host_matches(base_url, "openrouter.ai")
 
 
 def _is_custom_endpoint(base_url: str) -> bool:
@@ -1078,7 +1081,7 @@ def get_model_context_length(
 
     # 4. Anthropic /v1/models API (only for regular API keys, not OAuth)
     if provider == "anthropic" or (
-        base_url and "api.anthropic.com" in base_url
+        base_url and base_url_hostname(base_url) == "api.anthropic.com"
     ):
         ctx = _query_anthropic_context_length(model, base_url or "https://api.anthropic.com", api_key)
         if ctx:
@@ -1087,7 +1090,11 @@ def get_model_context_length(
     # 4b. AWS Bedrock — use static context length table.
     # Bedrock's ListFoundationModels doesn't expose context window sizes,
     # so we maintain a curated table in bedrock_adapter.py.
-    if provider == "bedrock" or (base_url and "bedrock-runtime" in base_url):
+    if provider == "bedrock" or (
+        base_url
+        and base_url_hostname(base_url).startswith("bedrock-runtime.")
+        and base_url_host_matches(base_url, "amazonaws.com")
+    ):
         try:
             from agent.bedrock_adapter import get_bedrock_context_length
             return get_bedrock_context_length(model)

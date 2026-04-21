@@ -86,7 +86,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
-from utils import atomic_yaml_write, is_truthy_value
+from utils import atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
@@ -279,6 +279,7 @@ from gateway.session import (
     build_session_context,
     build_session_context_prompt,
     build_session_key,
+    is_shared_multi_user_session,
 )
 from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import (
@@ -1266,7 +1267,6 @@ class GatewayRunner:
         the prefill_messages_file key in ~/.hermes/config.yaml.
         Relative paths are resolved from ~/.hermes/.
         """
-        import json as _json
         file_path = os.getenv("HERMES_PREFILL_MESSAGES_FILE", "")
         if not file_path:
             try:
@@ -1288,7 +1288,7 @@ class GatewayRunner:
             return []
         try:
             with open(path, "r", encoding="utf-8") as f:
-                data = _json.load(f)
+                data = json.load(f)
             if not isinstance(data, list):
                 logger.warning("Prefill messages file must contain a JSON array: %s", path)
                 return []
@@ -3275,10 +3275,9 @@ class GatewayRunner:
                     return "Usage: /queue <prompt>"
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    from gateway.platforms.base import MessageEvent as _ME, MessageType as _MT
-                    queued_event = _ME(
+                    queued_event = MessageEvent(
                         text=queued_text,
-                        message_type=_MT.TEXT,
+                        message_type=MessageType.TEXT,
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
@@ -3300,10 +3299,9 @@ class GatewayRunner:
                     # Agent hasn't started yet — queue as turn-boundary fallback.
                     adapter = self.adapters.get(source.platform)
                     if adapter:
-                        from gateway.platforms.base import MessageEvent as _ME, MessageType as _MT
-                        queued_event = _ME(
+                        queued_event = MessageEvent(
                             text=steer_text,
-                            message_type=_MT.TEXT,
+                            message_type=MessageType.TEXT,
                             source=event.source,
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
@@ -3323,10 +3321,9 @@ class GatewayRunner:
                 # Running agent is missing or lacks steer() — fall back to queue.
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    from gateway.platforms.base import MessageEvent as _ME, MessageType as _MT
-                    queued_event = _ME(
+                    queued_event = MessageEvent(
                         text=steer_text,
-                        message_type=_MT.TEXT,
+                        message_type=MessageType.TEXT,
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
@@ -3675,9 +3672,8 @@ class GatewayRunner:
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    import asyncio as _aio
                     result = plugin_handler(user_args)
-                    if _aio.iscoroutine(result):
+                    if asyncio.iscoroutine(result):
                         result = await result
                     return str(result) if result else None
             except Exception as e:
@@ -3794,12 +3790,12 @@ class GatewayRunner:
         history = history or []
         message_text = event.text or ""
 
-        _is_shared_thread = (
-            source.chat_type != "dm"
-            and source.thread_id
-            and not getattr(self.config, "thread_sessions_per_user", False)
+        _is_shared_multi_user = is_shared_multi_user_session(
+            source,
+            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
-        if _is_shared_thread and source.user_name:
+        if _is_shared_multi_user and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
 
         if event.media_urls:
@@ -3859,9 +3855,7 @@ class GatewayRunner:
             for i, path in enumerate(event.media_urls):
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
                 if mtype in ("", "application/octet-stream"):
-                    import os as _os2
-
-                    _ext = _os2.path.splitext(path)[1].lower()
+                    _ext = os.path.splitext(path)[1].lower()
                     if _ext in _TEXT_EXTENSIONS:
                         mtype = "text/plain"
                     else:
@@ -3871,13 +3865,10 @@ class GatewayRunner:
                 if not mtype.startswith(("application/", "text/")):
                     continue
 
-                import os as _os
-                import re as _re
-
-                basename = _os.path.basename(path)
+                basename = os.path.basename(path)
                 parts = basename.split("_", 2)
                 display_name = parts[2] if len(parts) >= 3 else basename
-                display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
+                display_name = re.sub(r'[^\w.\- ]', '_', display_name)
 
                 if mtype.startswith("text/"):
                     context_note = (
@@ -5175,7 +5166,6 @@ class GatewayRunner:
         # Save the requester's routing info so the new gateway process can
         # notify them once it comes back online.
         try:
-            import json as _json
             notify_data = {
                 "platform": event.source.platform.value if event.source.platform else None,
                 "chat_id": event.source.chat_id,
@@ -5183,7 +5173,7 @@ class GatewayRunner:
             if event.source.thread_id:
                 notify_data["thread_id"] = event.source.thread_id
             (_hermes_home / ".restart_notify.json").write_text(
-                _json.dumps(notify_data)
+                json.dumps(notify_data)
             )
         except Exception as e:
             logger.debug("Failed to write restart notify file: %s", e)
@@ -5194,16 +5184,14 @@ class GatewayRunner:
         # marker persists so the new gateway can still detect a delayed
         # /restart redelivery from Telegram.  Overwritten on every /restart.
         try:
-            import json as _json
-            import time as _time
             dedup_data = {
                 "platform": event.source.platform.value if event.source.platform else None,
-                "requested_at": _time.time(),
+                "requested_at": time.time(),
             }
             if event.platform_update_id is not None:
                 dedup_data["update_id"] = event.platform_update_id
             (_hermes_home / ".restart_last_processed.json").write_text(
-                _json.dumps(dedup_data)
+                json.dumps(dedup_data)
             )
         except Exception as e:
             logger.debug("Failed to write restart dedup marker: %s", e)
@@ -5251,12 +5239,10 @@ class GatewayRunner:
             return False
 
         try:
-            import json as _json
-            import time as _time
             marker_path = _hermes_home / ".restart_last_processed.json"
             if not marker_path.exists():
                 return False
-            data = _json.loads(marker_path.read_text())
+            data = json.loads(marker_path.read_text())
         except Exception:
             return False
 
@@ -5270,7 +5256,7 @@ class GatewayRunner:
         # swallow a fresh /restart from the user.
         requested_at = data.get("requested_at")
         if isinstance(requested_at, (int, float)):
-            if _time.time() - requested_at > 300:
+            if time.time() - requested_at > 300:
                 return False
         return event.platform_update_id <= recorded_uid
 
@@ -5661,7 +5647,7 @@ class GatewayRunner:
 
         # Cache notice
         cache_enabled = (
-            ("openrouter" in (result.base_url or "").lower() and "claude" in result.new_model.lower())
+            (base_url_host_matches(result.base_url or "", "openrouter.ai") and "claude" in result.new_model.lower())
             or result.api_mode == "anthropic_messages"
         )
         if cache_enabled:
@@ -7352,13 +7338,10 @@ class GatewayRunner:
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""
-        import asyncio as _asyncio
-
         args = event.get_command_args().strip()
 
         # Normalize Unicode dashes (Telegram/iOS auto-converts -- to em/en dash)
-        import re as _re
-        args = _re.sub(r'[\u2012\u2013\u2014\u2015](days|source)', r'--\1', args)
+        args = re.sub(r'[\u2012\u2013\u2014\u2015](days|source)', r'--\1', args)
 
         days = 30
         source = None
@@ -7387,7 +7370,7 @@ class GatewayRunner:
             from hermes_state import SessionDB
             from agent.insights import InsightsEngine
 
-            loop = _asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
 
             def _run_insights():
                 db = SessionDB()
@@ -7745,9 +7728,6 @@ class GatewayRunner:
         the messenger.  The user's next message is intercepted by
         ``_handle_message`` and written to ``.update_response``.
         """
-        import json
-        import re as _re
-
         pending_path = _hermes_home / ".update_pending.json"
         claimed_path = _hermes_home / ".update_pending.claimed.json"
         output_path = _hermes_home / ".update_output.txt"
@@ -7792,7 +7772,7 @@ class GatewayRunner:
             return
 
         def _strip_ansi(text: str) -> str:
-            return _re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
+            return re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
 
         bytes_sent = 0
         last_stream_time = loop.time()
@@ -7940,9 +7920,6 @@ class GatewayRunner:
         cannot resolve the adapter (e.g. after a gateway restart where the
         platform hasn't reconnected yet).
         """
-        import json
-        import re as _re
-
         pending_path = _hermes_home / ".update_pending.json"
         claimed_path = _hermes_home / ".update_pending.claimed.json"
         output_path = _hermes_home / ".update_output.txt"
@@ -7988,7 +7965,7 @@ class GatewayRunner:
 
             if adapter and chat_id:
                 # Strip ANSI escape codes for clean display
-                output = _re.sub(r'\x1b\[[0-9;]*m', '', output).strip()
+                output = re.sub(r'\x1b\[[0-9;]*m', '', output).strip()
                 if output:
                     if len(output) > 3500:
                         output = "…" + output[-3500:]
@@ -8021,14 +7998,12 @@ class GatewayRunner:
 
     async def _send_restart_notification(self) -> None:
         """Notify the chat that initiated /restart that the gateway is back."""
-        import json as _json
-
         notify_path = _hermes_home / ".restart_notify.json"
         if not notify_path.exists():
             return
 
         try:
-            data = _json.loads(notify_path.read_text())
+            data = json.loads(notify_path.read_text())
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             thread_id = data.get("thread_id")
@@ -8114,7 +8089,6 @@ class GatewayRunner:
             The enriched message string with vision descriptions prepended.
         """
         from tools.vision_tools import vision_analyze_tool
-        import json as _json
 
         analysis_prompt = (
             "Describe everything visible in this image in thorough detail. "
@@ -8130,7 +8104,7 @@ class GatewayRunner:
                     image_url=path,
                     user_prompt=analysis_prompt,
                 )
-                result = _json.loads(result_json)
+                result = json.loads(result_json)
                 if result.get("success"):
                     description = result.get("analysis", "")
                     enriched_parts.append(
@@ -8189,7 +8163,6 @@ class GatewayRunner:
             return disabled_note
 
         from tools.transcription_tools import transcribe_audio
-        import asyncio
 
         enriched_parts = []
         for path in audio_paths:
@@ -8325,7 +8298,6 @@ class GatewayRunner:
         if not adapter:
             return
         try:
-            from gateway.platforms.base import MessageEvent, MessageType
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -8430,7 +8402,6 @@ class GatewayRunner:
                             break
                     if adapter and source.chat_id:
                         try:
-                            from gateway.platforms.base import MessageEvent, MessageType
                             synth_event = MessageEvent(
                                 text=synth_text,
                                 message_type=MessageType.TEXT,
@@ -8952,7 +8923,6 @@ class GatewayRunner:
         if _streaming_enabled:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-                from gateway.config import Platform
                 _adapter = self.adapters.get(source.platform)
                 if _adapter:
                     _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
@@ -9236,8 +9206,7 @@ class GatewayRunner:
                 if args:
                     from agent.display import get_tool_preview_max_len
                     _pl = get_tool_preview_max_len()
-                    import json as _json
-                    args_str = _json.dumps(args, ensure_ascii=False, default=str)
+                    args_str = json.dumps(args, ensure_ascii=False, default=str)
                     # When tool_preview_length is 0 (default), don't truncate
                     # in verbose mode — the user explicitly asked for full
                     # detail.  Platform message-length limits handle the rest.
@@ -9303,8 +9272,7 @@ class GatewayRunner:
             # Skip tool progress for platforms that don't support message
             # editing (e.g. iMessage/BlueBubbles) — each progress update
             # would become a separate message bubble, which is noisy.
-            from gateway.platforms.base import BasePlatformAdapter as _BaseAdapter
-            if type(adapter).edit_message is _BaseAdapter.edit_message:
+            if type(adapter).edit_message is BasePlatformAdapter.edit_message:
                 while not progress_queue.empty():
                     try:
                         progress_queue.get_nowait()
@@ -10752,7 +10720,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # The PID file is scoped to HERMES_HOME, so future multi-profile
     # setups (each profile using a distinct HERMES_HOME) will naturally
     # allow concurrent instances without tripping this guard.
-    import time as _time
     from gateway.status import get_running_pid, remove_pid_file, terminate_pid
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
@@ -10792,7 +10759,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             for _ in range(20):
                 try:
                     os.kill(existing_pid, 0)
-                    _time.sleep(0.5)
+                    time.sleep(0.5)
                 except (ProcessLookupError, PermissionError):
                     break  # Process is gone
             else:
@@ -10803,10 +10770,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 )
                 try:
                     terminate_pid(existing_pid, force=True)
-                    _time.sleep(0.5)
+                    time.sleep(0.5)
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
             remove_pid_file()
+            # remove_pid_file() is a no-op when the PID doesn't match.
+            # Force-unlink to cover the old-process-crashed case.
+            try:
+                (get_hermes_home() / "gateway.pid").unlink(missing_ok=True)
+            except Exception:
+                pass
             # Clean up any takeover marker the old process didn't consume
             # (e.g. SIGKILL'd before its shutdown handler could read it).
             try:
@@ -10945,6 +10918,30 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     else:
         logger.info("Skipping signal handlers (not running in main thread).")
     
+    # Claim the PID file BEFORE bringing up any platform adapters.
+    # This closes the --replace race window: two concurrent `gateway run
+    # --replace` invocations both pass the termination-wait above, but
+    # only the winner of the O_CREAT|O_EXCL race below will ever open
+    # Telegram polling, Discord gateway sockets, etc. The loser exits
+    # cleanly before touching any external service.
+    import atexit
+    from gateway.status import write_pid_file, remove_pid_file, get_running_pid
+    _current_pid = get_running_pid()
+    if _current_pid is not None and _current_pid != os.getpid():
+        logger.error(
+            "Another gateway instance (PID %d) started during our startup. "
+            "Exiting to avoid double-running.", _current_pid
+        )
+        return False
+    try:
+        write_pid_file()
+    except FileExistsError:
+        logger.error(
+            "PID file race lost to another gateway instance. Exiting."
+        )
+        return False
+    atexit.register(remove_pid_file)
+
     # Start the gateway
     success = await runner.start()
     if not success:
@@ -10953,12 +10950,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
         return True
-    
-    # Write PID file so CLI can detect gateway is running
-    import atexit
-    from gateway.status import write_pid_file, remove_pid_file
-    write_pid_file()
-    atexit.register(remove_pid_file)
     
     # Start background cron ticker so scheduled jobs fire automatically.
     # Pass the event loop so cron delivery can use live adapters (E2EE support).
