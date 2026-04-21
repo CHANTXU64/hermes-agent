@@ -128,3 +128,13 @@ Each entry includes:
 ---
 
 <!-- Add new modifications below this line. -->
+
+### 10. Skill Review Prompt 配置化 (防止滥建 Skill)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-22 |
+| **Commit** | `907e6bd6` |
+| **Files** | `run_agent.py` (+11/-2) |
+| **What** | 将后台 Skill Review 线程的提示词从硬编码改为从 `config.yaml` 读取。修改前：`AIAgent._spawn_background_review()` 使用硬编码的 `_SKILL_REVIEW_PROMPT` 类属性，门槛极低，导致 Agent 频繁创建重复/无用的 Skill。修改后：在 `__init__` 中从 `config.yaml` 的 `skills.skill_review_prompt` 读取，fallback 到类属性默认值。Prompt 内容也在 config.yaml 中重写，核心要求：<br>• 新建前必须调用 `skills_list()` 检查已有 Skill<br>• 有相似 Skill 时用 `skill_manage(patch/edit)` 更新，不新建<br>• 更新技能必须满足严格条件：用户明确纠正 + 修正成功 + 用户未再反对/开启新话题<br>• 禁止因自己试错成功或用户还没评价就更新<br>• 一次性任务、代码修改、源码可读的东西不建 Skill<br><br>此改动只改了 `run_agent.py`，`config.yaml` 是用户配置不入库。 |
+| **Upstream status** | Fork-only. Bugfix for excessive/low-quality skill creation. |
