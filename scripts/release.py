@@ -46,6 +46,8 @@ AUTHOR_MAP = {
     # contributors (from noreply pattern)
     "snreynolds2506@gmail.com": "snreynolds",
     "35742124+0xbyt4@users.noreply.github.com": "0xbyt4",
+    "71184274+MassiveMassimo@users.noreply.github.com": "MassiveMassimo",
+    "massivemassimo@users.noreply.github.com": "MassiveMassimo",
     "82637225+kshitijk4poor@users.noreply.github.com": "kshitijk4poor",
     "kshitijk4poor@users.noreply.github.com": "kshitijk4poor",
     "kshitijk4poor@gmail.com": "kshitijk4poor",
@@ -53,6 +55,7 @@ AUTHOR_MAP = {
     "185121704+stablegenius49@users.noreply.github.com": "stablegenius49",
     "101283333+batuhankocyigit@users.noreply.github.com": "batuhankocyigit",
     "valdi.jorge@gmail.com": "jvcl",
+    "oussama.redcode@gmail.com": "mavrickdeveloper",
     "126368201+vilkasdev@users.noreply.github.com": "vilkasdev",
     "137614867+cutepawss@users.noreply.github.com": "cutepawss",
     "96793918+memosr@users.noreply.github.com": "memosr",
@@ -95,6 +98,7 @@ AUTHOR_MAP = {
     "ahmedsherif95@gmail.com": "asheriif",
     "liujinkun@bytedance.com": "liujinkun2025",
     "dmayhem93@gmail.com": "dmahan93",
+    "cdanis@gmail.com": "cdanis",
     "samherring99@gmail.com": "samherring99",
     "desaiaum08@gmail.com": "Aum08Desai",
     "shannon.sands.1979@gmail.com": "shannonsands",
@@ -173,6 +177,7 @@ AUTHOR_MAP = {
     "simon@simonmarcus.org": "simon-marcus",
     "xowiekk@gmail.com": "Xowiek",
     "1243352777@qq.com": "zons-zhaozhy",
+    "e.silacandmr@gmail.com": "Es1la",
     # ── bulk addition: 75 emails resolved via API, PR salvage bodies, noreply
     #    crossref, and GH contributor list matching (April 2026 audit) ──
     "1115117931@qq.com": "aaronagent",
@@ -201,6 +206,8 @@ AUTHOR_MAP = {
     "don.rhm@gmail.com": "donrhmexe",
     "dorukardahan@hotmail.com": "dorukardahan",
     "dsocolobsky@gmail.com": "dsocolobsky",
+    "dylan.socolobsky@lambdaclass.com": "dsocolobsky",
+    "ignacio.avecilla@lambdaclass.com": "IAvecilla",
     "duerzy@gmail.com": "duerzy",
     "emozilla@nousresearch.com": "emozilla",
     "fancydirty@gmail.com": "fancydirty",
@@ -288,6 +295,7 @@ AUTHOR_MAP = {
     "ywt000818@gmail.com": "OwenYWT",
     "dhandhalyabhavik@gmail.com": "v1k22",
     "rucchizhao@zhaochenfeideMacBook-Pro.local": "RucchiZ",
+    "tannerfokkens@Mac.attlocal.net": "tannerfokkens-maker",
     "lehaolin98@outlook.com": "LehaoLin",
     "yuewang1@microsoft.com": "imink",
     "1736355688@qq.com": "hedgeho9X",
@@ -310,6 +318,8 @@ AUTHOR_MAP = {
     "261797239+lumenradley@users.noreply.github.com": "lumenradley",
     "166376523+sjz-ks@users.noreply.github.com": "sjz-ks",
     "haileymarshall005@gmail.com": "haileymarshall",
+    "aniruddhaadak80@users.noreply.github.com": "aniruddhaadak80",
+    "zheng.jerilyn@gmail.com": "jerilynzheng",
 }
 
 

@@ -783,6 +783,21 @@ DEFAULT_CONFIG = {
     "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only)
     "quick_commands": {},
+
+    # Shell-script hooks — declarative bridge that invokes shell scripts
+    # on plugin-hook events (pre_tool_call, post_tool_call, pre_llm_call,
+    # subagent_stop, etc.).  Each entry maps an event name to a list of
+    # {matcher, command, timeout} dicts.  First registration of a new
+    # command prompts the user for consent; subsequent runs reuse the
+    # stored approval from ~/.hermes/shell-hooks-allowlist.json.
+    # See `website/docs/user-guide/features/hooks.md` for schema + examples.
+    "hooks": {},
+
+    # Auto-accept shell-hook registrations without a TTY prompt.  Also
+    # toggleable per-invocation via --accept-hooks or HERMES_ACCEPT_HOOKS=1.
+    # Gateway / cron / non-interactive runs need this (or one of the other
+    # channels) to pick up newly-added hooks.
+    "hooks_auto_accept": False,
     # Custom personalities — add your own entries here
     # Supports string format: {"name": "system prompt"}
     # Or dict format: {"name": {"description": "...", "system_prompt": "...", "tone": "...", "style": "..."}}
@@ -806,6 +821,11 @@ DEFAULT_CONFIG = {
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,
+        # Maximum number of due jobs to run in parallel per tick.
+        # null/0 = unbounded (limited only by thread count).
+        # 1 = serial (pre-v0.9 behaviour).
+        # Also overridable via HERMES_CRON_MAX_PARALLEL env var.
+        "max_parallel_jobs": None,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
