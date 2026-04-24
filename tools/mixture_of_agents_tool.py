@@ -73,6 +73,9 @@ logger = logging.getLogger(__name__)
 # Default OpenRouter reference models — these generate diverse initial responses in parallel.
 # Kept as fallback for when runtime provider resolution fails.
 REFERENCE_MODELS = [
+    "anthropic/claude-opus-4.6",
+    "google/gemini-2.5-pro",
+    "openai/gpt-5.4-pro",
     "deepseek/deepseek-v3.2",
     "qwen/qwen3.6-plus",
     "z-ai/glm-5.1",

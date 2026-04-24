@@ -8,14 +8,17 @@ import pytest
 moa = importlib.import_module("tools.mixture_of_agents_tool")
 
 
-def test_moa_defaults_track_current_openrouter_frontier_models():
-    assert moa.REFERENCE_MODELS == [
-        "deepseek/deepseek-v3.2",
-        "qwen/qwen3.6-plus",
-        "z-ai/glm-5.1",
-        "moonshotai/kimi-k2.5",
-    ]
-    assert moa.AGGREGATOR_MODEL == "qwen/qwen3.6-plus"
+def test_moa_defaults_are_well_formed():
+    # Invariants, not a catalog snapshot: the exact model list churns with
+    # OpenRouter availability (see PR #6636 where gemini-3-pro-preview was
+    # removed upstream). What we care about is that the defaults are present
+    # and valid vendor/model slugs.
+    assert isinstance(moa.REFERENCE_MODELS, list)
+    assert len(moa.REFERENCE_MODELS) >= 1
+    for m in moa.REFERENCE_MODELS:
+        assert isinstance(m, str) and "/" in m and not m.startswith("/")
+    assert isinstance(moa.AGGREGATOR_MODEL, str)
+    assert "/" in moa.AGGREGATOR_MODEL
 
 
 @pytest.mark.asyncio
