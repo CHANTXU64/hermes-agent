@@ -5374,29 +5374,26 @@ class HermesCLI:
         _cprint(f"  ✓ Model switched: {result.new_model}")
         _cprint(f"    Provider: {provider_label}")
 
-        # Rich metadata from models.dev
+        # Context: always resolve via the provider-aware chain so Codex OAuth,
+        # Copilot, and Nous-enforced caps win over the raw models.dev entry
+        # (e.g. gpt-5.5 is 1.05M on openai but 272K on Codex OAuth).
         mi = result.model_info
+        from hermes_cli.model_switch import resolve_display_context_length
+        ctx = resolve_display_context_length(
+            result.new_model,
+            result.target_provider,
+            base_url=result.base_url or self.base_url or "",
+            api_key=result.api_key or self.api_key or "",
+            model_info=mi,
+        )
+        if ctx:
+            _cprint(f"    Context: {ctx:,} tokens")
         if mi:
-            if mi.context_window:
-                _cprint(f"    Context: {mi.context_window:,} tokens")
             if mi.max_output:
                 _cprint(f"    Max output: {mi.max_output:,} tokens")
             if mi.has_cost_data():
                 _cprint(f"    Cost: {mi.format_cost()}")
             _cprint(f"    Capabilities: {mi.format_capabilities()}")
-        else:
-            # Fallback to old context length lookup
-            try:
-                from agent.model_metadata import get_model_context_length
-                ctx = get_model_context_length(
-                    result.new_model,
-                    base_url=result.base_url or self.base_url,
-                    api_key=result.api_key or self.api_key,
-                    provider=result.target_provider,
-                )
-                _cprint(f"    Context: {ctx:,} tokens")
-            except Exception:
-                pass
 
         # Cache notice
         cache_enabled = (
@@ -6165,6 +6162,8 @@ class HermesCLI:
             self._handle_skin_command(cmd_original)
         elif canonical == "voice":
             self._handle_voice_command(cmd_original)
+        elif canonical == "busy":
+            self._handle_busy_command(cmd_original)
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
@@ -6901,6 +6900,36 @@ class HermesCLI:
         else:
             _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (session only){_RST}")
 
+    def _handle_busy_command(self, cmd: str):
+        """Handle /busy — control what Enter does while Hermes is working.
+
+        Usage:
+            /busy               Show current busy input mode
+            /busy status        Show current busy input mode
+            /busy queue         Queue input for the next turn instead of interrupting
+            /busy interrupt     Interrupt the current run on Enter (default)
+        """
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or parts[1].strip().lower() == "status":
+            _cprint(f"  {_ACCENT}Busy input mode: {self.busy_input_mode}{_RST}")
+            _cprint(f"  {_DIM}Enter while busy: {'queues for next turn' if self.busy_input_mode == 'queue' else 'interrupts current run'}{_RST}")
+            _cprint(f"  {_DIM}Usage: /busy [queue|interrupt|status]{_RST}")
+            return
+
+        arg = parts[1].strip().lower()
+        if arg not in {"queue", "interrupt"}:
+            _cprint(f"  {_DIM}(._.) Unknown argument: {arg}{_RST}")
+            _cprint(f"  {_DIM}Usage: /busy [queue|interrupt|status]{_RST}")
+            return
+
+        self.busy_input_mode = arg
+        if save_config_value("display.busy_input_mode", arg):
+            behavior = "Enter will queue follow-up input while Hermes is busy." if arg == "queue" else "Enter will interrupt the current run while Hermes is busy."
+            _cprint(f"  {_ACCENT}✓ Busy input mode set to '{arg}' (saved to config){_RST}")
+            _cprint(f"  {_DIM}{behavior}{_RST}")
+        else:
+            _cprint(f"  {_ACCENT}✓ Busy input mode set to '{arg}' (session only){_RST}")
+
     def _handle_fast_command(self, cmd: str):
         """Handle /fast — toggle fast mode (OpenAI Priority Processing / Anthropic Fast Mode)."""
         if not self._fast_command_available():
@@ -6979,51 +7008,52 @@ class HermesCLI:
                 focus_topic = parts[1].strip()
 
         original_count = len(self.conversation_history)
-        try:
-            from agent.model_metadata import estimate_messages_tokens_rough
-            from agent.manual_compression_feedback import summarize_manual_compression
-            original_history = list(self.conversation_history)
-            approx_tokens = estimate_messages_tokens_rough(original_history)
-            if focus_topic:
-                print(f"🗜️  Compressing {original_count} messages (~{approx_tokens:,} tokens), "
-                      f"focus: \"{focus_topic}\"...")
-            else:
-                print(f"🗜️  Compressing {original_count} messages (~{approx_tokens:,} tokens)...")
+        with self._busy_command("Compressing context..."):
+            try:
+                from agent.model_metadata import estimate_messages_tokens_rough
+                from agent.manual_compression_feedback import summarize_manual_compression
+                original_history = list(self.conversation_history)
+                approx_tokens = estimate_messages_tokens_rough(original_history)
+                if focus_topic:
+                    print(f"🗜️  Compressing {original_count} messages (~{approx_tokens:,} tokens), "
+                          f"focus: \"{focus_topic}\"...")
+                else:
+                    print(f"🗜️  Compressing {original_count} messages (~{approx_tokens:,} tokens)...")
 
-            compressed, _ = self.agent._compress_context(
-                original_history,
-                self.agent._cached_system_prompt or "",
-                approx_tokens=approx_tokens,
-                focus_topic=focus_topic or None,
-            )
-            self.conversation_history = compressed
-            # _compress_context ends the old session and creates a new child
-            # session on the agent (run_agent.py::_compress_context). Sync the
-            # CLI's session_id so /status, /resume, exit summary, and title
-            # generation all point at the live continuation session, not the
-            # ended parent. Without this, subsequent end_session() calls target
-            # the already-closed parent and the child is orphaned.
-            if (
-                getattr(self.agent, "session_id", None)
-                and self.agent.session_id != self.session_id
-            ):
-                self.session_id = self.agent.session_id
-                self._pending_title = None
-            new_tokens = estimate_messages_tokens_rough(self.conversation_history)
-            summary = summarize_manual_compression(
-                original_history,
-                self.conversation_history,
-                approx_tokens,
-                new_tokens,
-            )
-            icon = "🗜️" if summary["noop"] else "✅"
-            print(f"  {icon} {summary['headline']}")
-            print(f"     {summary['token_line']}")
-            if summary["note"]:
-                print(f"     {summary['note']}")
+                compressed, _ = self.agent._compress_context(
+                    original_history,
+                    self.agent._cached_system_prompt or "",
+                    approx_tokens=approx_tokens,
+                    focus_topic=focus_topic or None,
+                )
+                self.conversation_history = compressed
+                # _compress_context ends the old session and creates a new child
+                # session on the agent (run_agent.py::_compress_context). Sync the
+                # CLI's session_id so /status, /resume, exit summary, and title
+                # generation all point at the live continuation session, not the
+                # ended parent. Without this, subsequent end_session() calls target
+                # the already-closed parent and the child is orphaned.
+                if (
+                    getattr(self.agent, "session_id", None)
+                    and self.agent.session_id != self.session_id
+                ):
+                    self.session_id = self.agent.session_id
+                    self._pending_title = None
+                new_tokens = estimate_messages_tokens_rough(self.conversation_history)
+                summary = summarize_manual_compression(
+                    original_history,
+                    self.conversation_history,
+                    approx_tokens,
+                    new_tokens,
+                )
+                icon = "🗜️" if summary["noop"] else "✅"
+                print(f"  {icon} {summary['headline']}")
+                print(f"     {summary['token_line']}")
+                if summary["note"]:
+                    print(f"     {summary['note']}")
 
-        except Exception as e:
-            print(f"  ❌ Compression failed: {e}")
+            except Exception as e:
+                print(f"  ❌ Compression failed: {e}")
 
     def _handle_debug_command(self):
         """Handle /debug — upload debug report + logs and print paste URLs."""
@@ -9525,9 +9555,20 @@ class HermesCLI:
         
         @kb.add('c-d')
         def handle_ctrl_d(event):
-            """Handle Ctrl+D - exit."""
-            self._should_exit = True
-            event.app.exit()
+            """Ctrl+D: delete char under cursor (standard readline behaviour).
+            Only exit when the input is empty — same as bash/zsh. Pending
+            attached images count as input and block the EOF-exit so the
+            user doesn't lose them silently.
+            """
+            buf = event.app.current_buffer
+            if buf.text:
+                buf.delete()
+            elif self._attached_images:
+                # Empty text but pending attachments — no-op, don't exit.
+                return
+            else:
+                self._should_exit = True
+                event.app.exit()
 
         _modal_prompt_active = Condition(
             lambda: bool(self._secret_state or self._sudo_state)

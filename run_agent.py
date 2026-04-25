@@ -502,6 +502,48 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
     return found
 
 
+def _escape_invalid_chars_in_json_strings(raw: str) -> str:
+    """Escape unescaped control chars inside JSON string values.
+
+    Walks the raw JSON character-by-character, tracking whether we are
+    inside a double-quoted string. Inside strings, replaces literal
+    control characters (0x00-0x1F) that aren't already part of an escape
+    sequence with their ``\\uXXXX`` equivalents. Pass-through for everything
+    else.
+
+    Ported from #12093 — complements the other repair passes in
+    ``_repair_tool_call_arguments`` when ``json.loads(strict=False)`` is
+    not enough (e.g. llama.cpp backends that emit literal apostrophes or
+    tabs alongside other malformations).
+    """
+    out: list[str] = []
+    in_string = False
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if in_string:
+            if ch == "\\" and i + 1 < n:
+                # Already-escaped char — pass through as-is
+                out.append(ch)
+                out.append(raw[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+                out.append(ch)
+            elif ord(ch) < 0x20:
+                out.append(f"\\u{ord(ch):04x}")
+            else:
+                out.append(ch)
+        else:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     """Attempt to repair malformed tool_call argument JSON.
 
@@ -522,6 +564,23 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     if raw_stripped == "None":
         logger.warning("Sanitized Python-None tool_call arguments for %s", tool_name)
         return "{}"
+
+    # Repair pass 0: llama.cpp backends sometimes emit literal control
+    # characters (tabs, newlines) inside JSON string values. json.loads
+    # with strict=False accepts these and lets us re-serialise the
+    # result into wire-valid JSON without any string surgery. This is
+    # the most common local-model repair case (#12068).
+    try:
+        parsed = json.loads(raw_stripped, strict=False)
+        reserialised = json.dumps(parsed, separators=(",", ":"))
+        if reserialised != raw_stripped:
+            logger.warning(
+                "Repaired unescaped control chars in tool_call arguments for %s",
+                tool_name,
+            )
+        return reserialised
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
 
     # Attempt common JSON repairs
     fixed = raw_stripped
@@ -555,6 +614,21 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
         )
         return fixed
     except json.JSONDecodeError:
+        pass
+
+    # Repair pass 4: escape unescaped control chars inside JSON strings,
+    # then retry. Catches cases where strict=False alone fails because
+    # other malformations are present too.
+    try:
+        escaped = _escape_invalid_chars_in_json_strings(fixed)
+        if escaped != fixed:
+            json.loads(escaped)
+            logger.warning(
+                "Repaired control-char-laced tool_call arguments for %s: %s → %s",
+                tool_name, raw_stripped[:80], escaped[:80],
+            )
+            return escaped
+    except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
     # Last resort: replace with empty object so the API request doesn't
@@ -739,6 +813,11 @@ class AIAgent:
     This class manages the conversation flow, tool execution, and response handling
     for AI models that support function calling.
     """
+
+    _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
+        "[hermes-agent: tool call arguments were corrupted in this session and "
+        "have been dropped to keep the conversation alive. See issue #15236.]"
+    )
 
     @property
     def base_url(self) -> str:
@@ -1437,6 +1516,8 @@ class AIAgent:
         
         # Track conversation messages for session logging
         self._session_messages: List[Dict[str, Any]] = []
+        self._memory_write_origin = "assistant_tool"
+        self._memory_write_context = "foreground"
         
         # Cached system prompt -- built once per session, only rebuilt on compression
         self._cached_system_prompt: Optional[str] = None
@@ -2258,6 +2339,34 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
 
+    def _emit_warning(self, message: str) -> None:
+        """Emit a user-visible warning through the same status plumbing.
+
+        Unlike debug logs, these warnings are meant for degraded side paths
+        such as auxiliary compression or memory flushes where the main turn can
+        continue but the user needs to know something important failed.
+        """
+        try:
+            self._vprint(f"{self.log_prefix}{message}", force=True)
+        except Exception:
+            pass
+        if self.status_callback:
+            try:
+                self.status_callback("warn", message)
+            except Exception:
+                logger.debug("status_callback error in _emit_warning", exc_info=True)
+
+    def _emit_auxiliary_failure(self, task: str, exc: BaseException) -> None:
+        """Surface a compact warning for failed auxiliary work."""
+        try:
+            detail = self._summarize_api_error(exc)
+        except Exception:
+            detail = str(exc)
+        detail = (detail or exc.__class__.__name__).strip()
+        if len(detail) > 220:
+            detail = detail[:217].rstrip() + "..."
+        self._emit_warning(f"⚠ Auxiliary {task} failed: {detail}")
+
     def _current_main_runtime(self) -> Dict[str, str]:
         """Return the live main runtime for session-scoped auxiliary routing."""
         return {
@@ -3074,7 +3183,10 @@ class AIAgent:
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
+                        parent_session_id=self.session_id,
                     )
+                    review_agent._memory_write_origin = "background_review"
+                    review_agent._memory_write_context = "background_review"
                     review_agent._memory_store = self._memory_store
                     review_agent._memory_enabled = self._memory_enabled
                     review_agent._user_profile_enabled = self._user_profile_enabled
@@ -3108,7 +3220,8 @@ class AIAgent:
                             pass
 
             except Exception as e:
-                logger.debug("Background memory/skill review failed: %s", e)
+                logger.warning("Background memory/skill review failed: %s", e)
+                self._emit_auxiliary_failure("background review", e)
             finally:
                 # Close all resources (httpx client, subprocesses, etc.) so
                 # GC doesn't try to clean them up on a dead asyncio event
@@ -3121,6 +3234,32 @@ class AIAgent:
 
         t = threading.Thread(target=_run_review, daemon=True, name="bg-review")
         t.start()
+
+    def _build_memory_write_metadata(
+        self,
+        *,
+        write_origin: Optional[str] = None,
+        execution_context: Optional[str] = None,
+        task_id: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build provenance metadata for external memory-provider mirrors."""
+        metadata: Dict[str, Any] = {
+            "write_origin": write_origin or getattr(self, "_memory_write_origin", "assistant_tool"),
+            "execution_context": (
+                execution_context
+                or getattr(self, "_memory_write_context", "foreground")
+            ),
+            "session_id": self.session_id or "",
+            "parent_session_id": self._parent_session_id or "",
+            "platform": self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+            "tool_name": "memory",
+        }
+        if task_id:
+            metadata["task_id"] = task_id
+        if tool_call_id:
+            metadata["tool_call_id"] = tool_call_id
+        return {k: v for k, v in metadata.items() if v not in (None, "")}
 
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
         """Rewrite the current-turn user message before persistence/return.
@@ -4047,6 +4186,49 @@ class AIAgent:
             return
         try:
             self._memory_manager.on_session_end(messages or [])
+        except Exception:
+            pass
+
+    def _sync_external_memory_for_turn(
+        self,
+        *,
+        original_user_message: Any,
+        final_response: Any,
+        interrupted: bool,
+    ) -> None:
+        """Mirror a completed turn into external memory providers.
+
+        Called at the end of ``run_conversation`` with the cleaned user
+        message (``original_user_message``) and the finalised assistant
+        response.  The external memory backend gets both ``sync_all`` (to
+        persist the exchange) and ``queue_prefetch_all`` (to start
+        warming context for the next turn) in one shot.
+
+        Uses ``original_user_message`` rather than ``user_message``
+        because the latter may carry injected skill content that bloats
+        or breaks provider queries.
+
+        Interrupted turns are skipped entirely (#15218).  A partial
+        assistant output, an aborted tool chain, or a mid-stream reset
+        is not durable conversational truth — mirroring it into an
+        external memory backend pollutes future recall with state the
+        user never saw completed.  The prefetch is gated on the same
+        flag: the user's next message is almost certainly a retry of
+        the same intent, and a prefetch keyed on the interrupted turn
+        would fire against stale context.
+
+        Normal completed turns still sync as before.  The whole body is
+        wrapped in ``try/except Exception`` because external memory
+        providers are strictly best-effort — a misconfigured or offline
+        backend must not block the user from seeing their response.
+        """
+        if interrupted:
+            return
+        if not (self._memory_manager and final_response and original_user_message):
+            return
+        try:
+            self._memory_manager.sync_all(original_user_message, final_response)
+            self._memory_manager.queue_prefetch_all(original_user_message)
         except Exception:
             pass
 
@@ -6035,11 +6217,25 @@ class AIAgent:
                 for idx in sorted(tool_calls_acc):
                     tc = tool_calls_acc[idx]
                     arguments = tc["function"]["arguments"]
+                    tool_name = tc["function"]["name"] or "?"
                     if arguments and arguments.strip():
                         try:
                             json.loads(arguments)
                         except json.JSONDecodeError:
-                            has_truncated_tool_args = True
+                            # Attempt repair before flagging as truncated.
+                            # Models like GLM-5.1 via Ollama produce trailing
+                            # commas, unclosed brackets, Python None, etc.
+                            # Without repair, these hit the truncation handler
+                            # and kill the session.  _repair_tool_call_arguments
+                            # returns "{}" for unrepairable args, which is far
+                            # better than a crashed session.
+                            repaired = _repair_tool_call_arguments(arguments, tool_name)
+                            if repaired != "{}":
+                                # Successfully repaired — use the fixed args
+                                arguments = repaired
+                            else:
+                                # Unrepairable — flag for truncation handling
+                                has_truncated_tool_args = True
                     mock_tool_calls.append(SimpleNamespace(
                         id=tc["id"],
                         type=tc["type"],
@@ -7456,6 +7652,12 @@ class AIAgent:
             raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
             if raw_reasoning_content is not None:
                 msg["reasoning_content"] = _sanitize_surrogates(raw_reasoning_content)
+            elif msg.get("tool_calls") and self._needs_deepseek_tool_reasoning():
+                # DeepSeek thinking mode requires reasoning_content on every
+                # assistant tool-call message. Without it, replaying the
+                # persisted message causes HTTP 400. Include empty string
+                # as a defensive compatibility fallback (refs #15250).
+                msg["reasoning_content"] = ""
 
         if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
             # Pass reasoning_details back unmodified so providers (OpenRouter,
@@ -7531,6 +7733,35 @@ class AIAgent:
 
         return msg
 
+    def _needs_kimi_tool_reasoning(self) -> bool:
+        """Return True when the current provider is Kimi / Moonshot thinking mode.
+
+        Kimi ``/coding`` and Moonshot thinking mode both require
+        ``reasoning_content`` on every assistant tool-call message; omitting
+        it causes the next replay to fail with HTTP 400.
+        """
+        return (
+            self.provider in {"kimi-coding", "kimi-coding-cn"}
+            or base_url_host_matches(self.base_url, "api.kimi.com")
+            or base_url_host_matches(self.base_url, "moonshot.ai")
+            or base_url_host_matches(self.base_url, "moonshot.cn")
+        )
+
+    def _needs_deepseek_tool_reasoning(self) -> bool:
+        """Return True when the current provider is DeepSeek thinking mode.
+
+        DeepSeek V4 thinking mode requires ``reasoning_content`` on every
+        assistant tool-call turn; omitting it causes HTTP 400 when the
+        message is replayed in a subsequent API request (#15250).
+        """
+        provider = (self.provider or "").lower()
+        model = (self.model or "").lower()
+        return (
+            provider == "deepseek"
+            or "deepseek" in model
+            or base_url_host_matches(self.base_url, "api.deepseek.com")
+        )
+
     def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
         """Copy provider-facing reasoning fields onto an API replay message."""
         if source_msg.get("role") != "assistant":
@@ -7546,13 +7777,14 @@ class AIAgent:
             api_msg["reasoning_content"] = normalized_reasoning
             return
 
-        kimi_requires_reasoning = (
-            self.provider in {"kimi-coding", "kimi-coding-cn"}
-            or base_url_host_matches(self.base_url, "api.kimi.com")
-            or base_url_host_matches(self.base_url, "moonshot.ai")
-            or base_url_host_matches(self.base_url, "moonshot.cn")
-        )
-        if kimi_requires_reasoning and source_msg.get("tool_calls"):
+        # Providers that require an echoed reasoning_content on every
+        # assistant tool-call turn. Detection logic lives in the per-provider
+        # helpers so both the creation path (_build_assistant_message) and
+        # this replay path stay in sync.
+        if source_msg.get("tool_calls") and (
+            self._needs_kimi_tool_reasoning()
+            or self._needs_deepseek_tool_reasoning()
+        ):
             api_msg["reasoning_content"] = ""
 
     @staticmethod
@@ -7582,6 +7814,115 @@ class AIAgent:
             for tc in tool_calls
         ]
         return api_msg
+
+    @staticmethod
+    def _sanitize_tool_call_arguments(
+        messages: list,
+        *,
+        logger=None,
+        session_id: str = None,
+    ) -> int:
+        """Repair corrupted assistant tool-call argument JSON in-place."""
+        log = logger or logging.getLogger(__name__)
+        if not isinstance(messages, list):
+            return 0
+
+        repaired = 0
+        marker = AIAgent._TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER
+
+        def _prepend_marker(tool_msg: dict) -> None:
+            existing = tool_msg.get("content")
+            if isinstance(existing, str):
+                if not existing:
+                    tool_msg["content"] = marker
+                elif not existing.startswith(marker):
+                    tool_msg["content"] = f"{marker}\n{existing}"
+                return
+            if existing is None:
+                tool_msg["content"] = marker
+                return
+            try:
+                existing_text = json.dumps(existing)
+            except TypeError:
+                existing_text = str(existing)
+            tool_msg["content"] = f"{marker}\n{existing_text}"
+
+        message_index = 0
+        while message_index < len(messages):
+            msg = messages[message_index]
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                message_index += 1
+                continue
+
+            tool_calls = msg.get("tool_calls")
+            if not isinstance(tool_calls, list) or not tool_calls:
+                message_index += 1
+                continue
+
+            insert_at = message_index + 1
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    continue
+
+                arguments = function.get("arguments")
+                if arguments is None or arguments == "":
+                    function["arguments"] = "{}"
+                    continue
+                if isinstance(arguments, str) and not arguments.strip():
+                    function["arguments"] = "{}"
+                    continue
+                if not isinstance(arguments, str):
+                    continue
+
+                try:
+                    json.loads(arguments)
+                except json.JSONDecodeError:
+                    tool_call_id = tool_call.get("id")
+                    function_name = function.get("name", "?")
+                    preview = arguments[:80]
+                    log.warning(
+                        "Corrupted tool_call arguments repaired before request "
+                        "(session=%s, message_index=%s, tool_call_id=%s, function=%s, preview=%r)",
+                        session_id or "-",
+                        message_index,
+                        tool_call_id or "-",
+                        function_name,
+                        preview,
+                    )
+                    function["arguments"] = "{}"
+
+                    existing_tool_msg = None
+                    scan_index = message_index + 1
+                    while scan_index < len(messages):
+                        candidate = messages[scan_index]
+                        if not isinstance(candidate, dict) or candidate.get("role") != "tool":
+                            break
+                        if candidate.get("tool_call_id") == tool_call_id:
+                            existing_tool_msg = candidate
+                            break
+                        scan_index += 1
+
+                    if existing_tool_msg is None:
+                        messages.insert(
+                            insert_at,
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": marker,
+                            },
+                        )
+                        insert_at += 1
+                    else:
+                        _prepend_marker(existing_tool_msg)
+
+                    repaired += 1
+
+            message_index += 1
+
+        return repaired
 
     def _should_sanitize_tool_calls(self) -> bool:
         """Determine if tool_calls need sanitization for strict APIs.
@@ -7680,6 +8021,7 @@ class AIAgent:
                 _flush_temperature = _fixed_temp
             else:
                 _flush_temperature = 0.3
+            aux_error = None
             try:
                 response = _call_llm(
                     task="flush_memories",
@@ -7689,14 +8031,19 @@ class AIAgent:
                     max_tokens=5120,
                     # timeout resolved from auxiliary.flush_memories.timeout config
                 )
-            except RuntimeError:
+            except Exception as e:
+                aux_error = e
                 _aux_available = False
                 response = None
 
             if not _aux_available and self.api_mode == "codex_responses":
                 # No auxiliary client -- use the Codex Responses path directly
                 codex_kwargs = self._build_api_kwargs(api_messages)
-                codex_kwargs["tools"] = self._get_transport().convert_tools([memory_tool_def])
+                _ct_flush = self._get_transport()
+                if _ct_flush is not None:
+                    codex_kwargs["tools"] = _ct_flush.convert_tools([memory_tool_def])
+                elif not codex_kwargs.get("tools"):
+                    codex_kwargs["tools"] = [memory_tool_def]
                 if _flush_temperature is not None:
                     codex_kwargs["temperature"] = _flush_temperature
                 else:
@@ -7728,11 +8075,37 @@ class AIAgent:
                     **api_kwargs, timeout=_get_task_timeout("flush_memories")
                 )
 
+            if aux_error is not None:
+                logger.warning("Auxiliary memory flush failed; used fallback path: %s", aux_error)
+                self._emit_auxiliary_failure("memory flush", aux_error)
+
+            def _openai_tool_calls(resp):
+                if resp is not None and hasattr(resp, "choices") and resp.choices:
+                    msg = getattr(resp.choices[0], "message", None)
+                    calls = getattr(msg, "tool_calls", None)
+                    if calls:
+                        return calls
+                return []
+
+            def _codex_output_tool_calls(resp):
+                calls = []
+                for item in getattr(resp, "output", []) or []:
+                    if getattr(item, "type", None) == "function_call":
+                        calls.append(SimpleNamespace(
+                            id=getattr(item, "call_id", None),
+                            type="function",
+                            function=SimpleNamespace(
+                                name=getattr(item, "name", ""),
+                                arguments=getattr(item, "arguments", "{}"),
+                            ),
+                        ))
+                return calls
+
             # Extract tool calls from the response, handling all API formats
             tool_calls = []
             if self.api_mode == "codex_responses" and not _aux_available:
                 _ct_flush = self._get_transport()
-                _cnr_flush = _ct_flush.normalize_response(response)
+                _cnr_flush = _ct_flush.normalize_response(response) if _ct_flush is not None else None
                 if _cnr_flush and _cnr_flush.tool_calls:
                     tool_calls = [
                         SimpleNamespace(
@@ -7740,6 +8113,8 @@ class AIAgent:
                             function=SimpleNamespace(name=tc.name, arguments=tc.arguments),
                         ) for tc in _cnr_flush.tool_calls
                     ]
+                else:
+                    tool_calls = _codex_output_tool_calls(response)
             elif self.api_mode == "anthropic_messages" and not _aux_available:
                 _tfn = self._get_transport()
                 _flush_result = _tfn.normalize_response(response, strip_tool_prefix=self._is_anthropic_oauth)
@@ -7752,15 +8127,16 @@ class AIAgent:
                     ]
             elif self.api_mode in ("chat_completions", "bedrock_converse"):
                 # chat_completions / bedrock — normalize through transport
-                _flush_result = self._get_transport().normalize_response(response)
-                if _flush_result.tool_calls:
+                _tfn = self._get_transport()
+                _flush_result = _tfn.normalize_response(response) if _tfn is not None else None
+                if _flush_result and _flush_result.tool_calls:
                     tool_calls = _flush_result.tool_calls
+                else:
+                    tool_calls = _openai_tool_calls(response)
             elif _aux_available and hasattr(response, "choices") and response.choices:
                 # Auxiliary client returned OpenAI-shaped response while main
                 # api_mode is codex/anthropic — extract tool_calls from .choices
-                _aux_msg = response.choices[0].message
-                if hasattr(_aux_msg, "tool_calls") and _aux_msg.tool_calls:
-                    tool_calls = _aux_msg.tool_calls
+                tool_calls = _openai_tool_calls(response)
 
             for tc in tool_calls:
                 if tc.function.name == "memory":
@@ -7775,12 +8151,27 @@ class AIAgent:
                             old_text=args.get("old_text"),
                             store=self._memory_store,
                         )
+                        if self._memory_manager and args.get("action") in ("add", "replace"):
+                            try:
+                                self._memory_manager.on_memory_write(
+                                    args.get("action", ""),
+                                    flush_target,
+                                    args.get("content", ""),
+                                    metadata=self._build_memory_write_metadata(
+                                        write_origin="memory_flush",
+                                        execution_context="flush_memories",
+                                    ),
+                                )
+                            except Exception:
+                                pass
                         if not self.quiet_mode:
                             print(f"  🧠 Memory flush: saved to {args.get('target', 'memory')}")
                     except Exception as e:
-                        logger.debug("Memory flush tool call failed: %s", e)
+                        logger.warning("Memory flush tool call failed: %s", e)
+                        self._emit_auxiliary_failure("memory flush tool", e)
         except Exception as e:
-            logger.debug("Memory flush API call failed: %s", e)
+            logger.warning("Memory flush API call failed: %s", e)
+            self._emit_auxiliary_failure("memory flush", e)
         finally:
             # Strip flush artifacts: remove everything from the flush message onward.
             # Use sentinel marker instead of identity check for robustness.
@@ -7825,6 +8216,15 @@ class AIAgent:
             # Plugin context engine with strict signature that doesn't accept
             # focus_topic — fall back to calling without it.
             compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+
+        summary_error = getattr(self.context_compressor, "_last_summary_error", None)
+        if summary_error:
+            if getattr(self, "_last_compression_summary_warning", None) != summary_error:
+                self._last_compression_summary_warning = summary_error
+                self._emit_warning(
+                    f"⚠ Compression summary failed: {summary_error}. "
+                    "Inserted a fallback context marker."
+                )
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
@@ -7995,6 +8395,10 @@ class AIAgent:
                         function_args.get("action", ""),
                         target,
                         function_args.get("content", ""),
+                        metadata=self._build_memory_write_metadata(
+                            task_id=effective_task_id,
+                            tool_call_id=tool_call_id,
+                        ),
                     )
                 except Exception:
                     pass
@@ -8506,6 +8910,10 @@ class AIAgent:
                             function_args.get("action", ""),
                             target,
                             function_args.get("content", ""),
+                            metadata=self._build_memory_write_metadata(
+                                task_id=effective_task_id,
+                                tool_call_id=getattr(tool_call, "id", None),
+                            ),
                         )
                     except Exception:
                         pass
@@ -8750,6 +9158,7 @@ class AIAgent:
             api_messages = []
             for msg in messages:
                 api_msg = msg.copy()
+                self._copy_reasoning_content_for_api(msg, api_msg)
                 for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
                     api_msg.pop(internal_field, None)
                 if _needs_sanitize:
@@ -9380,6 +9789,19 @@ class AIAgent:
             # Note: Reasoning is embedded in content via <think> tags for trajectory storage.
             # However, providers like Moonshot AI require a separate 'reasoning_content' field
             # on assistant messages with tool_calls. We handle both cases here.
+            request_logger = getattr(self, "logger", None) or logging.getLogger(__name__)
+            repaired_tool_calls = self._sanitize_tool_call_arguments(
+                messages,
+                logger=request_logger,
+                session_id=self.session_id,
+            )
+            if repaired_tool_calls > 0:
+                request_logger.info(
+                    "Sanitized %s corrupted tool_call arguments before request (session=%s)",
+                    repaired_tool_calls,
+                    self.session_id or "-",
+                )
+
             api_messages = []
             for idx, msg in enumerate(messages):
                 api_msg = msg.copy()
@@ -12209,14 +12631,11 @@ class AIAgent:
             self._iters_since_skill = 0
 
         # External memory provider: sync the completed turn + queue next prefetch.
-        # Use original_user_message (clean input) — user_message may contain
-        # injected skill content that bloats / breaks provider queries.
-        if self._memory_manager and final_response and original_user_message:
-            try:
-                self._memory_manager.sync_all(original_user_message, final_response)
-                self._memory_manager.queue_prefetch_all(original_user_message)
-            except Exception:
-                pass
+        self._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+        )
 
         # Background memory/skill review — runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.
