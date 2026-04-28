@@ -2747,7 +2747,6 @@ class AIAgent:
         eff_api_mode = api_mode if api_mode is not None else (self.api_mode or "")
         eff_model = (model if model is not None else self.model) or ""
 
-        base_lower = eff_base_url.lower()
         model_lower = eff_model.lower()
         provider_lower = eff_provider.lower()
         is_claude = "claude" in model_lower
@@ -4822,6 +4821,145 @@ class AIAgent:
                 len(missing_results),
             )
         return messages
+
+    @staticmethod
+    def _is_thinking_only_assistant(msg: Dict[str, Any]) -> bool:
+        """Return True if ``msg`` is an assistant turn whose only payload is reasoning.
+
+        "Thinking-only" means the model emitted reasoning (``reasoning`` or
+        ``reasoning_content``) but no visible text and no tool_calls. When sent
+        back to providers that convert reasoning into thinking blocks (native
+        Anthropic, OpenRouter Anthropic, third-party Anthropic-compatible
+        gateways), the resulting message has only thinking blocks — which
+        Anthropic rejects with HTTP 400 "The final block in an assistant
+        message cannot be `thinking`."
+
+        Symmetric with Claude Code's ``filterOrphanedThinkingOnlyMessages``
+        (src/utils/messages.ts). We drop the whole turn from the API copy
+        rather than fabricating stub text — the message log (UI transcript)
+        keeps the reasoning block; only the wire copy is cleaned.
+        """
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            return False
+        if msg.get("tool_calls"):
+            return False
+        # Does it have any actual output?
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                return False
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    if block:  # non-empty non-dict string etc.
+                        return False
+                    continue
+                btype = block.get("type")
+                if btype in ("thinking", "redacted_thinking"):
+                    continue
+                if btype == "text":
+                    text = block.get("text", "")
+                    if isinstance(text, str) and text.strip():
+                        return False
+                    continue
+                # tool_use, image, document, etc. — real payload
+                return False
+        elif content is not None and content != "":
+            return False
+        # Content is empty-ish. Is there reasoning to make it thinking-only?
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning")
+        if isinstance(reasoning, str) and reasoning.strip():
+            return True
+        # reasoning_details list form
+        rd = msg.get("reasoning_details")
+        if isinstance(rd, list) and rd:
+            return True
+        return False
+
+    @staticmethod
+    def _drop_thinking_only_and_merge_users(
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Drop thinking-only assistant turns; merge any adjacent user messages left behind.
+
+        Runs on the per-call ``api_messages`` copy only. The stored
+        conversation history (``self.messages``) is never mutated, so the
+        user still sees the thinking block in the CLI/gateway transcript and
+        session persistence keeps the full trace. Only the wire copy sent to
+        the provider is cleaned.
+
+        Why drop-and-merge rather than inject stub text:
+        - Fabricating ``"."`` / ``"(continued)"`` text lies in the history
+          and makes future turns see model output the model didn't emit.
+        - Dropping the turn preserves honesty; merging adjacent user messages
+          preserves the provider's role-alternation invariant.
+        - This is the pattern used by Claude Code's ``normalizeMessagesForAPI``
+          (filterOrphanedThinkingOnlyMessages + mergeAdjacentUserMessages).
+        """
+        if not messages:
+            return messages
+
+        # Pass 1: drop thinking-only assistant turns.
+        kept = [m for m in messages if not AIAgent._is_thinking_only_assistant(m)]
+        dropped = len(messages) - len(kept)
+        if dropped == 0:
+            return messages
+
+        # Pass 2: merge any newly-adjacent user messages.
+        merged: List[Dict[str, Any]] = []
+        merges = 0
+        for m in kept:
+            prev = merged[-1] if merged else None
+            if (
+                prev is not None
+                and prev.get("role") == "user"
+                and m.get("role") == "user"
+            ):
+                prev_content = prev.get("content", "")
+                cur_content = m.get("content", "")
+                # Work on a copy of ``prev`` so the caller's input dicts are
+                # never mutated. ``_sanitize_api_messages`` upstream already
+                # hands us per-call copies, but staying pure here means we
+                # can be called safely from anywhere (tests, other loops).
+                prev_copy = dict(prev)
+                # Only string-content merge is meaningful for role-alternation
+                # purposes. If either side is a list (multimodal), append as a
+                # separate block rather than collapsing.
+                if isinstance(prev_content, str) and isinstance(cur_content, str):
+                    sep = "\n\n" if prev_content and cur_content else ""
+                    prev_copy["content"] = prev_content + sep + cur_content
+                elif isinstance(prev_content, list) and isinstance(cur_content, list):
+                    prev_copy["content"] = list(prev_content) + list(cur_content)
+                elif isinstance(prev_content, list) and isinstance(cur_content, str):
+                    if cur_content:
+                        prev_copy["content"] = list(prev_content) + [
+                            {"type": "text", "text": cur_content}
+                        ]
+                    else:
+                        prev_copy["content"] = list(prev_content)
+                elif isinstance(prev_content, str) and isinstance(cur_content, list):
+                    new_blocks: List[Dict[str, Any]] = []
+                    if prev_content:
+                        new_blocks.append({"type": "text", "text": prev_content})
+                    new_blocks.extend(cur_content)
+                    prev_copy["content"] = new_blocks
+                else:
+                    # Unknown content shape — fall back to appending separately
+                    # (violates alternation, but safer than raising in a hot path).
+                    merged.append(m)
+                    continue
+                merged[-1] = prev_copy
+                merges += 1
+            else:
+                merged.append(m)
+
+        logger.debug(
+            "Pre-call sanitizer: dropped %d thinking-only assistant turn(s), "
+            "merged %d adjacent user message(s)",
+            dropped,
+            merges,
+        )
+        return merged
 
     @staticmethod
     def _cap_delegate_task_calls(tool_calls: list) -> list:
@@ -7901,6 +8039,7 @@ class AIAgent:
             or base_url_host_matches(self.base_url, "moonshot.ai")
             or base_url_host_matches(self.base_url, "moonshot.cn")
         )
+        _is_tokenhub = base_url_host_matches(self._base_url_lower, "tokenhub.tencentmaas.com")
 
         # Temperature: _fixed_temperature_for_model may return OMIT_TEMPERATURE
         # sentinel (temperature omitted entirely), a numeric override, or None.
@@ -7972,6 +8111,7 @@ class AIAgent:
             is_github_models=_is_gh,
             is_nvidia_nim=_is_nvidia,
             is_kimi=_is_kimi,
+            is_tokenhub=_is_tokenhub,
             is_custom_provider=self.provider == "custom",
             ollama_num_ctx=self._ollama_num_ctx,
             provider_preferences=_prefs or None,
@@ -7983,6 +8123,7 @@ class AIAgent:
             supports_reasoning=self._supports_reasoning_extra_body(),
             github_reasoning_extra=self._github_models_reasoning_extra_body() if _is_gh else None,
             anthropic_max_output=_ant_max,
+            provider_name=self.provider,
         )
 
     def _supports_reasoning_extra_body(self) -> bool:
@@ -8019,6 +8160,7 @@ class AIAgent:
             "x-ai/",
             "google/gemini-2",
             "qwen/qwen3",
+            "tencent/hy3-preview",
         )
         return any(model.startswith(prefix) for prefix in reasoning_model_prefixes)
 
@@ -8129,6 +8271,31 @@ class AIAgent:
                 # persisted message causes HTTP 400. Include empty string
                 # as a defensive compatibility fallback (refs #15250).
                 msg["reasoning_content"] = ""
+
+        # Additive fallback (refs #16844, #16884). Streaming-only providers
+        # (glm, MiniMax, gpt-5.x via aigw, Anthropic via openai-compat shims)
+        # accumulate reasoning through ``delta.reasoning_content`` chunks
+        # but never land it on the message object as a top-level attribute,
+        # so neither branch above fires and the chain-of-thought is stored
+        # only under the internal ``reasoning`` key. When the user later
+        # replays that history through a DeepSeek-v4 / Kimi thinking model,
+        # the missing ``reasoning_content`` causes HTTP 400 ("The
+        # reasoning_content in the thinking mode must be passed back to the
+        # API.").
+        #
+        # Promote the already-sanitized streamed ``reasoning_text`` to
+        # ``reasoning_content`` at write time, but ONLY when no prior branch
+        # already set it AND we actually captured reasoning text. This
+        # preserves every existing behavior:
+        #   - SDK-exposed ``reasoning_content`` (OpenAI/Moonshot/DeepSeek SDK)
+        #     still wins.
+        #   - DeepSeek tool-call ""-pad (#15250) still fires.
+        #   - Non-thinking turns with no reasoning leave the field absent,
+        #     so ``_copy_reasoning_content_for_api``'s cross-provider leak
+        #     guard (#15748) and ``reasoning``→``reasoning_content``
+        #     promotion tiers still apply at replay time.
+        if "reasoning_content" not in msg and reasoning_text:
+            msg["reasoning_content"] = reasoning_text
 
         if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
             # Pass reasoning_details back unmodified so providers (OpenRouter,
@@ -9500,6 +9667,10 @@ class AIAgent:
                 for idx, pfm in enumerate(self.prefill_messages):
                     api_messages.insert(sys_offset + idx, pfm.copy())
 
+            # Same safety net as the main loop: drop thinking-only assistant
+            # turns so Anthropic-family providers don't 400 the summary call.
+            api_messages = self._drop_thinking_only_and_merge_users(api_messages)
+
             summary_extra_body = {}
             try:
                 from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE as _OMIT_TEMP
@@ -9565,7 +9736,7 @@ class AIAgent:
                                    is_oauth=self._is_anthropic_oauth,
                                    preserve_dots=self._anthropic_preserve_dots())
                     summary_response = self._anthropic_messages_create(_ant_kw)
-                    _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=self._is_anthropic_oauth)
+                    _summary_result = _tsum.normalize_response(summary_response)
                     final_response = (_summary_result.content or "").strip()
                 else:
                     summary_response = self._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
@@ -9595,7 +9766,7 @@ class AIAgent:
                                     max_tokens=self.max_tokens, reasoning_config=self.reasoning_config,
                                     preserve_dots=self._anthropic_preserve_dots())
                     retry_response = self._anthropic_messages_create(_ant_kw2)
-                    _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=self._is_anthropic_oauth)
+                    _retry_result = _tretry.normalize_response(retry_response)
                     final_response = (_retry_result.content or "").strip()
                 else:
                     summary_kwargs = {
@@ -10210,6 +10381,16 @@ class AIAgent:
             # manual message manipulation are always caught.
             api_messages = self._sanitize_api_messages(api_messages)
 
+            # Drop thinking-only assistant turns (reasoning but no visible
+            # output and no tool_calls) and merge any adjacent user messages
+            # left behind. Prevents Anthropic 400s ("The final block in an
+            # assistant message cannot be `thinking`.") and equivalent errors
+            # from third-party Anthropic-compatible gateways that can't replay
+            # a thinking-only turn. Runs on the per-call copy only — the
+            # stored conversation history keeps the reasoning block for the
+            # UI transcript and session persistence.
+            api_messages = self._drop_thinking_only_and_merge_users(api_messages)
+
             # Normalize message whitespace and tool-call JSON for consistent
             # prefix matching.  Ensures bit-perfect prefixes across turns,
             # which enables KV cache reuse on local inference servers
@@ -10701,12 +10882,7 @@ class AIAgent:
                         # would have been appended in the non-truncated path.
                         _trunc_msg = None
                         _trunc_transport = self._get_transport()
-                        if self.api_mode == "anthropic_messages":
-                            _trunc_result = _trunc_transport.normalize_response(
-                                response, strip_tool_prefix=self._is_anthropic_oauth
-                            )
-                        else:
-                            _trunc_result = _trunc_transport.normalize_response(response)
+                        _trunc_result = _trunc_transport.normalize_response(response)
                         _trunc_msg = _trunc_result
 
                         _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
@@ -12044,10 +12220,7 @@ class AIAgent:
 
             try:
                 _transport = self._get_transport()
-                _normalize_kwargs = {}
-                if self.api_mode == "anthropic_messages":
-                    _normalize_kwargs["strip_tool_prefix"] = self._is_anthropic_oauth
-                normalized = _transport.normalize_response(response, **_normalize_kwargs)
+                normalized = _transport.normalize_response(response)
                 assistant_message = normalized
                 finish_reason = normalized.finish_reason
                 
