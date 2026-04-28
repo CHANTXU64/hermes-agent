@@ -3302,13 +3302,16 @@ class AIAgent:
         """
         import threading
 
-        # Pick the right prompt based on which triggers fired
+        # Pick the right prompt based on which triggers fired.
+        # Tests may construct a bare AIAgent via object.__new__ and only seed
+        # the legacy class-level prompt constants, so fall back to those when
+        # the newer instance attributes have not been initialized by __init__.
         if review_memory and review_skills:
-            prompt = self._combined_review_prompt
+            prompt = getattr(self, "_combined_review_prompt", self.__class__._COMBINED_REVIEW_PROMPT)
         elif review_memory:
-            prompt = self._memory_review_prompt
+            prompt = getattr(self, "_memory_review_prompt", self.__class__._MEMORY_REVIEW_PROMPT)
         else:
-            prompt = self._skill_review_prompt
+            prompt = getattr(self, "_skill_review_prompt", self.__class__._SKILL_REVIEW_PROMPT)
 
         def _run_review():
             import contextlib

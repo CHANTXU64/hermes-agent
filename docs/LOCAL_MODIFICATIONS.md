@@ -138,3 +138,24 @@ Each entry includes:
 | **Files** | `run_agent.py` (+19/-4), `tools/skill_manager_tool.py` (+13/-15), `docs/LOCAL_MODIFICATIONS.md` (updated) |
 | **What** | 将后台 Review 线程的三个提示词 + skill_manage 工具描述全部改为从 `config.yaml` 读取，消除硬编码。修改原因：官方原版 `_SKILL_REVIEW_PROMPT` 门槛极低，导致 Agent 频繁创建重复/无用的 Skill，且更新时不看已有 Skill 直接新建。<br><br>**配置化内容**：<br>• `skills.skill_review_prompt` — Skill 创建/更新提示词（新建前必须查已有 Skill，更新必须用户纠正+验证通过+用户未反对）<br>• `skills.memory_review_prompt` — Memory 保存提示词（禁止重复 Skill 内容，明确 memory vs skill 边界）<br>• `skills.combined_review_prompt` — 同时触发 Skill+Memory 审查时的统一提示词（严格分离两者内容）<br>• `skills.skill_manage_description` — skill_manage 工具描述（与 review prompt 保持一致，消除矛盾指令）<br><br>**代码改动**：<br>• `run_agent.py` `__init__`：新增三个实例变量从 config 读取，fallback 到类属性<br>• `run_agent.py` `_spawn_background_review`：三处改用实例变量<br>• `tools/skill_manager_tool.py`：新增 `_load_skill_manage_description()` 函数，SKILL_MANAGE_SCHEMA 调用该函数<br><br>此改动只改了代码文件，`config.yaml` 是用户配置不入库。 |
 | **Upstream status** | Fork-only. Bugfix for excessive/low-quality skill creation. |
+
+### 11. 回退 Qwen TTS，本 fork 恢复官方 TTS 实现
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-27 |
+| **Commit** | 未提交 |
+| **Files** | `tools/tts_tool.py`, `docs/LOCAL_MODIFICATIONS.md` |
+| **What** | 按用户要求删除 fork-only 的 Qwen TTS 改动，移除 DashScope/Qwen 相关实现、配置默认值与分支逻辑，恢复官方上游的 KittenTTS 分支与原始 provider 列表。原 Entry 6/7 保留作为历史审计记录，但代码状态已不再包含 Qwen TTS。 |
+| **Upstream status** | Fork local revert — code restored to upstream behavior for TTS. |
+
+### 12. 修复 background review prompt 回归，兼容裸对象测试构造
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-04-27 |
+| **Commit** | 未提交 |
+| **Files** | `run_agent.py`, `docs/LOCAL_MODIFICATIONS.md` |
+| **What** | 修复 `AIAgent._spawn_background_review()` 在 tests 中使用 `object.__new__(AIAgent)` 构造裸对象时访问不到 `_memory_review_prompt / _skill_review_prompt / _combined_review_prompt` 实例属性的问题。改为在读取 prompt 时优先取实例属性，缺失时 fallback 到旧的类级常量 `_MEMORY_REVIEW_PROMPT / _SKILL_REVIEW_PROMPT / _COMBINED_REVIEW_PROMPT`，从而兼容配置化前后的两种对象状态。 |
+| **Upstream status** | Fork-only fix for local prompt-config regression. |
+

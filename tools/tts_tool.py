@@ -2,7 +2,7 @@
 """
 Text-to-Speech Tool Module
 
-Supports eight TTS providers:
+Supports seven TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
@@ -10,7 +10,7 @@ Supports eight TTS providers:
 - Mistral (Voxstral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
-- Qwen TTS: Alibaba DashScope Qwen (multimodal REST API), needs DASHSCOPE_API_KEY
+
 
 Output formats:
 - Opus (.ogg) for Telegram voice bubbles (requires ffmpeg for Edge TTS)
@@ -116,10 +116,6 @@ DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
 GEMINI_TTS_SAMPLE_WIDTH = 2  # 16-bit PCM (L16)
-# Qwen TTS (DashScope multimodal REST API)
-DEFAULT_QWEN_TTS_MODEL = "qwen3-tts-flash-2025-11-27"
-DEFAULT_QWEN_TTS_VOICE = "Katerina"
-
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
     return str(get_hermes_dir("cache/audio", "audio_cache"))
@@ -852,107 +848,6 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     return output_path
 
 
-def _generate_qwen_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
-    """Generate audio using Alibaba DashScope Qwen TTS (multimodal REST API).
-
-    The qwen3-tts-flash series models are not supported by the dashscope SDK's
-    SpeechSynthesizer (which uses WebSocket). They require the multimodal
-    generation REST endpoint, which returns a downloadable audio URL.
-
-    Args:
-        text: Text to convert.
-        output_path: Where to save the audio file.
-        tts_config: TTS config dict.
-
-    Returns:
-        Path to the saved audio file.
-    """
-    import requests
-
-    api_key = os.getenv("DASHSCOPE_API_KEY")
-    if not api_key:
-        raise ValueError("DASHSCOPE_API_KEY not set. Get one at https://dashscope.console.aliyun.com/")
-
-    qw_config = tts_config.get("qwen", {})
-    model = qw_config.get("model", DEFAULT_QWEN_TTS_MODEL)
-    voice = qw_config.get("voice", DEFAULT_QWEN_TTS_VOICE)
-
-    # Determine output format for the API request.
-    # DashScope doesn't support opus natively, so .ogg requests use mp3
-    # and are converted to opus by the existing ffmpeg pipeline later.
-    if output_path.endswith(".ogg"):
-        audio_format = "mp3"  # DashScope doesn't support opus; will convert via ffmpeg
-    elif output_path.endswith(".wav"):
-        audio_format = "wav"
-    elif output_path.endswith(".mp3"):
-        audio_format = "mp3"
-    else:
-        audio_format = "wav"
-
-    url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "input": {
-            "text": text,
-        },
-        "parameters": {
-            "voice": voice,
-            "format": audio_format,
-        },
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=120)
-        resp.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        # Parse DashScope error response (contains code + message at top level)
-        try:
-            err_body = resp.json()
-            code = err_body.get("code", "")
-            msg = err_body.get("message", str(e))
-        except Exception:
-            code, msg = "", str(e)
-        raise RuntimeError(f"Qwen TTS API error ({resp.status_code}): code={code}, message={msg}") from e
-
-    result = resp.json()
-
-    # Check for API-level errors in the response body
-    if "output" not in result:
-        # Error may be at top level: {"code": "...", "message": "...", "request_id": "..."}
-        code = result.get("code", "UNKNOWN")
-        msg = result.get("message", "No output field in response")
-        req_id = result.get("request_id", "")
-        raise RuntimeError(f"Qwen TTS failed: code={code}, message={msg}, request_id={req_id}")
-
-    audio_info = result.get("output", {}).get("audio", {})
-    audio_url = audio_info.get("url") if audio_info else None
-
-    if not audio_url:
-        # Try multiple error paths: nested in audio, or at output level
-        error_msg = (
-            audio_info.get("error", "")
-            or result.get("output", {}).get("message", "")
-            or result.get("message", "Unknown error")
-        )
-        req_id = result.get("request_id", "")
-        raise RuntimeError(f"Qwen TTS failed: {error_msg} (request_id={req_id})")
-
-    # Download audio from the returned URL
-    try:
-        audio_resp = requests.get(audio_url, timeout=60)
-        audio_resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Qwen TTS: failed to download audio from URL: {e}") from e
-
-    with open(output_path, "wb") as f:
-        f.write(audio_resp.content)
-
-    return output_path
-
 
 # ===========================================================================
 # Provider: KittenTTS (local, lightweight)
@@ -1141,14 +1036,18 @@ def text_to_speech_tool(
             logger.info("Generating speech with NeuTTS (local)...")
             _generate_neutts(text, file_str, tts_config)
 
-        elif provider == "qwen":
-            if not os.getenv("DASHSCOPE_API_KEY"):
+        elif provider == "kittentts":
+            try:
+                _import_kittentts()
+            except ImportError:
                 return json.dumps({
                     "success": False,
-                    "error": "Qwen TTS provider selected but DASHSCOPE_API_KEY not set.",
+                    "error": "KittenTTS provider selected but 'kittentts' package not installed. "
+                             "Run 'hermes setup tts' and choose KittenTTS, or install manually: "
+                             "pip install https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl"
                 }, ensure_ascii=False)
-            logger.info("Generating speech with Qwen TTS (DashScope)...")
-            _generate_qwen_tts(text, file_str, tts_config)
+            logger.info("Generating speech with KittenTTS (local, ~25MB)...")
+            _generate_kittentts(text, file_str, tts_config)
 
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
@@ -1189,12 +1088,12 @@ def text_to_speech_tool(
         # Try Opus conversion for Telegram compatibility
         # Edge TTS outputs MP3, NeuTTS/KittenTTS output WAV — all need ffmpeg conversion
         voice_compatible = False
-        if provider in ("edge", "neutts", "minimax", "xai", "qwen") and not file_str.endswith(".ogg"):
+        if provider in ("edge", "neutts", "minimax", "xai", "kittentts") and not file_str.endswith(".ogg"):
             opus_path = _convert_to_opus(file_str)
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
-        elif provider in ("elevenlabs", "openai", "mistral", "gemini", "qwen"):
+        elif provider in ("elevenlabs", "openai", "mistral", "gemini"):
             voice_compatible = file_str.endswith(".ogg")
 
         file_size = os.path.getsize(file_str)
