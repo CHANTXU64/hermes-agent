@@ -86,7 +86,7 @@ from tools.browser_tool import cleanup_browser
 
 
 # Agent internals extracted to agent/ package for modularity
-from agent.memory_manager import build_memory_context_block, sanitize_context
+from agent.memory_manager import StreamingContextScrubber, build_memory_context_block, sanitize_context
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
@@ -1218,6 +1218,10 @@ class AIAgent:
         # Deferred paragraph break flag — set after tool iterations so a
         # single "\n\n" is prepended to the next real text delta.
         self._stream_needs_break = False
+        # Stateful scrubber for <memory-context> spans split across stream
+        # deltas (#5719).  sanitize_context() alone can't survive chunk
+        # boundaries because the block regex needs both tags in one string.
+        self._stream_context_scrubber = StreamingContextScrubber()
         # Visible assistant text already delivered through live token callbacks
         # during the current model response. Used to avoid re-sending the same
         # commentary when the provider later returns it as a completed interim
@@ -6049,6 +6053,20 @@ class AIAgent:
 
     def _reset_stream_delivery_tracking(self) -> None:
         """Reset tracking for text delivered during the current model response."""
+        # Flush any benign partial-tag tail held by the context scrubber so it
+        # reaches the UI before we clear state for the next model call.  If
+        # the scrubber is mid-span, flush() drops the orphaned content.
+        scrubber = getattr(self, "_stream_context_scrubber", None)
+        if scrubber is not None:
+            tail = scrubber.flush()
+            if tail:
+                callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+                for cb in callbacks:
+                    try:
+                        cb(tail)
+                    except Exception:
+                        pass
+                self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
 
     def _record_streamed_assistant_text(self, text: str) -> None:
@@ -6099,6 +6117,28 @@ class AIAgent:
         if getattr(self, "_stream_needs_break", False) and text and text.strip():
             self._stream_needs_break = False
             text = "\n\n" + text
+            prepended_break = True
+        else:
+            prepended_break = False
+        if isinstance(text, str):
+            # Strip <think> blocks first (per-delta is safe for closed pairs; the
+            # unterminated-tag path is handled downstream by stream_consumer).
+            # Then feed through the stateful context scrubber so memory-context
+            # spans split across chunks cannot leak to the UI (#5719).
+            text = self._strip_think_blocks(text or "")
+            scrubber = getattr(self, "_stream_context_scrubber", None)
+            if scrubber is not None:
+                text = scrubber.feed(text)
+            else:
+                # Defensive: legacy callers without the scrubber attribute.
+                text = sanitize_context(text)
+            # Only strip leading newlines on the first delta — mid-stream "\n" is legitimate markdown.
+            if not prepended_break and not getattr(
+                self, "_current_streamed_assistant_text", ""
+            ):
+                text = text.lstrip("\n")
+        if not text:
+            return
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         delivered = False
         for cb in callbacks:
@@ -8450,6 +8490,23 @@ class AIAgent:
                     f"⚠ Compression summary failed: {summary_error}. "
                     "Inserted a fallback context marker."
                 )
+        else:
+            # No hard failure — but did the configured aux model error out
+            # and get recovered by retrying on main?  Surface that so users
+            # know their auxiliary.compression.model setting is broken even
+            # though compression succeeded.
+            _aux_fail_model = getattr(self.context_compressor, "_last_aux_model_failure_model", None)
+            _aux_fail_err = getattr(self.context_compressor, "_last_aux_model_failure_error", None)
+            if _aux_fail_model:
+                # Dedup on (model, error) so we don't spam on every compaction
+                _aux_key = (_aux_fail_model, _aux_fail_err)
+                if getattr(self, "_last_aux_fallback_warning_key", None) != _aux_key:
+                    self._last_aux_fallback_warning_key = _aux_key
+                    self._emit_warning(
+                        f"ℹ Configured compression model '{_aux_fail_model}' failed "
+                        f"({_aux_fail_err or 'unknown error'}). Recovered using main model — "
+                        "check auxiliary.compression.model in config.yaml."
+                    )
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
@@ -9622,16 +9679,6 @@ class AIAgent:
         if isinstance(persist_user_message, str):
             persist_user_message = _sanitize_surrogates(persist_user_message)
 
-        # Strip leaked <memory-context> blocks from user input.  When Honcho's
-        # saveMessages persists a turn that included injected context, the block
-        # can reappear in the next turn's user message via message history.
-        # Stripping here prevents stale memory tags from leaking into the
-        # conversation and being visible to the user or the model as user text.
-        if isinstance(user_message, str):
-            user_message = sanitize_context(user_message)
-        if isinstance(persist_user_message, str):
-            persist_user_message = sanitize_context(persist_user_message)
-
         # Store stream callback for _interruptible_api_call to pick up
         self._stream_callback = stream_callback
         self._persist_user_message_idx = None
@@ -9709,6 +9756,13 @@ class AIAgent:
         
         # Track user turns for memory flush and periodic nudge logic
         self._user_turn_count += 1
+
+        # Reset the streaming context scrubber at the top of each turn so a
+        # hung span from a prior interrupted stream can't taint this turn's
+        # output.
+        scrubber = getattr(self, "_stream_context_scrubber", None)
+        if scrubber is not None:
+            scrubber.reset()
 
         # Preserve the original user message (no nudge injection).
         original_user_message = persist_user_message if persist_user_message is not None else user_message
@@ -12741,7 +12795,6 @@ class AIAgent:
                         truncated_response_prefix = ""
                         length_continue_retries = 0
                     
-                    # Strip <think> blocks from user-facing response (keep raw in messages for trajectory)
                     final_response = self._strip_think_blocks(final_response).strip()
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)

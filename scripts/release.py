@@ -43,6 +43,13 @@ AUTHOR_MAP = {
     "teknium1@gmail.com": "teknium1",
     "teknium@nousresearch.com": "teknium1",
     "127238744+teknium1@users.noreply.github.com": "teknium1",
+    # Matrix parity salvage batch (April 2026)
+    "sr@samirusani": "samrusani",
+    "angelclaw@AngelMacBook.local": "angel12",
+    "charles@cryptoassetrecovery.com": "charles-brooks",
+    "heathley@Heathley-MacBook-Air.local": "heathley",
+    "adamrummer@gmail.com": "cyclingwithelephants",
+    "nbot@liizfq.top": "liizfq",
     "274096618+hermes-agent-dhabibi@users.noreply.github.com": "dhabibi",
     "johnnncenaaa77@gmail.com": "johnncenae",
     "focusflow.app.help@gmail.com": "yes999zc",
@@ -557,6 +564,12 @@ AUTHOR_MAP = {
     "mor.aleksandr@yahoo.com": "MorAlekss",
     "ash@users.noreply.github.com": "ash",
     "andrewho.sf@gmail.com": "andrewhosf",
+    # April 2026 Honcho bug-fix consolidation (#15381)
+    "HiddenPuppy@users.noreply.github.com": "HiddenPuppy",
+    "code@sasha.id": "sasha-id",
+    "dontcallmejames@users.noreply.github.com": "dontcallmejames",
+    "hekaru.agent@gmail.com": "hekaru-agent",
+    "jas9000@gmail.com": "twozle",
 }
 
 
