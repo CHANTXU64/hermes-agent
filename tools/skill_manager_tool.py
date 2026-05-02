@@ -576,8 +576,18 @@ def _patch_skill(
     }
 
 
-def _delete_skill(name: str) -> Dict[str, Any]:
-    """Delete a skill."""
+def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
+    """Delete a skill.
+
+    ``absorbed_into`` declares intent:
+      - ``None`` / missing  → caller didn't declare (legacy / non-curator path);
+        accepted for backward compat but logs a warning because the curator
+        classification pipeline can't tell consolidation from pruning without it.
+      - ``""`` (empty)      → explicit "truly pruned, no forwarding target".
+      - ``"<skill-name>"``  → content was absorbed into that umbrella; the
+        target must exist on disk. Validated here so the model can't claim an
+        umbrella that doesn't exist.
+    """
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found."}
@@ -585,6 +595,24 @@ def _delete_skill(name: str) -> Dict[str, Any]:
     pinned_err = _pinned_guard(name)
     if pinned_err:
         return {"success": False, "error": pinned_err}
+
+    # Validate absorbed_into target when declared non-empty
+    if absorbed_into is not None and isinstance(absorbed_into, str) and absorbed_into.strip():
+        target_name = absorbed_into.strip()
+        if target_name == name:
+            return {
+                "success": False,
+                "error": f"absorbed_into='{target_name}' cannot equal the skill being deleted.",
+            }
+        target = _find_skill(target_name)
+        if not target:
+            return {
+                "success": False,
+                "error": (
+                    f"absorbed_into='{target_name}' does not exist. "
+                    f"Create or patch the umbrella skill first, then retry the delete."
+                ),
+            }
 
     skill_dir = existing["path"]
     skills_root = _containing_skills_root(skill_dir)
@@ -595,9 +623,13 @@ def _delete_skill(name: str) -> Dict[str, Any]:
     if parent != skills_root and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()
 
+    message = f"Skill '{name}' deleted."
+    if absorbed_into is not None and isinstance(absorbed_into, str) and absorbed_into.strip():
+        message += f" Content absorbed into '{absorbed_into.strip()}'."
+
     return {
         "success": True,
-        "message": f"Skill '{name}' deleted.",
+        "message": message,
     }
 
 
@@ -718,6 +750,7 @@ def skill_manage(
     old_string: str = None,
     new_string: str = None,
     replace_all: bool = False,
+    absorbed_into: str = None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
@@ -742,7 +775,7 @@ def skill_manage(
         result = _patch_skill(name, old_string, new_string, file_path, replace_all)
 
     elif action == "delete":
-        result = _delete_skill(name)
+        result = _delete_skill(name, absorbed_into=absorbed_into)
 
     elif action == "write_file":
         if not file_path:
@@ -850,6 +883,20 @@ SKILL_MANAGE_SCHEMA = {
                 "type": "string",
                 "description": "Content for the file. Required for 'write_file'."
             },
+            "absorbed_into": {
+                "type": "string",
+                "description": (
+                    "For 'delete' only — declares intent so the curator can "
+                    "tell consolidation from pruning without guessing. "
+                    "Pass the umbrella skill name when this skill's content "
+                    "was merged into another (the target must already exist). "
+                    "Pass an empty string when the skill is truly stale and "
+                    "being pruned with no forwarding target. Omitting the arg "
+                    "on delete is supported for backward compatibility but "
+                    "downstream tooling (e.g. cron-job skill reference "
+                    "rewriting) will have to guess at intent."
+                )
+            },
         },
         "required": ["action", "name"],
     },
@@ -872,6 +919,7 @@ registry.register(
         file_content=args.get("file_content"),
         old_string=args.get("old_string"),
         new_string=args.get("new_string"),
-        replace_all=args.get("replace_all", False)),
+        replace_all=args.get("replace_all", False),
+        absorbed_into=args.get("absorbed_into")),
     emoji="📝",
 )
