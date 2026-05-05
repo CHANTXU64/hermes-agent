@@ -153,14 +153,12 @@ def _containing_skills_root(skill_path: Path) -> Path:
 def _pinned_guard(name: str) -> Optional[str]:
     """Return a refusal message if *name* is pinned, else None.
 
-    Pinned skills are off-limits to the agent's skill_manage tool.  The only
-    way to modify one is for the user to unpin it via
-    ``hermes curator unpin <name>`` (or edit it directly by hand).  This
-    mirrors the curator's own pinned-skip behavior but extends the guard
-    to tool-driven writes as well, giving users a hard fence against
-    accidental agent edits.
+    Pin protects a skill from **deletion** — both the curator's auto-archive
+    passes and the agent's ``skill_manage(action="delete")`` tool call. The
+    agent can still patch/edit pinned skills; pin only guards against
+    irrecoverable loss, not against content evolution.
 
-    Best-effort: if the sidecar is unreadable we let the write through
+    Best-effort: if the sidecar is unreadable we let the delete through
     rather than block on a broken telemetry file.
     """
     try:
@@ -168,9 +166,11 @@ def _pinned_guard(name: str) -> Optional[str]:
         rec = skill_usage.get_record(name)
         if rec.get("pinned"):
             return (
-                f"Skill '{name}' is pinned and cannot be modified by "
+                f"Skill '{name}' is pinned and cannot be deleted by "
                 f"skill_manage. Ask the user to run "
-                f"`hermes curator unpin {name}` if they want the change."
+                f"`hermes curator unpin {name}` if they want to delete it. "
+                f"Patches and edits are allowed on pinned skills; only "
+                f"deletion is blocked."
             )
     except Exception:
         logger.debug("pinned-guard lookup failed for %s", name, exc_info=True)
@@ -455,10 +455,6 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found. Use skills_list() to see available skills."}
 
-    pinned_err = _pinned_guard(name)
-    if pinned_err:
-        return {"success": False, "error": pinned_err}
-
     skill_md = existing["path"] / "SKILL.md"
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
@@ -498,10 +494,6 @@ def _patch_skill(
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found."}
-
-    pinned_err = _pinned_guard(name)
-    if pinned_err:
-        return {"success": False, "error": pinned_err}
 
     skill_dir = existing["path"]
 
@@ -661,10 +653,6 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found. Create it first with action='create'."}
 
-    pinned_err = _pinned_guard(name)
-    if pinned_err:
-        return {"success": False, "error": pinned_err}
-
     target, err = _resolve_skill_target(existing["path"], file_path)
     if err:
         return {"success": False, "error": err}
@@ -698,10 +686,6 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found."}
-
-    pinned_err = _pinned_guard(name)
-    if pinned_err:
-        return {"success": False, "error": pinned_err}
 
     skill_dir = existing["path"]
 
