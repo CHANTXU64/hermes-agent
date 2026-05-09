@@ -1090,6 +1090,11 @@ DEFAULT_CONFIG = {
         # External hub installs (trusted/community sources) are always
         # scanned regardless of this setting.
         "guard_agent_created": False,
+        # When False, bundled skills introduced by future Hermes updates are
+        # still copied into ~/.hermes/skills/ and tracked in .bundled_manifest,
+        # but are appended to skills.disabled during that first sync. Existing
+        # bundled skills and user-created/hub-installed skills are left alone.
+        "auto_enable_new_bundled": True,
     },
 
     # Curator — background skill maintenance.

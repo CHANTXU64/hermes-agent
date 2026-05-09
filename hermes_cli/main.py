@@ -5942,6 +5942,11 @@ def _update_via_zip(args):
             print(
                 f"  ↑ {len(result['updated'])} updated: {', '.join(result['updated'])}"
             )
+        if result.get("auto_disabled"):
+            print(
+                f"  ⏸ {len(result['auto_disabled'])} new disabled by config: "
+                f"{', '.join(result['auto_disabled'])}"
+            )
         if result.get("user_modified"):
             print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
         if result.get("cleaned"):
@@ -7341,6 +7346,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print(
                     f"  ↑ {len(result['updated'])} updated: {', '.join(result['updated'])}"
                 )
+            if result.get("auto_disabled"):
+                print(
+                    f"  ⏸ {len(result['auto_disabled'])} new disabled by config: "
+                    f"{', '.join(result['auto_disabled'])}"
+                )
             if result.get("user_modified"):
                 print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
             if result.get("cleaned"):
@@ -7373,12 +7383,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         elif r:
                             copied = len(r.get("copied", []))
                             updated = len(r.get("updated", []))
+                            auto_disabled = len(r.get("auto_disabled", []))
                             modified = len(r.get("user_modified", []))
                             parts = []
                             if copied:
                                 parts.append(f"+{copied} new")
                             if updated:
                                 parts.append(f"↑{updated} updated")
+                            if auto_disabled:
+                                parts.append(f"⏸{auto_disabled} disabled")
                             if modified:
                                 parts.append(f"~{modified} user-modified")
                             status = ", ".join(parts) if parts else "up to date"

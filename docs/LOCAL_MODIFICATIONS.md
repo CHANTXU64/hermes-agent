@@ -205,6 +205,49 @@ Merge protection:
 
 Upstream status: fork-only documentation.
 
+### 6. Disable newly bundled skills by default when configured
+
+Date: 2026-05-09
+
+Files:
+
+- `tools/skills_sync.py`
+- `hermes_cli/config.py`
+- `hermes_cli/main.py`
+- `tests/tools/test_skills_sync.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+What changed:
+
+- Added `skills.auto_enable_new_bundled` config with upstream-compatible default
+  `true`.
+- When set to `false`, newly discovered bundled skills are still copied into
+  `~/.hermes/skills/` and recorded in `.bundled_manifest`, but their names are
+  appended to `skills.disabled` during that first sync.
+- Existing bundled skills, updated bundled skills, user-modified bundled skills,
+  user-deleted bundled skills, hub-installed skills, and user-created skills are
+  left alone.
+- `hermes update` output reports when new bundled skills were disabled by this
+  config.
+
+Why it matters:
+
+- The user does not want Hermes updates to silently enable newly shipped skills
+  such as Kanban skills.
+- Copying while disabling preserves discoverability and manifest tracking without
+  injecting new instructions into normal skill discovery.
+
+Merge protection:
+
+- Preserve the default `true` behavior for upstream compatibility.
+- Preserve the `false` behavior that only disables skills in `result["copied"]`;
+  do not disable all bundled skills or re-disable skills the user already chose
+  to enable.
+- Run `tests/tools/test_skills_sync.py` after conflicts touching skill sync or
+  skill config behavior.
+
+Upstream status: fork-only.
+
 ## Historical / reverted modifications
 
 ### 6. Qwen TTS provider via DashScope
@@ -317,6 +360,11 @@ deltas are expected in these areas:
   - `tools/terminal_tool.py`
   - `tests/tools/test_safe_cmd_rewrite.py`
   - `pyproject.toml`
+- Disable newly bundled skills by default when configured:
+  - `tools/skills_sync.py`
+  - `hermes_cli/config.py`
+  - `hermes_cli/main.py`
+  - `tests/tools/test_skills_sync.py`
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
 
@@ -326,9 +374,9 @@ TTS. Inspect the current code before making merge decisions.
 
 ## Summary statistics
 
-Documented entries: 7 major entries.
+Documented entries: 8 major entries.
 
-Active functional areas: 4.
+Active functional areas: 5.
 
 Historical reverted areas: 2.
 

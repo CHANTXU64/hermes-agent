@@ -11,6 +11,9 @@ Old v1 manifests (plain names without hashes) are auto-migrated.
 
 Update logic:
   - NEW skills (not in manifest): copied to user dir, origin hash recorded.
+    If skills.auto_enable_new_bundled is false, newly copied bundled skills are
+    also appended to skills.disabled so updates cannot silently enable new
+    instructions.
   - EXISTING skills (in manifest, present in user dir):
       * If user copy matches origin hash: user hasn't modified it → safe to
         update from bundled if bundled changed. New origin hash recorded.
@@ -174,6 +177,40 @@ def _dir_hash(directory: Path) -> str:
     return hasher.hexdigest()
 
 
+def _disable_new_bundled_skills_if_configured(skill_names: List[str]) -> List[str]:
+    """Append newly copied bundled skills to skills.disabled when configured.
+
+    Default Hermes behavior remains unchanged: new bundled skills are enabled
+    unless the user explicitly sets ``skills.auto_enable_new_bundled: false``.
+    This only applies to skills copied during the current sync; existing,
+    updated, user-modified, or user-deleted bundled skills are left alone.
+    """
+    if not skill_names:
+        return []
+
+    try:
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        skills_cfg = config.setdefault("skills", {})
+        if skills_cfg.get("auto_enable_new_bundled", True) is not False:
+            return []
+
+        disabled_raw = skills_cfg.get("disabled", [])
+        disabled = [str(name) for name in disabled_raw] if isinstance(disabled_raw, list) else []
+        disabled_set = set(disabled)
+        added = [name for name in skill_names if name not in disabled_set]
+        if not added:
+            return []
+
+        skills_cfg["disabled"] = sorted(disabled + added)
+        save_config(config)
+        return added
+    except Exception as e:
+        logger.debug("Failed to disable newly bundled skills %s: %s", skill_names, e, exc_info=True)
+        return []
+
+
 def sync_skills(quiet: bool = False) -> dict:
     """
     Sync bundled skills into ~/.hermes/skills/ using the manifest.
@@ -186,7 +223,7 @@ def sync_skills(quiet: bool = False) -> dict:
     if not bundled_dir.exists():
         return {
             "copied": [], "updated": [], "skipped": 0,
-            "user_modified": [], "cleaned": [], "total_bundled": 0,
+            "user_modified": [], "cleaned": [], "auto_disabled": [], "total_bundled": 0,
         }
 
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -295,6 +332,8 @@ def sync_skills(quiet: bool = False) -> dict:
     for name in cleaned:
         del manifest[name]
 
+    auto_disabled = _disable_new_bundled_skills_if_configured(copied)
+
     # Also copy DESCRIPTION.md files for categories (if not already present)
     for desc_md in bundled_dir.rglob("DESCRIPTION.md"):
         rel = desc_md.relative_to(bundled_dir)
@@ -314,6 +353,7 @@ def sync_skills(quiet: bool = False) -> dict:
         "skipped": skipped,
         "user_modified": user_modified,
         "cleaned": cleaned,
+        "auto_disabled": auto_disabled,
         "total_bundled": len(bundled_skills),
     }
 
@@ -426,6 +466,8 @@ if __name__ == "__main__":
     ]
     if result["user_modified"]:
         parts.append(f"{len(result['user_modified'])} user-modified (kept)")
+    if result.get("auto_disabled"):
+        parts.append(f"{len(result['auto_disabled'])} new disabled by config")
     if result["cleaned"]:
         parts.append(f"{len(result['cleaned'])} cleaned from manifest")
     print(f"\nDone: {', '.join(parts)}. {result['total_bundled']} total bundled.")
