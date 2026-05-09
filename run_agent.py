@@ -6539,8 +6539,10 @@ class AIAgent:
         """Attempt credential recovery via pool rotation.
 
         Returns (recovered, has_retried_429).
-        On rate limits: first occurrence retries same credential (sets flag True).
-                        second consecutive failure rotates to next credential.
+        On OpenAI Codex rate limits: cyclically rotates to the next credential
+                        without exhausting the current one; each account gets
+                        at most two attempts per API request.
+        On other rate limits: immediately marks exhausted and rotates to next credential.
         On billing exhaustion: immediately rotates.
         On auth failures: attempts token refresh before rotating.
 
@@ -6551,6 +6553,14 @@ class AIAgent:
         "out of extra usage".
         """
         pool = self._credential_pool
+        logger.info(
+            "[DEBUG] _recover_with_credential_pool: pool=%s status=%s reason=%s provider=%s model=%s",
+            "present" if pool is not None else "None",
+            status_code,
+            getattr(classified_reason, "value", None),
+            getattr(self, "provider", "?"),
+            getattr(self, "model", "?"),
+        )
         if pool is None:
             return False, has_retried_429
 
@@ -6577,9 +6587,50 @@ class AIAgent:
             return False, has_retried_429
 
         if effective_reason == FailoverReason.rate_limit:
-            if not has_retried_429:
-                return False, True
             rotate_status = status_code if status_code is not None else 429
+            if getattr(self, "provider", None) == "openai-codex" and hasattr(pool, "rotate_cyclic_on_rate_limit"):
+                if getattr(pool, "provider", None) != "openai-codex":
+                    logger.error(
+                        "Refusing Codex cyclic rotation with mismatched credential pool provider=%s",
+                        getattr(pool, "provider", None),
+                    )
+                    return False, has_retried_429
+                if hasattr(pool, "align_current_to_runtime_key"):
+                    aligned = pool.align_current_to_runtime_key(getattr(self, "api_key", ""))
+                    if aligned is None:
+                        logger.error(
+                            "Refusing Codex cyclic rotation because active api_key does not match any openai-codex pool entry"
+                        )
+                        return False, has_retried_429
+                entries_count = len(pool.entries()) if hasattr(pool, "entries") else 1
+                max_failures = max(1, entries_count) * 2
+                failures = int(getattr(self, "_codex_pool_429_failures", 0) or 0) + 1
+                self._codex_pool_429_failures = failures
+                if failures >= max_failures:
+                    self._codex_pool_cycle_exhausted = True
+                    logger.warning(
+                        "OpenAI Codex credential pool exhausted after %s/%s cyclic 429 attempts",
+                        failures,
+                        max_failures,
+                    )
+                    return False, has_retried_429
+                next_entry = pool.rotate_cyclic_on_rate_limit(
+                    status_code=rotate_status,
+                    error_context=error_context,
+                )
+                if next_entry is not None:
+                    logger.info(
+                        "Codex credential %s (rate limit) — cyclically rotated to pool entry %s (%s/%s attempts)",
+                        rotate_status,
+                        getattr(next_entry, "id", "?"),
+                        failures,
+                        max_failures,
+                    )
+                    self._swap_credential(next_entry)
+                    return True, False
+                self._codex_pool_cycle_exhausted = True
+                return False, has_retried_429
+
             next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
             if next_entry is not None:
                 logger.info(
@@ -11480,6 +11531,8 @@ class AIAgent:
             oauth_1m_beta_retry_attempted = False
             llama_cpp_grammar_retry_attempted = False
             has_retried_429 = False
+            self._codex_pool_429_failures = 0
+            self._codex_pool_cycle_exhausted = False
             restart_with_compressed_messages = False
             restart_with_length_continuation = False
 
@@ -12422,6 +12475,39 @@ class AIAgent:
                         classified_reason=classified.reason,
                         error_context=error_context,
                     )
+                    if getattr(self, "_codex_pool_cycle_exhausted", False):
+                        _final_summary = self._summarize_api_error(api_error)
+                        _pool_size = 0
+                        try:
+                            _pool_size = len(self._credential_pool.entries()) if self._credential_pool else 0
+                        except Exception:
+                            _pool_size = 0
+                        self._emit_status(
+                            f"❌ OpenAI Codex credential pool exhausted after two full cycles ({_pool_size} account(s)): {_final_summary}"
+                        )
+                        logging.error(
+                            "%sOpenAI Codex credential pool exhausted after two full cycles. %s | provider=%s model=%s",
+                            self.log_prefix,
+                            _final_summary,
+                            getattr(self, "provider", "unknown"),
+                            getattr(self, "model", "unknown"),
+                        )
+                        if api_kwargs is not None:
+                            self._dump_api_request_debug(
+                                api_kwargs, reason="codex_pool_cycle_exhausted", error=api_error,
+                            )
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": (
+                                "OpenAI Codex credential pool exhausted after two full cycles "
+                                f"({_pool_size} account(s)): {_final_summary}"
+                            ),
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _final_summary,
+                        }
                     if recovered_with_pool:
                         continue
 

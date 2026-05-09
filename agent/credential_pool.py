@@ -412,6 +412,27 @@ class CredentialPool:
                 self._entries[idx] = new
                 return
 
+    def _rotate_entries_to_front(self, entry_id: str) -> None:
+        """Persistently rotate priority order so entry_id is selected first.
+
+        Used by OpenAI Codex cyclic quota handling: the account that works
+        should remain the first choice across /new sessions, and a 429 should
+        move the next account to the front without freezing the failing account
+        behind an exhaustion cooldown.
+        """
+        if not self._entries:
+            return
+        ids = [entry.id for entry in self._entries]
+        if entry_id not in ids:
+            return
+        idx = ids.index(entry_id)
+        rotated = self._entries[idx:] + self._entries[:idx]
+        self._entries = [
+            replace(entry, priority=new_priority)
+            for new_priority, entry in enumerate(rotated)
+        ]
+        self._current_id = entry_id
+
     def _persist(self) -> None:
         write_credential_pool(
             self.provider,
@@ -840,6 +861,48 @@ class CredentialPool:
         with self._lock:
             return self._select_unlocked()
 
+    def select_cyclic_current(self) -> Optional[PooledCredential]:
+        """Select current/front entry without applying exhaustion skips.
+
+        OpenAI Codex has overlapping 5-hour and 7-day quota windows. For that
+        provider the desired behavior is pure cyclic failover: keep using the
+        currently successful account across new sessions, and only advance on a
+        new 429. Long reset_at values must not remove the account from future
+        cycles.
+        """
+        with self._lock:
+            if not self._entries:
+                self._current_id = None
+                return None
+            entry = self.current() or self._entries[0]
+            if self._entry_needs_refresh(entry):
+                refreshed = self._refresh_entry(entry, force=False)
+                if refreshed is not None:
+                    entry = refreshed
+            self._rotate_entries_to_front(entry.id)
+            self._persist()
+            return self.current() or entry
+
+    def align_current_to_runtime_key(self, runtime_key: str) -> Optional[PooledCredential]:
+        """Align current/front entry to the credential matching runtime_key.
+
+        This is a defensive guard for callers that pass both a concrete api_key
+        and a pool object.  If they drift apart, 429 recovery would rotate from
+        the wrong account.  Returning None means the key does not belong to this
+        pool and the caller should not rotate it.
+        """
+        runtime_key = runtime_key or ""
+        if not runtime_key:
+            return None
+        with self._lock:
+            for entry in self._entries:
+                entry_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
+                if entry_key == runtime_key:
+                    self._rotate_entries_to_front(entry.id)
+                    self._persist()
+                    return self.current() or entry
+        return None
+
     def _available_entries(self, *, clear_expired: bool = False, refresh: bool = False) -> List[PooledCredential]:
         """Return entries not currently in exhaustion cooldown.
 
@@ -972,6 +1035,53 @@ class CredentialPool:
                 _next_label = next_entry.label or next_entry.id[:8]
                 logger.info("credential pool: rotated to %s", _next_label)
             return next_entry
+
+    def rotate_cyclic_on_rate_limit(
+        self,
+        *,
+        status_code: Optional[int],
+        error_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[PooledCredential]:
+        """Rotate to the next credential without exhausting the current one.
+
+        OpenAI Codex usage-limit 429s should advance 1→2→3→1 while preserving
+        every account as a future candidate. Error metadata is persisted for
+        diagnostics, but last_status is not set to exhausted so selection does
+        not skip the entry for hours/days.
+        """
+        with self._lock:
+            if not self._entries:
+                self._current_id = None
+                return None
+            current = self.current() or self._entries[0]
+            current_idx = next(
+                (idx for idx, entry in enumerate(self._entries) if entry.id == current.id),
+                0,
+            )
+            normalized_error = _normalize_error_context(error_context)
+            updated_current = replace(
+                current,
+                last_status=None,
+                last_status_at=time.time(),
+                last_error_code=status_code,
+                last_error_reason=normalized_error.get("reason"),
+                last_error_message=normalized_error.get("message"),
+                last_error_reset_at=normalized_error.get("reset_at"),
+            )
+            self._replace_entry(current, updated_current)
+            next_idx = (current_idx + 1) % len(self._entries)
+            next_entry = self._entries[next_idx]
+            self._rotate_entries_to_front(next_entry.id)
+            self._persist()
+            _label = current.label or current.id[:8]
+            _next_label = next_entry.label or next_entry.id[:8]
+            logger.info(
+                "credential pool: cyclic Codex 429 rotation %s -> %s (status=%s)",
+                _label,
+                _next_label,
+                status_code,
+            )
+            return self.current() or next_entry
 
     def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
         """Acquire a soft lease on a credential.

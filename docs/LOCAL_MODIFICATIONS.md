@@ -340,6 +340,55 @@ Merge protection:
 
 Upstream status: reverted fork-only experiment.
 
+### 8. OpenAI Codex credential pool cyclic 429 rotation
+
+Date: 2026-05-09
+
+Files:
+
+- `agent/credential_pool.py`
+- `gateway/run.py`
+- `hermes_cli/runtime_provider.py`
+- `run_agent.py`
+- `tests/agent/test_credential_pool.py`
+- `tests/gateway/test_codex_session_override_runtime.py`
+- `tests/run_agent/test_run_agent.py`
+- `tests/hermes_cli/test_runtime_provider_resolution.py`
+
+What changed:
+
+- `openai-codex` runtime resolution loads and returns its provider-specific
+  credential pool instead of flattening to a single `api_key`.
+- Codex pool selection uses the current/front entry and persists that ordering,
+  so `/new` continues using the account that was last selected successfully.
+- Codex HTTP 429 recovery uses pure cyclic rotation instead of exhausted
+  cooldowns: `1 → 2 → 3 → 1 → 2 → 3`.
+- Gateway session overrides for `openai-codex` resolve fresh runtime state so
+  the concrete `api_key` and `credential_pool` current/front entry stay aligned;
+  they must not inherit a global custom-provider pool.
+- Each Codex account is attempted at most twice for one API request; if all
+  attempts are 429, the request stops with a clear pool-exhausted error.
+- Runtime pool load/select traces use logging rather than stdout prints.
+
+Why it matters:
+
+- ChatGPT Codex accounts can have overlapping 5-hour and 7-day usage windows.
+  Long `resets_at` values must not freeze an account out of the pool for days.
+- The user expects the currently working Codex account to remain sticky across
+  new sessions, and only rotate on 429.
+
+Merge protection:
+
+- Do not replace Codex cyclic 429 rotation with generic
+  `mark_exhausted_and_rotate()` cooldown behavior.
+- Do not remove `credential_pool` from the `openai-codex` runtime payload.
+- Do not hand-combine stale session override `api_key` values with a freshly
+  loaded Codex pool; use runtime resolution or explicit pool/key alignment.
+- Preserve tests that prove Codex selection ignores stale exhausted metadata and
+  cyclic rotation does not set `last_status=exhausted`.
+
+Upstream status: fork-only.
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -365,6 +414,15 @@ deltas are expected in these areas:
   - `hermes_cli/config.py`
   - `hermes_cli/main.py`
   - `tests/tools/test_skills_sync.py`
+- OpenAI Codex credential cyclic 429 rotation:
+  - `agent/credential_pool.py`
+  - `gateway/run.py`
+  - `hermes_cli/runtime_provider.py`
+  - `run_agent.py`
+  - `tests/agent/test_credential_pool.py`
+  - `tests/gateway/test_codex_session_override_runtime.py`
+  - `tests/run_agent/test_run_agent.py`
+  - `tests/hermes_cli/test_runtime_provider_resolution.py`
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
 
@@ -374,9 +432,9 @@ TTS. Inspect the current code before making merge decisions.
 
 ## Summary statistics
 
-Documented entries: 8 major entries.
+Documented entries: 9 major entries.
 
-Active functional areas: 5.
+Active functional areas: 6.
 
 Historical reverted areas: 2.
 
