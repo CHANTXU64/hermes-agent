@@ -37,6 +37,38 @@ class ImmediateThread:
         self._target()
 
 
+def test_background_review_uses_class_prompt_not_configured_instance_prompt(monkeypatch):
+    """Custom review prompts from config are disabled; use class prompts only."""
+    captured = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            captured["user_message"] = kwargs["user_message"]
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    agent._skill_review_prompt = "custom configured skill prompt"
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_skills=True,
+    )
+
+    assert captured["user_message"] == "review skills"
+
+
 def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
     events = []
 

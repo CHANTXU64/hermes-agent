@@ -178,53 +178,7 @@ Merge protection:
 
 Upstream status: fork-only.
 
-### 5. Review prompts and `skill_manage` description configurable from config
-
-Date: 2026-04-22
-
-Commits:
-
-- `907e6bd6` — initial `skills.skill_review_prompt` configurability
-- `afc0f3d1` — documented entry 10
-- `13446fdd` — memory/combined prompts and `skill_manage_description`
-- `78607d74` — fallback fix for bare-object tests
-
-Files:
-
-- `run_agent.py`
-- `tools/skill_manager_tool.py`
-- `docs/LOCAL_MODIFICATIONS.md`
-
-What changed:
-
-- Background review prompts can be loaded from `config.yaml`:
-  - `skills.skill_review_prompt`
-  - `skills.memory_review_prompt`
-  - `skills.combined_review_prompt`
-- `skill_manage` tool description can be loaded from:
-  - `skills.skill_manage_description`
-- `AIAgent._spawn_background_review()` falls back to class constants when tests
-  construct a bare `AIAgent` with `object.__new__(AIAgent)`.
-
-Why it matters:
-
-- The user has strict rules against low-quality or duplicate skill creation.
-- Prompt and tool-description behavior must stay aligned with user policy.
-- The fallback is required to avoid tests failing when `__init__` did not run.
-
-Merge protection:
-
-- Preserve instance prompt loading in `AIAgent.__init__`.
-- Preserve `getattr(instance_attr, class_constant)` fallback in
-  `_spawn_background_review()`.
-- Preserve `_load_skill_manage_description()` or an equivalent config-backed
-  mechanism.
-- Do not reintroduce a hardcoded tool description that contradicts configured
-  skill policy.
-
-Upstream status: fork-only.
-
-### 6. Local modifications document
+### 5. Local modifications document
 
 Date: 2026-04-21
 
@@ -253,7 +207,7 @@ Upstream status: fork-only documentation.
 
 ## Historical / reverted modifications
 
-### 7. Qwen TTS provider via DashScope
+### 6. Qwen TTS provider via DashScope
 
 Date: 2026-04-21
 
@@ -291,10 +245,62 @@ Merge protection:
 
 Upstream status: reverted fork-only experiment.
 
+### 7. Review prompt / `skill_manage` config overrides
+
+Date: 2026-04-22 to 2026-05-09
+
+Commits:
+
+- `907e6bd6` — initial `skills.skill_review_prompt` configurability
+- `afc0f3d1` — documented entry 10
+- `13446fdd` — memory/combined prompts and `skill_manage_description`
+- `78607d74` — fallback fix for bare-object tests
+
+Files:
+
+- `run_agent.py`
+- `tools/skill_manager_tool.py`
+- `tests/run_agent/test_background_review.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+What changed historically:
+
+- Background review prompts could be overridden from `config.yaml`:
+  - `skills.skill_review_prompt`
+  - `skills.memory_review_prompt`
+  - `skills.combined_review_prompt`
+- The `skill_manage` tool description could be overridden from:
+  - `skills.skill_manage_description`
+
+Current status:
+
+- Reverted / disabled in code.
+- Background review now uses the built-in class prompt constants directly.
+- `skill_manage` now uses its built-in schema description directly.
+- Config keys above may exist in user config but should be ignored by code.
+
+Why this matters:
+
+- The config-driven prompt override was not useful in practice and made behavior
+  harder to reason about.
+- Future merges must not preserve or revive this feature just because older
+  commits and docs mention it.
+
+Merge protection:
+
+- Do not reintroduce `_skill_review_prompt`, `_memory_review_prompt`, or
+  `_combined_review_prompt` instance attributes loaded from config.
+- Do not reintroduce `_load_skill_manage_description()` or config-backed
+  `skills.skill_manage_description` loading.
+- Preserve the regression test that proves configured instance prompts are not
+  used by background review.
+
+Upstream status: reverted fork-only experiment.
+
 ## Current fork delta checklist
 
-As of HEAD `87adafd53`, compared with the upstream parent of the latest merge,
-active fork deltas are expected in these areas:
+Compared with the upstream parent of the latest completed fork sync, active fork
+deltas are expected in these areas:
 
 - Hindsight Unicode support:
   - `.gitignore`
@@ -311,9 +317,6 @@ active fork deltas are expected in these areas:
   - `tools/terminal_tool.py`
   - `tests/tools/test_safe_cmd_rewrite.py`
   - `pyproject.toml`
-- Review prompt / skill policy configurability:
-  - `run_agent.py`
-  - `tools/skill_manager_tool.py`
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
 
@@ -325,11 +328,12 @@ TTS. Inspect the current code before making merge decisions.
 
 Documented entries: 7 major entries.
 
-Active functional areas: 5.
+Active functional areas: 4.
 
-Historical reverted areas: 1.
+Historical reverted areas: 2.
 
-Fork-only non-merge commits represented here: 14.
+Fork-only non-merge commits represented here: see
+`git log --no-merges upstream/main..HEAD`.
 
 <!--
 Add future modifications above this summary, under either:

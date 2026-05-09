@@ -1840,37 +1840,10 @@ class AIAgent:
                     _existing_tool_names.add(_tname)
 
         # Skills config: nudge interval for skill creation reminders
-        skills_config = _agent_cfg.get("skills", {}) if isinstance(_agent_cfg, dict) else {}
         self._skill_nudge_interval = 10
         try:
+            skills_config = _agent_cfg.get("skills", {})
             self._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
-        except Exception:
-            pass
-
-        # Skill review prompt — configurable via config.yaml skills.skill_review_prompt
-        self._skill_review_prompt = self.__class__._SKILL_REVIEW_PROMPT
-        try:
-            _prompt = skills_config.get("skill_review_prompt")
-            if isinstance(_prompt, str) and _prompt.strip():
-                self._skill_review_prompt = _prompt.strip()
-        except Exception:
-            pass
-
-        # Memory review prompt — configurable via config.yaml skills.memory_review_prompt
-        self._memory_review_prompt = self.__class__._MEMORY_REVIEW_PROMPT
-        try:
-            _prompt = skills_config.get("memory_review_prompt")
-            if isinstance(_prompt, str) and _prompt.strip():
-                self._memory_review_prompt = _prompt.strip()
-        except Exception:
-            pass
-
-        # Combined review prompt — configurable via config.yaml skills.combined_review_prompt
-        self._combined_review_prompt = self.__class__._COMBINED_REVIEW_PROMPT
-        try:
-            _prompt = skills_config.get("combined_review_prompt")
-            if isinstance(_prompt, str) and _prompt.strip():
-                self._combined_review_prompt = _prompt.strip()
         except Exception:
             pass
 
@@ -3688,16 +3661,13 @@ class AIAgent:
         """
         import threading
 
-        # Pick the right prompt based on which triggers fired.
-        # Tests may construct a bare AIAgent via object.__new__ and only seed
-        # the legacy class-level prompt constants, so fall back to those when
-        # the newer instance attributes have not been initialized by __init__.
+        # Pick the right prompt based on which triggers fired
         if review_memory and review_skills:
-            prompt = getattr(self, "_combined_review_prompt", self.__class__._COMBINED_REVIEW_PROMPT)
+            prompt = self._COMBINED_REVIEW_PROMPT
         elif review_memory:
-            prompt = getattr(self, "_memory_review_prompt", self.__class__._MEMORY_REVIEW_PROMPT)
+            prompt = self._MEMORY_REVIEW_PROMPT
         else:
-            prompt = getattr(self, "_skill_review_prompt", self.__class__._SKILL_REVIEW_PROMPT)
+            prompt = self._SKILL_REVIEW_PROMPT
 
         def _run_review():
             import contextlib
