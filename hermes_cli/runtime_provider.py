@@ -874,33 +874,6 @@ def _resolve_explicit_runtime(
         }
 
     if provider == "openai-codex":
-        # Without explicit runtime overrides, prefer the persistent credential
-        # pool so AIAgent receives the pool object and can rotate to the next
-        # Codex OAuth account on 429/401 recovery. Falling straight through to
-        # resolve_codex_runtime_credentials() returns only one api_key and makes
-        # the retry loop exhaust the same account repeatedly.
-        if not explicit_api_key and not explicit_base_url:
-            try:
-                pool = load_pool(provider)
-            except Exception:
-                pool = None
-            if pool and pool.has_credentials():
-                entry = pool.select_cyclic_current() if provider == "openai-codex" and hasattr(pool, "select_cyclic_current") else pool.select()
-                pool_api_key = ""
-                if entry is not None:
-                    pool_api_key = (
-                        getattr(entry, "runtime_api_key", None)
-                        or getattr(entry, "access_token", "")
-                    )
-                if entry is not None and pool_api_key:
-                    return _resolve_runtime_from_pool_entry(
-                        provider=provider,
-                        entry=entry,
-                        requested_provider=requested_provider,
-                        model_cfg=model_cfg,
-                        pool=pool,
-                    )
-
         base_url = explicit_base_url or DEFAULT_CODEX_BASE_URL
         api_key = explicit_api_key
         last_refresh = None

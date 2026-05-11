@@ -3578,7 +3578,7 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         agent._swap_credential.assert_called_once_with(next_entry)
 
-    def test_recover_with_pool_rotates_immediately_on_429(self, agent):
+    def test_recover_with_pool_retries_first_429_then_rotates(self, agent):
         next_entry = SimpleNamespace(label="secondary")
 
         class _Pool:
@@ -3597,105 +3597,17 @@ class TestCredentialPoolRecovery:
             status_code=429,
             has_retried_429=False,
         )
+        assert recovered is False
+        assert retry_same is True
+        agent._swap_credential.assert_not_called()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=True,
+        )
         assert recovered is True
         assert retry_same is False
         agent._swap_credential.assert_called_once_with(next_entry)
-
-    def test_recover_with_codex_pool_cycles_429_twice_then_stops(self, agent):
-        entries = [
-            SimpleNamespace(id="one", label="one"),
-            SimpleNamespace(id="two", label="two"),
-            SimpleNamespace(id="three", label="three"),
-        ]
-        rotated = [entries[1], entries[2], entries[0], entries[1], entries[2]]
-
-        class _Pool:
-            provider = "openai-codex"
-
-            def entries(self):
-                return entries
-
-            def align_current_to_runtime_key(self, runtime_key):
-                return entries[0]
-
-            def rotate_cyclic_on_rate_limit(self, *, status_code, error_context=None):
-                assert status_code == 429
-                assert error_context == {"reason": "usage_limit_reached"}
-                return rotated.pop(0)
-
-        agent.provider = "openai-codex"
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
-        agent._codex_pool_429_failures = 0
-        agent._codex_pool_cycle_exhausted = False
-
-        for expected in [entries[1], entries[2], entries[0], entries[1], entries[2]]:
-            recovered, retry_same = agent._recover_with_credential_pool(
-                status_code=429,
-                has_retried_429=False,
-                classified_reason=FailoverReason.rate_limit,
-                error_context={"reason": "usage_limit_reached"},
-            )
-            assert recovered is True
-            assert retry_same is False
-            assert agent._swap_credential.call_args.args[0] is expected
-
-        recovered, retry_same = agent._recover_with_credential_pool(
-            status_code=429,
-            has_retried_429=False,
-            classified_reason=FailoverReason.rate_limit,
-            error_context={"reason": "usage_limit_reached"},
-        )
-        assert recovered is False
-        assert retry_same is False
-        assert agent._codex_pool_cycle_exhausted is True
-        assert len(rotated) == 0
-
-    def test_recover_with_codex_refuses_mismatched_pool_provider(self, agent):
-        class _Pool:
-            provider = "custom:ali"
-
-            def rotate_cyclic_on_rate_limit(self, **kwargs):  # pragma: no cover - must not be called
-                raise AssertionError("must not rotate a non-Codex pool")
-
-        agent.provider = "openai-codex"
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
-
-        recovered, retry_same = agent._recover_with_credential_pool(
-            status_code=429,
-            has_retried_429=False,
-            classified_reason=FailoverReason.rate_limit,
-        )
-
-        assert recovered is False
-        assert retry_same is False
-        agent._swap_credential.assert_not_called()
-
-    def test_recover_with_codex_refuses_unmatched_runtime_key(self, agent):
-        class _Pool:
-            provider = "openai-codex"
-
-            def align_current_to_runtime_key(self, runtime_key):
-                return None
-
-            def rotate_cyclic_on_rate_limit(self, **kwargs):  # pragma: no cover - must not be called
-                raise AssertionError("must not rotate when api_key is not in pool")
-
-        agent.provider = "openai-codex"
-        agent.api_key = "not-in-pool"
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
-
-        recovered, retry_same = agent._recover_with_credential_pool(
-            status_code=429,
-            has_retried_429=False,
-            classified_reason=FailoverReason.rate_limit,
-        )
-
-        assert recovered is False
-        assert retry_same is False
-        agent._swap_credential.assert_not_called()
 
 
     def test_recover_with_pool_refreshes_on_401(self, agent):

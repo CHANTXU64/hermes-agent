@@ -7,7 +7,7 @@ Built-in TTS providers:
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
 - MiniMax TTS: High-quality with voice cloning, needs MINIMAX_API_KEY
-- Mistral (Voxstral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
+- Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
 - xAI TTS: Grok voices, needs XAI_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts
@@ -20,7 +20,6 @@ Custom command providers:
   writes the input text to a temp file and runs the configured shell
   command, which must produce the audio file at the expected path.
   See the Local Command section of ``website/docs/user-guide/features/tts.md``.
-
 
 Output formats:
 - Opus (.ogg) for Telegram voice bubbles (requires ffmpeg for Edge TTS)
@@ -154,6 +153,7 @@ DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
 GEMINI_TTS_SAMPLE_WIDTH = 2  # 16-bit PCM (L16)
+
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
     return str(get_hermes_dir("cache/audio", "audio_cache"))
@@ -1314,7 +1314,6 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
             os.rename(wav_path, output_path)
 
     return output_path
-
 
 
 # ===========================================================================

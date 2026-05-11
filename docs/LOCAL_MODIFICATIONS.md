@@ -248,148 +248,7 @@ Merge protection:
 
 Upstream status: fork-only.
 
-## Historical / reverted modifications
-
-### 6. Qwen TTS provider via DashScope
-
-Date: 2026-04-21
-
-Commits:
-
-- `0e7ab099` — added Qwen TTS provider
-- `bd7fd984` — moved Qwen from native Opus to ffmpeg conversion path
-- `78607d74` — reverted Qwen TTS and restored KittenTTS behavior
-
-Files:
-
-- `tools/tts_tool.py`
-
-What changed historically:
-
-- A Qwen / DashScope TTS provider was added and later adjusted for Opus output.
-
-Current status:
-
-- Reverted. The fork currently should not contain the Qwen / DashScope TTS
-  provider implementation.
-- Official KittenTTS behavior was restored.
-
-Why this matters:
-
-- This is an audit record, not an active merge-preservation rule.
-- Future conflict resolution must not resurrect Qwen TTS just because old entries
-  mention it.
-
-Merge protection:
-
-- If `tools/tts_tool.py` conflicts, preserve current upstream-compatible
-  KittenTTS behavior unless the user explicitly requests Qwen TTS again.
-- Treat Qwen TTS code as removed historical code.
-
-Upstream status: reverted fork-only experiment.
-
-### 7. Review prompt / `skill_manage` config overrides
-
-Date: 2026-04-22 to 2026-05-09
-
-Commits:
-
-- `907e6bd6` — initial `skills.skill_review_prompt` configurability
-- `afc0f3d1` — documented entry 10
-- `13446fdd` — memory/combined prompts and `skill_manage_description`
-- `78607d74` — fallback fix for bare-object tests
-
-Files:
-
-- `run_agent.py`
-- `tools/skill_manager_tool.py`
-- `tests/run_agent/test_background_review.py`
-- `docs/LOCAL_MODIFICATIONS.md`
-
-What changed historically:
-
-- Background review prompts could be overridden from `config.yaml`:
-  - `skills.skill_review_prompt`
-  - `skills.memory_review_prompt`
-  - `skills.combined_review_prompt`
-- The `skill_manage` tool description could be overridden from:
-  - `skills.skill_manage_description`
-
-Current status:
-
-- Reverted / disabled in code.
-- Background review now uses the built-in class prompt constants directly.
-- `skill_manage` now uses its built-in schema description directly.
-- Config keys above may exist in user config but should be ignored by code.
-
-Why this matters:
-
-- The config-driven prompt override was not useful in practice and made behavior
-  harder to reason about.
-- Future merges must not preserve or revive this feature just because older
-  commits and docs mention it.
-
-Merge protection:
-
-- Do not reintroduce `_skill_review_prompt`, `_memory_review_prompt`, or
-  `_combined_review_prompt` instance attributes loaded from config.
-- Do not reintroduce `_load_skill_manage_description()` or config-backed
-  `skills.skill_manage_description` loading.
-- Preserve the regression test that proves configured instance prompts are not
-  used by background review.
-
-Upstream status: reverted fork-only experiment.
-
-### 8. OpenAI Codex credential pool cyclic 429 rotation
-
-Date: 2026-05-09
-
-Files:
-
-- `agent/credential_pool.py`
-- `gateway/run.py`
-- `hermes_cli/runtime_provider.py`
-- `run_agent.py`
-- `tests/agent/test_credential_pool.py`
-- `tests/gateway/test_codex_session_override_runtime.py`
-- `tests/run_agent/test_run_agent.py`
-- `tests/hermes_cli/test_runtime_provider_resolution.py`
-
-What changed:
-
-- `openai-codex` runtime resolution loads and returns its provider-specific
-  credential pool instead of flattening to a single `api_key`.
-- Codex pool selection uses the current/front entry and persists that ordering,
-  so `/new` continues using the account that was last selected successfully.
-- Codex HTTP 429 recovery uses pure cyclic rotation instead of exhausted
-  cooldowns: `1 → 2 → 3 → 1 → 2 → 3`.
-- Gateway session overrides for `openai-codex` resolve fresh runtime state so
-  the concrete `api_key` and `credential_pool` current/front entry stay aligned;
-  they must not inherit a global custom-provider pool.
-- Each Codex account is attempted at most twice for one API request; if all
-  attempts are 429, the request stops with a clear pool-exhausted error.
-- Runtime pool load/select traces use logging rather than stdout prints.
-
-Why it matters:
-
-- ChatGPT Codex accounts can have overlapping 5-hour and 7-day usage windows.
-  Long `resets_at` values must not freeze an account out of the pool for days.
-- The user expects the currently working Codex account to remain sticky across
-  new sessions, and only rotate on 429.
-
-Merge protection:
-
-- Do not replace Codex cyclic 429 rotation with generic
-  `mark_exhausted_and_rotate()` cooldown behavior.
-- Do not remove `credential_pool` from the `openai-codex` runtime payload.
-- Do not hand-combine stale session override `api_key` values with a freshly
-  loaded Codex pool; use runtime resolution or explicit pool/key alignment.
-- Preserve tests that prove Codex selection ignores stale exhausted metadata and
-  cyclic rotation does not set `last_status=exhausted`.
-
-Upstream status: fork-only.
-
-### 9. OpenAI Codex configured gateway endpoint
+### 7. OpenAI Codex configured gateway endpoint
 
 Date: 2026-05-11
 
@@ -449,6 +308,63 @@ Merge protection:
 
 Upstream status: fork-only.
 
+## Historical / reverted modifications
+
+
+### 8. Review prompt / `skill_manage` config overrides
+
+Date: 2026-04-22 to 2026-05-09
+
+Commits:
+
+- `907e6bd6` — initial `skills.skill_review_prompt` configurability
+- `afc0f3d1` — documented entry 10
+- `13446fdd` — memory/combined prompts and `skill_manage_description`
+- `78607d74` — fallback fix for bare-object tests
+
+Files:
+
+- `run_agent.py`
+- `tools/skill_manager_tool.py`
+- `tests/run_agent/test_background_review.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+What changed historically:
+
+- Background review prompts could be overridden from `config.yaml`:
+  - `skills.skill_review_prompt`
+  - `skills.memory_review_prompt`
+  - `skills.combined_review_prompt`
+- The `skill_manage` tool description could be overridden from:
+  - `skills.skill_manage_description`
+
+Current status:
+
+- Reverted / disabled in code.
+- Background review now uses the built-in class prompt constants directly.
+- `skill_manage` now uses its built-in schema description directly.
+- Config keys above may exist in user config but should be ignored by code.
+
+Why this matters:
+
+- The config-driven prompt override was not useful in practice and made behavior
+  harder to reason about.
+- Future merges must not preserve or revive this feature just because older
+  commits and docs mention it.
+
+Merge protection:
+
+- Do not reintroduce `_skill_review_prompt`, `_memory_review_prompt`, or
+  `_combined_review_prompt` instance attributes loaded from config.
+- Do not reintroduce `_load_skill_manage_description()` or config-backed
+  `skills.skill_manage_description` loading.
+- Preserve the regression test that proves configured instance prompts are not
+  used by background review.
+
+Upstream status: reverted fork-only experiment.
+
+
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -474,15 +390,6 @@ deltas are expected in these areas:
   - `hermes_cli/config.py`
   - `hermes_cli/main.py`
   - `tests/tools/test_skills_sync.py`
-- OpenAI Codex credential cyclic 429 rotation:
-  - `agent/credential_pool.py`
-  - `gateway/run.py`
-  - `hermes_cli/runtime_provider.py`
-  - `run_agent.py`
-  - `tests/agent/test_credential_pool.py`
-  - `tests/gateway/test_codex_session_override_runtime.py`
-  - `tests/run_agent/test_run_agent.py`
-  - `tests/hermes_cli/test_runtime_provider_resolution.py`
 - OpenAI Codex configured gateway endpoint:
   - `agent/model_metadata.py`
   - `hermes_cli/runtime_provider.py`
@@ -494,17 +401,14 @@ deltas are expected in these areas:
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
 
-Note: `tools/tts_tool.py` may still show tiny formatting or typo diffs from the
-historical Qwen revert path. Do not treat those as a reason to preserve Qwen
-TTS. Inspect the current code before making merge decisions.
 
 ## Summary statistics
 
-Documented entries: 10 major entries.
+Documented entries: 8 major entries.
 
-Active functional areas: 7.
+Active functional areas: 6.
 
-Historical reverted areas: 2.
+Historical reverted areas: 1.
 
 Fork-only non-merge commits represented here: see
 `git log --no-merges upstream/main..HEAD`.

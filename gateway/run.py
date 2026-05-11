@@ -1804,31 +1804,8 @@ class GatewayRunner:
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
-            override_provider = override.get("provider")
-            if override_provider == "openai-codex":
-                # Codex session overrides must be resolved fresh instead of
-                # reusing the stored api_key.  The stored token may be from an
-                # older pool entry, while the persistent Codex pool front may
-                # have advanced after a 429 in another turn/session.  Resolving
-                # through runtime_provider keeps api_key and credential_pool
-                # aligned via select_cyclic_current().
-                from hermes_cli.runtime_provider import resolve_runtime_provider
-
-                override_runtime = resolve_runtime_provider(
-                    requested=override_provider,
-                    target_model=override_model,
-                )
-                override_runtime.pop("model", None)
-                logger.debug(
-                    "Session model override (codex fresh runtime): session=%s config_model=%s -> override_model=%s provider=%s pool=%s",
-                    resolved_session_key or "", model, override_model,
-                    override_runtime.get("provider"),
-                    "yes" if override_runtime.get("credential_pool") else "no",
-                )
-                return override_model, override_runtime
-
             override_runtime = {
-                "provider": override_provider,
+                "provider": override.get("provider"),
                 "api_key": override.get("api_key"),
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
