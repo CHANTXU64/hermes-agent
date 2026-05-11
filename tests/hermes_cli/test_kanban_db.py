@@ -177,12 +177,9 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
         killed: list[int] = []
-        state = {"alive": True}
 
-        def _signal(pid, sig):
+        def _signal(_pid, sig):
             killed.append(sig)
-            if sig == signal.SIGTERM:
-                state["alive"] = False
 
         kb._set_worker_pid(conn, t, 12345)
         # Rewind claim_expires so it looks stale.
@@ -190,11 +187,94 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
             (int(time.time()) - 3600, t),
         )
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+        # Worker PID has died — exactly the case ``release_stale_claims``
+        # should still reclaim (post-#23025: live PIDs are now extended).
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
         reclaimed = kb.release_stale_claims(conn, signal_fn=_signal)
         assert reclaimed == 1
         assert kb.get_task(conn, t).status == "ready"
         assert killed == [signal.SIGTERM]
+
+
+def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
+    kanban_home, monkeypatch,
+):
+    """A stale-by-TTL claim whose worker PID is still alive should be
+    extended, not reclaimed (#23025). Slow models can spend longer than
+    ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM call;
+    killing those healthy workers produces a respawn loop with zero
+    progress."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+
+        old_expires = int(time.time()) - 60
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (old_expires, t),
+        )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        killed: list[int] = []
+        reclaimed = kb.release_stale_claims(
+            conn, signal_fn=lambda _p, sig: killed.append(sig),
+        )
+        assert reclaimed == 0
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert task.claim_expires is not None
+        assert task.claim_expires > old_expires
+        assert killed == []  # live worker not killed
+
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (t,),
+            ).fetchall()
+        ]
+        assert "claim_extended" in kinds
+        assert "reclaimed" not in kinds
+
+
+def test_stale_claim_reclaim_event_records_diagnostic_payload(
+    kanban_home, monkeypatch,
+):
+    """``reclaimed`` events should carry claim_expires, last_heartbeat_at,
+    and worker_pid so operators can diagnose why a claim went stale
+    (#23025: previous payload only had ``stale_lock`` which gives no
+    timing context)."""
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+        old_expires = int(time.time()) - 3600
+        hb_at = int(time.time()) - 1800
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
+            "WHERE id = ?",
+            (old_expires, hb_at, t),
+        )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'reclaimed'",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row["payload"])
+        assert payload["claim_expires"] == old_expires
+        assert payload["last_heartbeat_at"] == hb_at
+        assert payload["worker_pid"] == 12345
+        assert payload["host_local"] is True
 
 
 def test_max_runtime_uses_current_run_start_after_retry(kanban_home):
@@ -603,6 +683,57 @@ def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawna
         # Must return to ready so the next tick can retry.
         assert kb.get_task(conn, t).status == "ready"
         assert kb.get_task(conn, t).claim_lock is None
+
+
+def test_dispatch_max_spawn_counts_existing_running_tasks(
+    kanban_home, all_assignees_spawnable
+):
+    """max_spawn is a live concurrency cap, not a per-tick spawn cap.
+
+    Without counting tasks already in ``running``, every dispatcher tick can
+    launch up to ``max_spawn`` more workers while previous workers are still
+    alive. Long-running boards then accumulate unbounded worker subprocesses.
+    """
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        running_a = kb.create_task(conn, title="running-a", assignee="alice")
+        running_b = kb.create_task(conn, title="running-b", assignee="bob")
+        ready = kb.create_task(conn, title="ready", assignee="carol")
+        kb.claim_task(conn, running_a)
+        kb.claim_task(conn, running_b)
+
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+
+        assert res.spawned == []
+        assert spawns == []
+        assert kb.get_task(conn, ready).status == "ready"
+
+
+def test_dispatch_max_spawn_fills_remaining_capacity(
+    kanban_home, all_assignees_spawnable
+):
+    """When below cap, dispatch only fills available worker slots."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="alice")
+        ready_a = kb.create_task(conn, title="ready-a", assignee="bob")
+        ready_b = kb.create_task(conn, title="ready-b", assignee="carol")
+        kb.claim_task(conn, running)
+
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+
+        assert len(res.spawned) == 1
+        assert spawns == [ready_a]
+        assert kb.get_task(conn, ready_a).status == "running"
+        assert kb.get_task(conn, ready_b).status == "ready"
 
 
 def test_dispatch_reclaims_stale_before_spawning(kanban_home):

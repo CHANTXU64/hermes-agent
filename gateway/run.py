@@ -1249,6 +1249,7 @@ class GatewayRunner:
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+        self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
@@ -3206,6 +3207,28 @@ class GatewayRunner:
         except RuntimeError:
             self._gateway_loop = None
         logger.info("Session storage: %s", self.config.sessions_dir)
+
+        # Sanity-check that systemd's TimeoutStopSec covers our drain
+        # window.  When the user upgraded hermes-agent without re-running
+        # ``hermes setup``, their unit file may still encode the old
+        # default — in which case SIGKILL hits mid-drain and looks like
+        # a phantom kill in the journal.  Best-effort, never raises.
+        try:
+            from gateway.shutdown_forensics import check_systemd_timing_alignment
+            _alignment = check_systemd_timing_alignment(self._restart_drain_timeout)
+            if _alignment is not None and _alignment.get("mismatch"):
+                logger.warning(
+                    "Stale systemd unit detected: %s has TimeoutStopSec=%.0fs but "
+                    "drain_timeout=%.0fs (expected >=%.0fs). systemd may SIGKILL the "
+                    "gateway mid-drain. Run `hermes gateway service install --replace` "
+                    "to regenerate the unit, or shorten agent.restart_drain_timeout.",
+                    _alignment.get("unit", "(unknown)"),
+                    _alignment["timeout_stop_sec"],
+                    _alignment["drain_timeout"],
+                    _alignment["expected_min"],
+                )
+        except Exception as _e:
+            logger.debug("check_systemd_timing_alignment failed: %s", _e)
         # Log the resolved max_iterations budget so operators can verify the
         # config.yaml → env bridge did the right thing at a glance (instead
         # of silently running at a stale .env value for weeks).
@@ -3659,9 +3682,233 @@ class GatewayRunner:
             )
         asyncio.create_task(self._platform_reconnect_watcher())
 
+        # Start background handoff watcher — picks up CLI sessions marked
+        # handoff_state='pending' in state.db and re-binds them to the
+        # destination platform's home channel, then forges a synthetic user
+        # turn so the agent kicks off the new chat.
+        asyncio.create_task(self._handoff_watcher())
+
         logger.info("Press Ctrl+C to stop")
         
         return True
+
+    async def _handoff_watcher(self, interval: float = 2.0) -> None:
+        """Background task that processes pending CLI→gateway session handoffs.
+
+        Polls ``state.db`` for sessions in ``handoff_state='pending'`` and,
+        for each one:
+
+        1. Atomically claims it (pending → running).
+        2. Resolves the destination platform's configured home channel.
+        3. Re-binds the gateway's session_key for that home channel to the
+           CLI's existing session_id via ``session_store.switch_session`` so
+           the full role-aware transcript replays on the next agent turn.
+        4. Forges a synthetic ``MessageEvent`` (``internal=True``) with a
+           handoff-notice text and dispatches through the normal gateway
+           message pipeline so the agent runs and replies on the platform.
+        5. Marks the row ``completed`` (or ``failed`` with ``handoff_error``).
+
+        The CLI process is poll-blocked on the row's terminal state and
+        prints the result to the user.
+        """
+        # Initial delay so the gateway is fully connected to its platforms
+        # before we try to dispatch handoffs through them.
+        await asyncio.sleep(5)
+        while self._running:
+            try:
+                if self._session_db is None:
+                    await asyncio.sleep(interval)
+                    continue
+                pending = self._session_db.list_pending_handoffs()
+                for row in pending:
+                    session_id = row.get("id")
+                    if not session_id:
+                        continue
+                    if not self._session_db.claim_handoff(session_id):
+                        # Another tick or another gateway already claimed it.
+                        continue
+                    try:
+                        await self._process_handoff(row)
+                        self._session_db.complete_handoff(session_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "Handoff for session %s failed: %s",
+                            session_id, exc, exc_info=True,
+                        )
+                        self._session_db.fail_handoff(session_id, str(exc))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Handoff watcher tick error: %s", exc, exc_info=True)
+            await asyncio.sleep(interval)
+
+    async def _process_handoff(self, row: Dict[str, Any]) -> None:
+        """Execute one handoff row. Raises on failure (caller marks failed)."""
+        from gateway.config import Platform
+        from gateway.session import SessionSource, build_session_key
+        from gateway.platforms.base import MessageEvent
+
+        cli_session_id = row["id"]
+        platform_name = (row.get("handoff_platform") or "").strip().lower()
+        if not platform_name:
+            raise RuntimeError("handoff_platform is empty")
+
+        # Resolve platform enum
+        try:
+            platform = Platform(platform_name)
+        except (ValueError, KeyError):
+            raise RuntimeError(f"unknown platform '{platform_name}'")
+
+        # Adapter must be live
+        adapter = self.adapters.get(platform)
+        if not adapter:
+            raise RuntimeError(
+                f"platform '{platform_name}' is not active in this gateway"
+            )
+
+        # Home channel must be configured
+        home = self.config.get_home_channel(platform)
+        if not home or not home.chat_id:
+            raise RuntimeError(
+                f"no home channel configured for {platform_name}; "
+                f"run /sethome on the desired chat first"
+            )
+
+        cli_title = row.get("title") or cli_session_id[:8]
+
+        # Try to create a fresh thread on the destination so the handoff
+        # has its own scrollback. Adapter returns None if threading isn't
+        # supported (Matrix/WhatsApp/Signal/SMS) or if creation failed
+        # (no permission, topics-mode off, parent is a DM, etc.). When
+        # None we fall through to using the home channel directly — the
+        # synthetic turn still lands; just without thread isolation.
+        thread_name = f"Hermes — {cli_title}"
+        try:
+            new_thread_id = await adapter.create_handoff_thread(
+                str(home.chat_id), thread_name,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Handoff: create_handoff_thread raised on %s: %s",
+                platform_name, exc, exc_info=True,
+            )
+            new_thread_id = None
+
+        # Use the new thread if the adapter created one; otherwise fall
+        # back to whatever thread (if any) the home channel was configured
+        # with.
+        effective_thread_id = new_thread_id or (
+            str(home.thread_id) if home.thread_id else None
+        )
+
+        # Determine chat_type for the destination source. If we created a
+        # thread, key the session_key as a thread (build_session_key sets
+        # thread sessions to user-shared by default, which is what we
+        # want — the synthetic turn and any later real-user message both
+        # land on the same key without needing a user_id).
+        if new_thread_id:
+            dest_chat_type = "thread"
+        else:
+            # No thread — assume DM-style for the home channel. For
+            # group/channel home channels without thread support
+            # (Matrix/WhatsApp/Signal), the platform's own keying makes
+            # the synthetic turn shared anyway (single-DM platforms).
+            dest_chat_type = "dm"
+
+        dest_source = SessionSource(
+            platform=platform,
+            chat_id=str(home.chat_id),
+            chat_name=home.name,
+            chat_type=dest_chat_type,
+            user_id="system:handoff",
+            user_name="Handoff",
+            thread_id=effective_thread_id,
+        )
+
+        # Compute the gateway's session_key for that destination using the
+        # same rules its adapters use, so switch_session targets the right
+        # entry. For thread destinations build_session_key keys without
+        # user_id (thread_sessions_per_user defaults to False) — so the
+        # next real user message in the thread shares this same session.
+        platform_cfg = self.config.platforms.get(platform)
+        extra = platform_cfg.extra if platform_cfg else {}
+        session_key = build_session_key(
+            dest_source,
+            group_sessions_per_user=extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+        )
+
+        # Make sure there's an entry in the session_store for this key. If
+        # the home channel has never been used, get_or_create_session
+        # creates one; switch_session then re-points it.
+        self.session_store.get_or_create_session(dest_source)
+
+        # Re-bind the destination key to the CLI session_id. switch_session
+        # ends the prior session in SQLite and reopens the CLI session under
+        # the new key. The CLI's transcript becomes the active one for the
+        # gateway from this moment on.
+        switched = self.session_store.switch_session(session_key, cli_session_id)
+        if switched is None:
+            raise RuntimeError(
+                f"could not switch session key {session_key} → {cli_session_id}"
+            )
+
+        # Evict any cached AIAgent for this session_key so the next dispatch
+        # rebuilds it against the CLI session_id (mirrors /resume / /branch).
+        self._evict_cached_agent(session_key)
+
+        # Cancel any in-flight running-agent state for the destination key
+        # so the synthetic turn isn't queued behind a stale running flag.
+        self._release_running_agent_state(session_key)
+
+        synthetic_text = (
+            f"[Session was just handed off from CLI (\"{cli_title}\") to this "
+            f"channel. The full prior conversation history is loaded above. "
+            f"Briefly confirm you're working here and summarize what we were "
+            f"working on, so the user can continue from this device.]"
+        )
+
+        synthetic_event = MessageEvent(
+            text=synthetic_text,
+            source=dest_source,
+            internal=True,
+        )
+
+        logger.info(
+            "Handoff: dispatching synthetic turn for CLI session %s → %s "
+            "(home=%s, thread=%s, session_key=%s)",
+            cli_session_id, platform_name, home.chat_id, effective_thread_id,
+            session_key,
+        )
+
+        # Dispatch through the runner directly. Going through
+        # adapter.handle_message would spawn a background task and we'd
+        # lose synchronous error visibility; calling _handle_message inline
+        # keeps the success/failure path observable for the watcher.
+        response_text = await self._handle_message(synthetic_event)
+        if not response_text:
+            # Streaming may have already delivered the response inline.
+            # Either way, agent ran without raising — count as success.
+            return
+
+        # Send the agent's reply to the destination. Route to the new
+        # thread if we created one; otherwise the configured home channel
+        # (which may itself carry a thread_id).
+        send_metadata: Dict[str, Any] = {}
+        if effective_thread_id:
+            send_metadata["thread_id"] = effective_thread_id
+        try:
+            result = await adapter.send(
+                chat_id=str(home.chat_id),
+                content=response_text,
+                metadata=send_metadata or None,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"adapter.send failed: {exc}") from exc
+
+        if not getattr(result, "success", True):
+            err = getattr(result, "error", "send returned success=False")
+            raise RuntimeError(f"adapter.send failed: {err}")
 
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.
@@ -3825,6 +4072,14 @@ class GatewayRunner:
                     break
                 await asyncio.sleep(1)
 
+    def _active_profile_name(self) -> str:
+        """Return the profile name this gateway represents."""
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            return get_active_profile_name() or "default"
+        except Exception:
+            return "default"
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -3852,10 +4107,18 @@ class GatewayRunner:
             return
 
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
-        # Terminal event kinds trigger automatic unsubscription — the task
-        # is done or in a retry-needed state that the human
-        # shouldn't keep pinging a stale chat for.
-        TERMINAL_EVENT_KINDS = ("completed", "gave_up", "crashed", "timed_out")
+        # Subscriptions are removed only when the task reaches a truly final
+        # status (done / archived). We used to also unsub on any terminal
+        # event kind (gave_up / crashed / timed_out / blocked), but that
+        # silently dropped the user out of the loop whenever the dispatcher
+        # respawned the task: a worker that crashes, gets reclaimed, runs
+        # again, and crashes a second time would only notify on the first
+        # crash because the subscription was deleted after the first event.
+        # Same shape as the reblock-after-unblock cycle that PR #22941
+        # fixed for `blocked`. Keeping the subscription alive until the
+        # task is genuinely done lets the cursor (advanced atomically by
+        # claim_unseen_events_for_sub) handle dedup, and any retry-loop
+        # event reaches the user.
         # Per-subscription send-failure counter. Adapter.send raising
         # means the chat is dead (deleted, bot kicked, etc.) — after N
         # consecutive send failures the sub is dropped so we don't spin
@@ -3865,6 +4128,10 @@ class GatewayRunner:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        notifier_profile = getattr(self, "_kanban_notifier_profile", None)
+        if not notifier_profile:
+            notifier_profile = self._active_profile_name()
+            self._kanban_notifier_profile = notifier_profile
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -3873,18 +4140,42 @@ class GatewayRunner:
             try:
                 def _collect():
                     deliveries: list[dict] = []
-                    # Enumerate every board on disk. Cheap: a few
-                    # directory stat calls per tick. Missing/empty
-                    # boards are silently skipped.
+                    active_platforms = {
+                        getattr(platform, "value", str(platform)).lower()
+                        for platform in self.adapters.keys()
+                    }
+                    if not active_platforms:
+                        logger.debug("kanban notifier: no connected adapters; skipping tick")
+                        return deliveries
+
+                    # Enumerate every board on disk, but poll each resolved DB
+                    # path once. Multiple slugs can point at the same DB when
+                    # HERMES_KANBAN_DB pins the board path; without this guard
+                    # one gateway could collect the same subscription/event
+                    # more than once before advancing the cursor.
                     try:
                         boards = _kb.list_boards(include_archived=False)
                     except Exception:
                         boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                    seen_db_paths: set[str] = set()
                     for board_meta in boards:
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                        db_path = board_meta.get("db_path")
+                        try:
+                            resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(_kb.kanban_db_path(slug).resolve())
+                        except Exception:
+                            resolved_db_path = f"slug:{slug}"
+                        if resolved_db_path in seen_db_paths:
+                            logger.debug(
+                                "kanban notifier: skipping duplicate board slug %s for DB %s",
+                                slug, resolved_db_path,
+                            )
+                            continue
+                        seen_db_paths.add(resolved_db_path)
                         try:
                             conn = _kb.connect(board=slug)
-                        except Exception:
+                        except Exception as exc:
+                            logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
                         try:
                             # `connect()` runs the schema + idempotent migration
@@ -3900,8 +4191,24 @@ class GatewayRunner:
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
                             subs = _kb.list_notify_subs(conn)
+                            if not subs:
+                                logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
-                                cursor, events = _kb.unseen_events_for_sub(
+                                owner_profile = sub.get("notifier_profile") or None
+                                if owner_profile and owner_profile != notifier_profile:
+                                    logger.debug(
+                                        "kanban notifier: subscription for %s owned by profile %s; current profile %s skipping",
+                                        sub.get("task_id"), owner_profile, notifier_profile,
+                                    )
+                                    continue
+                                platform = (sub.get("platform") or "").lower()
+                                if platform not in active_platforms:
+                                    logger.debug(
+                                        "kanban notifier: subscription for %s on %s skipped; adapter not connected",
+                                        sub.get("task_id"), platform or "<missing>",
+                                    )
+                                    continue
+                                old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                     conn,
                                     task_id=sub["task_id"],
                                     platform=sub["platform"],
@@ -3912,8 +4219,13 @@ class GatewayRunner:
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                logger.debug(
+                                    "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
+                                    len(events), sub["task_id"], slug, old_cursor, cursor,
+                                )
                                 deliveries.append({
                                     "sub": sub,
+                                    "old_cursor": old_cursor,
                                     "cursor": cursor,
                                     "events": events,
                                     "task": task,
@@ -3940,7 +4252,18 @@ class GatewayRunner:
                         continue
                     adapter = self.adapters.get(plat)
                     if adapter is None:
-                        continue  # platform not currently connected
+                        logger.debug(
+                            "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
+                            platform_str, sub["task_id"],
+                        )
+                        await asyncio.to_thread(
+                            self._kanban_rewind,
+                            sub,
+                            d["cursor"],
+                            d.get("old_cursor", 0),
+                            board_slug,
+                        )
+                        continue
                     title = (task.title if task else sub["task_id"])[:120]
                     for ev in d["events"]:
                         kind = ev.kind
@@ -4008,6 +4331,10 @@ class GatewayRunner:
                             await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
+                            logger.debug(
+                                "kanban notifier: delivered %s event for %s to %s/%s on board %s",
+                                kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                            )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
@@ -4027,22 +4354,34 @@ class GatewayRunner:
                                 )
                                 await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
                                 sub_fail_counts.pop(sub_key, None)
-                            # Don't advance cursor on send failure — retry next tick.
+                            else:
+                                await asyncio.to_thread(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
+                            # Rewind the pre-send claim on transient failure so
+                            # a later tick can retry. After too many failures,
+                            # dropping the subscription is the terminal action.
                             break
                     else:
-                        # All events delivered; advance cursor + maybe unsub.
+                        # All events delivered; advance cursor. The cursor
+                        # is the dedup mechanism — it prevents re-delivery
+                        # of the same event on subsequent ticks.
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
-                        # Unsubscribe when the LAST delivered event is a
-                        # terminal kind (the task hit a "no further updates"
-                        # state), not just on task.status in {done, archived}.
-                        # Covers blocked / gave_up / crashed / timed_out which
-                        # used to leak subs forever.
-                        last_kind = d["events"][-1].kind if d["events"] else None
+                        # Unsubscribe only when the task has reached a truly
+                        # final status (done / archived). For blocked /
+                        # gave_up / crashed / timed_out the subscription is
+                        # kept alive so the user gets notified again if the
+                        # dispatcher respawns the task and it cycles into the
+                        # same state. See the longer comment on TERMINAL_KINDS
+                        # above for the failure mode this prevents.
                         task_terminal = task and task.status in ("done", "archived")
-                        event_terminal = last_kind in TERMINAL_EVENT_KINDS
-                        if task_terminal or event_terminal:
+                        if task_terminal:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
@@ -4086,6 +4425,29 @@ class GatewayRunner:
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
+            )
+        finally:
+            conn.close()
+
+    def _kanban_rewind(
+        self,
+        sub: dict,
+        claimed_cursor: int,
+        old_cursor: int,
+        board: Optional[str] = None,
+    ) -> None:
+        """Sync helper: undo a claimed notification cursor after send failure."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.rewind_notify_cursor(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                claimed_cursor=claimed_cursor,
+                old_cursor=old_cursor,
             )
         finally:
             conn.close()
@@ -4498,15 +4860,34 @@ class GatewayRunner:
                 "Stopping gateway%s...",
                 " for restart" if self._restart_requested else "",
             )
+            _stop_started_at = time.monotonic()
+
+            def _phase_elapsed() -> float:
+                return time.monotonic() - _stop_started_at
+
             self._running = False
             self._draining = True
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()
+            logger.info(
+                "Shutdown phase: notify_active_sessions done at +%.2fs",
+                _phase_elapsed(),
+            )
 
             timeout = self._restart_drain_timeout
+            _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
+            logger.info(
+                "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
+                "timed_out=%s, active_at_start=%d, active_now=%d)",
+                _phase_elapsed(),
+                time.monotonic() - _drain_started_at,
+                timed_out,
+                len(active_agents),
+                self._running_agent_count(),
+            )
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s); interrupting remaining work.",
@@ -4564,6 +4945,10 @@ class GatewayRunner:
                 # killed by systemd instead of us (issue #8202).  The final
                 # catch-all cleanup below still runs for the graceful path.
                 _kill_tool_subprocesses("post-interrupt")
+                logger.info(
+                    "Shutdown phase: post-interrupt tool kill done at +%.2fs",
+                    _phase_elapsed(),
+                )
 
             if self._restart_requested and self._restart_detached:
                 try:
@@ -4591,15 +4976,29 @@ class GatewayRunner:
                     self._cleanup_agent_resources(_agent)
 
             for platform, adapter in list(self.adapters.items()):
+                _adapter_started_at = time.monotonic()
                 try:
                     await adapter.cancel_background_tasks()
                 except Exception as e:
                     logger.debug("✗ %s background-task cancel error: %s", platform.value, e)
                 try:
                     await adapter.disconnect()
-                    logger.info("✓ %s disconnected", platform.value)
+                    logger.info(
+                        "✓ %s disconnected (%.2fs)",
+                        platform.value,
+                        time.monotonic() - _adapter_started_at,
+                    )
                 except Exception as e:
-                    logger.error("✗ %s disconnect error: %s", platform.value, e)
+                    logger.error(
+                        "✗ %s disconnect error after %.2fs: %s",
+                        platform.value,
+                        time.monotonic() - _adapter_started_at,
+                        e,
+                    )
+            logger.info(
+                "Shutdown phase: all adapters disconnected at +%.2fs",
+                _phase_elapsed(),
+            )
 
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:
@@ -4624,6 +5023,10 @@ class GatewayRunner:
             # that got respawned between the earlier call and adapter
             # disconnect (defense in depth; safe to call repeatedly).
             _kill_tool_subprocesses("final-cleanup")
+            logger.info(
+                "Shutdown phase: final-cleanup tool kill done at +%.2fs",
+                _phase_elapsed(),
+            )
 
             # Reap the process-global auxiliary-client cache once at the very
             # end of teardown.  Per-turn cleanup runs in _cleanup_agent_resources
@@ -4651,6 +5054,10 @@ class GatewayRunner:
                     _db.close()
                 except Exception as _e:
                     logger.debug("SessionDB close error: %s", _e)
+            logger.info(
+                "Shutdown phase: SessionDB close done at +%.2fs",
+                _phase_elapsed(),
+            )
 
             from gateway.status import remove_pid_file, release_gateway_runtime_lock
             remove_pid_file()
@@ -4690,7 +5097,7 @@ class GatewayRunner:
 
             self._draining = False
             self._update_runtime_status("stopped", self._exit_reason)
-            logger.info("Gateway stopped")
+            logger.info("Gateway stopped (total teardown %.2fs)", _phase_elapsed())
 
         self._stop_task = asyncio.create_task(_stop_impl())
         await self._stop_task
@@ -5516,6 +5923,17 @@ class GatewayRunner:
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
+            # Slash command access control on the running-agent fast-path.
+            # Mirrors the cold-path gate further below so non-admin users
+            # can't bypass gating just because an agent happens to be busy.
+            # /status above is intentionally pre-gate so users always see
+            # session state. /help and /whoami fall under the always-allowed
+            # floor inside _check_slash_access.
+            if _evt_cmd and _cmd_def_inner is not None:
+                _denied = self._check_slash_access(source, _cmd_def_inner.name)
+                if _denied is not None:
+                    return _denied
+
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
                 return await self._handle_restart_command(event)
 
@@ -5792,10 +6210,9 @@ class GatewayRunner:
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
             running_agent.interrupt(event.text)
-            if _quick_key in self._pending_messages:
-                self._pending_messages[_quick_key] += "\n" + event.text
-            else:
-                self._pending_messages[_quick_key] = event.text
+            # NOTE: self._pending_messages was write-only (never consumed).
+            # The actual interrupt message is delivered via adapter._pending_messages
+            # which is read by _run_agent. Removed to prevent unbounded growth.
             return None
 
         # Check for commands
@@ -5833,6 +6250,17 @@ class GatewayRunner:
                         command = target_command.split()[0] if target_command else target_command
                         _cmd_def = _resolve_cmd(command) if command else None
                         canonical = _cmd_def.name if _cmd_def else command
+
+        # Per-platform slash command access control. Only kicks in when the
+        # operator has set ``allow_admin_from`` for the source's scope (DM
+        # vs group). When unset → backward-compat: every allowed user can
+        # run every command. When set → non-admins can run only commands in
+        # ``user_allowed_commands`` (plus the always-allowed floor: /help,
+        # /whoami). Plain chat is unaffected — only slash commands gate.
+        if command and canonical and is_gateway_known_command(canonical):
+            _denied = self._check_slash_access(source, canonical)
+            if _denied is not None:
+                return _denied
 
         # Fire the ``command:<canonical>`` hook for any recognized slash
         # command — built-in OR plugin-registered. Handlers can return a
@@ -5916,6 +6344,9 @@ class GatewayRunner:
         
         if canonical == "profile":
             return await self._handle_profile_command(event)
+
+        if canonical == "whoami":
+            return await self._handle_whoami_command(event)
 
         if canonical == "status":
             return await self._handle_status_command(event)
@@ -6050,13 +6481,23 @@ class GatewayRunner:
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
+                            # Sanitize env to prevent credential leakage —
+                            # quick commands run in the gateway process which
+                            # has all API keys in os.environ.
+                            from tools.environments.local import _sanitize_subprocess_env
+                            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
+                                env=sanitized_env,
                             )
                             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
                             output = (stdout or stderr).decode().strip()
+                            # Redact any remaining sensitive patterns in output
+                            if output:
+                                from agent.redact import redact_sensitive_text
+                                output = redact_sensitive_text(output)
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
                             return "Quick command timed out (30s)."
@@ -6613,7 +7054,7 @@ class GatewayRunner:
                             pass
                         await adapter.send(
                             source.chat_id, notice,
-                            metadata=getattr(event, 'metadata', None),
+                            metadata=self._thread_metadata_for_source(source),
                         )
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
@@ -7760,6 +8201,101 @@ class GatewayRunner:
         return "\n".join(lines)
 
 
+    def _check_slash_access(
+        self, source: SessionSource, canonical_cmd: str
+    ) -> Optional[str]:
+        """Return a denial message if ``source`` cannot run ``canonical_cmd``,
+        else None. Used by both the cold and running-agent dispatch paths
+        in ``_handle_message`` so admin/user gating can't be bypassed by
+        an in-flight agent.
+
+        Backward-compat semantics live in
+        :func:`gateway.slash_access.policy_for_source` — when the operator
+        hasn't set ``allow_admin_from`` for the scope, the policy returns
+        ``enabled=False`` and this method always returns None.
+        """
+        from gateway.slash_access import policy_for_source as _policy_for_source
+
+        if not canonical_cmd:
+            return None
+        policy = _policy_for_source(self.config, source)
+        if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
+            return None
+        logger.info(
+            "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",
+            canonical_cmd,
+            source.platform.value if source.platform else "?",
+            source.user_id,
+        )
+        allowed_preview = sorted(policy.user_allowed_commands)
+        if allowed_preview:
+            suffix = (
+                "You can run: "
+                + ", ".join(f"/{c}" for c in allowed_preview[:12])
+                + ("…" if len(allowed_preview) > 12 else "")
+                + ". Use /whoami for the full list."
+            )
+        else:
+            suffix = (
+                "No slash commands are enabled for non-admins on this "
+                "platform. Ask an admin to add you to allow_admin_from "
+                "or to set user_allowed_commands."
+            )
+        return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
+
+
+    async def _handle_whoami_command(self, event: MessageEvent) -> str:
+        """Handle /whoami — show the user's slash command access on this scope.
+
+        Always works (it's in the always-allowed floor of slash_access).
+        Reports: platform, scope (DM vs group), the user's tier
+        (admin / user / unrestricted), and the slash commands they can
+        actually run on this scope.
+        """
+        from gateway.slash_access import policy_for_source as _policy_for_source
+
+        source = event.source
+        policy = _policy_for_source(self.config, source)
+        platform = source.platform.value if source and source.platform else "?"
+        chat_type = (source.chat_type if source else "") or "dm"
+        scope = "DM" if chat_type.lower() in ("dm", "direct", "private", "") else "group/channel"
+        user_id = (source.user_id if source else None) or "?"
+
+        if not policy.enabled:
+            return (
+                f"**You** — {platform} ({scope})\n"
+                f"User ID: `{user_id}`\n"
+                f"Tier: unrestricted (no admin list configured for this scope)\n"
+                f"Slash commands: all available"
+            )
+
+        if policy.is_admin(user_id):
+            return (
+                f"**You** — {platform} ({scope})\n"
+                f"User ID: `{user_id}`\n"
+                f"Tier: **admin**\n"
+                f"Slash commands: all available"
+            )
+
+        # Non-admin user. Show what's actually reachable.
+        floor = ["help", "whoami"]  # mirrors slash_access._ALWAYS_ALLOWED_FOR_USERS
+        configured = sorted(policy.user_allowed_commands)
+        # Combine + dedupe, preserve order: floor first, then operator additions.
+        seen: set[str] = set()
+        runnable: list[str] = []
+        for c in floor + configured:
+            if c not in seen:
+                seen.add(c)
+                runnable.append(c)
+        runnable_str = ", ".join(f"/{c}" for c in runnable) if runnable else "(none)"
+        return (
+            f"**You** — {platform} ({scope})\n"
+            f"User ID: `{user_id}`\n"
+            f"Tier: user\n"
+            f"Slash commands you can run: {runnable_str}"
+        )
+
+
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
         """Handle /kanban — delegate to the shared kanban CLI.
 
@@ -7776,6 +8312,7 @@ class GatewayRunner:
         """
         import asyncio
         import re
+        import shlex
         from hermes_cli.kanban import run_slash
 
         text = (event.text or "").strip()
@@ -7785,7 +8322,26 @@ class GatewayRunner:
         if text.startswith("kanban"):
             text = text[len("kanban"):].lstrip()
 
-        is_create = text.split(None, 1)[:1] == ["create"]
+        tokens = shlex.split(text) if text else []
+        requested_board = None
+        action = None
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "--board":
+                if i + 1 >= len(tokens):
+                    break
+                requested_board = tokens[i + 1]
+                i += 2
+                continue
+            if tok.startswith("--board="):
+                requested_board = tok.split("=", 1)[1]
+                i += 1
+                continue
+            action = tok
+            break
+
+        is_create = action == "create"
 
         try:
             output = await asyncio.to_thread(run_slash, text)
@@ -7812,13 +8368,14 @@ class GatewayRunner:
                     if platform_str and chat_id:
                         def _sub():
                             from hermes_cli import kanban_db as _kb
-                            conn = _kb.connect()
+                            conn = _kb.connect(board=requested_board)
                             try:
                                 _kb.add_notify_sub(
                                     conn, task_id=task_id,
                                     platform=platform_str, chat_id=chat_id,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
+                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
                                 )
                             finally:
                                 conn.close()
@@ -13378,12 +13935,15 @@ class GatewayRunner:
                         cursor=_effective_cursor,
                         buffer_only=_buffer_only,
                         fresh_final_after_seconds=_fresh_final_secs,
+                        transport=_scfg.transport or "auto",
+                        chat_type=getattr(source, "chat_type", "") or "",
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
                         chat_id=source.chat_id,
                         config=_consumer_cfg,
                         metadata=_thread_metadata,
+                        initial_reply_to_id=event_message_id,
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -14198,6 +14758,8 @@ class GatewayRunner:
                             cursor=_effective_cursor,
                             buffer_only=_buffer_only,
                             fresh_final_after_seconds=_fresh_final_secs,
+                            transport=_scfg.transport or "auto",
+                            chat_type=getattr(source, "chat_type", "") or "",
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
@@ -14209,6 +14771,7 @@ class GatewayRunner:
                                 if progress_queue is not None
                                 else None
                             ),
+                            initial_reply_to_id=event_message_id,
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
@@ -15762,40 +16325,62 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             except Exception as e:
                 logger.debug("Planned stop marker check failed: %s", e)
 
+        # Fast (<10ms) snapshot of who's asking us to shut down — runs
+        # synchronously inside the asyncio signal handler, so we keep it
+        # purely stdlib + /proc reads, no subprocesses.  See PR #15826
+        # (May 2026): the previous implementation called `ps aux` here
+        # synchronously, blocking the event loop for up to 3s while
+        # adapter teardown couldn't begin.
+        try:
+            from gateway.shutdown_forensics import (
+                format_context_for_log,
+                snapshot_shutdown_context,
+                spawn_async_diagnostic,
+            )
+            _shutdown_ctx = snapshot_shutdown_context(received_signal)
+        except Exception as _e:
+            _shutdown_ctx = None
+            logger.debug("snapshot_shutdown_context failed: %s", _e)
+
         if planned_takeover:
             logger.info(
-                "Received SIGTERM as a planned --replace takeover — exiting cleanly"
+                "Received %s as a planned --replace takeover — exiting cleanly",
+                _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM",
             )
         elif planned_stop:
             logger.info(
-                "Received SIGTERM/SIGINT as a planned gateway stop — exiting cleanly"
+                "Received %s as a planned gateway stop — exiting cleanly",
+                _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
             )
         else:
             _signal_initiated_shutdown = True
-            logger.info("Received SIGTERM/SIGINT — initiating shutdown")
-        # Diagnostic: log all hermes-related processes so we can identify
-        # what triggered the signal (hermes update, hermes gateway restart,
-        # a stale detached subprocess, etc.).
-        try:
-            import subprocess as _sp
-            _ps = _sp.run(
-                ["ps", "aux"],
-                capture_output=True, text=True, timeout=3,
+            logger.info(
+                "Received %s — initiating shutdown",
+                _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
             )
-            _hermes_procs = [
-                line for line in _ps.stdout.splitlines()
-                if ("hermes" in line.lower() or "gateway" in line.lower())
-                and str(os.getpid()) not in line.split()[1:2]  # exclude self
-            ]
-            if _hermes_procs:
+
+        # Always log who/what triggered the signal — most useful single
+        # line when diagnosing "the gateway keeps dying" tickets.  Format
+        # is one line, key=value, parent_cmdline last (often long).
+        if _shutdown_ctx is not None:
+            try:
                 logger.warning(
-                    "Shutdown diagnostic — other hermes processes running:\n  %s",
-                    "\n  ".join(_hermes_procs),
+                    "Shutdown context: %s", format_context_for_log(_shutdown_ctx)
                 )
-            else:
-                logger.info("Shutdown diagnostic — no other hermes processes found")
-        except Exception:
-            pass
+            except Exception as _e:
+                logger.debug("format_context_for_log failed: %s", _e)
+
+            # Spawn the heavyweight diagnostic (ps auxf, pstree, dmesg) in
+            # a detached subprocess so it can finish writing to disk even
+            # if our cgroup is being torn down.  Bounded by an internal
+            # timeout; never blocks the event loop here.
+            try:
+                _diag_log = _hermes_home / "logs" / "gateway-shutdown-diag.log"
+                spawn_async_diagnostic(
+                    _diag_log, _shutdown_ctx["signal"], timeout_seconds=5.0
+                )
+            except Exception as _e:
+                logger.debug("spawn_async_diagnostic failed: %s", _e)
         asyncio.create_task(runner.stop())
 
     def restart_signal_handler():

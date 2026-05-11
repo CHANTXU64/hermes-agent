@@ -8793,8 +8793,17 @@ class AIAgent:
             "image/jpg": ".jpg",
         }.get(mime, ".jpg")
         tmp = tempfile.NamedTemporaryFile(prefix="anthropic_image_", suffix=suffix, delete=False)
-        with tmp:
-            tmp.write(base64.b64decode(data))
+        try:
+            with tmp:
+                tmp.write(base64.b64decode(data))
+        except Exception:
+            # delete=False means a corrupt/unsupported data URL would otherwise
+            # leak a zero-byte temp file on every failed materialization.
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            raise
         path = Path(tmp.name)
         return str(path), path
 
@@ -13108,6 +13117,21 @@ class AIAgent:
                         "does not support multimodal",
                         "does not support vision",
                         "model does not support image",
+                        # ChatGPT-account Codex backend
+                        # (https://chatgpt.com/backend-api/codex) rejects
+                        # data:image/...base64 URLs in input_image fields
+                        # with HTTP 400 "Invalid 'input[N].content[K].image_url'.
+                        # Expected a valid URL, but got a value with an
+                        # invalid format." The OpenAI Responses API on the
+                        # public endpoint accepts data URLs, but the
+                        # ChatGPT-account variant does not. Without this
+                        # phrase the agent cascaded into compression /
+                        # context-too-large recovery instead of just
+                        # stripping the images. Match is narrow on
+                        # purpose — keyed on the field-path apostrophe so
+                        # we don't false-trip on other URL validation
+                        # errors. (issue #23570)
+                        "image_url'. expected",
                     )
                     _err_lower = _err_body.lower()
                     _looks_like_image_rejection = any(
@@ -14959,7 +14983,41 @@ class AIAgent:
                     "— requesting summary..."
                 )
             final_response = self._handle_max_iterations(messages, api_call_count)
-        
+
+            # If running as a kanban worker, block the task so the dispatcher
+            # knows the worker could not complete (rather than treating it as a
+            # protocol violation).  The agent loop strips tools before calling
+            # _handle_max_iterations, so the model cannot call kanban_block
+            # itself — we must do it on its behalf.
+            _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+            if _kanban_task:
+                try:
+                    handle_function_call(
+                        "kanban_block",
+                        {
+                            "task_id": _kanban_task,
+                            "reason": (
+                                f"Iteration budget exhausted "
+                                f"({api_call_count}/{self.max_iterations}) — "
+                                "task could not complete within the allowed "
+                                "iterations"
+                            ),
+                        },
+                        task_id=effective_task_id,
+                    )
+                    logger.info(
+                        "kanban_block called for task %s after iteration "
+                        "exhaustion (%d/%d)",
+                        _kanban_task, api_call_count, self.max_iterations,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to call kanban_block after iteration "
+                        "exhaustion for task %s",
+                        _kanban_task,
+                        exc_info=True,
+                    )
+
         # Determine if conversation completed successfully
         completed = final_response is not None and api_call_count < self.max_iterations
 
