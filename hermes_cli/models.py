@@ -29,6 +29,59 @@ COPILOT_REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high"]
 COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 
 
+def _resolve_config_api_key_value(raw: Any) -> str:
+    """Resolve inline API key values and simple env references from config."""
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    env_name = ""
+    if value.startswith("${") and value.endswith("}") and len(value) > 3:
+        env_name = value[2:-1].strip()
+    elif value.startswith("$") and len(value) > 1:
+        env_name = value[1:].strip()
+    if env_name:
+        try:
+            from hermes_cli.config import get_env_value
+            return (get_env_value(env_name) or os.getenv(env_name, "")).strip()
+        except Exception:
+            return os.getenv(env_name, "").strip()
+    return value
+
+
+def _configured_openai_codex_gateway() -> tuple[str, str] | None:
+    """Return (base_url, api_key) for model-configured openai-codex gateways."""
+    try:
+        from hermes_cli.auth import DEFAULT_CODEX_BASE_URL
+        from hermes_cli.config import get_env_value, load_config
+        cfg = load_config()
+    except Exception:
+        return None
+    model_cfg = cfg.get("model")
+    if not isinstance(model_cfg, dict):
+        return None
+    if str(model_cfg.get("provider") or "").strip().lower() != "openai-codex":
+        return None
+    base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+    if not base_url or base_url == DEFAULT_CODEX_BASE_URL.rstrip("/"):
+        return None
+
+    api_key = ""
+    for env_key_name in ("api_key_env", "key_env"):
+        env_name = str(model_cfg.get(env_key_name) or "").strip()
+        if env_name:
+            api_key = (get_env_value(env_name) or os.getenv(env_name, "")).strip()
+            if api_key:
+                break
+    if not api_key:
+        for key_name in ("api_key", "api"):
+            api_key = _resolve_config_api_key_value(model_cfg.get(key_name))
+            if api_key:
+                break
+    if not api_key:
+        return None
+    return base_url, api_key
+
+
 # Fallback OpenRouter snapshot used when the live catalog is unavailable.
 # (model_id, display description shown in menus)
 OPENROUTER_MODELS: list[tuple[str, str]] = [
@@ -1938,6 +1991,16 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         return model_ids(force_refresh=force_refresh)
     if normalized == "openai-codex":
         from hermes_cli.codex_models import get_codex_model_ids
+
+        configured_gateway = _configured_openai_codex_gateway()
+        if configured_gateway:
+            base_url, api_key = configured_gateway
+            try:
+                live = fetch_api_models(api_key, base_url)
+                if live:
+                    return live
+            except Exception:
+                pass
 
         # Pass the live OAuth access token so the picker matches whatever
         # ChatGPT lists for this account right now (new models appear without

@@ -27,7 +27,7 @@ from hermes_cli.auth import (
     resolve_external_process_provider_credentials,
     has_usable_secret,
 )
-from hermes_cli.config import get_compatible_custom_providers, load_config
+from hermes_cli.config import get_compatible_custom_providers, get_env_value, load_config
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname
 
@@ -127,6 +127,77 @@ def _get_model_config() -> Dict[str, Any]:
     if isinstance(model_cfg, str) and model_cfg.strip():
         return {"default": model_cfg.strip()}
     return {}
+
+
+def _resolve_api_key_config_value(raw: Any) -> str:
+    """Resolve an API key value from inline config or simple env-var references."""
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+
+    env_name = ""
+    if value.startswith("${") and value.endswith("}") and len(value) > 3:
+        env_name = value[2:-1].strip()
+    elif value.startswith("$") and len(value) > 1:
+        env_name = value[1:].strip()
+
+    if env_name:
+        return (get_env_value(env_name) or os.getenv(env_name, "")).strip()
+    return value
+
+
+def _resolve_model_config_api_key(model_cfg: Dict[str, Any]) -> str:
+    """Resolve api_key/api/key_env/api_key_env from the model config."""
+    for env_key_name in ("api_key_env", "key_env"):
+        env_name = str(model_cfg.get(env_key_name) or "").strip()
+        if env_name:
+            value = (get_env_value(env_name) or os.getenv(env_name, "")).strip()
+            if value:
+                return value
+    for key_name in ("api_key", "api"):
+        value = _resolve_api_key_config_value(model_cfg.get(key_name))
+        if value:
+            return value
+    return ""
+
+
+def _resolve_configured_openai_codex_runtime(
+    *,
+    model_cfg: Dict[str, Any],
+    requested_provider: str,
+) -> Optional[Dict[str, Any]]:
+    """Use model.base_url/api_key for openai-codex when it points at a proxy.
+
+    The built-in openai-codex provider normally resolves Hermes-managed OAuth
+    credentials and talks directly to ChatGPT's Codex backend.  When the user
+    explicitly configures a non-default base_url, treat it as an OpenAI-compatible
+    Codex Responses gateway (for example CodexManager) and bypass the OAuth pool.
+    """
+    cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+    if cfg_provider and cfg_provider != "openai-codex":
+        return None
+
+    base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+    if not base_url or base_url == DEFAULT_CODEX_BASE_URL.rstrip("/"):
+        return None
+
+    api_key = _resolve_model_config_api_key(model_cfg)
+    if not api_key:
+        raise AuthError(
+            "Configured openai-codex endpoint requires model.api_key, "
+            "model.api_key_env, or model.key_env.",
+            provider="openai-codex",
+            code="openai_codex_configured_endpoint_missing_key",
+        )
+
+    return {
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+        "base_url": base_url,
+        "api_key": api_key,
+        "source": "configured-openai-codex-endpoint",
+        "requested_provider": requested_provider,
+    }
 
 
 def _provider_supports_explicit_api_mode(provider: Optional[str], configured_provider: Optional[str] = None) -> bool:
@@ -1016,6 +1087,14 @@ def resolve_runtime_provider(
     )
     if explicit_runtime:
         return explicit_runtime
+
+    if provider == "openai-codex":
+        configured_codex_runtime = _resolve_configured_openai_codex_runtime(
+            model_cfg=model_cfg,
+            requested_provider=requested_provider,
+        )
+        if configured_codex_runtime:
+            return configured_codex_runtime
 
     should_use_pool = provider != "openrouter"
     if provider == "openrouter":

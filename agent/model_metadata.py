@@ -1324,7 +1324,27 @@ def get_model_context_length(
             else:
                 return cached
 
-    # 1b. AWS Bedrock — use static context length table.
+    # 1b. Codex provider — use Codex-enforced context limits before treating a
+    # configured Codex gateway (for example CodexManager on a LAN/custom URL) as
+    # a generic custom endpoint.  Many Codex-compatible gateways expose
+    # OpenAI-shaped /models entries without context metadata; letting the custom
+    # endpoint path run first makes Hermes fall back to DEFAULT_FALLBACK_CONTEXT
+    # (256K) instead of Codex's known 272K window for gpt-5.x slugs.
+    if provider == "openai-codex":
+        # Only the real ChatGPT Codex backend accepts the OAuth bearer token for
+        # live context probing.  Configured gateways use their own API keys, so
+        # don't send those keys to chatgpt.com; fall back to the verified Codex
+        # table instead.
+        codex_access_token = api_key or ""
+        if base_url and not base_url_host_matches(base_url, "chatgpt.com"):
+            codex_access_token = ""
+        codex_ctx = _resolve_codex_oauth_context_length(model, access_token=codex_access_token)
+        if codex_ctx:
+            if base_url:
+                save_context_length(model, base_url, codex_ctx)
+            return codex_ctx
+
+    # 1c. AWS Bedrock — use static context length table.
     # Bedrock's ListFoundationModels API doesn't expose context window sizes,
     # so we maintain a curated table in bedrock_adapter.py that reflects
     # AWS-imposed limits (e.g. 200K for Claude models vs 1M on the native

@@ -150,6 +150,58 @@ def test_resolve_runtime_provider_codex(monkeypatch):
     assert resolved["requested_provider"] == "openai-codex"
 
 
+def test_resolve_runtime_provider_openai_codex_configured_endpoint_bypasses_pool(monkeypatch):
+    def _unexpected_pool(provider):
+        raise AssertionError(f"load_pool should not be called for {provider}")
+
+    def _unexpected_codex_auth():
+        raise AssertionError("resolve_codex_runtime_credentials should not be called")
+
+    monkeypatch.setenv("CODEXMANAGER_API_KEY", "cm-key")
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", _unexpected_pool)
+    monkeypatch.setattr(rp, "resolve_codex_runtime_credentials", _unexpected_codex_auth)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.5",
+            "base_url": "http://127.0.0.1:48761/v1/",
+            "api_key": "${CODEXMANAGER_API_KEY}",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == "http://127.0.0.1:48761/v1"
+    assert resolved["api_key"] == "cm-key"
+    assert resolved["source"] == "configured-openai-codex-endpoint"
+    assert resolved.get("credential_pool") is None
+
+
+def test_resolve_runtime_provider_openai_codex_configured_endpoint_requires_key(monkeypatch):
+    monkeypatch.delenv("CODEXMANAGER_API_KEY", raising=False)
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.5",
+            "base_url": "http://127.0.0.1:48761/v1",
+            "api_key_env": "CODEXMANAGER_API_KEY",
+        },
+    )
+
+    with pytest.raises(rp.AuthError) as excinfo:
+        rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert excinfo.value.code == "openai_codex_configured_endpoint_missing_key"
+
+
 def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
     monkeypatch.setattr(

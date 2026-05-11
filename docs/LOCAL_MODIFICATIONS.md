@@ -389,6 +389,66 @@ Merge protection:
 
 Upstream status: fork-only.
 
+### 9. OpenAI Codex configured gateway endpoint
+
+Date: 2026-05-11
+
+Files:
+
+- `hermes_cli/runtime_provider.py`
+- `agent/model_metadata.py`
+- `hermes_cli/models.py`
+- `hermes_cli/model_switch.py`
+- `tests/agent/test_model_metadata.py`
+- `tests/hermes_cli/test_runtime_provider_resolution.py`
+- `tests/hermes_cli/test_openai_codex_configured_gateway_model_list.py`
+
+What changed:
+
+- `openai-codex` runtime resolution now checks `model.base_url` before loading
+  Hermes-managed Codex OAuth credentials.
+- When `model.provider` is `openai-codex` and `model.base_url` is a non-default
+  endpoint, Hermes treats it as an OpenAI-compatible Codex Responses gateway:
+  `api_mode=codex_responses`, `base_url=model.base_url`, and the API key comes
+  from `model.api_key`, `model.api_key_env`, `model.key_env`, or `model.api`.
+- Simple env references like `${CODEXMANAGER_API_KEY}` and `$CODEXMANAGER_API_KEY`
+  are resolved via Hermes `.env` / process environment.
+- If no configured gateway endpoint is present, the existing Codex OAuth pool
+  behavior is preserved.
+- `/model` provider discovery treats a configured gateway endpoint as valid
+  `openai-codex` credentials and displays the provider even when the Hermes
+  OAuth pool is empty; configured gateways are checked before auth-store/pool
+  probing so discovery does not touch or seed the Codex OAuth pool.
+- `provider_model_ids("openai-codex")` prefers the configured gateway's
+  OpenAI-compatible `/v1/models` catalog before falling back to ChatGPT OAuth
+  model discovery / the static Codex list.
+- Context display for configured Codex gateways uses Codex-enforced context
+  windows (for example `gpt-5.5` = 272K) instead of treating the gateway as an
+  unknown custom endpoint and falling back to the generic 256K probe tier.
+
+Why it matters:
+
+- The user wants Hermes to keep using the `openai-codex` provider path, including
+  Codex Responses transport and session/cache headers, while routing traffic
+  through CodexManager instead of direct ChatGPT OAuth accounts.
+- Using a generic `custom` provider for CodexManager has caused provider/transport
+  bugs; this fork keeps the `openai-codex` semantics while allowing a configured
+  gateway endpoint.
+
+Merge protection:
+
+- Do not remove the configured-endpoint check before Codex pool loading.
+- Do not move configured Codex gateway context resolution behind the generic
+  custom-endpoint fallback; OpenAI-shaped `/models` responses may not include
+  context metadata, and Codex semantics should still win.
+- Preserve the fallback to `resolve_codex_runtime_credentials()` when no
+  non-default `model.base_url` is configured.
+- Preserve tests proving the configured endpoint bypasses the pool, requires a
+  usable configured key, appears in `/model`, and uses the gateway `/v1/models`
+  catalog.
+
+Upstream status: fork-only.
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -423,6 +483,14 @@ deltas are expected in these areas:
   - `tests/gateway/test_codex_session_override_runtime.py`
   - `tests/run_agent/test_run_agent.py`
   - `tests/hermes_cli/test_runtime_provider_resolution.py`
+- OpenAI Codex configured gateway endpoint:
+  - `agent/model_metadata.py`
+  - `hermes_cli/runtime_provider.py`
+  - `hermes_cli/models.py`
+  - `hermes_cli/model_switch.py`
+  - `tests/agent/test_model_metadata.py`
+  - `tests/hermes_cli/test_runtime_provider_resolution.py`
+  - `tests/hermes_cli/test_openai_codex_configured_gateway_model_list.py`
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
 
@@ -432,9 +500,9 @@ TTS. Inspect the current code before making merge decisions.
 
 ## Summary statistics
 
-Documented entries: 9 major entries.
+Documented entries: 10 major entries.
 
-Active functional areas: 6.
+Active functional areas: 7.
 
 Historical reverted areas: 2.
 

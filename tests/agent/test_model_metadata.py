@@ -355,6 +355,31 @@ class TestCodexOAuthContextLength:
             )
         assert ctx == 272_000
 
+    def test_configured_codex_gateway_uses_codex_context_not_generic_256k(self):
+        """CodexManager-style gateways are custom URLs but still use Codex
+        semantics. If their OpenAI-shaped /models response lacks context
+        metadata, Hermes must not fall back to the generic 256K probe tier.
+        """
+        from agent import model_metadata as mm
+
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata._resolve_endpoint_context_length") as mock_endpoint_ctx, \
+             patch("agent.model_metadata._query_local_context_length") as mock_local_ctx, \
+             patch("agent.model_metadata.requests.get") as mock_get, \
+             patch("agent.model_metadata.save_context_length") as mock_save:
+            ctx = mm.get_model_context_length(
+                model="gpt-5.5",
+                base_url="http://127.0.0.1:48761/v1",
+                api_key="codexmanager-key",
+                provider="openai-codex",
+            )
+
+        assert ctx == 272_000
+        mock_endpoint_ctx.assert_not_called()
+        mock_local_ctx.assert_not_called()
+        mock_get.assert_not_called()
+        mock_save.assert_called_with("gpt-5.5", "http://127.0.0.1:48761/v1", 272_000)
+
     def test_non_codex_providers_unaffected(self):
         """Resolving gpt-5.5 on non-Codex providers must NOT use the Codex
         272k override — OpenRouter / direct OpenAI API have different limits.

@@ -1078,7 +1078,8 @@ def list_authenticated_providers(
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.models import (
         OPENROUTER_MODELS, _PROVIDER_MODELS,
-        _MODELS_DEV_PREFERRED, _merge_with_models_dev, provider_model_ids,
+        _MODELS_DEV_PREFERRED, _configured_openai_codex_gateway,
+        _merge_with_models_dev, provider_model_ids,
     )
 
     results: List[dict] = []
@@ -1294,6 +1295,13 @@ def list_authenticated_providers(
                     if any(os.environ.get(ev) for ev in pcfg.api_key_env_vars):
                         has_creds = True
                         break
+        # Configured Codex gateways (for example CodexManager) do not use the
+        # Hermes OAuth auth store or credential pool, but they are still valid
+        # openai-codex runtimes and should appear in /model.  Check this before
+        # OAuth/pool probing so a configured gateway does not touch or seed the
+        # Codex credential pool during discovery.
+        if not has_creds and hermes_slug == "openai-codex":
+            has_creds = _configured_openai_codex_gateway() is not None
         # Check auth store and credential pool for non-env-var credentials.
         # This applies to OAuth providers AND api_key providers that also
         # support OAuth (e.g. anthropic supports both API key and Claude Code
