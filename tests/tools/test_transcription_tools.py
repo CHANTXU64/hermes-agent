@@ -44,13 +44,21 @@ def sample_ogg(tmp_path):
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    """Ensure no real API keys leak into tests."""
+    """Ensure no real API keys or host-local STT packages leak into tests."""
     monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_COMMAND", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
+
+    # The fork supports mlx_whisper as a macOS local provider, and this host may
+    # have it installed. Most historical auto-detect tests assert the cloud
+    # fallback order and should not depend on the developer machine's packages.
+    import tools.transcription_tools as transcription_tools
+
+    monkeypatch.setattr(transcription_tools, "_HAS_MLX_WHISPER", False)
 
 
 # ============================================================================
@@ -91,6 +99,15 @@ class TestGetProviderFallbackPriority:
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True):
             from tools.transcription_tools import _get_provider
             assert _get_provider({}) == "local"
+
+    def test_auto_detect_prefers_mlx_whisper_on_macos(self):
+        """Fork: MLX Whisper is a local macOS fallback before cloud providers."""
+        with patch("platform.system", return_value="Darwin"), \
+             patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._HAS_MLX_WHISPER", True), \
+             patch("tools.transcription_tools._has_local_command", return_value=False):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({}) == "mlx_whisper"
 
     def test_auto_detect_prefers_groq_over_openai(self, monkeypatch):
         """Auto-detect: groq (free) is preferred over openai (paid)."""
