@@ -50,7 +50,10 @@ AUTHOR_MAP = {
     "buraysandro9@gmail.com": "ygd58",
     "teknium@nousresearch.com": "teknium1",
     "piyushvp1@gmail.com": "thelumiereguy",
+    "421774554@qq.com": "wuli666",
     "harish.kukreja@gmail.com": "counterposition",
+    "1046611633@qq.com": "zhengyn0001",
+    "ahmed@abadr.net": "ahmedbadr3",
     "cleo@edaphic.xyz": "curiouscleo",
     "hirokazu.ogawa@kwansei.ac.jp": "hrkzogw",
     "datapod.k@gmail.com": "dandacompany",
@@ -86,6 +89,7 @@ AUTHOR_MAP = {
     "maksesipov@gmail.com": "Qwinty",
     "denisamania@gmail.com": "CalmProton",
     "308068+mbac@users.noreply.github.com": "mbac",
+    "nicoechaniz@altermundi.net": "nicoechaniz",
     "ninso112@proton.me": "Ninso112",
     "wesleysimplicio@live.com": "wesleysimplicio",
     "matthew.dean.cater@gmail.com": "SiliconID",
@@ -1424,7 +1428,7 @@ def main():
     print(f"  SemVer:          v{current_version} → v{new_version}")
     print(f"  Previous tag:    {prev_tag or '(none — first release)'}")
     print(f"  Commits:         {len(commits)}")
-    print(f"  Unique authors:  {len(set(c['github_author'] for c in commits))}")
+    print(f"  Unique authors:  {len({c['github_author'] for c in commits})}")
     print(f"  Mode:            {'PUBLISH' if args.publish else 'DRY RUN'}")
     print(f"{'='*60}")
     print()

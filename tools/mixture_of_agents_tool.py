@@ -66,6 +66,7 @@ from hermes_cli.codex_models import get_codex_model_ids
 from hermes_cli.config import load_config
 from hermes_cli.runtime_provider import format_runtime_provider_error, resolve_runtime_provider
 from tools.debug_helpers import DebugSession
+import sys
 
 logger = logging.getLogger(__name__)
 
