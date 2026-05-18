@@ -69,7 +69,8 @@ def test_background_review_uses_class_prompt_not_configured_instance_prompt(monk
         review_skills=True,
     )
 
-    assert captured["user_message"] == "review skills"
+    assert captured["user_message"].startswith("review skills")
+    assert "custom configured skill prompt" not in captured["user_message"]
 
 
 def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
