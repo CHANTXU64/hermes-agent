@@ -75,6 +75,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("save", "Save the current conversation", "Session",
                cli_only=True),
+    CommandDef("retain", "Manually flush buffered Hindsight memory turns", "Session"),
     CommandDef("retry", "Retry the last message (resend to agent)", "Session"),
     CommandDef("undo", "Remove the last user/assistant exchange", "Session"),
     CommandDef("title", "Set a title for the current session", "Session",
@@ -1004,6 +1005,15 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         # Slack description cap is 2000 chars; keep it short.
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
+
+    # Reserve common short aliases before canonical commands so Slack's 50-command
+    # cap does not drop documented muscle-memory shortcuts such as /q.
+    priority_aliases = ("btw", "bg", "reset", "q")
+    for alias in priority_aliases:
+        for cmd in COMMAND_REGISTRY:
+            if alias in cmd.aliases and _is_gateway_available(cmd, overrides):
+                _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+                break
 
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:

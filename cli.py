@@ -8026,6 +8026,18 @@ class HermesCLI:
             self._handle_branch_command(cmd_original)
         elif canonical == "save":
             self.save_conversation()
+        elif canonical == "retain":
+            memory_manager = getattr(self.agent, "_memory_manager", None) if self.agent else None
+            provider = memory_manager.get_provider("hindsight") if memory_manager else None
+            if not provider or not hasattr(provider, "flush_retained_turns"):
+                _cprint("  Hindsight memory provider is not active.")
+            else:
+                try:
+                    data = provider.flush_retained_turns()
+                    msg = data.get("message") if not data.get("queued") else "Buffered session turns queued for retain."
+                except Exception as e:
+                    msg = f"Failed to retain session: {e}"
+                _cprint(f"  {msg}")
         elif canonical == "cron":
             self._handle_cron_command(cmd_original)
         elif canonical == "curator":

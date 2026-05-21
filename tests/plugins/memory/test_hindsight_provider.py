@@ -18,6 +18,7 @@ from plugins.memory.hindsight import (
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
+    RETAIN_SESSION_SCHEMA,
     _load_config,
     _build_embedded_profile_env,
     _normalize_retain_tags,
@@ -34,6 +35,9 @@ from plugins.memory.hindsight import (
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """Ensure no stale env vars leak between tests."""
+    from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+    with _append_capability_lock:
+        _append_capability_cache.clear()
     for key in (
         "HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID",
         "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
@@ -82,7 +86,7 @@ class _FakeSessionDB:
     def __init__(self, messages=None):
         self._messages = list(messages or [])
 
-    def get_messages_as_conversation(self, session_id):
+    def get_messages_as_conversation(self, session_id, include_ancestors=False):
         return list(self._messages)
 
 
@@ -172,11 +176,20 @@ class TestSchemas:
         assert REFLECT_SCHEMA["name"] == "hindsight_reflect"
         assert "query" in REFLECT_SCHEMA["parameters"]["properties"]
 
-    def test_get_tool_schemas_returns_three(self, provider):
+    def test_retain_session_schema_has_no_required_params(self):
+        assert RETAIN_SESSION_SCHEMA["name"] == "hindsight_retain_session"
+        assert RETAIN_SESSION_SCHEMA["parameters"]["properties"] == {}
+        assert RETAIN_SESSION_SCHEMA["parameters"]["required"] == []
+
+    def test_get_tool_schemas_does_not_expose_retain_session(self, provider):
         schemas = provider.get_tool_schemas()
         assert len(schemas) == 3
         names = {s["name"] for s in schemas}
-        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect"}
+        assert names == {
+            "hindsight_retain",
+            "hindsight_recall",
+            "hindsight_reflect",
+        }
 
     def test_context_mode_returns_no_tools(self, provider_with_config):
         p = provider_with_config(memory_mode="context")
@@ -526,6 +539,207 @@ class TestToolHandlers:
         ))
         assert "error" in result
 
+    def test_retain_session_flushes_buffered_turns_with_normal_metadata_and_tags(self, provider_with_config):
+        p = provider_with_config(auto_retain=False, retain_tags=["configured-tag"])
+        p.sync_turn("你好", "收到")
+        p._client.aretain_batch.assert_not_called()
+
+        result = json.loads(p.handle_tool_call("hindsight_retain_session", {}))
+
+        assert result["result"] == "Buffered session turns queued for retain."
+        p._retain_queue.join()
+        call_kwargs = p._client.aretain_batch.call_args.kwargs
+        assert call_kwargs["bank_id"] == "test-bank"
+        assert call_kwargs["document_id"].startswith("test-session-")
+        item = call_kwargs["items"][0]
+        assert item["metadata"]["session_id"] == "test-session"
+        assert item["tags"] == ["configured-tag", "session:test-session"]
+        assert "你好" in item["content"]
+        assert "\\u4f60" not in item["content"]
+
+    def test_retain_session_direct_flush_works_in_context_mode(self, provider_with_config):
+        p = provider_with_config(auto_retain=False, memory_mode="context")
+        assert p.get_tool_schemas() == []
+        p.sync_turn("context user", "context assistant")
+
+        info = p.flush_retained_turns()
+
+        assert info["queued"] is True
+        p._retain_queue.join()
+        call_kwargs = p._client.aretain_batch.call_args.kwargs
+        assert call_kwargs["document_id"].startswith("test-session-")
+        assert "context user" in call_kwargs["items"][0]["content"]
+
+    def test_retain_session_second_call_does_not_repeat_same_turns(self, provider_with_config):
+        p = provider_with_config(auto_retain=False)
+        p.sync_turn("once", "stored")
+        first = p.flush_retained_turns()
+        assert first["queued"] is True
+        p._retain_queue.join()
+        p._client.aretain_batch.assert_called_once()
+
+        p._client.aretain_batch.reset_mock()
+        second = p.flush_retained_turns()
+
+        assert second["queued"] is False
+        assert second["message"] == "No new buffered turns to retain."
+        p._retain_queue.join()
+        p._client.aretain_batch.assert_not_called()
+
+    def test_auto_retain_then_manual_retain_does_not_repeat_same_turns(self, provider):
+        provider.sync_turn("auto", "stored")
+        provider._retain_queue.join()
+        provider._client.aretain_batch.assert_called_once()
+
+        provider._client.aretain_batch.reset_mock()
+        info = provider.flush_retained_turns()
+
+        assert info["queued"] is False
+        assert info["message"] == "No new buffered turns to retain."
+        provider._retain_queue.join()
+        provider._client.aretain_batch.assert_not_called()
+
+    def test_append_mode_manual_retain_flushes_only_new_turns(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        p.sync_turn("first-user", "first-assistant")
+        p.sync_turn("second-user", "second-assistant")
+        p.flush_retained_turns()
+        p._retain_queue.join()
+
+        p._client.aretain_batch.reset_mock()
+        p.sync_turn("third-user", "third-assistant")
+        info = p.flush_retained_turns()
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        kw = p._client.aretain_batch.call_args.kwargs
+        assert kw["document_id"] == "test-session"
+        item = kw["items"][0]
+        assert item["update_mode"] == "append"
+        assert "third-user" in item["content"]
+        assert "first-user" not in item["content"]
+        assert "second-user" not in item["content"]
+
+    def test_retain_flush_rejects_second_job_while_pending(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        monkeypatch.setattr(p, "_ensure_writer", lambda: None)
+        p.sync_turn("first-user", "first-assistant")
+
+        first = p.flush_retained_turns()
+        p.sync_turn("second-user", "second-assistant")
+        second = p.flush_retained_turns()
+
+        assert first["queued"] is True
+        assert second == {
+            "queued": False,
+            "turn_count": 0,
+            "message": "A retain flush is already queued.",
+        }
+        assert p._retain_queue.qsize() == 1
+        assert p._last_queued_flush_count == 1
+        assert p._last_flushed_turn_count == 0
+
+    def test_failed_pending_retain_clears_pending_and_can_retry(self, provider_with_config, monkeypatch):
+        p = provider_with_config(auto_retain=False)
+        monkeypatch.setattr(p, "_ensure_writer", lambda: None)
+        p.sync_turn("first-user", "first-assistant")
+        first = p.flush_retained_turns()
+        assert first["queued"] is True
+        job = p._retain_queue.get_nowait()
+        monkeypatch.setattr(
+            p,
+            "_run_hindsight_operation",
+            lambda _operation: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            job()
+        p._retain_queue.task_done()
+
+        assert p._retain_flush_pending is False
+        assert p._last_queued_flush_count == 0
+        assert p._last_flushed_turn_count == 0
+
+        retry = p.flush_retained_turns()
+        assert retry["queued"] is True
+        assert retry["flush_up_to"] == 1
+
+    def test_old_pending_retain_success_does_not_pollute_new_session(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        monkeypatch.setattr(p, "_ensure_writer", lambda: None)
+        p.sync_turn("old-user", "old-assistant")
+        first = p.flush_retained_turns()
+        assert first["queued"] is True
+        old_job = p._retain_queue.get_nowait()
+
+        p.on_session_switch("new-sid")
+        old_job()
+        p._retain_queue.task_done()
+
+        assert p._session_id == "new-sid"
+        assert p._last_flushed_turn_count == 0
+        assert p._last_queued_flush_count == 0
+        assert p._retain_flush_pending is False
+
+    def test_old_pending_retain_failure_does_not_roll_back_new_session(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        monkeypatch.setattr(p, "_ensure_writer", lambda: None)
+        p.sync_turn("old-user", "old-assistant")
+        assert p.flush_retained_turns()["queued"] is True
+        old_job = p._retain_queue.get_nowait()
+
+        p.on_session_switch("new-sid")
+        p.sync_turn("new-user", "new-assistant")
+        assert p.flush_retained_turns()["queued"] is True
+        assert p._last_queued_flush_count == 1
+        assert p._retain_flush_pending is True
+        monkeypatch.setattr(
+            p,
+            "_run_hindsight_operation",
+            lambda _operation: (_ for _ in ()).throw(RuntimeError("old boom")),
+        )
+
+        with pytest.raises(RuntimeError, match="old boom"):
+            old_job()
+        p._retain_queue.task_done()
+
+        assert p._session_id == "new-sid"
+        assert p._last_queued_flush_count == 1
+        assert p._last_flushed_turn_count == 0
+        assert p._retain_flush_pending is True
+
+    def test_retain_session_without_buffer_returns_message(self, provider):
+        result = json.loads(provider.handle_tool_call("hindsight_retain_session", {}))
+        assert result["result"] == "No buffered turns to retain."
+
     def test_unknown_tool(self, provider):
         result = json.loads(provider.handle_tool_call(
             "hindsight_unknown", {}
@@ -701,10 +915,11 @@ class TestSyncTurn:
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?\+00:00", content[0][0]["timestamp"])
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", item["metadata"]["retained_at"])
 
-    def test_sync_turn_skipped_when_auto_retain_off(self, provider_with_config):
+    def test_sync_turn_buffers_when_auto_retain_off(self, provider_with_config):
         p = provider_with_config(auto_retain=False)
         p.sync_turn("hello", "hi")
         assert p._sync_thread is None
+        assert len(p._session_turns) == 1
         p._client.aretain_batch.assert_not_called()
 
     def test_sync_turn_with_tags(self, provider_with_config):
@@ -972,6 +1187,20 @@ class TestSessionSwitchBufferFlush:
         assert p._document_id != old_doc
         assert p._document_id.startswith("new-sid-")
 
+    def test_auto_retain_false_does_not_flush_on_session_switch(self, provider_with_config):
+        p = provider_with_config(auto_retain=False)
+        p.sync_turn("manual-only", "do not auto retain")
+        assert len(p._session_turns) == 1
+
+        p.on_session_switch("new-sid", parent_session_id="test-session", reset=True)
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_not_called()
+        assert p._session_id == "new-sid"
+        assert p._session_turns == []
+        assert p._last_flushed_turn_count == 0
+        assert p._last_queued_flush_count == 0
+
     def test_no_flush_when_buffer_empty(self, provider):
         """Switch with no buffered turns must not fire a spurious retain."""
         provider.on_session_switch("new-sid")
@@ -1116,6 +1345,26 @@ class TestUpdateModeAppendCapability:
         assert kw["document_id"] == "test-session"
         item = kw["items"][0]
         assert item["update_mode"] == "append"
+
+    def test_modern_api_auto_retain_appends_only_new_turn_after_first_flush(self, provider, monkeypatch):
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        provider.sync_turn("first-user", "first-assistant")
+        provider._retain_queue.join()
+        provider._client.aretain_batch.reset_mock()
+
+        provider.sync_turn("second-user", "second-assistant")
+        provider._retain_queue.join()
+
+        kw = provider._client.aretain_batch.call_args.kwargs
+        assert kw["document_id"] == "test-session"
+        item = kw["items"][0]
+        assert item["update_mode"] == "append"
+        assert "second-user" in item["content"]
+        assert "first-user" not in item["content"]
 
     def test_capability_cached_per_url(self, provider, monkeypatch):
         """The /version probe must run at most once per (process, api_url)."""
