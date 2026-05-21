@@ -363,6 +363,56 @@ Merge protection:
 
 Upstream status: reverted fork-only experiment.
 
+### 9. Hindsight manual full-session retain
+
+Status: active
+
+Date: 2026-05-21
+
+Files:
+
+- `plugins/memory/hindsight/__init__.py`
+- `tests/plugins/memory/test_hindsight_provider.py`
+- `hermes_cli/commands.py`
+- `tests/hermes_cli/test_commands.py`
+- `cli.py`
+- `gateway/run.py`
+- `tests/gateway/test_retain_command.py`
+- `docs/chantxu64/hindsight-manual-retain.md`
+
+Summary:
+
+- Adds a user-triggered `/retain` command that flushes Hindsight's existing buffered conversation turns through the normal automatic retain storage path.
+
+What changed:
+
+- Added `hindsight_retain_session` / `/retain` to manually flush buffered Hindsight conversation turns.
+- Manual flush uses the same document, metadata, tags, and Unicode-preserving serialization path as automatic retain.
+- Manual flush tracks one pending append job, a session generation guard, and queued/flushed turn counts so repeated `/retain` calls do not duplicate the same buffered turns or let old-session background jobs mutate new-session counters.
+- When `auto_retain=false`, completed turns are buffered but not sent until `/retain`; session switches clear the buffer without auto-flushing.
+- Only `/retain` is user-facing; no long command aliases are registered.
+- `hindsight_retain_session` is not registered in model-visible tool schemas; CLI/Gateway call the provider directly via `memory_manager.get_provider("hindsight")`, so manual retain works even when `memory_mode="context"` hides Hindsight tools from the model.
+
+Why it matters:
+
+- The user needs an explicit, user-triggered way to preserve the normal Hindsight session document without changing the automatic retain storage model.
+
+Merge protection:
+
+- Do not route manual session retain through SessionDB lineage reconstruction; it must flush the provider's existing `_session_turns` buffer.
+- Do not create a separate `manual-session:*` document; use `_resolve_retain_target()` exactly like automatic retain.
+- Do not expose `hindsight_retain_session` as a model-visible tool by default; this is a user slash command/provider method.
+- Preserve tests proving manual retain uses normal metadata/tags, buffers when `auto_retain=false`, avoids duplicate flushes, rejects a second pending flush, rolls back/clears pending after failure, guards old-session background jobs after session switch, skips auto-flush on session switch when `auto_retain=false`, appends only new turns in `update_mode="append"`, and works when `memory_mode="context"`.
+
+Verification:
+
+- `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='` → 250 passed.
+- `python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py hermes_cli/commands.py tests/gateway/test_retain_command.py` → passed.
+- `git diff --check` → passed.
+
+Feature docs: `docs/chantxu64/hindsight-manual-retain.md`.
+
+Upstream status: fork-only.
 
 
 ## Current fork delta checklist
@@ -370,9 +420,16 @@ Upstream status: reverted fork-only experiment.
 Compared with the upstream parent of the latest completed fork sync, active fork
 deltas are expected in these areas:
 
-- Hindsight Unicode support:
+- Hindsight Unicode support / manual session retain:
   - `.gitignore`
   - `plugins/memory/hindsight/__init__.py`
+  - `tests/plugins/memory/test_hindsight_provider.py`
+  - `hermes_cli/commands.py`
+  - `tests/hermes_cli/test_commands.py`
+  - `cli.py`
+  - `gateway/run.py`
+  - `tests/gateway/test_retain_command.py`
+  - `docs/chantxu64/hindsight-manual-retain.md`
 - MoA custom provider support:
   - `tools/mixture_of_agents_tool.py`
   - `tests/tools/test_mixture_of_agents_tool.py`
@@ -404,9 +461,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 8 major entries.
+Documented entries: 9 major entries.
 
-Active functional areas: 6.
+Active functional areas: 7.
 
 Historical reverted areas: 1.
 

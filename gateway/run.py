@@ -7187,6 +7187,9 @@ class GatewayRunner:
         if canonical == "status":
             return await self._handle_status_command(event)
 
+        if canonical == "retain":
+            return await self._handle_retain_command(event)
+
         if canonical == "agents":
             return await self._handle_agents_command(event)
 
@@ -9190,6 +9193,34 @@ class GatewayRunner:
                 "or to set user_allowed_commands."
             )
         return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
+
+    async def _handle_retain_command(self, event: MessageEvent) -> str:
+        """Handle /retain — manually flush buffered Hindsight turns."""
+        session_key = self._session_key_for_source(event.source)
+        agent = None
+        try:
+            running = getattr(self, "_running_agents", {}) or {}
+            agent = running.get(session_key)
+        except Exception:
+            agent = None
+        if agent is None:
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache_lock is not None and cache is not None:
+                with cache_lock:
+                    cached = cache.get(session_key)
+                    agent = cached[0] if isinstance(cached, tuple) else cached if cached else None
+        memory_manager = getattr(agent, "_memory_manager", None) if agent is not None else None
+        provider = memory_manager.get_provider("hindsight") if memory_manager else None
+        if not provider or not hasattr(provider, "flush_retained_turns"):
+            return "Hindsight memory provider is not active for this session."
+        try:
+            data = provider.flush_retained_turns()
+            if not data.get("queued"):
+                return str(data.get("message") or "No buffered turns to retain.")
+            return "Buffered session turns queued for retain."
+        except Exception as e:
+            return f"Failed to retain session: {e}"
 
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
