@@ -387,10 +387,12 @@ Summary:
 What changed:
 
 - Added `hindsight_retain_session` / `/retain` for user-triggered Hindsight session retain.
-- Gateway/CLI `/retain` now reads the current session's persisted SessionDB transcript, filters it down to visible user→assistant turns, and submits those turns through the Hindsight provider.
+- Hindsight `sync_turn()` now persists the exact same turn JSON used by automatic retain into a separate SQLite file: `$HERMES_HOME/hindsight/retain_turns.sqlite3`.
+- Gateway/CLI `/retain` no longer reconstructs from raw Hermes SessionDB transcript; it asks the provider to read persisted retain turns for the current session lineage.
+- Manual retain follows `parent_session_id` from the current session back to the root and submits root → current turns together, so users do not need to retain before context compression.
 - Manual retain uses the same document, metadata, tags, Unicode-preserving serialization, `_resolve_retain_target()`, and writer queue path as automatic retain.
 - Legacy provider buffer flush still tracks one pending append job, a session generation guard, and queued/flushed turn counts so automatic retain and direct provider tests do not regress.
-- When `auto_retain=false`, completed turns are not auto-submitted to Hindsight, but they remain in SessionDB; switching sessions or restarting the gateway no longer loses data needed for a later `/retain`.
+- When `auto_retain=false`, completed turns are written only to the local retain-turn SQLite file until `/retain` submits them.
 - Only `/retain` is user-facing; no long command aliases are registered.
 - `hindsight_retain_session` is not registered in model-visible tool schemas; CLI/Gateway call the provider directly via `memory_manager.get_provider("hindsight")`, so manual retain works even when `memory_mode="context"` hides Hindsight tools from the model.
 
@@ -400,15 +402,15 @@ Why it matters:
 
 Merge protection:
 
-- Do not route manual session retain through raw/unfiltered SessionDB lineage reconstruction; it must use the current session transcript filtered to visible user→assistant turns.
+- Do not reconstruct manual session retain from raw Hermes SessionDB transcript; the source of truth is provider-owned `$HERMES_HOME/hindsight/retain_turns.sqlite3` rows written by `sync_turn()`.
 - Do not create a separate `manual-session:*` document; use `_resolve_retain_target()` exactly like automatic retain.
 - Do not expose `hindsight_retain_session` as a model-visible tool by default; this is a user slash command/provider method.
-- Manual `/retain` must use SessionDB transcript as source of truth, filtered to visible user→assistant turns only; do not include tool output, tool-call assistant stubs, internal reasoning, or injected recent-summary rows.
-- Preserve tests proving manual retain uses normal metadata/tags, reads SessionDB in Gateway/CLI paths, filters transcript noise, handles no-visible-turn sessions, and keeps legacy buffer flush behavior (pending rejection, failure rollback, generation guard, `memory_mode="context"`).
+- Manual `/retain` must include the current session's parent lineage from the persisted retain-turn store, ordered root → current, without mixing sibling sessions.
+- Preserve tests proving manual retain uses normal metadata/tags, persists Hindsight turn payloads to the separate SQLite file, reads parent lineage, handles no-persisted-turn sessions, and keeps legacy buffer flush behavior (pending rejection, failure rollback, generation guard, `memory_mode="context"`).
 
 Verification:
 
-- `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='` → 250 passed.
+- `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='` → 258 passed.
 - `python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py hermes_cli/commands.py tests/gateway/test_retain_command.py` → passed.
 - `git diff --check` → passed.
 

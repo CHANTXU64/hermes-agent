@@ -9212,24 +9212,22 @@ class GatewayRunner:
                     agent = cached[0] if isinstance(cached, tuple) else cached if cached else None
         memory_manager = getattr(agent, "_memory_manager", None) if agent is not None else None
         provider = memory_manager.get_provider("hindsight") if memory_manager else None
-        if not provider or not (hasattr(provider, "retain_conversation_messages") or hasattr(provider, "flush_retained_turns")):
+        if not provider or not (hasattr(provider, "retain_persisted_session_lineage") or hasattr(provider, "flush_retained_turns")):
             return "Hindsight memory provider is not active for this session."
         try:
             data = None
             session_id = str(getattr(agent, "session_id", "") or getattr(provider, "_session_id", "") or "").strip()
-            session_store = getattr(self, "session_store", None)
-            if session_id and session_store is not None and hasattr(provider, "retain_conversation_messages"):
-                messages = session_store.load_transcript(session_id) if hasattr(session_store, "load_transcript") else []
+            if session_id and hasattr(provider, "retain_persisted_session_lineage"):
                 parent_session_id = ""
-                db = getattr(session_store, "_db", None)
+                session_store = getattr(self, "session_store", None)
+                db = getattr(session_store, "_db", None) if session_store is not None else None
                 if db is not None:
                     try:
                         row = db.get_session(session_id)
                         parent_session_id = str((row or {}).get("parent_session_id") or "")
                     except Exception:
                         parent_session_id = ""
-                data = provider.retain_conversation_messages(
-                    messages,
+                data = provider.retain_persisted_session_lineage(
                     session_id=session_id,
                     parent_session_id=parent_session_id,
                 )

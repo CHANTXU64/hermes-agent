@@ -35,7 +35,9 @@ import json
 import logging
 import os
 import queue
+import sqlite3
 import threading
+import time
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -575,6 +577,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._session_id = ""
         self._parent_session_id = ""
         self._document_id = ""
+        self._retain_store_path = get_hermes_home() / "hindsight" / "retain_turns.sqlite3"
 
         # Tags
         self._tags: list[str] | None = None
@@ -1383,42 +1386,110 @@ class HindsightMemoryProvider(MemoryProvider):
             },
         ]
 
-    @staticmethod
-    def _stringify_retain_content(content: Any) -> str:
-        if content is None:
-            return ""
-        if isinstance(content, str):
-            return content
-        return json.dumps(content, ensure_ascii=False)
+    def _retain_store_connect(self) -> sqlite3.Connection:
+        self._retain_store_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self._retain_store_path), timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hindsight_retain_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bank_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                parent_session_id TEXT NOT NULL DEFAULT '',
+                turn_index INTEGER NOT NULL,
+                turn_json TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hindsight_retain_turns_session "
+            "ON hindsight_retain_turns(bank_id, session_id, id)"
+        )
+        return conn
 
-    def _build_turns_from_conversation_messages(self, messages: List[Dict[str, Any]]) -> List[str]:
-        """Build retain turn JSON from persisted conversation messages.
+    def _persist_retain_turn(self, turn_json: str) -> None:
+        if not self._session_id:
+            return
+        try:
+            with self._retain_store_connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO hindsight_retain_turns
+                    (bank_id, session_id, parent_session_id, turn_index, turn_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self._bank_id,
+                        self._session_id,
+                        self._parent_session_id,
+                        self._turn_index,
+                        turn_json,
+                        time.time(),
+                    ),
+                )
+        except Exception as e:
+            logger.warning("Hindsight retain store write failed: %s", e, exc_info=True)
 
-        SessionDB stores the full model transcript, including tool-call
-        assistant stubs, tool outputs, and injected compression summaries.
-        Manual DB-backed retain must mirror sync_turn(): one visible user
-        message plus the final visible assistant response for each turn.
-        """
-        turns: List[str] = []
-        pending_user = ""
-        for msg in messages or []:
-            role = msg.get("role")
-            content = self._stringify_retain_content(msg.get("content")).strip()
-            if not content:
-                continue
-            if role == "user":
-                pending_user = content
-                continue
-            if role == "assistant" and content.startswith("[Recent Summary"):
-                continue
-            if role != "assistant" or not pending_user:
-                continue
-            if msg.get("tool_calls") or msg.get("finish_reason") == "tool_calls":
-                continue
-            turn = self._build_turn_messages(pending_user, content)
-            turns.append(json.dumps(turn, ensure_ascii=False))
-            pending_user = ""
-        return turns
+    def _lineage_session_ids(self, session_id: str, fallback_parent_session_id: str = "") -> list[str]:
+        current = str(session_id or "").strip()
+        if not current:
+            return []
+        lineage: list[str] = []
+        seen: set[str] = set()
+        fallback_parent = str(fallback_parent_session_id or "").strip()
+        try:
+            with self._retain_store_connect() as conn:
+                while current and current not in seen:
+                    lineage.append(current)
+                    seen.add(current)
+                    row = conn.execute(
+                        """
+                        SELECT parent_session_id
+                        FROM hindsight_retain_turns
+                        WHERE bank_id = ? AND session_id = ?
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (self._bank_id, current),
+                    ).fetchone()
+                    parent = str(row[0] if row and row[0] else "").strip()
+                    if not parent and current == lineage[0]:
+                        parent = fallback_parent
+                    current = parent
+        except Exception as e:
+            logger.warning("Hindsight retain lineage lookup failed: %s", e, exc_info=True)
+            return [str(session_id).strip()]
+        return list(reversed(lineage))
+
+    def _load_persisted_retain_turns(
+        self,
+        session_id: str,
+        *,
+        parent_session_id: str = "",
+    ) -> tuple[list[str], list[str]]:
+        lineage = self._lineage_session_ids(session_id, parent_session_id)
+        if not lineage:
+            return [], []
+        turns: list[str] = []
+        try:
+            with self._retain_store_connect() as conn:
+                for sid in lineage:
+                    rows = conn.execute(
+                        """
+                        SELECT turn_json
+                        FROM hindsight_retain_turns
+                        WHERE bank_id = ? AND session_id = ?
+                        ORDER BY id ASC
+                        """,
+                        (self._bank_id, sid),
+                    ).fetchall()
+                    turns.extend(str(row[0]) for row in rows if row and row[0])
+        except Exception as e:
+            logger.warning("Hindsight retain store read failed: %s", e, exc_info=True)
+            return [], lineage
+        return turns, lineage
 
     def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
         metadata: Dict[str, str] = {
@@ -1477,22 +1548,25 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["tags"] = merged_tags
         return kwargs
 
-    def retain_conversation_messages(
+    def retain_persisted_session_lineage(
         self,
-        messages: List[Dict[str, Any]],
         *,
         session_id: str = "",
         parent_session_id: str = "",
     ) -> Dict[str, Any]:
-        """Queue a manual retain built from persisted SessionDB messages."""
+        """Queue a manual retain from the provider-owned SQLite turn store."""
         if self._shutting_down.is_set():
             raise RuntimeError("Hindsight provider is shutting down")
 
-        turns = self._build_turns_from_conversation_messages(messages)
-        if not turns:
-            return {"queued": False, "turn_count": 0, "message": "No conversation turns to retain."}
-
         target_session_id = str(session_id or self._session_id or "").strip()
+        parent_id = str(parent_session_id or self._parent_session_id or "").strip()
+        turns, lineage = self._load_persisted_retain_turns(
+            target_session_id,
+            parent_session_id=parent_id,
+        )
+        if not turns:
+            return {"queued": False, "turn_count": 0, "message": "No persisted turns to retain."}
+
         fallback_document_id = self._document_id
         if target_session_id and target_session_id != self._session_id:
             fallback_document_id = f"{target_session_id}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
@@ -1501,9 +1575,8 @@ class HindsightMemoryProvider(MemoryProvider):
         lineage_tags: list[str] = []
         if target_session_id:
             lineage_tags.append(f"session:{target_session_id}")
-        parent_id = str(parent_session_id or self._parent_session_id or "").strip()
-        if parent_id:
-            lineage_tags.append(f"parent:{parent_id}")
+        if lineage:
+            lineage_tags.append(f"root_session:{lineage[0]}")
 
         metadata_snapshot = self._build_metadata(
             message_count=len(turns) * 2,
@@ -1511,6 +1584,9 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         if target_session_id:
             metadata_snapshot["session_id"] = target_session_id
+        if lineage:
+            metadata_snapshot["root_session_id"] = lineage[0]
+            metadata_snapshot["lineage_session_ids"] = ",".join(lineage)
         if parent_id:
             metadata_snapshot["parent_session_id"] = parent_id
 
@@ -1531,8 +1607,8 @@ class HindsightMemoryProvider(MemoryProvider):
             if update_mode is not None:
                 item["update_mode"] = update_mode
             logger.debug(
-                "Hindsight DB retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
-                bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns,
+                "Hindsight persisted retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d, lineage=%s",
+                bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns, lineage,
             )
             self._run_hindsight_operation(
                 lambda client: client.aretain_batch(
@@ -1542,7 +1618,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     retain_async=retain_async_flag,
                 )
             )
-            logger.debug("Hindsight DB retain succeeded")
+            logger.debug("Hindsight persisted retain succeeded")
 
         self._ensure_writer()
         self._register_atexit()
@@ -1553,6 +1629,7 @@ class HindsightMemoryProvider(MemoryProvider):
             "document_id": document_id,
             "update_mode": update_mode,
             "content_chars": len(content),
+            "lineage_session_ids": lineage,
         }
 
     def flush_retained_turns(self) -> Dict[str, Any]:
@@ -1680,6 +1757,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._session_turns.append(turn)
         self._turn_counter += 1
         self._turn_index = self._turn_counter
+        self._persist_retain_turn(turn)
 
         if not self._auto_retain:
             logger.debug("sync_turn: buffered turn %d (auto_retain disabled)", self._turn_counter)
@@ -1767,9 +1845,9 @@ class HindsightMemoryProvider(MemoryProvider):
 
         elif tool_name == "hindsight_retain_session":
             try:
-                info = self.flush_retained_turns()
+                info = self.retain_persisted_session_lineage()
                 if not info.get("queued"):
-                    return json.dumps({"result": info.get("message", "No buffered turns to retain.")}, ensure_ascii=False)
+                    return json.dumps({"result": info.get("message", "No persisted turns to retain.")}, ensure_ascii=False)
                 return json.dumps(
                     {"result": "Buffered session turns queued for retain.", **info},
                     ensure_ascii=False,

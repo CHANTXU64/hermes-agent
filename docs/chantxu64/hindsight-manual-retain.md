@@ -4,9 +4,43 @@
 
 ## 作用
 
-`/retain` 用于把当前 Hermes session 已持久化在 SessionDB (`~/.hermes/state.db`) 里的可见对话 turn 手动提交到 Hindsight。
+`/retain` 用于把当前 Hermes 会话 lineage 中，Hindsight provider 每轮已经整理好的 retain turn，手动提交到 Hindsight。
 
-它不是让模型调用 `hindsight_retain`，也不暴露新模型工具；用户只需要发送 slash 命令。
+关键点：手动保存不再从 Hermes 原始 SessionDB transcript 反推内容；Hindsight provider 在 `sync_turn()` 生成自动 retain payload 时，会把同一份 turn JSON 持久化到独立 SQLite 文件。
+
+## 本地持久化文件
+
+独立文件：
+
+```text
+$HERMES_HOME/hindsight/retain_turns.sqlite3
+```
+
+不写入 Hermes 主 `state.db`。
+
+表：
+
+```text
+hindsight_retain_turns
+```
+
+每行保存：
+
+- `bank_id`
+- `session_id`
+- `parent_session_id`
+- `turn_index`
+- `turn_json`
+- `created_at`
+
+`turn_json` 是自动 retain 同源格式：
+
+```json
+[
+  {"role": "user", "content": "User: ...", "timestamp": "..."},
+  {"role": "assistant", "content": "Assistant: ...", "timestamp": "..."}
+]
+```
 
 ## 命令
 
@@ -16,48 +50,63 @@
 
 只保留这一个用户手打命令。没有其它别名。
 
-## 适用场景
-
-- 关闭自动 retain 后，需要由用户决定什么时候保存当前会话。
-- `memory_mode="context"` 时，Hindsight 工具不暴露给模型，但用户仍希望通过 slash 命令保存会话。
-- 在同一 Gateway 运行期间或重启后，切换到某个已存在 session，再手动保存该 session 的可见对话。
-
 ## 行为说明
 
-- Gateway/CLI `/retain` 会读取当前 active `session_id` 对应的 SessionDB transcript。
-- 提交前会过滤掉 SessionDB 里的非可见对话噪音：tool 输出、tool-call assistant stub、内部推理/工具调用消息、压缩/LCM 注入的 recent summary。
-- 实际提交内容按原自动 retain 的 turn 形状生成：每个 turn 是一条可见 user 消息 + 随后的最终 assistant 回复。
-- 仍复用 Hindsight provider 的配置、metadata、tags、`_resolve_retain_target()`/`update_mode="append"` 判断和 writer queue。
-- 不创建 `manual-session:*` 之类的新 document；现代 Hindsight API 下 document_id 仍是当前 `session_id`。
-- `hindsight_retain_session` 不出现在模型可见的 tool schema 里；它只作为 provider 内部 handler/旧 buffer flush 测试入口保留。
+- 每个完成 turn 的 `sync_turn()` 都会先把同源 retain payload 写入 `hindsight/retain_turns.sqlite3`。
+- `auto_retain=true` 时，自动提交逻辑仍按原机制运行。
+- `auto_retain=false` 时，只写本地 SQLite，不自动提交到 Hindsight。
+- `/retain` 从当前 active `session_id` 出发，按 `parent_session_id` 往上找 lineage。
+- 提交顺序是 root parent → ... → current child。
+- 提交内容来自 Hindsight provider 自己持久化的 turn payload，不包含 tool output、tool-call stub、内部推理或压缩 summary。
+- 不创建 `manual-session:*` 文档。
 
-## 和自动 retain 的关系
+## 压缩和 parent session
 
-### `auto_retain=true`
+如果一次用户视角会话因为压缩形成：
 
-- 自动 retain 仍按原机制运行。
-- `/retain` 现在会从 SessionDB 重建当前 session 的可见 transcript 并提交。
-- 当前实现不做“已提交 cursor”去重；重复 `/retain` 可能重复 append。该功能按用户当前使用习惯设计：一个 session 完成后手动保存一次。
+```text
+A -> B -> C
+```
 
-### `auto_retain=false`
+在 C 中执行 `/retain` 会读取并提交：
 
-- `sync_turn()` 不会自动提交到 Hindsight。
-- 可见对话仍会由 Hermes 正常写入 SessionDB。
-- `/retain` 从 SessionDB 读取当前 session，所以 `/new`、`/resume`、切平台、Gateway 重启后再切回该 session，仍可保存该 session 已持久化的可见对话。
-- session switch 不再决定手动 retain 能否成功；关键是目标 session 的 transcript 是否已经在 SessionDB 中。
+```text
+A 的 persisted retain turns
++ B 的 persisted retain turns
++ C 的 persisted retain turns
+```
 
-## 压缩和 session 边界
+因此不需要赶在压缩前手动 `/retain`。
 
-- Hermes 压缩会创建新的 child `session_id`，旧 session 通过 `parent_session_id` 保留 lineage。
-- `/retain` 默认只保存当前 active `session_id` 的可见 turn，不自动拼接 parent chain。
-- 这与当前 Hindsight 自动 retain 的 session/document 边界一致：压缩后新 turn 属于新的 session/document。
+## document_id 和 metadata
+
+默认使用当前 leaf session 作为 document：
+
+```text
+document_id = current session_id
+```
+
+metadata 会带 lineage 信息：
+
+```text
+session_id = current leaf session
+root_session_id = lineage root
+lineage_session_ids = root,...,current
+parent_session_id = current parent, if known
+```
+
+## 重复提交
+
+当前实现不维护 retained cursor。也就是说，同一个 session lineage 反复执行 `/retain`，append 模式下可能重复提交完整 lineage。
+
+这是有意保持简单：当前使用目标是“一个会话结束后手动保存一次”。
 
 ## 返回结果
 
 常见返回：
 
-- `Buffered session turns queued for retain.`：当前 session 的可见 turn 已排队提交。
-- `No conversation turns to retain.`：SessionDB 里没有可提交的可见 user→assistant turn。
+- `Buffered session turns queued for retain.`：当前 session lineage 的 persisted turns 已排队提交。
+- `No persisted turns to retain.`：本地 retain turn store 中没有可提交 turn。
 - `Hindsight memory provider is not active for this session.`：当前会话没有可用 Hindsight provider。
 - `Failed to retain session: ...`：提交过程抛错。
 
@@ -66,12 +115,11 @@
 相关测试覆盖：
 
 - `/retain` Gateway handler 可从 cached agent 找到 Hindsight provider。
-- Gateway `/retain` 优先使用当前 session 的 SessionDB transcript。
-- 没有 provider 时返回明确提示。
+- Gateway `/retain` 调用 provider 的 persisted lineage retain，而不是读取原始 SessionDB transcript。
+- `sync_turn()` 会持久化和自动 retain 同源的 turn payload。
+- child session `/retain` 会包含 parent + child lineage turns。
+- 没有 persisted turns 时不提交。
 - `get_tool_schemas()` 不暴露 `hindsight_retain_session`。
-- `memory_mode="context"` 下仍可直接通过 provider flush。
-- DB-backed retain 会过滤 recent summary、tool output、tool-call assistant stub，只保留可见 user→assistant turn。
-- DB-backed retain 无可见 turn 时不提交。
 - legacy buffer flush 的 append/pending/失败回滚/generation guard 回归测试仍保留，避免自动 retain 路径退化。
 
 验证命令：

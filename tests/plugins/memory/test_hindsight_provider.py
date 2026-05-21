@@ -553,7 +553,7 @@ class TestToolHandlers:
         assert call_kwargs["document_id"].startswith("test-session-")
         item = call_kwargs["items"][0]
         assert item["metadata"]["session_id"] == "test-session"
-        assert item["tags"] == ["configured-tag", "session:test-session"]
+        assert item["tags"] == ["configured-tag", "session:test-session", "root_session:test-session"]
         assert "你好" in item["content"]
         assert "\\u4f60" not in item["content"]
 
@@ -736,7 +736,7 @@ class TestToolHandlers:
         assert p._last_flushed_turn_count == 0
         assert p._retain_flush_pending is True
 
-    def test_retain_conversation_messages_filters_db_transcript_noise(self, provider_with_config, monkeypatch):
+    def test_persisted_retain_uses_hindsight_turn_payload_and_parent_lineage(self, provider_with_config, monkeypatch):
         from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
         with _append_capability_lock:
             _append_capability_cache.clear()
@@ -745,47 +745,43 @@ class TestToolHandlers:
             lambda *a, **kw: "0.5.6",
         )
         p = provider_with_config(auto_retain=False)
-        messages = [
-            {"role": "assistant", "content": "[Recent Summary] old", "finish_reason": None},
-            {"role": "user", "content": "real user"},
-            {"role": "assistant", "content": "[Recent Summary] injected after user", "finish_reason": None},
-            {"role": "assistant", "content": "internal thought", "finish_reason": "tool_calls", "tool_calls": [{"id": "t"}]},
-            {"role": "tool", "content": "tool output"},
-            {"role": "assistant", "content": "real assistant", "finish_reason": "stop"},
-        ]
+        p.initialize(session_id="root-session", hermes_home=str(p._retain_store_path.parents[1]), platform="cli")
+        p._client = _make_mock_client()
+        p.sync_turn("root user", "root assistant")
+        p.on_session_switch("child-session", parent_session_id="root-session")
+        p.sync_turn("child user", "child assistant")
 
-        info = p.retain_conversation_messages(messages, session_id="db-session", parent_session_id="parent-session")
+        info = p.retain_persisted_session_lineage(session_id="child-session", parent_session_id="root-session")
         p._retain_queue.join()
 
         assert info["queued"] is True
-        assert info["turn_count"] == 1
+        assert info["turn_count"] == 2
+        assert info["lineage_session_ids"] == ["root-session", "child-session"]
         kw = p._client.aretain_batch.call_args.kwargs
-        assert kw["document_id"] == "db-session"
+        assert kw["document_id"] == "child-session"
         item = kw["items"][0]
         assert item["update_mode"] == "append"
-        assert item["metadata"]["session_id"] == "db-session"
-        assert item["metadata"]["parent_session_id"] == "parent-session"
-        assert "real user" in item["content"]
-        assert "real assistant" in item["content"]
-        assert "Recent Summary" not in item["content"]
-        assert "injected after user" not in item["content"]
-        assert "internal thought" not in item["content"]
+        assert item["metadata"]["session_id"] == "child-session"
+        assert item["metadata"]["root_session_id"] == "root-session"
+        assert item["metadata"]["lineage_session_ids"] == "root-session,child-session"
+        assert "User: root user" in item["content"]
+        assert "Assistant: root assistant" in item["content"]
+        assert "User: child user" in item["content"]
+        assert "Assistant: child assistant" in item["content"]
         assert "tool output" not in item["content"]
+        assert p._retain_store_path.name == "retain_turns.sqlite3"
 
-    def test_retain_conversation_messages_without_visible_turns_returns_message(self, provider_with_config):
+    def test_persisted_retain_without_turns_returns_message(self, provider_with_config):
         p = provider_with_config(auto_retain=False)
 
-        info = p.retain_conversation_messages([
-            {"role": "assistant", "content": "[Recent Summary]", "finish_reason": None},
-            {"role": "tool", "content": "tool output"},
-        ], session_id="db-session")
+        info = p.retain_persisted_session_lineage(session_id="db-session")
 
-        assert info == {"queued": False, "turn_count": 0, "message": "No conversation turns to retain."}
+        assert info == {"queued": False, "turn_count": 0, "message": "No persisted turns to retain."}
         p._client.aretain_batch.assert_not_called()
 
     def test_retain_session_without_buffer_returns_message(self, provider):
         result = json.loads(provider.handle_tool_call("hindsight_retain_session", {}))
-        assert result["result"] == "No buffered turns to retain."
+        assert result["result"] == "No persisted turns to retain."
 
     def test_unknown_tool(self, provider):
         result = json.loads(provider.handle_tool_call(

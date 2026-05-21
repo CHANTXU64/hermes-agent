@@ -8023,18 +8023,16 @@ class HermesCLI:
         elif canonical == "retain":
             memory_manager = getattr(self.agent, "_memory_manager", None) if self.agent else None
             provider = memory_manager.get_provider("hindsight") if memory_manager else None
-            if not provider or not (hasattr(provider, "retain_conversation_messages") or hasattr(provider, "flush_retained_turns")):
+            if not provider or not (hasattr(provider, "retain_persisted_session_lineage") or hasattr(provider, "flush_retained_turns")):
                 _cprint("  Hindsight memory provider is not active.")
             else:
                 try:
                     data = None
-                    if self._session_db and self.session_id and hasattr(provider, "retain_conversation_messages"):
-                        messages = self._session_db.get_messages_as_conversation(self.session_id)
-                        row = self._session_db.get_session(self.session_id) or {}
-                        data = provider.retain_conversation_messages(
-                            messages,
+                    if hasattr(provider, "retain_persisted_session_lineage"):
+                        row = self._session_db.get_session(self.session_id) if self._session_db and self.session_id else {}
+                        data = provider.retain_persisted_session_lineage(
                             session_id=self.session_id,
-                            parent_session_id=str(row.get("parent_session_id") or ""),
+                            parent_session_id=str((row or {}).get("parent_session_id") or ""),
                         )
                     elif hasattr(provider, "flush_retained_turns"):
                         data = provider.flush_retained_turns()
