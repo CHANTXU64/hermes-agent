@@ -736,6 +736,53 @@ class TestToolHandlers:
         assert p._last_flushed_turn_count == 0
         assert p._retain_flush_pending is True
 
+    def test_retain_conversation_messages_filters_db_transcript_noise(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        messages = [
+            {"role": "assistant", "content": "[Recent Summary] old", "finish_reason": None},
+            {"role": "user", "content": "real user"},
+            {"role": "assistant", "content": "[Recent Summary] injected after user", "finish_reason": None},
+            {"role": "assistant", "content": "internal thought", "finish_reason": "tool_calls", "tool_calls": [{"id": "t"}]},
+            {"role": "tool", "content": "tool output"},
+            {"role": "assistant", "content": "real assistant", "finish_reason": "stop"},
+        ]
+
+        info = p.retain_conversation_messages(messages, session_id="db-session", parent_session_id="parent-session")
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["turn_count"] == 1
+        kw = p._client.aretain_batch.call_args.kwargs
+        assert kw["document_id"] == "db-session"
+        item = kw["items"][0]
+        assert item["update_mode"] == "append"
+        assert item["metadata"]["session_id"] == "db-session"
+        assert item["metadata"]["parent_session_id"] == "parent-session"
+        assert "real user" in item["content"]
+        assert "real assistant" in item["content"]
+        assert "Recent Summary" not in item["content"]
+        assert "injected after user" not in item["content"]
+        assert "internal thought" not in item["content"]
+        assert "tool output" not in item["content"]
+
+    def test_retain_conversation_messages_without_visible_turns_returns_message(self, provider_with_config):
+        p = provider_with_config(auto_retain=False)
+
+        info = p.retain_conversation_messages([
+            {"role": "assistant", "content": "[Recent Summary]", "finish_reason": None},
+            {"role": "tool", "content": "tool output"},
+        ], session_id="db-session")
+
+        assert info == {"queued": False, "turn_count": 0, "message": "No conversation turns to retain."}
+        p._client.aretain_batch.assert_not_called()
+
     def test_retain_session_without_buffer_returns_message(self, provider):
         result = json.loads(provider.handle_tool_call("hindsight_retain_session", {}))
         assert result["result"] == "No buffered turns to retain."

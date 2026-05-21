@@ -8023,11 +8023,23 @@ class HermesCLI:
         elif canonical == "retain":
             memory_manager = getattr(self.agent, "_memory_manager", None) if self.agent else None
             provider = memory_manager.get_provider("hindsight") if memory_manager else None
-            if not provider or not hasattr(provider, "flush_retained_turns"):
+            if not provider or not (hasattr(provider, "retain_conversation_messages") or hasattr(provider, "flush_retained_turns")):
                 _cprint("  Hindsight memory provider is not active.")
             else:
                 try:
-                    data = provider.flush_retained_turns()
+                    data = None
+                    if self._session_db and self.session_id and hasattr(provider, "retain_conversation_messages"):
+                        messages = self._session_db.get_messages_as_conversation(self.session_id)
+                        row = self._session_db.get_session(self.session_id) or {}
+                        data = provider.retain_conversation_messages(
+                            messages,
+                            session_id=self.session_id,
+                            parent_session_id=str(row.get("parent_session_id") or ""),
+                        )
+                    elif hasattr(provider, "flush_retained_turns"):
+                        data = provider.flush_retained_turns()
+                    if data is None:
+                        data = {"queued": False, "message": "Hindsight memory provider is not active."}
                     msg = data.get("message") if not data.get("queued") else "Buffered session turns queued for retain."
                 except Exception as e:
                     msg = f"Failed to retain session: {e}"

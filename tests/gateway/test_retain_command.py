@@ -38,6 +38,39 @@ def _make_runner():
 
 
 @pytest.mark.asyncio
+async def test_retain_command_uses_sessiondb_transcript_when_available():
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+    provider = MagicMock()
+    provider.retain_conversation_messages.return_value = {"queued": True}
+    memory_manager = SimpleNamespace(get_provider=lambda name: provider if name == "hindsight" else None)
+    agent = SimpleNamespace(_memory_manager=memory_manager, session_id="sid-1")
+    runner._agent_cache[session_key] = (agent, "sig")
+    db = SimpleNamespace(get_session=lambda sid: {"parent_session_id": "parent-1"})
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _db=db,
+        load_transcript=lambda sid: [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi", "finish_reason": "stop"},
+        ],
+    )
+
+    result = await runner._handle_retain_command(_make_event())
+
+    assert result == "Buffered session turns queued for retain."
+    provider.retain_conversation_messages.assert_called_once_with(
+        [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi", "finish_reason": "stop"},
+        ],
+        session_id="sid-1",
+        parent_session_id="parent-1",
+    )
+    provider.flush_retained_turns.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_retain_command_flushes_cached_agent_provider():
     runner = _make_runner()
     source = _make_source()

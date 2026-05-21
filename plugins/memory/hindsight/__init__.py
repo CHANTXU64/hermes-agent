@@ -1054,6 +1054,14 @@ class HindsightMemoryProvider(MemoryProvider):
                 return str(url)
         return self._api_url or ""
 
+    def _resolve_retain_target_for_session(self, session_id: str, fallback_document_id: str) -> tuple[str, str | None]:
+        """Pick (document_id, update_mode) for a specific session."""
+        if not session_id:
+            return fallback_document_id, None
+        if _check_api_supports_update_mode_append(self._probe_url(), self._api_key):
+            return session_id, "append"
+        return fallback_document_id, None
+
     def _resolve_retain_target(self, fallback_document_id: str) -> tuple[str, str | None]:
         """Pick (document_id, update_mode) based on live API capability.
 
@@ -1069,11 +1077,7 @@ class HindsightMemoryProvider(MemoryProvider):
         round-trip per (process, api_url) pair regardless of how many
         retains fire.
         """
-        if not self._session_id:
-            return fallback_document_id, None
-        if _check_api_supports_update_mode_append(self._probe_url(), self._api_key):
-            return self._session_id, "append"
-        return fallback_document_id, None
+        return self._resolve_retain_target_for_session(self._session_id, fallback_document_id)
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
@@ -1379,6 +1383,43 @@ class HindsightMemoryProvider(MemoryProvider):
             },
         ]
 
+    @staticmethod
+    def _stringify_retain_content(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        return json.dumps(content, ensure_ascii=False)
+
+    def _build_turns_from_conversation_messages(self, messages: List[Dict[str, Any]]) -> List[str]:
+        """Build retain turn JSON from persisted conversation messages.
+
+        SessionDB stores the full model transcript, including tool-call
+        assistant stubs, tool outputs, and injected compression summaries.
+        Manual DB-backed retain must mirror sync_turn(): one visible user
+        message plus the final visible assistant response for each turn.
+        """
+        turns: List[str] = []
+        pending_user = ""
+        for msg in messages or []:
+            role = msg.get("role")
+            content = self._stringify_retain_content(msg.get("content")).strip()
+            if not content:
+                continue
+            if role == "user":
+                pending_user = content
+                continue
+            if role == "assistant" and content.startswith("[Recent Summary"):
+                continue
+            if role != "assistant" or not pending_user:
+                continue
+            if msg.get("tool_calls") or msg.get("finish_reason") == "tool_calls":
+                continue
+            turn = self._build_turn_messages(pending_user, content)
+            turns.append(json.dumps(turn, ensure_ascii=False))
+            pending_user = ""
+        return turns
+
     def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
         metadata: Dict[str, str] = {
             "retained_at": _utc_timestamp(),
@@ -1435,6 +1476,84 @@ class HindsightMemoryProvider(MemoryProvider):
         if merged_tags:
             kwargs["tags"] = merged_tags
         return kwargs
+
+    def retain_conversation_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        session_id: str = "",
+        parent_session_id: str = "",
+    ) -> Dict[str, Any]:
+        """Queue a manual retain built from persisted SessionDB messages."""
+        if self._shutting_down.is_set():
+            raise RuntimeError("Hindsight provider is shutting down")
+
+        turns = self._build_turns_from_conversation_messages(messages)
+        if not turns:
+            return {"queued": False, "turn_count": 0, "message": "No conversation turns to retain."}
+
+        target_session_id = str(session_id or self._session_id or "").strip()
+        fallback_document_id = self._document_id
+        if target_session_id and target_session_id != self._session_id:
+            fallback_document_id = f"{target_session_id}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        document_id, update_mode = self._resolve_retain_target_for_session(target_session_id, fallback_document_id)
+        content = "[" + ",".join(turns) + "]"
+        lineage_tags: list[str] = []
+        if target_session_id:
+            lineage_tags.append(f"session:{target_session_id}")
+        parent_id = str(parent_session_id or self._parent_session_id or "").strip()
+        if parent_id:
+            lineage_tags.append(f"parent:{parent_id}")
+
+        metadata_snapshot = self._build_metadata(
+            message_count=len(turns) * 2,
+            turn_index=len(turns),
+        )
+        if target_session_id:
+            metadata_snapshot["session_id"] = target_session_id
+        if parent_id:
+            metadata_snapshot["parent_session_id"] = parent_id
+
+        bank_id = self._bank_id
+        retain_async_flag = self._retain_async
+        retain_context = self._retain_context
+        num_turns = len(turns)
+
+        def _do_retain() -> None:
+            item = self._build_retain_kwargs(
+                content,
+                context=retain_context,
+                metadata=metadata_snapshot,
+                tags=lineage_tags or None,
+            )
+            item.pop("bank_id", None)
+            item.pop("retain_async", None)
+            if update_mode is not None:
+                item["update_mode"] = update_mode
+            logger.debug(
+                "Hindsight DB retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
+                bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns,
+            )
+            self._run_hindsight_operation(
+                lambda client: client.aretain_batch(
+                    bank_id=bank_id,
+                    items=[item],
+                    document_id=document_id,
+                    retain_async=retain_async_flag,
+                )
+            )
+            logger.debug("Hindsight DB retain succeeded")
+
+        self._ensure_writer()
+        self._register_atexit()
+        self._retain_queue.put(_do_retain)
+        return {
+            "queued": True,
+            "turn_count": num_turns,
+            "document_id": document_id,
+            "update_mode": update_mode,
+            "content_chars": len(content),
+        }
 
     def flush_retained_turns(self) -> Dict[str, Any]:
         """Flush buffered turns that have not already been queued for retain."""

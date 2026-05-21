@@ -386,10 +386,11 @@ Summary:
 
 What changed:
 
-- Added `hindsight_retain_session` / `/retain` to manually flush buffered Hindsight conversation turns.
-- Manual flush uses the same document, metadata, tags, and Unicode-preserving serialization path as automatic retain.
-- Manual flush tracks one pending append job, a session generation guard, and queued/flushed turn counts so repeated `/retain` calls do not duplicate the same buffered turns or let old-session background jobs mutate new-session counters.
-- When `auto_retain=false`, completed turns are buffered but not sent until `/retain`; session switches clear the buffer without auto-flushing.
+- Added `hindsight_retain_session` / `/retain` for user-triggered Hindsight session retain.
+- Gateway/CLI `/retain` now reads the current session's persisted SessionDB transcript, filters it down to visible user→assistant turns, and submits those turns through the Hindsight provider.
+- Manual retain uses the same document, metadata, tags, Unicode-preserving serialization, `_resolve_retain_target()`, and writer queue path as automatic retain.
+- Legacy provider buffer flush still tracks one pending append job, a session generation guard, and queued/flushed turn counts so automatic retain and direct provider tests do not regress.
+- When `auto_retain=false`, completed turns are not auto-submitted to Hindsight, but they remain in SessionDB; switching sessions or restarting the gateway no longer loses data needed for a later `/retain`.
 - Only `/retain` is user-facing; no long command aliases are registered.
 - `hindsight_retain_session` is not registered in model-visible tool schemas; CLI/Gateway call the provider directly via `memory_manager.get_provider("hindsight")`, so manual retain works even when `memory_mode="context"` hides Hindsight tools from the model.
 
@@ -399,10 +400,11 @@ Why it matters:
 
 Merge protection:
 
-- Do not route manual session retain through SessionDB lineage reconstruction; it must flush the provider's existing `_session_turns` buffer.
+- Do not route manual session retain through raw/unfiltered SessionDB lineage reconstruction; it must use the current session transcript filtered to visible user→assistant turns.
 - Do not create a separate `manual-session:*` document; use `_resolve_retain_target()` exactly like automatic retain.
 - Do not expose `hindsight_retain_session` as a model-visible tool by default; this is a user slash command/provider method.
-- Preserve tests proving manual retain uses normal metadata/tags, buffers when `auto_retain=false`, avoids duplicate flushes, rejects a second pending flush, rolls back/clears pending after failure, guards old-session background jobs after session switch, skips auto-flush on session switch when `auto_retain=false`, appends only new turns in `update_mode="append"`, and works when `memory_mode="context"`.
+- Manual `/retain` must use SessionDB transcript as source of truth, filtered to visible user→assistant turns only; do not include tool output, tool-call assistant stubs, internal reasoning, or injected recent-summary rows.
+- Preserve tests proving manual retain uses normal metadata/tags, reads SessionDB in Gateway/CLI paths, filters transcript noise, handles no-visible-turn sessions, and keeps legacy buffer flush behavior (pending rejection, failure rollback, generation guard, `memory_mode="context"`).
 
 Verification:
 

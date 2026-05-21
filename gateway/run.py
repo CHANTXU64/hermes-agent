@@ -9212,10 +9212,33 @@ class GatewayRunner:
                     agent = cached[0] if isinstance(cached, tuple) else cached if cached else None
         memory_manager = getattr(agent, "_memory_manager", None) if agent is not None else None
         provider = memory_manager.get_provider("hindsight") if memory_manager else None
-        if not provider or not hasattr(provider, "flush_retained_turns"):
+        if not provider or not (hasattr(provider, "retain_conversation_messages") or hasattr(provider, "flush_retained_turns")):
             return "Hindsight memory provider is not active for this session."
         try:
-            data = provider.flush_retained_turns()
+            data = None
+            session_id = str(getattr(agent, "session_id", "") or getattr(provider, "_session_id", "") or "").strip()
+            session_store = getattr(self, "session_store", None)
+            if session_id and session_store is not None and hasattr(provider, "retain_conversation_messages"):
+                messages = session_store.load_transcript(session_id) if hasattr(session_store, "load_transcript") else []
+                parent_session_id = ""
+                db = getattr(session_store, "_db", None)
+                if db is not None:
+                    try:
+                        row = db.get_session(session_id)
+                        parent_session_id = str((row or {}).get("parent_session_id") or "")
+                    except Exception:
+                        parent_session_id = ""
+                data = provider.retain_conversation_messages(
+                    messages,
+                    session_id=session_id,
+                    parent_session_id=parent_session_id,
+                )
+            elif hasattr(provider, "flush_retained_turns"):
+                data = provider.flush_retained_turns()
+            else:
+                return "Hindsight memory provider is not active for this session."
+            if data is None:
+                return "Hindsight memory provider is not active for this session."
             if not data.get("queued"):
                 return str(data.get("message") or "No buffered turns to retain.")
             return "Buffered session turns queued for retain."
