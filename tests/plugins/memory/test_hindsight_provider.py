@@ -554,7 +554,7 @@ class TestToolHandlers:
         item = call_kwargs["items"][0]
         assert "metadata" not in item
         assert "tags" not in item
-        assert "context" not in item
+        assert item["context"] == p._retain_context
         assert "你好" in item["content"]
         assert "\\u4f60" not in item["content"]
 
@@ -764,7 +764,7 @@ class TestToolHandlers:
         assert item["update_mode"] == "append"
         assert "metadata" not in item
         assert "tags" not in item
-        assert "context" not in item
+        assert item["context"] == p._retain_context
         assert "User: root user" in item["content"]
         assert "Assistant: root assistant" in item["content"]
         assert "User: child user" in item["content"]

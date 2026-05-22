@@ -391,7 +391,7 @@ What changed:
 - Gateway/CLI `/retain` no longer reconstructs from raw Hermes SessionDB transcript; it asks the provider to read persisted retain turns for the current session lineage.
 - Manual retain follows `parent_session_id` from the current session back to the root and submits root → current turns together, so users do not need to retain before context compression.
 - Persisted turn lookup does not filter by the historical local `bank_id`; `/retain` submits matching lineage turns to the bank configured at retain time.
-- Manual `/retain` submits a clean item with `content` only, avoiding extra metadata/tags/context.
+- Manual `/retain` submits a clean item with `content` and configured `context`, avoiding extra metadata/tags.
 - Legacy provider buffer flush still tracks one pending append job, a session generation guard, and queued/flushed turn counts so automatic retain and direct provider tests do not regress.
 - When `auto_retain=false`, completed turns are written only to the local retain-turn SQLite file until `/retain` submits them.
 - Only `/retain` is user-facing; no long command aliases are registered.
@@ -408,7 +408,7 @@ Merge protection:
 - Do not expose `hindsight_retain_session` as a model-visible tool by default; this is a user slash command/provider method.
 - Manual `/retain` must include the current session's parent lineage from the persisted retain-turn store, ordered root → current, without mixing sibling sessions.
 - Manual `/retain` must not filter persisted turns by historical local `bank_id`; the current provider config determines the API target bank.
-- Manual `/retain` payload items should stay clean (`content` plus `update_mode` only when needed), without extra metadata/tags/context.
+- Manual `/retain` payload items should stay clean (`content`, configured `context`, and `update_mode` only when needed), without extra metadata/tags.
 - Preserve tests proving manual retain persists Hindsight turn payloads to the separate SQLite file, reads parent lineage, ignores historical local bank casing/config changes, handles no-persisted-turn sessions, and keeps legacy buffer flush behavior (pending rejection, failure rollback, generation guard, `memory_mode="context"`).
 
 Verification:

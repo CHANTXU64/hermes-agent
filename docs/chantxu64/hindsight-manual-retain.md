@@ -97,10 +97,10 @@ bank_id = current configured bank
 手动 `/retain` 的 item 保持干净，只提交：
 
 ```json
-{"content": "..."}
+{"content": "...", "context": "..."}
 ```
 
-不额外塞 `metadata`、`tags`、`context`。
+不额外塞 `metadata`、`tags`。
 
 ## 重复提交
 
@@ -125,7 +125,7 @@ bank_id = current configured bank
 - Gateway `/retain` 调用 provider 的 persisted lineage retain，而不是读取原始 SessionDB transcript。
 - `sync_turn()` 会持久化和自动 retain 同源的 turn payload。
 - local `bank_id` differences in `retain_turns.sqlite3` do not exclude persisted turns; `/retain` submits all matching session lineage turns to the currently configured Hindsight bank.
-- Manual `/retain` submits a clean item containing `content` only, with no extra metadata/tags/context.
+- Manual `/retain` submits a clean item containing `content` and configured `context`, with no extra metadata/tags.
 - 没有 persisted turns 时不提交。
 - `get_tool_schemas()` 不暴露 `hindsight_retain_session`。
 - legacy buffer flush 的 append/pending/失败回滚/generation guard 回归测试仍保留，避免自动 retain 路径退化。

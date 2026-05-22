@@ -1574,10 +1574,13 @@ class HindsightMemoryProvider(MemoryProvider):
         content = "[" + ",".join(turns) + "]"
         bank_id = self._bank_id
         retain_async_flag = self._retain_async
+        retain_context = self._retain_context
         num_turns = len(turns)
 
         def _do_retain() -> None:
             item: Dict[str, Any] = {"content": content}
+            if retain_context:
+                item["context"] = retain_context
             if update_mode is not None:
                 item["update_mode"] = update_mode
             logger.debug(
