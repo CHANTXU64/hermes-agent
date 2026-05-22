@@ -2,7 +2,7 @@
 """
 Transcription Tools Module
 
-Provides speech-to-text transcription with six providers:
+Provides speech-to-text transcription with seven providers:
 
   - **local** (default, free) — faster-whisper running locally, no API key needed.
     Auto-downloads the model (~150 MB for ``base``) on first use.
@@ -13,6 +13,7 @@ Provides speech-to-text transcription with six providers:
   - **mistral** — Mistral Voxtral Transcribe API, requires ``MISTRAL_API_KEY``.
   - **xai** — xAI Grok STT API, requires ``XAI_API_KEY``. High accuracy,
     Inverse Text Normalization, diarization, 21 languages.
+  - **custom_api** — OpenAI-compatible STT endpoint configured in ``stt.custom_api``.
 
 Used by the messaging gateway to automatically transcribe voice messages
 sent by users on Telegram, Discord, WhatsApp, Slack, and Signal.
@@ -34,6 +35,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import base64
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -87,6 +89,8 @@ DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
+DEFAULT_CUSTOM_API_STT_MODEL = os.getenv("STT_CUSTOM_API_MODEL", "qwen3-asr-flash-2026-02-10")
+DEFAULT_CUSTOM_API_STT_ENDPOINT = "/chat/completions"
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
@@ -150,6 +154,55 @@ def _has_openai_audio_backend() -> bool:
         return True
     except ValueError:
         return False
+
+
+def _resolve_custom_api_config(stt_config: Optional[dict] = None) -> Dict[str, Any]:
+    """Resolve config for an OpenAI-compatible custom STT endpoint."""
+    if stt_config is None:
+        stt_config = _load_stt_config()
+    custom_cfg = stt_config.get("custom_api", {}) if isinstance(stt_config, dict) else {}
+    if not isinstance(custom_cfg, dict):
+        custom_cfg = {}
+
+    base_url = str(custom_cfg.get("base_url") or os.getenv("STT_CUSTOM_API_BASE_URL") or "").strip().rstrip("/")
+    endpoint = str(custom_cfg.get("endpoint") or os.getenv("STT_CUSTOM_API_ENDPOINT") or DEFAULT_CUSTOM_API_STT_ENDPOINT).strip()
+    if endpoint and not endpoint.startswith("/"):
+        endpoint = f"/{endpoint}"
+
+    api_key = str(custom_cfg.get("api_key") or "").strip()
+    api_key_env = str(custom_cfg.get("api_key_env") or "QWEN_API_KEY").strip()
+    if not api_key and api_key_env:
+        api_key = str(get_env_value(api_key_env) or "").strip()
+
+    model = str(custom_cfg.get("model") or os.getenv("STT_CUSTOM_API_MODEL") or DEFAULT_CUSTOM_API_STT_MODEL).strip()
+    mode = str(custom_cfg.get("mode") or os.getenv("STT_CUSTOM_API_MODE") or "").strip()
+    if not mode:
+        mode = "chat_completions" if endpoint.rstrip("/") == "/chat/completions" else "multipart"
+    response_format = str(custom_cfg.get("response_format") or os.getenv("STT_CUSTOM_API_RESPONSE_FORMAT") or "json").strip()
+    language = str(custom_cfg.get("language") or os.getenv(LOCAL_STT_LANGUAGE_ENV) or "").strip()
+    prompt = str(custom_cfg.get("prompt") or os.getenv("STT_CUSTOM_API_PROMPT") or "请将这段音频转写为文本。" ).strip()
+    try:
+        timeout = float(custom_cfg.get("timeout", os.getenv("STT_CUSTOM_API_TIMEOUT", 120)))
+    except (TypeError, ValueError):
+        timeout = 120.0
+
+    return {
+        "base_url": base_url,
+        "endpoint": endpoint,
+        "api_key": api_key,
+        "api_key_env": api_key_env,
+        "model": model,
+        "mode": mode,
+        "response_format": response_format,
+        "language": language,
+        "prompt": prompt,
+        "timeout": timeout,
+    }
+
+
+def _has_custom_api_backend(stt_config: Optional[dict] = None) -> bool:
+    cfg = _resolve_custom_api_config(stt_config)
+    return bool(cfg["base_url"] and cfg["api_key"])
 
 
 def _find_binary(binary_name: str) -> Optional[str]:
@@ -284,6 +337,18 @@ def _get_provider(stt_config: dict) -> str:
             logger.warning(
                 "STT provider 'openai' configured but no API key available"
             )
+            return "none"
+
+        if provider == "custom_api":
+            custom_cfg = _resolve_custom_api_config(stt_config)
+            if custom_cfg["base_url"] and custom_cfg["api_key"]:
+                return "custom_api"
+            missing = []
+            if not custom_cfg["base_url"]:
+                missing.append("stt.custom_api.base_url")
+            if not custom_cfg["api_key"]:
+                missing.append(f"stt.custom_api.api_key or {custom_cfg['api_key_env']}")
+            logger.warning("STT provider 'custom_api' configured but missing %s", ", ".join(missing))
             return "none"
 
         if provider == "mistral":
@@ -870,6 +935,136 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Provider: custom_api (OpenAI-compatible STT endpoint)
+# ---------------------------------------------------------------------------
+
+
+def _transcribe_custom_api(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe using a configured OpenAI-compatible STT API."""
+    cfg = _resolve_custom_api_config()
+    if not cfg["base_url"]:
+        return {"success": False, "transcript": "", "error": "stt.custom_api.base_url not set"}
+    if not cfg["api_key"]:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": f"stt.custom_api.api_key not set and {cfg['api_key_env']} is unavailable",
+        }
+
+    try:
+        import requests
+
+        if cfg["mode"] == "chat_completions":
+            audio_path = Path(file_path)
+            audio_format = audio_path.suffix.lower().lstrip(".") or "wav"
+            mime_type = {
+                "wav": "audio/wav",
+                "mp3": "audio/mpeg",
+                "mpeg": "audio/mpeg",
+                "ogg": "audio/ogg",
+                "oga": "audio/ogg",
+                "m4a": "audio/mp4",
+                "mp4": "audio/mp4",
+                "aac": "audio/aac",
+                "flac": "audio/flac",
+                "webm": "audio/webm",
+            }.get(audio_format, f"audio/{audio_format}")
+            audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
+            audio_item: Dict[str, Any] = {
+                "type": "input_audio",
+                "input_audio": {"data": f"data:{mime_type};base64,{audio_b64}"},
+            }
+            if cfg["prompt"]:
+                audio_item["text"] = cfg["prompt"]
+            payload: Dict[str, Any] = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": [audio_item]}],
+                "stream": False,
+            }
+            asr_options: Dict[str, Any] = {"enable_itn": False}
+            if cfg["language"]:
+                asr_options["language"] = cfg["language"]
+            payload["asr_options"] = asr_options
+            response = requests.post(
+                f"{cfg['base_url']}{cfg['endpoint']}",
+                headers={
+                    "Authorization": f"Bearer {cfg['api_key']}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=cfg["timeout"],
+            )
+        else:
+            data: Dict[str, str] = {"model": model_name}
+            if cfg["response_format"]:
+                data["response_format"] = cfg["response_format"]
+            if cfg["language"]:
+                data["language"] = cfg["language"]
+
+            with open(file_path, "rb") as audio_file:
+                response = requests.post(
+                    f"{cfg['base_url']}{cfg['endpoint']}",
+                    headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                    files={"file": (Path(file_path).name, audio_file)},
+                    data=data,
+                    timeout=cfg["timeout"],
+                )
+
+        if response.status_code != 200:
+            detail = ""
+            try:
+                err_body = response.json()
+                detail = err_body.get("error", {}).get("message", "") or response.text[:300]
+            except Exception:
+                detail = response.text[:300]
+            return {
+                "success": False,
+                "transcript": "",
+                "error": f"Custom STT API error (HTTP {response.status_code}): {detail}",
+            }
+
+        try:
+            result: Any = response.json()
+        except Exception:
+            result = response.text
+        transcript_text = ""
+        if isinstance(result, dict):
+            choices = result.get("choices", [])
+            if choices:
+                message = choices[0].get("message", {})
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    parts = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            parts.append(str(item.get("text") or item.get("transcript") or ""))
+                        else:
+                            parts.append(str(item))
+                    transcript_text = "".join(parts).strip()
+                else:
+                    transcript_text = str(content).strip()
+        if not transcript_text:
+            transcript_text = _extract_transcript_text(result)
+
+        if not transcript_text:
+            return {"success": False, "transcript": "", "error": "Custom STT API returned empty transcript"}
+
+        logger.info(
+            "Transcribed %s via custom STT API (%s, %d chars)",
+            Path(file_path).name,
+            model_name,
+            len(transcript_text),
+        )
+        return {"success": True, "transcript": transcript_text, "provider": "custom_api"}
+
+    except PermissionError:
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except Exception as e:
+        logger.error("Custom STT API transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"Custom STT API transcription failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -947,6 +1142,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         model_name = model or "grok-stt"
         return _transcribe_xai(file_path, model_name)
 
+    if provider == "custom_api":
+        custom_cfg = _resolve_custom_api_config(stt_config)
+        model_name = model or custom_cfg.get("model") or DEFAULT_CUSTOM_API_STT_MODEL
+        return _transcribe_custom_api(file_path, model_name)
+
     # No provider available
     return {
         "success": False,
@@ -956,7 +1156,8 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "install mlx-whisper for Apple Silicon, "
             f"configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
             "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
-            "Voxtral Transcribe, configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
+            "Voxtral Transcribe, configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, "
+            "configure stt.custom_api for an OpenAI-compatible STT endpoint, or set VOICE_TOOLS_OPENAI_KEY "
             "or OPENAI_API_KEY for the OpenAI Whisper API."
         ),
     }

@@ -24,6 +24,9 @@ def isolate_env(monkeypatch):
         "MISTRAL_API_KEY",
         "XAI_API_KEY",
         "XAI_STT_BASE_URL",
+        "DASHSCOPE_API_KEY",
+        "QWEN_API_KEY",
+        "STT_CUSTOM_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -120,6 +123,35 @@ class TestProviderSelectionGate:
                    return_value={"XAI_API_KEY": "dotenv-secret"}):
             assert tt._get_provider({"enabled": True, "provider": "xai"}) == "xai"
 
+    def test_explicit_custom_api_sees_dotenv_env_key(self):
+        from tools import transcription_tools as tt
+
+        stt_config = {
+            "enabled": True,
+            "provider": "custom_api",
+            "custom_api": {
+                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "api_key_env": "QWEN_API_KEY",
+            },
+        }
+        with patch("hermes_cli.config.load_env",
+                   return_value={"QWEN_API_KEY": "dotenv-secret"}):
+            assert tt._get_provider(stt_config) == "custom_api"
+
+    def test_default_custom_api_uses_qwen_dotenv_key(self):
+        from tools import transcription_tools as tt
+
+        stt_config = {
+            "enabled": True,
+            "provider": "custom_api",
+            "custom_api": {
+                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            },
+        }
+        with patch("hermes_cli.config.load_env",
+                   return_value={"QWEN_API_KEY": "dotenv-secret"}):
+            assert tt._get_provider(stt_config) == "custom_api"
+
     def test_auto_detect_sees_dotenv_groq(self):
         """No local backend, no explicit provider — auto-detect should fall
         through to Groq when its key lives in dotenv only. Before the fix
@@ -127,6 +159,7 @@ class TestProviderSelectionGate:
         from tools import transcription_tools as tt
 
         with patch.object(tt, "_HAS_FASTER_WHISPER", False), \
+             patch.object(tt, "_HAS_MLX_WHISPER", False), \
              patch.object(tt, "_HAS_OPENAI", True), \
              patch.object(tt, "_HAS_MISTRAL", False), \
              patch.object(tt, "_has_local_command", return_value=False), \
@@ -230,6 +263,36 @@ class TestTranscribeCallSitesReadDotenv:
 
         assert result["success"] is True
         assert captured["headers"]["Authorization"] == "Bearer xai-dotenv-key"
+
+    def test_transcribe_custom_api_forwards_dotenv_env_key(self):
+        from tools import transcription_tools as tt
+
+        captured: dict = {}
+
+        def fake_post(url, **kwargs):
+            captured["headers"] = kwargs.get("headers", {})
+            response = MagicMock()
+            response.status_code = 200
+            response.json.return_value = {"text": "hello"}
+            return response
+
+        cfg = {
+            "custom_api": {
+                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "api_key_env": "QWEN_API_KEY",
+                "model": "qwen3-asr-flash-2026-02-10",
+                "endpoint": "/audio/transcriptions",
+                "mode": "multipart",
+            }
+        }
+        with patch.object(tt, "_load_stt_config", return_value=cfg), \
+             patch("hermes_cli.config.load_env", return_value={"QWEN_API_KEY": "qwen-dotenv-key"}), \
+             patch("requests.post", side_effect=fake_post), \
+             patch("builtins.open", MagicMock()):
+            result = tt._transcribe_custom_api("/tmp/fake.mp3", "qwen3-asr")
+
+        assert result["success"] is True
+        assert captured["headers"]["Authorization"] == "Bearer qwen-dotenv-key"
 
 
 class TestEndToEndRegressionGuard:

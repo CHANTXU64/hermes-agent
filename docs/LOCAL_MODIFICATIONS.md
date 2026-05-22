@@ -423,6 +423,54 @@ Feature docs: `docs/chantxu64/hindsight-manual-retain.md`.
 
 Upstream status: fork-only.
 
+### 10. Custom OpenAI-compatible STT provider
+
+Status: active
+
+Date: 2026-05-22
+
+Files:
+
+- `tools/transcription_tools.py`
+- `tests/tools/test_transcription.py`
+- `tests/tools/test_transcription_dotenv_fallback.py`
+- `hermes_cli/config.py`
+
+Summary:
+
+- Adds a configurable OpenAI-compatible STT provider so the fork can use hosted ASR endpoints such as Alibaba DashScope Qwen STT without hardcoding a vendor-specific provider.
+
+What changed:
+
+- Added `stt.provider: custom_api` dispatch in `tools/transcription_tools.py`.
+- Added `stt.custom_api` config for `base_url`, `api_key` / `api_key_env`, `model`, `endpoint`, `mode`, `response_format`, `language`, `prompt`, and `timeout`.
+- The custom provider supports both multipart audio uploads and DashScope-style chat-completions audio input, using a single `input_audio` content item with a Base64 Data URL.
+- It parses common transcription response shapes: `{text: ...}`, plain text, and `{choices:[{message:{content: ...}}]}`.
+- Added tests for provider selection, dotenv/env-key resolution, request construction, response parsing, and `transcribe_audio()` dispatch.
+
+Why it matters:
+
+- The user's gateway can switch from local MLX Whisper to Alibaba Qwen STT through config only, while preserving MLX Whisper as a fallback/local option.
+- Future upstream merges must not collapse custom STT back into OpenAI-only credentials or hardcoded provider names.
+
+Merge protection:
+
+- Preserve explicit `stt.provider: custom_api` behavior and do not silently fall back to another STT provider when custom credentials are missing.
+- Preserve `api_key_env` lookup through `get_env_value()` so keys in `~/.hermes/.env` work.
+- Preserve the Qwen ASR configuration shape: `QWEN_API_KEY`, model `qwen3-asr-flash-2026-02-10`, DashScope compatible base URL, and `/chat/completions` mode.
+- Preserve response parsing for both OpenAI-style `{text: ...}` and chat-style `choices[0].message.content` responses unless upstream has a verified equivalent.
+
+Verification:
+
+```bash
+python -m py_compile tools/transcription_tools.py hermes_cli/config.py tests/tools/test_transcription.py tests/tools/test_transcription_dotenv_fallback.py
+python -m pytest tests/tools/test_transcription.py tests/tools/test_transcription_dotenv_fallback.py tests/tools/test_transcription_tools.py -q -o 'addopts='
+```
+
+Feature docs: none — STT provider extension documented in this index.
+
+Upstream status: fork-only.
+
 
 ## Current fork delta checklist
 
@@ -444,8 +492,11 @@ deltas are expected in these areas:
   - `tests/tools/test_mixture_of_agents_tool.py`
   - `hermes_cli/config.py`
   - `hermes_cli/runtime_provider.py`
-- MLX Whisper STT:
+- MLX Whisper STT / custom STT API:
   - `tools/transcription_tools.py`
+  - `tests/tools/test_transcription.py`
+  - `tests/tools/test_transcription_dotenv_fallback.py`
+  - `hermes_cli/config.py`
 - Safe command rewrite:
   - `tools/safe_cmd_rewrite.py`
   - `tools/terminal_tool.py`
@@ -470,9 +521,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 9 major entries.
+Documented entries: 10 major entries.
 
-Active functional areas: 7.
+Active functional areas: 8.
 
 Historical reverted areas: 1.
 

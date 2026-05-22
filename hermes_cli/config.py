@@ -1149,7 +1149,7 @@ DEFAULT_CONFIG = {
     
     "stt": {
         "enabled": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe)
+        "provider": "local",  # "local" (free, faster-whisper) | "mlx_whisper" | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "xai" | "custom_api"
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
@@ -1159,6 +1159,18 @@ DEFAULT_CONFIG = {
         },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
+        },
+        "custom_api": {
+            "base_url": "",  # e.g. https://dashscope.aliyuncs.com/compatible-mode/v1
+            "api_key": "",  # or leave empty and set api_key_env
+            "api_key_env": "QWEN_API_KEY",
+            "model": "qwen3-asr-flash-2026-02-10",
+            "endpoint": "/chat/completions",
+            "mode": "chat_completions",  # chat_completions or multipart
+            "response_format": "json",
+            "language": "",
+            "prompt": "请将这段音频转写为文本。",
+            "timeout": 120,
         },
     },
 
