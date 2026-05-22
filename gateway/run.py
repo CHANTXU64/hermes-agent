@@ -9196,7 +9196,23 @@ class GatewayRunner:
 
     async def _handle_retain_command(self, event: MessageEvent) -> str:
         """Handle /retain — manually flush buffered Hindsight turns."""
-        session_key = self._session_key_for_source(event.source)
+        source = event.source
+        session_store = getattr(self, "session_store", None)
+        session_entry = None
+        if session_store is not None:
+            try:
+                # Match the normal message path: SessionStore is the source of
+                # truth for the currently selected conversation after /resume
+                # and across gateway restarts.
+                session_entry = session_store.get_or_create_session(source)
+            except Exception:
+                session_entry = None
+        session_key = (
+            getattr(session_entry, "session_key", "")
+            or self._session_key_for_source(source)
+        )
+        current_session_id = str(getattr(session_entry, "session_id", "") or "").strip()
+
         agent = None
         try:
             running = getattr(self, "_running_agents", {}) or {}
@@ -9210,18 +9226,54 @@ class GatewayRunner:
                 with cache_lock:
                     cached = cache.get(session_key)
                     agent = cached[0] if isinstance(cached, tuple) else cached if cached else None
-        if agent is None:
-            return "当前会话还没有加载运行中的 Agent。/resume 后请先发送一条普通消息，再执行 /retain。"
-        memory_manager = getattr(agent, "_memory_manager", None)
+
+        memory_manager = getattr(agent, "_memory_manager", None) if agent is not None else None
         provider = memory_manager.get_provider("hindsight") if memory_manager else None
+        if provider is None:
+            try:
+                from hermes_cli.config import cfg_get, load_config
+                from hermes_constants import get_hermes_home
+                from plugins.memory import load_memory_provider
+
+                config = load_config()
+                if (cfg_get(config, "memory", "provider") or "").strip() == "hindsight":
+                    candidate = load_memory_provider("hindsight")
+                    if candidate and candidate.is_available():
+                        init_kwargs = {
+                            "session_id": current_session_id,
+                            "platform": source.platform.value if source and source.platform else "gateway",
+                            "hermes_home": str(get_hermes_home()),
+                            "agent_context": "primary",
+                            "gateway_session_key": session_key,
+                        }
+                        for attr in ("user_id", "user_name", "chat_id", "chat_name", "chat_type", "thread_id"):
+                            value = getattr(source, attr, "") if source is not None else ""
+                            if value:
+                                init_kwargs[attr] = value
+                        db = getattr(session_store, "_db", None) if session_store is not None else None
+                        if db is not None and current_session_id:
+                            try:
+                                title = db.get_session_title(current_session_id)
+                                if title:
+                                    init_kwargs["session_title"] = title
+                            except Exception:
+                                pass
+                        candidate.initialize(**init_kwargs)
+                        provider = candidate
+            except Exception:
+                provider = None
         if not provider or not (hasattr(provider, "retain_persisted_session_lineage") or hasattr(provider, "flush_retained_turns")):
             return "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。"
         try:
             data = None
-            session_id = str(getattr(agent, "session_id", "") or getattr(provider, "_session_id", "") or "").strip()
+            session_id = str(
+                current_session_id
+                or getattr(agent, "session_id", "")
+                or getattr(provider, "_session_id", "")
+                or ""
+            ).strip()
             if session_id and hasattr(provider, "retain_persisted_session_lineage"):
                 parent_session_id = ""
-                session_store = getattr(self, "session_store", None)
                 db = getattr(session_store, "_db", None) if session_store is not None else None
                 if db is not None:
                     try:
@@ -9236,9 +9288,9 @@ class GatewayRunner:
             elif hasattr(provider, "flush_retained_turns"):
                 data = provider.flush_retained_turns()
             else:
-                return "Hindsight memory provider is not active for this session."
+                return "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。"
             if data is None:
-                return "Hindsight memory provider is not active for this session."
+                return "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。"
             if not data.get("queued"):
                 return str(data.get("message") or "No buffered turns to retain.")
             return "Buffered session turns queued for retain."

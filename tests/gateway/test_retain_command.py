@@ -77,16 +77,44 @@ async def test_retain_command_flushes_cached_agent_provider():
 
 
 @pytest.mark.asyncio
-async def test_retain_command_reports_no_loaded_agent_in_chinese():
+async def test_retain_command_loads_hindsight_provider_from_current_session_after_resume(monkeypatch):
     runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+    session_entry = SimpleNamespace(session_key=session_key, session_id="resumed-sid")
+    db = SimpleNamespace(
+        get_session=lambda sid: {"parent_session_id": "parent-sid"},
+        get_session_title=lambda sid: "Resumed Session",
+    )
+    store = SimpleNamespace(
+        _db=db,
+        get_or_create_session=MagicMock(return_value=session_entry),
+    )
+    runner.__dict__["session_store"] = store
+    provider = MagicMock()
+    provider.is_available.return_value = True
+    provider.retain_persisted_session_lineage.return_value = {"queued": True}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"memory": {"provider": "hindsight"}})
+    monkeypatch.setattr("plugins.memory.load_memory_provider", lambda name: provider if name == "hindsight" else None)
 
     result = await runner._handle_retain_command(_make_event())
 
-    assert result == "当前会话还没有加载运行中的 Agent。/resume 后请先发送一条普通消息，再执行 /retain。"
+    assert result == "Buffered session turns queued for retain."
+    store.get_or_create_session.assert_called_once()
+    provider.initialize.assert_called_once()
+    init_kwargs = provider.initialize.call_args.kwargs
+    assert init_kwargs["session_id"] == "resumed-sid"
+    assert init_kwargs["gateway_session_key"] == session_key
+    assert init_kwargs["session_title"] == "Resumed Session"
+    provider.retain_persisted_session_lineage.assert_called_once_with(
+        session_id="resumed-sid",
+        parent_session_id="parent-sid",
+    )
 
 
 @pytest.mark.asyncio
-async def test_retain_command_reports_no_hindsight_provider_in_chinese():
+async def test_retain_command_reports_no_hindsight_provider_in_chinese(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"memory": {"provider": "builtin"}})
     runner = _make_runner()
     source = _make_source()
     session_key = build_session_key(source)

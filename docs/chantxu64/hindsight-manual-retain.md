@@ -56,6 +56,7 @@ hindsight_retain_turns
 - `auto_retain=true` 时，自动提交逻辑仍按原机制运行。
 - `auto_retain=false` 时，只写本地 SQLite，不自动提交到 Hindsight。
 - `/retain` 从当前 active `session_id` 出发，按 `parent_session_id` 往上找 lineage。
+- Gateway `/retain` 使用和普通消息相同的 `SessionStore.get_or_create_session(source)` 解析当前 `session_id`；因此 `/resume` 或 gateway 重启后，即使还没有 cached agent，也能识别当前会话。
 - 提交顺序是 root parent → ... → current child。
 - 提交内容来自 Hindsight provider 自己持久化的 turn payload，不包含 tool output、tool-call stub、内部推理或压缩 summary。
 - 不创建 `manual-session:*` 文档。
@@ -122,6 +123,7 @@ bank_id = current configured bank
 相关测试覆盖：
 
 - `/retain` Gateway handler 可从 cached agent 找到 Hindsight provider。
+- `/retain` Gateway handler 在没有 cached agent 时，会按普通消息路径从 `SessionStore` 解析当前 resumed/restarted session，并按当前 `memory.provider=hindsight` 加载 provider。
 - Gateway `/retain` 调用 provider 的 persisted lineage retain，而不是读取原始 SessionDB transcript。
 - `sync_turn()` 会持久化和自动 retain 同源的 turn payload。
 - local `bank_id` differences in `retain_turns.sqlite3` do not exclude persisted turns; `/retain` submits all matching session lineage turns to the currently configured Hindsight bank.
