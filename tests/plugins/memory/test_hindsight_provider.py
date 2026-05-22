@@ -208,6 +208,8 @@ class TestConfig:
         assert provider._retain_every_n_turns == 1
         assert provider._recall_max_tokens == 4096
         assert provider._recall_max_input_chars == 800
+        assert provider._recall_sync_on_cache_miss is True
+        assert provider._recall_sync_timeout_seconds == 5.0
         assert provider._tags is None
         assert provider._recall_tags is None
         assert provider._bank_mission == ""
@@ -231,6 +233,8 @@ class TestConfig:
             recall_types=["world", "experience"],
             recall_prompt_preamble="Custom preamble:",
             recall_max_input_chars=500,
+            recall_sync_on_cache_miss=False,
+            recall_sync_timeout_seconds=2.5,
             bank_mission="Test agent mission",
         )
         assert p._tags == ["tag1", "tag2"]
@@ -249,6 +253,8 @@ class TestConfig:
         assert p._recall_types == ["world", "experience"]
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
+        assert p._recall_sync_on_cache_miss is False
+        assert p._recall_sync_timeout_seconds == 2.5
         assert p._bank_mission == "Test agent mission"
 
     def test_config_from_env_fallback(self, tmp_path, monkeypatch):
@@ -858,7 +864,46 @@ class TestToolHandlers:
 
 
 class TestPrefetch:
-    def test_prefetch_returns_empty_when_no_result(self, provider):
+    def test_prefetch_returns_empty_when_no_result_and_sync_disabled(self, provider_with_config):
+        p = provider_with_config(recall_sync_on_cache_miss=False)
+        assert p.prefetch("test") == ""
+        p._client.arecall.assert_not_called()
+
+    def test_prefetch_cache_miss_sync_recalls_current_query(self, provider):
+        result = provider.prefetch("current user question")
+        assert "Hindsight Memory" in result
+        assert "Memory 1" in result
+        provider._client.arecall.assert_called_once()
+        call_kwargs = provider._client.arecall.call_args.kwargs
+        assert call_kwargs["query"] == "current user question"
+
+    def test_prefetch_sync_fallback_does_not_cache_for_next_turn(self, provider):
+        result = provider.prefetch("first turn")
+        assert "Memory 1" in result
+        provider._client.arecall.reset_mock()
+        provider._client.arecall.return_value = SimpleNamespace(results=[])
+        assert provider.prefetch("second turn") == ""
+        provider._client.arecall.assert_called_once()
+
+    def test_prefetch_sync_skipped_in_tools_mode(self, provider_with_config):
+        p = provider_with_config(memory_mode="tools")
+        assert p.prefetch("test") == ""
+        p._client.arecall.assert_not_called()
+
+    def test_prefetch_sync_skipped_when_auto_recall_off(self, provider_with_config):
+        p = provider_with_config(auto_recall=False)
+        assert p.prefetch("test") == ""
+        p._client.arecall.assert_not_called()
+
+    def test_prefetch_sync_reflect_mode(self, provider_with_config):
+        p = provider_with_config(recall_prefetch_method="reflect")
+        result = p.prefetch("summarize user")
+        assert "Synthesized answer" in result
+        p._client.areflect.assert_called_once()
+        assert p._client.areflect.call_args.kwargs["query"] == "summarize user"
+
+    def test_prefetch_sync_errors_are_best_effort(self, provider):
+        provider._client.arecall = AsyncMock(side_effect=RuntimeError("boom"))
         assert provider.prefetch("test") == ""
 
     def test_prefetch_default_preamble(self, provider):
@@ -922,6 +967,41 @@ class TestPrefetch:
         assert call_kwargs["tags"] == ["t1"]
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
+
+    def test_late_prefetch_generation_cannot_overwrite_newer_result(self, provider):
+        import threading
+
+        old_started = threading.Event()
+        release_old = threading.Event()
+
+        def _fake_recall(query, *, timeout=None):
+            if query == "old query":
+                old_started.set()
+                release_old.wait(timeout=5.0)
+                return "- old recall"
+            return "- new recall"
+
+        provider._recall_for_query = _fake_recall
+        provider.queue_prefetch("old query")
+        assert old_started.wait(timeout=5.0)
+        old_thread = provider._prefetch_thread
+
+        provider.queue_prefetch("new query")
+        new_thread = provider._prefetch_thread
+        new_thread.join(timeout=5.0)
+        release_old.set()
+        old_thread.join(timeout=5.0)
+
+        assert provider._prefetch_result == "- new recall"
+
+    def test_queue_prefetch_clears_cached_result_when_new_generation_returns_empty(self, provider):
+        provider._prefetch_result = "- old cached recall"
+        provider._recall_for_query = lambda query, *, timeout=None: ""
+
+        provider.queue_prefetch("new query")
+        provider._prefetch_thread.join(timeout=5.0)
+
+        assert provider._prefetch_result == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1277,14 +1357,23 @@ class TestSessionSwitchBufferFlush:
         provider._client.aretain_batch.assert_not_called()
         assert provider._session_id == "new-sid"
 
-    def test_prefetch_result_cleared_on_switch(self, provider):
+    def test_prefetch_result_cleared_on_switch(self, provider_with_config):
         """Stale recall text from the old session must not leak into the
         next session's first prefetch read."""
+        provider = provider_with_config(recall_sync_on_cache_miss=False)
         provider._prefetch_result = "old-session recall: User likes Rust"
         provider.on_session_switch("new-sid")
         assert provider._prefetch_result == ""
         # And subsequent prefetch() should now report empty, not the leftover.
         assert provider.prefetch("anything") == ""
+
+    def test_first_prefetch_after_switch_sync_recalls_new_query(self, provider):
+        provider._prefetch_result = "old-session recall"
+        provider.on_session_switch("new-sid")
+        result = provider.prefetch("new-session question")
+        assert "Memory 1" in result
+        assert "old-session recall" not in result
+        assert provider._client.arecall.call_args.kwargs["query"] == "new-session question"
 
     def test_in_flight_prefetch_thread_drained_on_switch(self, provider, monkeypatch):
         """on_session_switch must wait for an in-flight prefetch from the

@@ -308,6 +308,50 @@ Merge protection:
 
 Upstream status: fork-only.
 
+### 8. Hindsight synchronous cache-miss recall
+
+Date: 2026-05-22
+
+Files:
+
+- `plugins/memory/hindsight/__init__.py`
+- `tests/plugins/memory/test_hindsight_provider.py`
+- `tests/agent/test_memory_session_switch.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+What changed:
+
+- Hindsight auto-recall now has a bounded synchronous fallback when the prefetch
+  cache is empty, so the first user turn in a new session or after compression can
+  receive `<memory-context>` instead of waiting for the previous-turn prefetch.
+- Added `recall_sync_on_cache_miss` and `recall_sync_timeout_seconds` provider
+  settings. Defaults: enabled, 5 seconds.
+- Background prefetch results are guarded by a generation counter so late results
+  from an old query/session cannot overwrite newer recall context.
+- Shared recall/reflect parameter handling now lives in a single helper used by
+  both sync fallback and background prefetch.
+
+Why it matters:
+
+- The user expects `auto_recall=true` to include relevant Hindsight memory on the
+  first turn of fresh sessions and compression-created continuation sessions.
+- Compression/session switches must still clear stale recall, while allowing the
+  next current query to recall safely.
+
+Merge protection:
+
+- Preserve generation checks when refactoring Hindsight prefetch; clearing
+  `_prefetch_result` alone does not stop a late background thread from writing
+  stale context.
+- Preserve a short timeout for synchronous fallback; do not reuse the general
+  Hindsight API timeout for first-turn recall.
+- Preserve tests covering cache-miss sync recall, tools/auto_recall guards,
+  reflect mode, and late prefetch generation discard.
+
+Feature docs: `docs/chantxu64/hindsight-sync-cache-miss-recall/README.md`
+
+Upstream status: fork-only.
+
 ## Historical / reverted modifications
 
 
@@ -477,10 +521,11 @@ Upstream status: fork-only.
 Compared with the upstream parent of the latest completed fork sync, active fork
 deltas are expected in these areas:
 
-- Hindsight Unicode support / manual session retain:
+- Hindsight Unicode support / manual session retain / synchronous cache-miss recall:
   - `.gitignore`
   - `plugins/memory/hindsight/__init__.py`
   - `tests/plugins/memory/test_hindsight_provider.py`
+  - `tests/agent/test_memory_session_switch.py`
   - `hermes_cli/commands.py`
   - `tests/hermes_cli/test_commands.py`
   - `cli.py`
@@ -521,9 +566,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 10 major entries.
+Documented entries: 11 major entries.
 
-Active functional areas: 8.
+Active functional areas: 9.
 
 Historical reverted areas: 1.
 

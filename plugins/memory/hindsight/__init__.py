@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import concurrent.futures
 import importlib
 import json
 import logging
@@ -83,6 +84,33 @@ def _parse_int_setting(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         logger.warning("Invalid integer Hindsight setting %r; using default %s", value, default)
         return default
+
+
+def _parse_float_setting(value: Any, default: float) -> float:
+    """Parse a float config/env value, falling back on invalid input."""
+    if value is None or value == "":
+        return default
+    try:
+        parsed = float(value)
+        return parsed if parsed > 0 else default
+    except (TypeError, ValueError):
+        logger.warning("Invalid float Hindsight setting %r; using default %s", value, default)
+        return default
+
+
+def _parse_bool_setting(value: Any, default: bool) -> bool:
+    """Parse a boolean config/env value, accepting common string forms."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
 
 
 def _check_local_runtime() -> tuple[bool, str | None]:
@@ -228,7 +256,11 @@ def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT):
     future = safe_schedule_threadsafe(coro, loop)
     if future is None:
         raise RuntimeError("Hindsight loop unavailable")
-    return future.result(timeout=timeout)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +595,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
+        self._prefetch_thread_generation = 0
+        self._prefetch_generation = 0
         # Single-writer model for retain. sync_turn() enqueues; the writer
         # thread drains sequentially. Avoids spawning ad-hoc threads that
         # can race the interpreter shutdown and emit "cannot schedule new
@@ -603,6 +637,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types: list[str] | None = None
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
+        self._recall_sync_on_cache_miss = True
+        self._recall_sync_timeout_seconds = 5.0
 
         # Bank
         self._bank_mission = ""
@@ -884,6 +920,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
+            {"key": "recall_sync_on_cache_miss", "description": "Synchronously recall on first/cache-miss prefetch", "default": True},
+            {"key": "recall_sync_timeout_seconds", "description": "Short timeout for synchronous cache-miss recall", "default": 5},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -941,9 +979,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._client = Hindsight(**kwargs)
         return self._client
 
-    def _run_sync(self, coro):
+    def _run_sync(self, coro, timeout: float | None = None):
         """Schedule *coro* on the shared loop using the configured timeout."""
-        return _run_sync(coro, timeout=self._timeout)
+        return _run_sync(coro, timeout=timeout if timeout is not None else self._timeout)
 
     def _is_retriable_embedded_connection_error(self, exc: Exception) -> bool:
         """Return True for stale embedded-daemon connection failures."""
@@ -1027,11 +1065,11 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Hindsight atexit shutdown failed: %s", exc)
 
-    def _run_hindsight_operation(self, operation):
+    def _run_hindsight_operation(self, operation, *, timeout: float | None = None):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
         client = self._get_client()
         try:
-            return self._run_sync(operation(client))
+            return self._run_sync(operation(client), timeout=timeout)
         except Exception as exc:
             if not self._is_retriable_embedded_connection_error(exc):
                 raise
@@ -1042,7 +1080,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = None
             client = self._get_client()
             self._client = client
-            return self._run_sync(operation(client))
+            return self._run_sync(operation(client), timeout=timeout)
 
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
@@ -1220,6 +1258,14 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types = self._config.get("recall_types") or None
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
+        self._recall_sync_on_cache_miss = _parse_bool_setting(
+            self._config.get("recall_sync_on_cache_miss"),
+            True,
+        )
+        self._recall_sync_timeout_seconds = _parse_float_setting(
+            self._config.get("recall_sync_timeout_seconds"),
+            5.0,
+        )
         self._retain_async = self._config.get("retain_async", True)
 
         _client_version = "unknown"
@@ -1308,23 +1354,83 @@ class HindsightMemoryProvider(MemoryProvider):
             f"hindsight_retain to store facts."
         )
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            logger.debug("Prefetch: waiting for background thread to complete")
-            self._prefetch_thread.join(timeout=3.0)
-        with self._prefetch_lock:
-            result = self._prefetch_result
-            self._prefetch_result = ""
-        if not result:
-            logger.debug("Prefetch: no results available")
-            return ""
-        logger.debug("Prefetch: returning %d chars of context", len(result))
+    def _format_prefetch_context(self, result: str) -> str:
         header = self._recall_prompt_preamble or (
             "# Hindsight Memory (persistent cross-session context)\n"
             "Use this to answer questions about the user and prior sessions. "
             "Do not call tools to look up information that is already present here."
         )
         return f"{header}\n\n{result}"
+
+    def _recall_for_query(self, query: str, *, timeout: float | None = None) -> str:
+        query = str(query or "").strip()
+        if not query:
+            return ""
+        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
+            query = query[:self._recall_max_input_chars]
+        if self._prefetch_method == "reflect":
+            logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
+            resp = self._run_hindsight_operation(
+                lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget),
+                timeout=timeout,
+            )
+            return resp.text or ""
+
+        recall_kwargs: dict = {
+            "bank_id": self._bank_id,
+            "query": query,
+            "budget": self._budget,
+            "max_tokens": self._recall_max_tokens,
+        }
+        if self._recall_tags:
+            recall_kwargs["tags"] = self._recall_tags
+            recall_kwargs["tags_match"] = self._recall_tags_match
+        if self._recall_types:
+            recall_kwargs["types"] = self._recall_types
+        logger.debug(
+            "Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
+            self._bank_id, len(query), self._budget,
+        )
+        resp = self._run_hindsight_operation(
+            lambda client: client.arecall(**recall_kwargs),
+            timeout=timeout,
+        )
+        num_results = len(resp.results) if resp.results else 0
+        logger.debug("Prefetch: recall returned %d results", num_results)
+        return "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        thread = self._prefetch_thread
+        thread_generation = self._prefetch_thread_generation
+        if thread and thread.is_alive() and thread_generation == self._prefetch_generation:
+            logger.debug("Prefetch: waiting for background thread to complete")
+            thread.join(timeout=3.0)
+            if thread.is_alive():
+                logger.debug("Prefetch: background thread still running; skipping sync fallback")
+                return ""
+        with self._prefetch_lock:
+            result = self._prefetch_result
+            self._prefetch_result = ""
+        if not result:
+            if (
+                self._memory_mode == "tools"
+                or not self._auto_recall
+                or self._shutting_down.is_set()
+                or not self._recall_sync_on_cache_miss
+                or not str(query or "").strip()
+            ):
+                logger.debug("Prefetch: no results available")
+                return ""
+            try:
+                result = self._recall_for_query(query, timeout=self._recall_sync_timeout_seconds)
+            except Exception as e:
+                logger.debug("Hindsight sync prefetch failed: %s", e, exc_info=True)
+                return ""
+            if not result:
+                logger.debug("Prefetch: sync fallback returned no results")
+                return ""
+        logger.debug("Prefetch: returning %d chars of context", len(result))
+        return self._format_prefetch_context(result)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
@@ -1336,39 +1442,31 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._shutting_down.is_set():
             logger.debug("Prefetch: skipped (shutting down)")
             return
-        # Truncate query to max chars
-        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
-            query = query[:self._recall_max_input_chars]
+        query = str(query or "").strip()
+        if not query:
+            return
+        with self._prefetch_lock:
+            self._prefetch_generation += 1
+            generation = self._prefetch_generation
+            # A new queued query supersedes any previously cached recall.
+            # If this generation returns no text, the next prefetch() should
+            # sync-recall the current query instead of consuming stale context.
+            self._prefetch_result = ""
 
         def _run():
             try:
-                if self._prefetch_method == "reflect":
-                    logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
-                    text = resp.text or ""
-                else:
-                    recall_kwargs: dict = {
-                        "bank_id": self._bank_id, "query": query,
-                        "budget": self._budget, "max_tokens": self._recall_max_tokens,
-                    }
-                    if self._recall_tags:
-                        recall_kwargs["tags"] = self._recall_tags
-                        recall_kwargs["tags_match"] = self._recall_tags_match
-                    if self._recall_types:
-                        recall_kwargs["types"] = self._recall_types
-                    logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
-                                 self._bank_id, len(query), self._budget)
-                    resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                    num_results = len(resp.results) if resp.results else 0
-                    logger.debug("Prefetch: recall returned %d results", num_results)
-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+                text = self._recall_for_query(query)
                 if text:
                     with self._prefetch_lock:
-                        self._prefetch_result = text
+                        if generation == self._prefetch_generation:
+                            self._prefetch_result = text
+                        else:
+                            logger.debug("Prefetch: discarded stale generation %s", generation)
             except Exception as e:
                 logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
+        self._prefetch_thread_generation = generation
         self._prefetch_thread.start()
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
@@ -1948,6 +2046,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
+            self._prefetch_generation += 1
             self._prefetch_result = ""
 
         # 3. Now rotate to the new session.

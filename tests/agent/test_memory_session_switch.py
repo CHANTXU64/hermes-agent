@@ -212,6 +212,12 @@ def _make_hindsight_provider():
     provider._parent_session_id = ""
     provider._document_id = "old-sid-20260101_000000_000000"
     provider._session_turns = ["turn-1", "turn-2"]
+    provider._last_flushed_turn_count = 0
+    provider._last_queued_flush_count = 2
+    provider._retain_flush_pending = False
+    provider._retain_generation = 0
+    provider._retain_flush_lock = threading.Lock()
+    provider._auto_retain = True
     provider._turn_counter = 2
     provider._turn_index = 2
     # Attrs read by _build_metadata / _build_retain_kwargs when the
@@ -233,6 +239,8 @@ def _make_hindsight_provider():
     provider._bank_id = "test-bank"
     # Prefetch state the switch path drains/clears.
     provider._prefetch_thread = None
+    provider._prefetch_thread_generation = 0
+    provider._prefetch_generation = 0
     provider._prefetch_lock = threading.Lock()
     provider._prefetch_result = ""
     # Sync thread tracking (legacy alias at the writer).
