@@ -273,6 +273,26 @@ def _normalize_mlx_model(model_name: Optional[str]) -> str:
     return MLX_MODEL_ALIASES.get(model_name, model_name)
 
 
+def _try_lazy_install_stt() -> bool:
+    """Attempt to lazy-install faster-whisper and return True on success.
+
+    The module-level ``_HAS_FASTER_WHISPER`` flag is set at import time and
+    cached. If the package wasn't installed at startup, calling ``ensure()``
+    installs it. This function re-checks dynamically after installation so
+    the provider can use it immediately without a process restart.
+    """
+    try:
+        from tools.lazy_deps import ensure
+        ensure("stt.faster_whisper")
+        # Re-check dynamically after install
+        import importlib.util as _iu
+        if _iu.find_spec("faster_whisper"):
+            return True
+    except Exception as exc:
+        logger.debug("Lazy install of faster-whisper failed: %s", exc)
+    return False
+
+
 def _get_provider(stt_config: dict) -> str:
     """Determine which STT provider to use.
 
@@ -306,6 +326,9 @@ def _get_provider(stt_config: dict) -> str:
                 return "local"
             if _has_local_command():
                 return "local_command"
+            # Try lazy-install before giving up
+            if _try_lazy_install_stt():
+                return "local"
             logger.warning(
                 "STT provider 'local' configured but unavailable "
                 "(install faster-whisper or set HERMES_LOCAL_STT_COMMAND)"
@@ -390,6 +413,9 @@ def _get_provider(stt_config: dict) -> str:
             return "mlx_whisper"
     if _has_local_command():
         return "local_command"
+    # Try lazy-install before falling through to cloud providers
+    if _try_lazy_install_stt():
+        return "local"
     if _HAS_OPENAI and get_env_value("GROQ_API_KEY"):
         logger.info("No local STT available, using Groq Whisper API")
         return "groq"
@@ -508,7 +534,8 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
     global _local_model, _local_model_name
 
     if not _HAS_FASTER_WHISPER:
-        return {"success": False, "transcript": "", "error": "faster-whisper not installed"}
+        if not _try_lazy_install_stt():
+            return {"success": False, "transcript": "", "error": "faster-whisper not installed"}
 
     try:
         # Lazy-load the model (downloads on first use, ~150 MB for 'base')
