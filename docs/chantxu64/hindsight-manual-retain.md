@@ -78,7 +78,7 @@ A 的 persisted retain turns
 
 因此不需要赶在压缩前手动 `/retain`。
 
-## document_id 和 metadata
+## document_id / bank / metadata
 
 默认使用当前 leaf session 作为 document：
 
@@ -86,14 +86,21 @@ A 的 persisted retain turns
 document_id = current session_id
 ```
 
-metadata 会带 lineage 信息：
+提交到哪个 Hindsight Bank 只看 `/retain` 执行时的当前配置：
 
 ```text
-session_id = current leaf session
-root_session_id = lineage root
-lineage_session_ids = root,...,current
-parent_session_id = current parent, if known
+bank_id = current configured bank
 ```
+
+本地 `retain_turns.sqlite3` 里的历史 `bank_id` 不参与读取过滤；它只是当时写入时的记录，避免因 `hermes` / `Hermes` 这类大小写或配置变化丢 turn。
+
+手动 `/retain` 的 item 保持干净，只提交：
+
+```json
+{"content": "..."}
+```
+
+不额外塞 `metadata`、`tags`、`context`。
 
 ## 重复提交
 
@@ -117,7 +124,8 @@ parent_session_id = current parent, if known
 - `/retain` Gateway handler 可从 cached agent 找到 Hindsight provider。
 - Gateway `/retain` 调用 provider 的 persisted lineage retain，而不是读取原始 SessionDB transcript。
 - `sync_turn()` 会持久化和自动 retain 同源的 turn payload。
-- child session `/retain` 会包含 parent + child lineage turns。
+- local `bank_id` differences in `retain_turns.sqlite3` do not exclude persisted turns; `/retain` submits all matching session lineage turns to the currently configured Hindsight bank.
+- Manual `/retain` submits a clean item containing `content` only, with no extra metadata/tags/context.
 - 没有 persisted turns 时不提交。
 - `get_tool_schemas()` 不暴露 `hindsight_retain_session`。
 - legacy buffer flush 的 append/pending/失败回滚/generation guard 回归测试仍保留，避免自动 retain 路径退化。

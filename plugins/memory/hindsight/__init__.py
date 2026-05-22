@@ -1448,11 +1448,11 @@ class HindsightMemoryProvider(MemoryProvider):
                         """
                         SELECT parent_session_id
                         FROM hindsight_retain_turns
-                        WHERE bank_id = ? AND session_id = ?
+                        WHERE session_id = ?
                         ORDER BY id DESC
                         LIMIT 1
                         """,
-                        (self._bank_id, current),
+                        (current,),
                     ).fetchone()
                     parent = str(row[0] if row and row[0] else "").strip()
                     if not parent and current == lineage[0]:
@@ -1480,10 +1480,10 @@ class HindsightMemoryProvider(MemoryProvider):
                         """
                         SELECT turn_json
                         FROM hindsight_retain_turns
-                        WHERE bank_id = ? AND session_id = ?
+                        WHERE session_id = ?
                         ORDER BY id ASC
                         """,
-                        (self._bank_id, sid),
+                        (sid,),
                     ).fetchall()
                     turns.extend(str(row[0]) for row in rows if row and row[0])
         except Exception as e:
@@ -1572,38 +1572,12 @@ class HindsightMemoryProvider(MemoryProvider):
             fallback_document_id = f"{target_session_id}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         document_id, update_mode = self._resolve_retain_target_for_session(target_session_id, fallback_document_id)
         content = "[" + ",".join(turns) + "]"
-        lineage_tags: list[str] = []
-        if target_session_id:
-            lineage_tags.append(f"session:{target_session_id}")
-        if lineage:
-            lineage_tags.append(f"root_session:{lineage[0]}")
-
-        metadata_snapshot = self._build_metadata(
-            message_count=len(turns) * 2,
-            turn_index=len(turns),
-        )
-        if target_session_id:
-            metadata_snapshot["session_id"] = target_session_id
-        if lineage:
-            metadata_snapshot["root_session_id"] = lineage[0]
-            metadata_snapshot["lineage_session_ids"] = ",".join(lineage)
-        if parent_id:
-            metadata_snapshot["parent_session_id"] = parent_id
-
         bank_id = self._bank_id
         retain_async_flag = self._retain_async
-        retain_context = self._retain_context
         num_turns = len(turns)
 
         def _do_retain() -> None:
-            item = self._build_retain_kwargs(
-                content,
-                context=retain_context,
-                metadata=metadata_snapshot,
-                tags=lineage_tags or None,
-            )
-            item.pop("bank_id", None)
-            item.pop("retain_async", None)
+            item: Dict[str, Any] = {"content": content}
             if update_mode is not None:
                 item["update_mode"] = update_mode
             logger.debug(

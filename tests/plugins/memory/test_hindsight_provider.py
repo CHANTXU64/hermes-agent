@@ -539,7 +539,7 @@ class TestToolHandlers:
         ))
         assert "error" in result
 
-    def test_retain_session_flushes_buffered_turns_with_normal_metadata_and_tags(self, provider_with_config):
+    def test_retain_session_flushes_persisted_turns_cleanly(self, provider_with_config):
         p = provider_with_config(auto_retain=False, retain_tags=["configured-tag"])
         p.sync_turn("你好", "收到")
         p._client.aretain_batch.assert_not_called()
@@ -552,8 +552,9 @@ class TestToolHandlers:
         assert call_kwargs["bank_id"] == "test-bank"
         assert call_kwargs["document_id"].startswith("test-session-")
         item = call_kwargs["items"][0]
-        assert item["metadata"]["session_id"] == "test-session"
-        assert item["tags"] == ["configured-tag", "session:test-session", "root_session:test-session"]
+        assert "metadata" not in item
+        assert "tags" not in item
+        assert "context" not in item
         assert "你好" in item["content"]
         assert "\\u4f60" not in item["content"]
 
@@ -761,15 +762,39 @@ class TestToolHandlers:
         assert kw["document_id"] == "child-session"
         item = kw["items"][0]
         assert item["update_mode"] == "append"
-        assert item["metadata"]["session_id"] == "child-session"
-        assert item["metadata"]["root_session_id"] == "root-session"
-        assert item["metadata"]["lineage_session_ids"] == "root-session,child-session"
+        assert "metadata" not in item
+        assert "tags" not in item
+        assert "context" not in item
         assert "User: root user" in item["content"]
         assert "Assistant: root assistant" in item["content"]
         assert "User: child user" in item["content"]
         assert "Assistant: child assistant" in item["content"]
         assert "tool output" not in item["content"]
         assert p._retain_store_path.name == "retain_turns.sqlite3"
+
+    def test_persisted_retain_ignores_stored_bank_id_and_submits_current_bank(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        p._bank_id = "hermes"
+        p.sync_turn("old bank user", "old bank assistant")
+        p._bank_id = "Hermes"
+        p.sync_turn("new bank user", "new bank assistant")
+
+        info = p.retain_persisted_session_lineage(session_id="test-session")
+        p._retain_queue.join()
+
+        assert info["turn_count"] == 2
+        kw = p._client.aretain_batch.call_args.kwargs
+        assert kw["bank_id"] == "Hermes"
+        content = kw["items"][0]["content"]
+        assert "old bank user" in content
+        assert "new bank user" in content
 
     def test_persisted_retain_without_turns_returns_message(self, provider_with_config):
         p = provider_with_config(auto_retain=False)
