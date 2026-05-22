@@ -77,9 +77,22 @@ async def test_retain_command_flushes_cached_agent_provider():
 
 
 @pytest.mark.asyncio
-async def test_retain_command_reports_no_provider():
+async def test_retain_command_reports_no_loaded_agent_in_chinese():
     runner = _make_runner()
 
     result = await runner._handle_retain_command(_make_event())
 
-    assert result == "Hindsight memory provider is not active for this session."
+    assert result == "当前会话还没有加载运行中的 Agent。/resume 后请先发送一条普通消息，再执行 /retain。"
+
+
+@pytest.mark.asyncio
+async def test_retain_command_reports_no_hindsight_provider_in_chinese():
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+    memory_manager = SimpleNamespace(get_provider=lambda name: None)
+    runner._agent_cache[session_key] = (SimpleNamespace(_memory_manager=memory_manager), "sig")
+
+    result = await runner._handle_retain_command(_make_event())
+
+    assert result == "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。"

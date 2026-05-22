@@ -9210,10 +9210,12 @@ class GatewayRunner:
                 with cache_lock:
                     cached = cache.get(session_key)
                     agent = cached[0] if isinstance(cached, tuple) else cached if cached else None
-        memory_manager = getattr(agent, "_memory_manager", None) if agent is not None else None
+        if agent is None:
+            return "当前会话还没有加载运行中的 Agent。/resume 后请先发送一条普通消息，再执行 /retain。"
+        memory_manager = getattr(agent, "_memory_manager", None)
         provider = memory_manager.get_provider("hindsight") if memory_manager else None
         if not provider or not (hasattr(provider, "retain_persisted_session_lineage") or hasattr(provider, "flush_retained_turns")):
-            return "Hindsight memory provider is not active for this session."
+            return "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。"
         try:
             data = None
             session_id = str(getattr(agent, "session_id", "") or getattr(provider, "_session_id", "") or "").strip()
