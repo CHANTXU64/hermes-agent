@@ -113,6 +113,7 @@ Commit: `ae8c0acd`
 Files:
 
 - `tools/transcription_tools.py`
+- `agent/transcription_registry.py`
 
 What changed:
 
@@ -132,6 +133,8 @@ Merge protection:
 
 - Preserve `_HAS_MLX_WHISPER`, `_normalize_mlx_model`, and
   `_transcribe_mlx_whisper` behavior unless upstream provides an equivalent.
+- Preserve `mlx_whisper` as a native/built-in STT provider name in
+  `agent/transcription_registry.py` if upstream adds plugin dispatch around STT.
 - Confirm provider selection still supports explicit `stt.provider: mlx_whisper`.
 
 Upstream status: fork adaptation of upstream STT work.
@@ -479,6 +482,7 @@ Files:
 - `tests/tools/test_transcription.py`
 - `tests/tools/test_transcription_dotenv_fallback.py`
 - `hermes_cli/config.py`
+- `agent/transcription_registry.py`
 
 Summary:
 
@@ -500,6 +504,9 @@ Why it matters:
 Merge protection:
 
 - Preserve explicit `stt.provider: custom_api` behavior and do not silently fall back to another STT provider when custom credentials are missing.
+- Preserve `custom_api` as a native/built-in STT provider name in
+  `agent/transcription_registry.py`; command providers and plugin providers must
+  not shadow the fork's configured custom STT implementation.
 - Preserve `api_key_env` lookup through `get_env_value()` so keys in `~/.hermes/.env` work.
 - Preserve the Qwen ASR configuration shape: `QWEN_API_KEY`, model `qwen3-asr-flash-2026-02-10`, DashScope compatible base URL, and `/chat/completions` mode.
 - Preserve response parsing for both OpenAI-style `{text: ...}` and chat-style `choices[0].message.content` responses unless upstream has a verified equivalent.
@@ -539,6 +546,7 @@ deltas are expected in these areas:
   - `hermes_cli/runtime_provider.py`
 - MLX Whisper STT / custom STT API:
   - `tools/transcription_tools.py`
+  - `agent/transcription_registry.py`
   - `tests/tools/test_transcription.py`
   - `tests/tools/test_transcription_dotenv_fallback.py`
   - `hermes_cli/config.py`
