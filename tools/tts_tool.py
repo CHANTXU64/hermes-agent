@@ -10,6 +10,7 @@ Built-in TTS providers:
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
 - xAI TTS: Grok voices, uses xAI Grok OAuth credentials or XAI_API_KEY
+- Custom API TTS: configurable HTTP endpoint, defaults to Qwen/DashScope
 - NeuTTS (local, free, no API key): On-device TTS via neutts
 - KittenTTS (local, free, no API key): On-device 25MB model
 - Piper (local, free, no API key): OHF-Voice/piper1-gpl neural VITS, 44 languages
@@ -177,6 +178,10 @@ DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 DEFAULT_GEMINI_TTS_VOICE = "Kore"
 DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_CUSTOM_API_TTS_MODEL = os.getenv("TTS_CUSTOM_API_MODEL", "qwen3-tts-flash")
+DEFAULT_CUSTOM_API_TTS_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
+DEFAULT_CUSTOM_API_TTS_ENDPOINT = "/services/aigc/multimodal-generation/generation"
+DEFAULT_CUSTOM_API_TTS_VOICE = os.getenv("TTS_CUSTOM_API_VOICE", "Cherry")
 # PCM output specs for Gemini TTS (fixed by the API)
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
@@ -202,6 +207,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "minimax": 10000,     # https://platform.minimax.io/docs/api-reference/speech-t2a-http (sync)
     "mistral": 4000,      # conservative; no published per-request cap
     "gemini": 5000,       # Gemini TTS caps at ~8k input tokens / ~655s audio
+    "custom_api": 10000,  # generic OpenAI-compatible TTS endpoint; user override wins
     "elevenlabs": 10000,  # fallback when model-aware lookup can't resolve (multilingual_v2)
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
@@ -349,6 +355,7 @@ BUILTIN_TTS_PROVIDERS = frozenset({
     "xai",
     "mistral",
     "gemini",
+    "custom_api",
     "neutts",
     "kittentts",
     "piper",
@@ -1510,6 +1517,264 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
 
 
 # ===========================================================================
+# Provider: Custom API TTS (DashScope multimodal or OpenAI-compatible audio/speech)
+# ===========================================================================
+def _resolve_custom_api_tts_config(tts_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Resolve config for a custom TTS HTTP endpoint.
+
+    The defaults target Alibaba Cloud DashScope Qwen TTS and reuse
+    ``QWEN_API_KEY`` to match the custom STT defaults.  Users can override
+    every field under ``tts.custom_api``; ``mode: audio_speech`` keeps a generic
+    OpenAI-compatible ``/audio/speech`` request shape available.
+    """
+    cfg = tts_config or {}
+    custom_cfg = cfg.get("custom_api", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(custom_cfg, dict):
+        custom_cfg = {}
+
+    base_url = str(
+        custom_cfg.get("base_url")
+        or get_env_value("TTS_CUSTOM_API_BASE_URL")
+        or DEFAULT_CUSTOM_API_TTS_BASE_URL
+    ).strip().rstrip("/")
+    endpoint = str(
+        custom_cfg.get("endpoint")
+        or get_env_value("TTS_CUSTOM_API_ENDPOINT")
+        or DEFAULT_CUSTOM_API_TTS_ENDPOINT
+    ).strip()
+    if endpoint and not endpoint.startswith("/"):
+        endpoint = f"/{endpoint}"
+
+    api_key = str(custom_cfg.get("api_key") or "").strip()
+    api_key_env = str(custom_cfg.get("api_key_env") or "QWEN_API_KEY").strip()
+    if not api_key and api_key_env:
+        api_key = str(get_env_value(api_key_env) or "").strip()
+
+    model = str(
+        custom_cfg.get("model")
+        or get_env_value("TTS_CUSTOM_API_MODEL")
+        or DEFAULT_CUSTOM_API_TTS_MODEL
+    ).strip()
+    voice = str(
+        custom_cfg.get("voice")
+        or custom_cfg.get("voice_id")
+        or get_env_value("TTS_CUSTOM_API_VOICE")
+        or DEFAULT_CUSTOM_API_TTS_VOICE
+    ).strip()
+    mode = str(
+        custom_cfg.get("mode")
+        or get_env_value("TTS_CUSTOM_API_MODE")
+        or ""
+    ).strip().lower()
+    if not mode:
+        mode = "dashscope_multimodal" if "multimodal-generation" in endpoint else "audio_speech"
+
+    response_format = str(
+        custom_cfg.get("response_format")
+        or custom_cfg.get("format")
+        or get_env_value("TTS_CUSTOM_API_RESPONSE_FORMAT")
+        or ""
+    ).strip().lower().lstrip(".")
+    try:
+        speed = float(custom_cfg.get("speed", get_env_value("TTS_CUSTOM_API_SPEED", 1.0)))
+    except (TypeError, ValueError):
+        speed = 1.0
+    try:
+        timeout = float(custom_cfg.get("timeout", get_env_value("TTS_CUSTOM_API_TIMEOUT", 120)))
+    except (TypeError, ValueError):
+        timeout = 120.0
+
+    extra_body = custom_cfg.get("extra_body", {})
+    if not isinstance(extra_body, dict):
+        extra_body = {}
+    language_type = str(
+        custom_cfg.get("language_type")
+        or get_env_value("TTS_CUSTOM_API_LANGUAGE_TYPE")
+        or ""
+    ).strip()
+
+    return {
+        "base_url": base_url,
+        "endpoint": endpoint,
+        "api_key": api_key,
+        "api_key_env": api_key_env,
+        "model": model,
+        "mode": mode,
+        "voice": voice,
+        "response_format": response_format,
+        "speed": speed,
+        "timeout": timeout,
+        "extra_body": extra_body,
+        "language_type": language_type,
+    }
+
+
+def _custom_api_response_format(output_path: str, cfg: Dict[str, Any]) -> str:
+    """Return the response_format sent to the custom TTS API."""
+    if cfg.get("response_format"):
+        return str(cfg["response_format"]).lower().lstrip(".")
+    suffix = Path(output_path).suffix.lower().lstrip(".")
+    if suffix == "ogg":
+        return "opus"
+    return suffix or "mp3"
+
+
+def _extract_custom_api_audio_bytes(response: Any) -> bytes:
+    """Extract raw audio bytes from a custom TTS HTTP response."""
+    content_type = response.headers.get("Content-Type", "")
+    if "audio/" in content_type or "application/octet-stream" in content_type:
+        return response.content
+
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Custom TTS API returned unexpected Content-Type '{content_type}' "
+            f"({len(response.content)} bytes)"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError("Custom TTS API JSON response was not an object")
+
+    # Common shapes seen in OpenAI-compatible / provider-specific audio APIs:
+    # {"audio": "<base64>"}, {"data": {"audio": "..."}},
+    # {"data": [{"audio": "..."}]}, {"audio_data": "..."}.
+    candidates: list[Any] = [
+        data.get("audio"),
+        data.get("audio_data"),
+        data.get("b64_json"),
+    ]
+    nested = data.get("data")
+    if isinstance(nested, dict):
+        candidates.extend([
+            nested.get("audio"),
+            nested.get("audio_data"),
+            nested.get("b64_json"),
+        ])
+    elif isinstance(nested, list) and nested:
+        first = nested[0]
+        if isinstance(first, dict):
+            candidates.extend([
+                first.get("audio"),
+                first.get("audio_data"),
+                first.get("b64_json"),
+            ])
+
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            raw = candidate.strip()
+            if raw.startswith("data:") and "," in raw:
+                raw = raw.split(",", 1)[1]
+            try:
+                return base64.b64decode(raw)
+            except Exception as exc:
+                raise RuntimeError("Custom TTS API returned invalid base64 audio") from exc
+
+    error = data.get("error")
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("msg")
+        if message:
+            raise RuntimeError(f"Custom TTS API error: {message}")
+    raise RuntimeError("Custom TTS API returned no audio data")
+
+
+def _generate_custom_api_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate audio through a custom OpenAI-compatible TTS API."""
+    import requests
+
+    cfg = _resolve_custom_api_tts_config(tts_config)
+    if not cfg["base_url"]:
+        raise ValueError("tts.custom_api.base_url not set")
+    if not cfg["api_key"]:
+        raise ValueError(
+            f"tts.custom_api.api_key not set and {cfg['api_key_env']} is unavailable"
+        )
+    if not cfg["model"]:
+        raise ValueError("tts.custom_api.model not set")
+    if not cfg["voice"]:
+        raise ValueError("tts.custom_api.voice not set")
+
+    if cfg["mode"] == "dashscope_multimodal":
+        input_payload: Dict[str, Any] = {
+            "text": text,
+            "voice": cfg["voice"],
+        }
+        if cfg.get("language_type"):
+            input_payload["language_type"] = cfg["language_type"]
+        payload: Dict[str, Any] = {
+            "model": cfg["model"],
+            "input": input_payload,
+        }
+    else:
+        response_format = _custom_api_response_format(output_path, cfg)
+        payload = {
+            "model": cfg["model"],
+            "input": text,
+            "voice": cfg["voice"],
+            "response_format": response_format,
+        }
+        if cfg["speed"] != 1.0:
+            payload["speed"] = max(0.25, min(4.0, cfg["speed"]))
+    payload.update(cfg.get("extra_body") or {})
+
+    response = requests.post(
+        f"{cfg['base_url']}{cfg['endpoint']}",
+        headers={
+            "Authorization": f"Bearer {cfg['api_key']}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=cfg["timeout"],
+    )
+    if response.status_code != 200:
+        try:
+            err_body = response.json()
+            error = err_body.get("error", {}) if isinstance(err_body, dict) else {}
+            detail = error.get("message", "") if isinstance(error, dict) else ""
+            detail = detail or response.text[:300]
+        except Exception:
+            detail = response.text[:300]
+        raise RuntimeError(
+            f"Custom TTS API error (HTTP {response.status_code}): {detail}"
+        )
+
+    audio_url = ""
+    if cfg["mode"] == "dashscope_multimodal":
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
+        if isinstance(data, dict):
+            output_obj = data.get("output")
+            output = output_obj if isinstance(output_obj, dict) else {}
+            audio_obj = output.get("audio")
+            audio = audio_obj if isinstance(audio_obj, dict) else {}
+            audio_url = str(audio.get("url") or "").strip()
+            audio_data = str(audio.get("data") or "").strip()
+            if audio_data:
+                audio_bytes = base64.b64decode(audio_data)
+            elif audio_url:
+                audio_response = requests.get(audio_url, timeout=cfg["timeout"])
+                if audio_response.status_code != 200:
+                    raise RuntimeError(
+                        f"Custom TTS API audio download failed (HTTP {audio_response.status_code})"
+                    )
+                audio_bytes = audio_response.content
+            else:
+                # Fall back to generic JSON extract for provider variants.
+                audio_bytes = _extract_custom_api_audio_bytes(response)
+        else:
+            audio_bytes = _extract_custom_api_audio_bytes(response)
+    else:
+        audio_bytes = _extract_custom_api_audio_bytes(response)
+    if not audio_bytes:
+        raise RuntimeError("Custom TTS API returned empty audio data")
+    with open(output_path, "wb") as f:
+        f.write(audio_bytes)
+    return output_path
+
+
+# ===========================================================================
 # NeuTTS (local, on-device TTS via neutts_cli)
 # ===========================================================================
 
@@ -1994,6 +2259,10 @@ def text_to_speech_tool(
             logger.info("Generating speech with Google Gemini TTS...")
             _generate_gemini_tts(text, file_str, tts_config)
 
+        elif provider == "custom_api":
+            logger.info("Generating speech with custom API TTS...")
+            _generate_custom_api_tts(text, file_str, tts_config)
+
         elif provider == "neutts":
             if not _check_neutts_available():
                 return json.dumps({
@@ -2095,7 +2364,7 @@ def text_to_speech_tool(
                 voice_compatible = file_str.endswith(".ogg")
         elif (
             want_opus
-            and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper"}
+            and provider in {"edge", "neutts", "minimax", "xai", "custom_api", "kittentts", "piper"}
             and not file_str.endswith(".ogg")
         ):
             opus_path = _convert_to_opus(file_str)
@@ -2183,6 +2452,12 @@ def check_tts_requirements() -> bool:
         pass
     if get_env_value("GEMINI_API_KEY") or get_env_value("GOOGLE_API_KEY"):
         return True
+    try:
+        custom_cfg = _resolve_custom_api_tts_config(_load_tts_config())
+        if custom_cfg.get("base_url") and custom_cfg.get("api_key"):
+            return True
+    except Exception:
+        pass
     try:
         _import_mistral_client()
         if get_env_value("MISTRAL_API_KEY"):

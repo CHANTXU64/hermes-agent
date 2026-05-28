@@ -462,6 +462,68 @@ Feature docs: none — STT provider extension documented in this index.
 
 Upstream status: fork-only.
 
+### 11. Custom Qwen/DashScope TTS provider
+
+Status: active
+
+Date: 2026-05-28
+
+Files:
+
+- `tools/tts_tool.py`
+- `tests/tools/test_tts_custom_api.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- Adds a configurable `tts.provider: custom_api` path so the fork can synthesize speech through Qwen/DashScope using the same `QWEN_API_KEY` convention as custom STT.
+
+What changed:
+
+- Added `custom_api` as a built-in TTS provider in `tools/tts_tool.py`.
+- Added `tts.custom_api` resolution for `base_url`, `endpoint`, `mode`, `api_key` / `api_key_env`, `model`, `voice`, `language_type`, `response_format`, `speed`, `timeout`, and `extra_body`.
+- Default custom TTS config targets Alibaba DashScope Qwen TTS: `https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation`, `mode: dashscope_multimodal`, model `qwen3-tts-flash`, voice `Cherry`, and `api_key_env: QWEN_API_KEY`.
+- The DashScope multimodal mode posts `model` plus `input.text` / `input.voice`, then downloads the returned `output.audio.url` into the requested audio file.
+- A generic `audio_speech` mode remains available for OpenAI-compatible `/audio/speech` endpoints.
+- Telegram voice delivery can convert custom TTS output to Opus/OGG for voice-compatible media.
+- Added focused tests for OpenAI-compatible request construction, DashScope multimodal request construction, URL audio download, JSON base64 audio parsing, and missing `QWEN_API_KEY` errors.
+
+Why it matters:
+
+- The user wants Chinese voice replies to use the existing Qwen/DashScope credential setup rather than Edge TTS or a separate TTS-specific key.
+- Future upstream merges must not remove the `custom_api` TTS provider path or collapse it into Edge/OpenAI-only behavior.
+
+Merge protection:
+
+- Preserve `custom_api` as a native/built-in TTS provider name; command providers or plugin providers must not shadow this configured implementation.
+- Preserve `api_key_env` lookup through `get_env_value()` so keys in `~/.hermes/.env` work.
+- Preserve DashScope multimodal handling of `output.audio.url`; Qwen TTS does not use the OpenAI-compatible `/audio/speech` endpoint shape by default.
+- Preserve the generic `audio_speech` mode unless upstream provides a verified equivalent configurable HTTP TTS provider.
+- Preserve Telegram Opus conversion behavior for `custom_api` when voice-compatible delivery is needed.
+
+Verification:
+
+```bash
+python -m pytest tests/tools/test_tts_custom_api.py -q -o 'addopts='
+python -m pytest tests/tools/test_tts_custom_api.py tests/tools/test_tts_opus_routing.py tests/tools/test_tts_max_text_length.py -q -o 'addopts='
+python - <<'PY'
+import json, os
+from tools.tts_tool import text_to_speech_tool
+out='/tmp/hermes_qwen_tts_test.mp3'
+try:
+    os.remove(out)
+except FileNotFoundError:
+    pass
+res=json.loads(text_to_speech_tool('你好，这是语音合成测试。', out))
+print(res)
+PY
+ffprobe -v error -show_entries format=format_name,duration -of json /tmp/hermes_qwen_tts_test.ogg
+```
+
+Feature docs: none — TTS provider extension documented in this index.
+
+Upstream status: fork-only.
+
 
 ## Current fork delta checklist
 
@@ -484,11 +546,13 @@ deltas are expected in these areas:
   - `tests/tools/test_mixture_of_agents_tool.py`
   - `hermes_cli/config.py`
   - `hermes_cli/runtime_provider.py`
-- MLX Whisper STT / custom STT API:
+- MLX Whisper STT / custom STT API / custom Qwen TTS API:
   - `tools/transcription_tools.py`
+  - `tools/tts_tool.py`
   - `agent/transcription_registry.py`
   - `tests/tools/test_transcription.py`
   - `tests/tools/test_transcription_dotenv_fallback.py`
+  - `tests/tools/test_tts_custom_api.py`
   - `hermes_cli/config.py`
 - Safe command rewrite:
   - `tools/safe_cmd_rewrite.py`
@@ -506,9 +570,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 10 major entries.
+Documented entries: 11 major entries.
 
-Active functional areas: 8.
+Active functional areas: 9.
 
 Historical reverted areas: 1.
 
