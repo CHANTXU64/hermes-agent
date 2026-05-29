@@ -49,9 +49,8 @@ from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
-    get_next_probe_tier,
+    get_context_length_from_provider_error,
     parse_available_output_tokens_from_error,
-    parse_context_limit_from_error,
     save_context_length,
 )
 from agent.nous_rate_guard import (
@@ -2900,9 +2899,13 @@ def run_conversation(
                         restart_with_compressed_messages = True
                         break
 
-                    # Error is about the INPUT being too large — reduce context_length.
-                    # Try to parse the actual limit from the error message
-                    parsed_limit = parse_context_limit_from_error(error_msg)
+                    # Error is about the INPUT being too large.  Only reduce
+                    # context_length when the provider explicitly reports the
+                    # real lower limit.  If the provider only says "input
+                    # exceeds the context window", keep the configured window
+                    # and try compression; guessing probe tiers can incorrectly
+                    # turn a user-configured 1M window into 256K/128K/64K.
+                    new_ctx = get_context_length_from_provider_error(error_msg, old_ctx)
                     _provider_lower = (getattr(agent, "provider", "") or "").lower()
                     _base_lower = (getattr(agent, "base_url", "") or "").rstrip("/").lower()
                     is_minimax_provider = (
@@ -2914,23 +2917,12 @@ def run_conversation(
                     )
                     minimax_delta_only_overflow = (
                         is_minimax_provider
-                        and parsed_limit is None
+                        and new_ctx is None
                         and "context window exceeds limit (" in error_msg
                     )
-                    if parsed_limit and parsed_limit < old_ctx:
-                        new_ctx = parsed_limit
-                        agent._buffer_vprint(f"Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})")
-                    elif minimax_delta_only_overflow:
-                        new_ctx = old_ctx
-                        agent._buffer_vprint(
-                            f"Provider reported overflow amount only; "
-                            f"keeping context_length at {old_ctx:,} tokens and compressing."
-                        )
-                    else:
-                        # Step down to the next probe tier
-                        new_ctx = get_next_probe_tier(old_ctx)
 
-                    if new_ctx and new_ctx < old_ctx:
+                    if new_ctx is not None:
+                        agent._buffer_vprint(f"Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})")
                         compressor.update_model(
                             model=agent.model,
                             context_length=new_ctx,
@@ -2940,20 +2932,22 @@ def run_conversation(
                             api_mode=agent.api_mode,
                         )
                         # Context probing flags — only set on built-in
-                        # compressor (plugin engines manage their own).
+                        # compressor (plugin engines manage their own).  This
+                        # value came from the provider, so it is safe to cache.
                         if hasattr(compressor, "_context_probed"):
                             compressor._context_probed = True
-                            # Only persist limits parsed from the provider's
-                            # error message (a real number).  Guessed fallback
-                            # tiers from get_next_probe_tier() should stay
-                            # in-memory only — persisting them pollutes the
-                            # cache with wrong values.
-                            compressor._context_probe_persistable = bool(
-                                parsed_limit and parsed_limit == new_ctx
-                            )
-                        agent._buffer_vprint(f"⚠️  Context length exceeded — stepping down: {old_ctx:,} → {new_ctx:,} tokens")
+                            compressor._context_probe_persistable = True
+                        agent._buffer_vprint(f"⚠️  Context length exceeded — using provider limit: {old_ctx:,} → {new_ctx:,} tokens")
+                    elif minimax_delta_only_overflow:
+                        agent._buffer_vprint(
+                            f"Provider reported overflow amount only; "
+                            f"keeping context_length at {old_ctx:,} tokens and compressing."
+                        )
                     else:
-                        agent._buffer_vprint(f"⚠️  Context length exceeded at minimum tier — attempting compression...")
+                        agent._buffer_vprint(
+                            f"⚠️  Context length exceeded, but provider did not report a max context length; "
+                            f"keeping context_length at {old_ctx:,} tokens and compressing."
+                        )
 
                     compression_attempts += 1
                     if compression_attempts > max_compression_attempts:
@@ -3080,7 +3074,10 @@ def run_conversation(
                 if is_client_error:
                     # Try fallback before aborting — a different provider
                     # may not have the same issue (rate limit, auth, etc.)
-                    agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
+                    if classified.reason == FailoverReason.content_policy_blocked:
+                        agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
+                    else:
+                        agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
                     if agent._try_activate_fallback():
                         retry_count = 0
                         compression_attempts = 0
@@ -3093,10 +3090,16 @@ def run_conversation(
                     # Terminal — flush buffered context so the user sees
                     # what was tried before the abort.
                     agent._flush_status_buffer()
-                    agent._emit_status(
-                        f"❌ Non-retryable error (HTTP {status_code}): "
-                        f"{agent._summarize_api_error(api_error)}"
-                    )
+                    if classified.reason == FailoverReason.content_policy_blocked:
+                        agent._emit_status(
+                            f"❌ Provider safety filter blocked this request: "
+                            f"{agent._summarize_api_error(api_error)}"
+                        )
+                    else:
+                        agent._emit_status(
+                            f"❌ Non-retryable error (HTTP {status_code}): "
+                            f"{agent._summarize_api_error(api_error)}"
+                        )
                     agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                     agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
@@ -3143,6 +3146,28 @@ def run_conversation(
                                 agent._vprint(f"{agent.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
                     else:
                         agent._vprint(f"{agent.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
+                    # Content-policy blocks deserve their own actionable
+                    # guidance — neither "fix your API key" nor "retry won't
+                    # help" tells the user what to actually do. The provider
+                    # has refused this specific prompt, so the recovery is
+                    # either a rephrase or routing to a different model.
+                    if classified.reason == FailoverReason.content_policy_blocked:
+                        agent._vprint(
+                            f"{agent.log_prefix}   💡 The provider's safety filter rejected this specific prompt.",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}      • Try rephrasing the request, narrowing the context, or splitting into smaller steps.",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}      • Configure a fallback provider so future blocks route automatically:",
+                            force=True,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}        hermes fallback add   (interactive picker — same as `hermes model`)",
+                            force=True,
+                        )
                     logger.error(f"{agent.log_prefix}Non-retryable client error: {api_error}")
                     # Skip session persistence when the error is likely
                     # context-overflow related (status 400 + large session).
@@ -3157,6 +3182,23 @@ def run_conversation(
                         )
                     else:
                         agent._persist_session(messages, conversation_history)
+                    if classified.reason == FailoverReason.content_policy_blocked:
+                        _summary = agent._summarize_api_error(api_error)
+                        _policy_response = (
+                            f"⚠️  The model provider's safety filter blocked this request "
+                            f"(not a Hermes/gateway failure).\n\n"
+                            f"Provider message: {_summary}\n\n"
+                            f"Try rephrasing the request, narrowing the context, or "
+                            f"adding a fallback provider with `hermes fallback add`."
+                        )
+                        return {
+                            "final_response": _policy_response,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": f"content_policy_blocked: {_summary}",
+                        }
                     return {
                         "final_response": None,
                         "messages": messages,
@@ -4519,6 +4561,7 @@ def run_conversation(
         original_user_message=original_user_message,
         final_response=final_response,
         interrupted=interrupted,
+        messages=messages,
     )
 
     # Background memory/skill review — runs AFTER the response is delivered
