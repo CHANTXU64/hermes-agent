@@ -787,7 +787,7 @@ class TestToolHandlers:
         assert info["turn_count"] == 2
         assert info["lineage_session_ids"] == ["root-session", "child-session"]
         kw = p._client.aretain_batch.call_args.kwargs
-        assert kw["document_id"] == "child-session"
+        assert kw["document_id"] == "root-session"
         item = kw["items"][0]
         assert item["update_mode"] == "append"
         assert "metadata" not in item
@@ -799,6 +799,72 @@ class TestToolHandlers:
         assert "Assistant: child assistant" in item["content"]
         assert "tool output" not in item["content"]
         assert p._retain_store_path.name == "retain_turns.sqlite3"
+
+    def test_persisted_retain_lineage_uses_prior_non_empty_parent_when_latest_row_is_empty(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        p.initialize(session_id="root-session", hermes_home=str(p._retain_store_path.parents[1]), platform="cli")
+        p._client = _make_mock_client()
+        p.sync_turn("root user", "root assistant")
+        p.on_session_switch("child-session", parent_session_id="root-session")
+        p.sync_turn("child user", "child assistant")
+
+        # Simulate a later provider lifecycle that persisted the same child
+        # session with an empty parent. This matched the observed production
+        # retain_turns.sqlite3 rows for 20260529_120758_e5d0e5.
+        p._parent_session_id = ""
+        p.sync_turn("child later user", "child later assistant")
+
+        info = p.retain_persisted_session_lineage(session_id="child-session")
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["turn_count"] == 3
+        assert info["lineage_session_ids"] == ["root-session", "child-session"]
+        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert "root user" in content
+        assert "child user" in content
+        assert "child later user" in content
+
+    def test_manual_retain_groups_compression_sibling_sessions_by_retain_document_id(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        p.initialize(session_id="root-session", hermes_home=str(p._retain_store_path.parents[1]), platform="cli")
+        p._client = _make_mock_client()
+        p.sync_turn("root user", "root assistant")
+
+        # C1 and C2 are observed as siblings in state.db after gateway/session
+        # pointer drift, but they still belong to the same logical compression
+        # document. Manual retain should group them by retain_document_id rather
+        # than lose C1 when retaining from C2.
+        p.on_session_switch("child-one", parent_session_id="root-session")
+        p.sync_turn("child one user", "child one assistant")
+        p.on_session_switch("child-two", parent_session_id="root-session")
+        p.sync_turn("child two user", "child two assistant")
+
+        info = p.retain_persisted_session_lineage(session_id="child-two")
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["turn_count"] == 3
+        assert info["document_id"] == "root-session"
+        assert info["lineage_session_ids"] == ["root-session", "child-one", "child-two"]
+        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert "root user" in content
+        assert "child one user" in content
+        assert "child two user" in content
 
     def test_persisted_retain_ignores_stored_bank_id_and_submits_current_bank(self, provider_with_config, monkeypatch):
         from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock

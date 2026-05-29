@@ -29,6 +29,7 @@ hindsight_retain_turns
 - `bank_id`
 - `session_id`
 - `parent_session_id`
+- `retain_document_id`
 - `turn_index`
 - `turn_json`
 - `created_at`
@@ -55,15 +56,16 @@ hindsight_retain_turns
 - 每个完成 turn 的 `sync_turn()` 都会先把同源 retain payload 写入 `hindsight/retain_turns.sqlite3`。
 - `auto_retain=true` 时，自动提交逻辑仍按原机制运行。
 - `auto_retain=false` 时，只写本地 SQLite，不自动提交到 Hindsight。
-- `/retain` 从当前 active `session_id` 出发，按 `parent_session_id` 往上找 lineage。
+- `/retain` 从当前 active `session_id` 出发，优先解析该 session 的 `retain_document_id`，并读取同一个 logical document 下的 persisted turns。
+- 旧数据没有 `retain_document_id` 时，仍可回退到 `parent_session_id` lineage；回退查找会忽略后续空 parent row，避免空 parent 覆盖早先非空 parent。
 - Gateway `/retain` 使用和普通消息相同的 `SessionStore.get_or_create_session(source)` 解析当前 `session_id`；因此 `/resume` 或 gateway 重启后，即使还没有 cached agent，也能识别当前会话。
 - 提交顺序是 root parent → ... → current child。
 - 提交内容来自 Hindsight provider 自己持久化的 turn payload，不包含 tool output、tool-call stub、内部推理或压缩 summary。
 - 不创建 `manual-session:*` 文档。
 
-## 压缩和 parent session
+## 压缩、parent session 和 retain document
 
-如果一次用户视角会话因为压缩形成：
+如果一次用户视角会话因为压缩形成干净 parent 链：
 
 ```text
 A -> B -> C
@@ -79,12 +81,24 @@ A 的 persisted retain turns
 
 因此不需要赶在压缩前手动 `/retain`。
 
-## document_id / bank / metadata
-
-默认使用当前 leaf session 作为 document：
+如果 SessionDB / gateway 状态把压缩后的 continuation 记录成 sibling：
 
 ```text
-document_id = current session_id
+A
+├─ B
+└─ C
+```
+
+provider 写入 turn 时仍会让 B/C 继承同一个 `retain_document_id=A`。在 C 中执行 `/retain` 时，读取的是同一个 `retain_document_id` 下的 rows，而不是只沿 C → A 的 parent 链，因此不会漏掉 B。
+
+## document_id / bank / metadata
+
+默认使用 logical root retain document：
+
+```text
+root session: retain_document_id = session_id
+child session: retain_document_id = parent retain_document_id
+document_id = retain_document_id
 ```
 
 提交到哪个 Hindsight Bank 只看 `/retain` 执行时的当前配置：
@@ -105,7 +119,7 @@ bank_id = current configured bank
 
 ## 重复提交
 
-当前实现不维护 retained cursor。也就是说，同一个 session lineage 反复执行 `/retain`，append 模式下可能重复提交完整 lineage。
+当前实现不维护 retained cursor，也不会在 retain 成功后清理 `retain_turns.sqlite3`。也就是说，同一个 `retain_document_id` 反复执行 `/retain`，append 模式下可能重复提交完整 logical document。
 
 这是有意保持简单：当前使用目标是“一个会话结束后手动保存一次”。
 
@@ -126,6 +140,8 @@ bank_id = current configured bank
 - `/retain` Gateway handler 在没有 cached agent 时，会按普通消息路径从 `SessionStore` 解析当前 resumed/restarted session，并按当前 `memory.provider=hindsight` 加载 provider。
 - Gateway `/retain` 调用 provider 的 persisted lineage retain，而不是读取原始 SessionDB transcript。
 - `sync_turn()` 会持久化和自动 retain 同源的 turn payload。
+- Manual `/retain` 会按 `retain_document_id` 聚合同一压缩 logical document；即使 B/C 在 SessionDB 中表现为 siblings，也能从 C retain 到 A+B+C。
+- 旧 row 后续写入空 `parent_session_id` 时，lineage fallback 会使用早先非空 parent，而不是被空 parent 截断。
 - local `bank_id` differences in `retain_turns.sqlite3` do not exclude persisted turns; `/retain` submits all matching session lineage turns to the currently configured Hindsight bank.
 - Manual `/retain` submits a clean item containing `content` and configured `context`, with no extra metadata/tags.
 - 没有 persisted turns 时不提交。
@@ -136,6 +152,7 @@ bank_id = current configured bank
 
 ```bash
 python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='
+python -m pytest tests/plugins/memory/test_hindsight_provider.py -q
 python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py hermes_cli/commands.py tests/gateway/test_retain_command.py
 git diff --check
 ```

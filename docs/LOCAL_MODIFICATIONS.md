@@ -375,9 +375,11 @@ What changed:
 
 - Added `hindsight_retain_session` / `/retain` for user-triggered Hindsight session retain.
 - Hindsight `sync_turn()` now persists the exact same turn JSON used by automatic retain into a separate SQLite file: `$HERMES_HOME/hindsight/retain_turns.sqlite3`.
+- Persisted retain rows include `retain_document_id`, a stable logical document id inherited across compression-created child sessions.
 - Gateway/CLI `/retain` no longer reconstructs from raw Hermes SessionDB transcript; it asks the provider to read persisted retain turns for the current session lineage.
 - Gateway `/retain` resolves the current `session_id` via `SessionStore.get_or_create_session(source)`, matching the normal message path, so `/resume` and gateway restart still point retain at the selected session even before a cached agent exists.
-- Manual retain follows `parent_session_id` from the current session back to the root and submits root → current turns together, so users do not need to retain before context compression.
+- Manual retain first groups persisted turns by `retain_document_id`; this preserves a single logical Hindsight document even when compression/session bookkeeping records continuation sessions as siblings rather than a clean parent chain.
+- Parent-chain lookup remains a fallback for older local rows without `retain_document_id`, and ignores empty stored parents when looking for a prior non-empty parent.
 - Persisted turn lookup does not filter by the historical local `bank_id`; `/retain` submits matching lineage turns to the bank configured at retain time.
 - Manual `/retain` submits a clean item with `content` and configured `context`, avoiding extra metadata/tags.
 - Legacy provider buffer flush still tracks one pending append job, a session generation guard, and queued/flushed turn counts so automatic retain and direct provider tests do not regress.
@@ -392,19 +394,20 @@ Why it matters:
 Merge protection:
 
 - Do not reconstruct manual session retain from raw Hermes SessionDB transcript; the source of truth is provider-owned `$HERMES_HOME/hindsight/retain_turns.sqlite3` rows written by `sync_turn()`.
-- Do not create a separate `manual-session:*` document; use `_resolve_retain_target()` exactly like automatic retain.
+- Do not create a separate `manual-session:*` document; use `_resolve_retain_target_for_session()` with the resolved `retain_document_id` so Hindsight append semantics stay aligned with automatic retain.
 - Do not expose `hindsight_retain_session` as a model-visible tool by default; this is a user slash command/provider method.
-- Manual `/retain` must include the current session's parent lineage from the persisted retain-turn store, ordered root → current, without mixing sibling sessions.
+- Manual `/retain` must include all sessions that share the same `retain_document_id`, ordered by persisted row id; do not rely solely on `parent_session_id`, because compression continuations can appear as siblings in SessionDB.
 - Gateway `/retain` must resolve the active session from `SessionStore.get_or_create_session(source)` before consulting cached agents, mirroring the normal message path after `/resume` or gateway restart.
 - Manual `/retain` must not filter persisted turns by historical local `bank_id`; the current provider config determines the API target bank.
 - Manual `/retain` payload items should stay clean (`content`, configured `context`, and `update_mode` only when needed), without extra metadata/tags.
-- Preserve tests proving manual retain persists Hindsight turn payloads to the separate SQLite file, reads parent lineage, resolves resumed/restarted gateway sessions without cached agents, ignores historical local bank casing/config changes, handles no-persisted-turn sessions, and keeps legacy buffer flush behavior (pending rejection, failure rollback, generation guard, `memory_mode="context"`).
+- Preserve tests proving manual retain persists Hindsight turn payloads to the separate SQLite file, groups compression siblings by root `retain_document_id`, falls back through prior non-empty parent rows for older data, resolves resumed/restarted gateway sessions without cached agents, ignores historical local bank casing/config changes, handles no-persisted-turn sessions, and keeps legacy buffer flush behavior (pending rejection, failure rollback, generation guard, `memory_mode="context"`).
 
 Verification:
 
 - `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='` → 260 passed.
 - `python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py hermes_cli/commands.py tests/gateway/test_retain_command.py` → passed.
 - `git diff --check` → passed.
+- `python -m pytest tests/plugins/memory/test_hindsight_provider.py -q` → 127 passed after adding `retain_document_id` grouping.
 
 Feature docs: `docs/chantxu64/hindsight-manual-retain.md`.
 

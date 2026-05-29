@@ -610,6 +610,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._sync_thread = None
         self._session_id = ""
         self._parent_session_id = ""
+        self._retain_document_id = ""
         self._document_id = ""
         self._retain_store_path = get_hermes_home() / "hindsight" / "retain_turns.sqlite3"
 
@@ -1132,6 +1133,7 @@ class HindsightMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
+        self._retain_document_id = self._parent_session_id or self._session_id
 
         # Each process lifecycle gets its own document_id. Reusing session_id
         # alone caused overwrites on /resume — the reloaded session starts
@@ -1514,6 +1516,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 bank_id TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 parent_session_id TEXT NOT NULL DEFAULT '',
+                retain_document_id TEXT NOT NULL DEFAULT '',
                 turn_index INTEGER NOT NULL,
                 turn_json TEXT NOT NULL,
                 created_at REAL NOT NULL
@@ -1524,23 +1527,66 @@ class HindsightMemoryProvider(MemoryProvider):
             "CREATE INDEX IF NOT EXISTS idx_hindsight_retain_turns_session "
             "ON hindsight_retain_turns(bank_id, session_id, id)"
         )
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(hindsight_retain_turns)").fetchall()}
+            if "retain_document_id" not in columns:
+                conn.execute("ALTER TABLE hindsight_retain_turns ADD COLUMN retain_document_id TEXT NOT NULL DEFAULT ''")
+        except Exception as e:
+            logger.debug("Hindsight retain store migration skipped/failed: %s", e)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hindsight_retain_turns_document "
+            "ON hindsight_retain_turns(bank_id, retain_document_id, id)"
+        )
         return conn
+
+    def _lookup_retain_document_id(self, conn: sqlite3.Connection, session_id: str) -> str:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return ""
+        row = conn.execute(
+            """
+            SELECT retain_document_id
+            FROM hindsight_retain_turns
+            WHERE session_id = ?
+              AND retain_document_id != ''
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (sid,),
+        ).fetchone()
+        return str(row[0] if row and row[0] else "").strip()
+
+    def _resolve_retain_document_id(self, conn: sqlite3.Connection, session_id: str, parent_session_id: str = "") -> str:
+        sid = str(session_id or "").strip()
+        parent = str(parent_session_id or "").strip()
+        existing = self._lookup_retain_document_id(conn, sid)
+        if existing:
+            return existing
+        if parent:
+            parent_doc = self._lookup_retain_document_id(conn, parent)
+            return parent_doc or parent
+        return sid
 
     def _persist_retain_turn(self, turn_json: str) -> None:
         if not self._session_id:
             return
         try:
             with self._retain_store_connect() as conn:
+                retain_document_id = self._retain_document_id or self._resolve_retain_document_id(
+                    conn, self._session_id, self._parent_session_id
+                )
+                self._retain_document_id = retain_document_id
                 conn.execute(
                     """
                     INSERT INTO hindsight_retain_turns
-                    (bank_id, session_id, parent_session_id, turn_index, turn_json, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (bank_id, session_id, parent_session_id, retain_document_id, turn_index, turn_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         self._bank_id,
                         self._session_id,
                         self._parent_session_id,
+                        retain_document_id,
                         self._turn_index,
                         turn_json,
                         time.time(),
@@ -1566,6 +1612,7 @@ class HindsightMemoryProvider(MemoryProvider):
                         SELECT parent_session_id
                         FROM hindsight_retain_turns
                         WHERE session_id = ?
+                          AND parent_session_id != ''
                         ORDER BY id DESC
                         LIMIT 1
                         """,
@@ -1585,11 +1632,41 @@ class HindsightMemoryProvider(MemoryProvider):
         session_id: str,
         *,
         parent_session_id: str = "",
-    ) -> tuple[list[str], list[str]]:
-        lineage = self._lineage_session_ids(session_id, parent_session_id)
-        if not lineage:
-            return [], []
+    ) -> tuple[list[str], list[str], str]:
+        target_session_id = str(session_id or "").strip()
         turns: list[str] = []
+        try:
+            with self._retain_store_connect() as conn:
+                retain_document_id = self._resolve_retain_document_id(
+                    conn, target_session_id, parent_session_id
+                )
+                if retain_document_id:
+                    rows = conn.execute(
+                        """
+                        SELECT session_id, turn_json
+                        FROM hindsight_retain_turns
+                        WHERE retain_document_id = ?
+                        ORDER BY id ASC
+                        """,
+                        (retain_document_id,),
+                    ).fetchall()
+                    if rows:
+                        lineage: list[str] = []
+                        seen: set[str] = set()
+                        for sid, turn_json in rows:
+                            sid = str(sid or "").strip()
+                            if sid and sid not in seen:
+                                lineage.append(sid)
+                                seen.add(sid)
+                            if turn_json:
+                                turns.append(str(turn_json))
+                        return turns, lineage, retain_document_id
+        except Exception as e:
+            logger.warning("Hindsight retain document lookup failed: %s", e, exc_info=True)
+
+        lineage = self._lineage_session_ids(target_session_id, parent_session_id)
+        if not lineage:
+            return [], [], ""
         try:
             with self._retain_store_connect() as conn:
                 for sid in lineage:
@@ -1605,8 +1682,8 @@ class HindsightMemoryProvider(MemoryProvider):
                     turns.extend(str(row[0]) for row in rows if row and row[0])
         except Exception as e:
             logger.warning("Hindsight retain store read failed: %s", e, exc_info=True)
-            return [], lineage
-        return turns, lineage
+            return [], lineage, ""
+        return turns, lineage, target_session_id
 
     def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
         metadata: Dict[str, str] = {
@@ -1677,7 +1754,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         target_session_id = str(session_id or self._session_id or "").strip()
         parent_id = str(parent_session_id or self._parent_session_id or "").strip()
-        turns, lineage = self._load_persisted_retain_turns(
+        turns, lineage, retain_document_id = self._load_persisted_retain_turns(
             target_session_id,
             parent_session_id=parent_id,
         )
@@ -1687,7 +1764,7 @@ class HindsightMemoryProvider(MemoryProvider):
         fallback_document_id = self._document_id
         if target_session_id and target_session_id != self._session_id:
             fallback_document_id = f"{target_session_id}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-        document_id, update_mode = self._resolve_retain_target_for_session(target_session_id, fallback_document_id)
+        document_id, update_mode = self._resolve_retain_target_for_session(retain_document_id or target_session_id, fallback_document_id)
         content = "[" + ",".join(turns) + "]"
         bank_id = self._bank_id
         retain_async_flag = self._retain_async
@@ -2069,8 +2146,16 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_result = ""
 
         # 3. Now rotate to the new session.
-        if parent_session_id:
-            self._parent_session_id = str(parent_session_id).strip()
+        parent_id = str(parent_session_id or "").strip()
+        if parent_id:
+            self._parent_session_id = parent_id
+            try:
+                with self._retain_store_connect() as conn:
+                    self._retain_document_id = self._resolve_retain_document_id(conn, new_id, parent_id)
+            except Exception:
+                self._retain_document_id = parent_id
+        else:
+            self._retain_document_id = new_id
         self._session_id = new_id
         start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self._document_id = f"{self._session_id}-{start_ts}"
