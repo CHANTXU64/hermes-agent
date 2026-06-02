@@ -8,6 +8,8 @@ const {
   ipcMain,
   nativeImage,
   nativeTheme,
+  net: electronNet,
+  protocol,
   safeStorage,
   session,
   shell,
@@ -364,6 +366,66 @@ app.setAboutPanelOptions({
   copyright: 'Copyright © 2026 Nous Research'
 })
 
+// Custom scheme for streaming local media (video/audio) into the renderer.
+// Reading large media through `readFileDataUrl` failed: it base64-loads the
+// whole file into memory and is hard-capped at DATA_URL_READ_MAX_BYTES (16 MB),
+// so any non-trivial video silently refused to load. Streaming via a protocol
+// handler removes the size cap and gives the <video> element seekable,
+// range-aware playback. Must be registered before the app is ready.
+const MEDIA_PROTOCOL = 'hermes-media'
+// Only audio/video may be streamed. Without this the handler would read any
+// non-blocklisted local file (no size cap) for any `fetch(hermes-media://…)`.
+const STREAMABLE_MEDIA_EXTS = new Set([
+  '.avi',
+  '.flac',
+  '.m4a',
+  '.mkv',
+  '.mov',
+  '.mp3',
+  '.mp4',
+  '.ogg',
+  '.opus',
+  '.wav',
+  '.webm'
+])
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: MEDIA_PROTOCOL,
+    privileges: {
+      secure: true,
+      standard: true,
+      stream: true,
+      supportFetchAPI: true
+    }
+  }
+])
+
+function registerMediaProtocol() {
+  protocol.handle(MEDIA_PROTOCOL, async request => {
+    let resolvedPath
+    try {
+      const url = new URL(request.url)
+      const filePath = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
+      ;({ resolvedPath } = await resolveReadableFileForIpc(filePath, { purpose: 'Media stream' }))
+    } catch {
+      return new Response('Media not found', { status: 404 })
+    }
+
+    if (!STREAMABLE_MEDIA_EXTS.has(path.extname(resolvedPath).toLowerCase())) {
+      return new Response('Unsupported media type', { status: 415 })
+    }
+
+    // Delegate to Electron's net stack on a file:// URL — it resolves the
+    // content-type and honors Range requests so seeking works. Forward the
+    // renderer's headers (notably Range) and skip custom-protocol re-entry.
+    return electronNet.fetch(pathToFileURL(resolvedPath).toString(), {
+      bypassCustomProtocolHandlers: true,
+      headers: request.headers
+    })
+  })
+}
+
 let mainWindow = null
 let hermesProcess = null
 let connectionPromise = null
@@ -373,6 +435,9 @@ let connectionPromise = null
 // instead of re-running install.ps1 in a hot loop. Cleared explicitly by
 // the renderer's "Reload and retry" path or by quitting the app.
 let bootstrapFailure = null
+// Active first-launch install, so the renderer's Cancel button (and app quit)
+// can abort the in-flight install.sh/ps1 instead of leaving it running.
+let bootstrapAbortController = null
 let connectionConfigCache = null
 const hermesLog = []
 const previewWatchers = new Map()
@@ -1678,12 +1743,15 @@ async function ensureRuntime(backend) {
       })
     } catch {}
 
+    bootstrapAbortController = new AbortController()
+
     const bootstrapResult = await runBootstrap({
       installStamp: backend.installStamp,
       activeRoot: backend.activeRoot,
       sourceRepoRoot: SOURCE_REPO_ROOT,
       hermesHome: HERMES_HOME,
       logRoot: path.join(HERMES_HOME, 'logs'),
+      abortSignal: bootstrapAbortController.signal,
       onEvent: ev => {
         // Tee every bootstrap event to (a) the desktop log for forensics
         // and (b) the renderer for live progress UI. Either may be absent;
@@ -1698,6 +1766,16 @@ async function ensureRuntime(backend) {
       },
       writeMarker: writeBootstrapMarker
     })
+
+    bootstrapAbortController = null
+
+    if (bootstrapResult.cancelled) {
+      const cancelledError = new Error('Hermes install was cancelled.')
+      cancelledError.isBootstrapFailure = true
+      cancelledError.bootstrapCancelled = true
+      bootstrapFailure = cancelledError
+      throw cancelledError
+    }
 
     if (!bootstrapResult.ok) {
       const bootstrapError = new Error(
@@ -3194,6 +3272,18 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
   resetHermesConnection()
   return { ok: true }
 })
+ipcMain.handle('hermes:bootstrap:cancel', async () => {
+  // Renderer's Cancel button during first-launch install. Abort the running
+  // install script (SIGTERM via the runner's abortSignal). runBootstrap
+  // resolves with { cancelled: true }, which surfaces the recovery overlay.
+  if (bootstrapAbortController) {
+    try {
+      bootstrapAbortController.abort()
+    } catch {}
+    return { ok: true, cancelled: true }
+  }
+  return { ok: false, cancelled: false }
+})
 ipcMain.handle('hermes:boot-progress:get', async () => bootProgressState)
 ipcMain.handle('hermes:bootstrap:get', async () => getBootstrapState())
 ipcMain.handle('hermes:connection-config:get', async () => sanitizeDesktopConnectionConfig())
@@ -3654,6 +3744,7 @@ app.whenReady().then(() => {
     Menu.setApplicationMenu(null)
   }
   installMediaPermissions()
+  registerMediaProtocol()
   ensureWslWindowsFonts()
   createWindow()
 
@@ -3663,6 +3754,13 @@ app.whenReady().then(() => {
 })
 
 app.on('before-quit', () => {
+  // Quitting mid-install should stop the installer, not orphan it.
+  if (bootstrapAbortController) {
+    try {
+      bootstrapAbortController.abort()
+    } catch {}
+  }
+
   if (desktopLogFlushTimer) {
     clearTimeout(desktopLogFlushTimer)
     desktopLogFlushTimer = null
