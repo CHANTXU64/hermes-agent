@@ -63,6 +63,18 @@ hindsight_retain_turns
 - 提交内容来自 Hindsight provider 自己持久化的 turn payload，不包含 tool output、tool-call stub、内部推理或压缩 summary。
 - 不创建 `manual-session:*` 文档。
 
+## 与 upstream append retain 的差异
+
+2026-06-09 合并 upstream `09d66037f` 时，官方用 `_last_retained_turn_count` 作为 append retain 的简单 watermark，目标是避免 append 模式重复发送整个 session。
+
+本 fork 不采用该独立 watermark。当前实现保留 `flush_retained_turns()` 的 queued/flushed/pending/generation 状态机：
+
+- append-capable API：只发送 `_last_queued_flush_count` 之后的新 turns。
+- legacy / overwrite API：仍发送完整 session，避免覆盖式写入丢历史。
+- pending append job 失败时可回滚 queued watermark。
+- session switch 用 generation guard 防止旧 pending job 污染新 session。
+- `sync_turn()` 必须先持久化 turn；`auto_retain=false` 时仍只写本地 SQLite，供 `/retain` 使用。
+
 ## 压缩、parent session 和 retain document
 
 如果一次用户视角会话因为压缩形成干净 parent 链：
