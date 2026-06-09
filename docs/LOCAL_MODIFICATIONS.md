@@ -358,13 +358,20 @@ Date: 2026-05-21
 
 Files:
 
+- `agent/memory_manager.py`
+- `agent/memory_provider.py`
 - `plugins/memory/hindsight/__init__.py`
 - `tests/plugins/memory/test_hindsight_provider.py`
+- `tests/agent/test_memory_session_switch.py`
 - `hermes_cli/commands.py`
 - `tests/hermes_cli/test_commands.py`
 - `cli.py`
 - `gateway/run.py`
+- `gateway/slash_commands.py`
 - `tests/gateway/test_retain_command.py`
+- `tests/gateway/test_undo_rewind_session.py`
+- `tui_gateway/server.py`
+- `tests/tui_gateway/test_undo_command.py`
 - `docs/chantxu64/hindsight-manual-retain.md`
 
 Summary:
@@ -385,6 +392,8 @@ What changed:
 - Legacy provider buffer flush still tracks one pending append job, a session generation guard, and queued/flushed turn counts so automatic retain and direct provider tests do not regress.
 - After upstream `09d66037f` added `_last_retained_turn_count` for append retain deltas, this fork intentionally keeps automatic retain routed through `flush_retained_turns()` instead, so automatic retain and manual/direct flush share the same queued/flushed/pending/generation state machine while still sending only new turns on append-capable APIs.
 - When `auto_retain=false`, completed turns are written only to the local retain-turn SQLite file until `/retain` submits them.
+- `/undo` now calls a dedicated memory rewind hook in CLI, Gateway, and TUI paths; Hindsight mirrors that rewind by soft-excluding the last N active rows in `hindsight_retain_turns` (`active=0`, `rewound_at`) so future manual `/retain` skips undone turns without hard-deleting audit rows.
+- Hindsight rewind handling truncates the in-memory retain buffer and invalidates flush state without running the normal session-switch flush, so `/undo` does not itself push stale buffered turns to Hindsight.
 - Only `/retain` is user-facing; no long command aliases are registered.
 - `hindsight_retain_session` is not registered in model-visible tool schemas; CLI/Gateway call the provider directly via `memory_manager.get_provider("hindsight")`, so manual retain works even when `memory_mode="context"` hides Hindsight tools from the model.
 
@@ -401,7 +410,9 @@ Merge protection:
 - Gateway `/retain` must resolve the active session from `SessionStore.get_or_create_session(source)` before consulting cached agents, mirroring the normal message path after `/resume` or gateway restart.
 - Manual `/retain` must not filter persisted turns by historical local `bank_id`; the current provider config determines the API target bank.
 - Manual `/retain` payload items should stay clean (`content`, configured `context`, and `update_mode` only when needed), without extra metadata/tags.
-- Preserve tests proving manual retain persists Hindsight turn payloads to the separate SQLite file, groups compression siblings by root `retain_document_id`, falls back through prior non-empty parent rows for older data, resolves resumed/restarted gateway sessions without cached agents, ignores historical local bank casing/config changes, handles no-persisted-turn sessions, and keeps legacy buffer flush behavior (pending rejection, failure rollback, generation guard, `memory_mode="context"`).
+- `/undo` must notify memory providers through the dedicated rewind hook, not only evict cached agents or call the normal session-switch hook; otherwise provider-owned persisted turns can drift from the active transcript.
+- Hindsight `/undo` handling must mark local persisted retain rows inactive and must not run flush-on-switch for rewound buffered turns.
+- Preserve tests proving manual retain persists Hindsight turn payloads to the separate SQLite file, groups compression siblings by root `retain_document_id`, falls back through prior non-empty parent rows for older data, resolves resumed/restarted gateway sessions without cached agents, ignores historical local bank casing/config changes, handles no-persisted-turn sessions, excludes rewound persisted turns, and keeps legacy buffer flush behavior (pending rejection, failure rollback, generation guard, `memory_mode="context"`).
 - Do not reintroduce upstream's standalone `_last_retained_turn_count` watermark unless the entire fork flush state machine is deliberately replaced and all manual `/retain`, append-delta, pending-failure rollback, and session-switch generation tests still pass. The expected fork behavior is `sync_turn()` persists the turn first, then automatic retain calls `flush_retained_turns()`.
 
 Verification:
@@ -411,6 +422,8 @@ Verification:
 - `git diff --check` → passed.
 - `python -m pytest tests/plugins/memory/test_hindsight_provider.py -q` → 127 passed after adding `retain_document_id` grouping.
 - 2026-06-09 conflict resolution against upstream `09d66037f`: `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/run_agent/test_memory_sync_interrupted.py -q -o 'addopts='` → 158 passed, 1 unrelated `audioop` deprecation warning.
+- Rewind filtering update: `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_async_sync.py tests/run_agent/test_memory_sync_interrupted.py tests/gateway/test_undo_rewind_session.py tests/tui_gateway/test_undo_command.py -q -o 'addopts='` → 186 passed.
+- Rewind filtering update: `python -m pytest tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='` → 148 passed.
 
 Feature docs: `docs/chantxu64/hindsight-manual-retain.md`.
 
@@ -538,6 +551,8 @@ deltas are expected in these areas:
 
 - Hindsight Unicode support / manual session retain / synchronous cache-miss recall:
   - `.gitignore`
+  - `agent/memory_manager.py`
+  - `agent/memory_provider.py`
   - `plugins/memory/hindsight/__init__.py`
   - `tests/plugins/memory/test_hindsight_provider.py`
   - `tests/agent/test_memory_session_switch.py`
@@ -545,7 +560,11 @@ deltas are expected in these areas:
   - `tests/hermes_cli/test_commands.py`
   - `cli.py`
   - `gateway/run.py`
+  - `gateway/slash_commands.py`
   - `tests/gateway/test_retain_command.py`
+  - `tests/gateway/test_undo_rewind_session.py`
+  - `tui_gateway/server.py`
+  - `tests/tui_gateway/test_undo_command.py`
   - `docs/chantxu64/hindsight-manual-retain.md`
 - MoA custom provider support:
   - `tools/mixture_of_agents_tool.py`

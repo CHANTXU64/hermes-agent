@@ -6911,20 +6911,27 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             session["history"] = list(active)
             session["history_version"] = int(session.get("history_version", 0)) + 1
-        # Notify memory providers — same hook /branch fires, plus the
-        # rewound flag so providers caching per-turn document state
-        # know to invalidate. See #6672 + #21910.
+        # Notify memory providers that /undo rewound this same session so
+        # provider-owned per-turn stores can exclude undone turns without
+        # treating this as a session switch. See #6672 + #21910.
         agent = session.get("agent")
         if agent is not None:
             mm = getattr(agent, "_memory_manager", None)
             if mm is not None:
                 try:
-                    mm.on_session_switch(
-                        session_key,
-                        parent_session_id="",
-                        reset=False,
-                        rewound=True,
-                    )
+                    if hasattr(mm, "on_session_rewind"):
+                        mm.on_session_rewind(
+                            session_key,
+                            turns_undone=target_idx + 1,
+                        )
+                    else:
+                        mm.on_session_switch(
+                            session_key,
+                            parent_session_id="",
+                            reset=False,
+                            rewound=True,
+                            turns_undone=target_idx + 1,
+                        )
                 except Exception:
                     pass
             if hasattr(agent, "_invalidate_system_prompt"):

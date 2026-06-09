@@ -868,6 +868,83 @@ class TestToolHandlers:
         assert "child one user" in content
         assert "child two user" in content
 
+    def test_rewound_persisted_turns_are_excluded_from_manual_retain(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        p.sync_turn("keep user", "keep assistant")
+        p.sync_turn("undo one user", "undo one assistant")
+        p.sync_turn("undo two user", "undo two assistant")
+
+        assert p.mark_persisted_turns_rewound("test-session", 2) == 2
+        info = p.retain_persisted_session_lineage(session_id="test-session")
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["turn_count"] == 1
+        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert "keep user" in content
+        assert "undo one user" not in content
+        assert "undo two user" not in content
+
+    def test_rewind_excludes_only_target_session_from_grouped_document(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        p.initialize(session_id="root-session", hermes_home=str(p._retain_store_path.parents[1]), platform="cli")
+        p._client = _make_mock_client()
+        p.sync_turn("root user", "root assistant")
+        p.on_session_switch("child-one", parent_session_id="root-session")
+        p.sync_turn("child one user", "child one assistant")
+        p.on_session_switch("child-two", parent_session_id="root-session")
+        p.sync_turn("child two keep user", "child two keep assistant")
+        p.sync_turn("child two undo user", "child two undo assistant")
+
+        assert p.mark_persisted_turns_rewound("child-two", 1) == 1
+        info = p.retain_persisted_session_lineage(session_id="child-two")
+        p._retain_queue.join()
+
+        assert info["turn_count"] == 3
+        assert info["lineage_session_ids"] == ["root-session", "child-one", "child-two"]
+        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert "root user" in content
+        assert "child one user" in content
+        assert "child two keep user" in content
+        assert "child two undo user" not in content
+
+    def test_rewind_hook_marks_persisted_turns_without_flushing_buffer(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=True, retain_every_n_turns=999)
+        p.sync_turn("keep user", "keep assistant")
+        p.sync_turn("undo user", "undo assistant")
+        p._client.aretain_batch.reset_mock()
+
+        p.on_session_rewind("test-session", turns_undone=1)
+
+        assert p._client.aretain_batch.call_count == 0
+        info = p.retain_persisted_session_lineage(session_id="test-session")
+        p._retain_queue.join()
+        assert info["turn_count"] == 1
+        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert "keep user" in content
+        assert "undo user" not in content
+
     def test_persisted_retain_ignores_stored_bank_id_and_submits_current_bank(self, provider_with_config, monkeypatch):
         from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
         with _append_capability_lock:

@@ -209,10 +209,24 @@ class MemoryProvider(ABC):
             set. ``False`` for ``/resume`` / ``/branch`` / compression
             where the logical conversation continues under the new id.
         rewound:
-            ``True`` if session_id is unchanged but the transcript was
-            truncated; providers caching per-turn document state should
-            invalidate.
+            Deprecated compatibility flag for old /undo callers. Prefer
+            :meth:`on_session_rewind` when the session id is unchanged.
 
+        Default is no-op for backward compatibility.
+        """
+
+    def on_session_rewind(
+        self,
+        session_id: str,
+        *,
+        turns_undone: int = 1,
+        **kwargs,
+    ) -> None:
+        """Called when ``/undo`` rewinds active transcript within a session.
+
+        Unlike :meth:`on_session_switch`, the logical session id is unchanged;
+        providers that persist per-turn buffers should exclude the last
+        ``turns_undone`` active turns from future retain/export operations.
         Default is no-op for backward compatibility.
         """
 

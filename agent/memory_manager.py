@@ -655,18 +655,11 @@ class MemoryManager:
         session's record. See ``MemoryProvider.on_session_switch`` for
         the full contract.
 
-        ``rewound=True`` signals that session_id is unchanged but the
-        transcript was truncated; providers caching per-turn document
-        state should invalidate.
+        ``rewound=True`` is retained for backward compatibility with older
+        /undo callers; new code should call :meth:`on_session_rewind`.
         """
         if not new_session_id:
             return
-        # Only forward ``rewound`` when it's actually set. Passing it
-        # unconditionally would inject ``rewound=False`` into every
-        # provider's **kwargs for the common /resume, /branch, /new, and
-        # compression paths, polluting providers that capture extra kwargs
-        # (and breaking exact-dict assertions). The /undo path sets
-        # rewound=True explicitly; everyone else stays clean.
         if rewound:
             kwargs["rewound"] = True
         for provider in self._providers:
@@ -680,6 +673,36 @@ class MemoryManager:
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_session_switch failed: %s",
+                    provider.name, e,
+                )
+
+    def on_session_rewind(
+        self,
+        session_id: str,
+        *,
+        turns_undone: int = 1,
+        **kwargs,
+    ) -> None:
+        """Notify providers that ``/undo`` rewound the active transcript.
+
+        This is not a true session switch: the session id stays the same,
+        but providers with their own per-turn persistence need to exclude the
+        rewound turns from future retains/exports.
+        """
+        if not session_id:
+            return
+        if turns_undone < 1:
+            turns_undone = 1
+        for provider in self._providers:
+            try:
+                provider.on_session_rewind(
+                    session_id,
+                    turns_undone=turns_undone,
+                    **kwargs,
+                )
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' on_session_rewind failed: %s",
                     provider.name, e,
                 )
 

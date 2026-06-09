@@ -54,6 +54,7 @@ hindsight_retain_turns
 ## 行为说明
 
 - 每个完成 turn 的 `sync_turn()` 都会先把同源 retain payload 写入 `hindsight/retain_turns.sqlite3`。
+- retained turn rows 带 `active` 标记；正常写入为 `active=1`。
 - `auto_retain=true` 时，自动提交逻辑仍按原机制运行。
 - `auto_retain=false` 时，只写本地 SQLite，不自动提交到 Hindsight。
 - `/retain` 从当前 active `session_id` 出发，优先解析该 session 的 `retain_document_id`，并读取同一个 logical document 下的 persisted turns。
@@ -74,6 +75,20 @@ hindsight_retain_turns
 - pending append job 失败时可回滚 queued watermark。
 - session switch 用 generation guard 防止旧 pending job 污染新 session。
 - `sync_turn()` 必须先持久化 turn；`auto_retain=false` 时仍只写本地 SQLite，供 `/retain` 使用。
+
+## `/undo` 与 manual `/retain`
+
+`/undo N` 的语义是撤销当前 active conversation 的最后 N 个用户 turns。为了让 manual `/retain` 不再保存这些已撤销内容，CLI、Gateway、TUI `/undo` 都会通知 memory provider 的 rewind hook。
+
+Hindsight 收到 rewind 后：
+
+- 在 `hindsight_retain_turns` 中把当前 session 最后 N 个 `active=1` rows 标为 `active=0`，并写入 `rewound_at`。
+- `/retain` 读取 persisted turns 时只读取 `active=1` rows。
+- 不硬删除 rows，保留本地审计能力。
+- 截断当前 provider 的内存 retain buffer，并重置 queued/flushed/pending/generation 状态。
+- rewind 场景不会执行普通 `on_session_switch()` 的 flush-on-switch，避免 `/undo` 自己把即将撤销的 buffered turns 推到 Hindsight。
+
+边界：如果某些 turns 在 `/undo` 前已经通过 `auto_retain=true` 成功提交到远端 Hindsight，本地 rewind 不能保证远端删除；当前保证的是后续 manual `/retain` 不再从本地 persisted store 提交这些 inactive turns。
 
 ## 压缩、parent session 和 retain document
 
@@ -155,6 +170,8 @@ bank_id = current configured bank
 - Manual `/retain` 会按 `retain_document_id` 聚合同一压缩 logical document；即使 B/C 在 SessionDB 中表现为 siblings，也能从 C retain 到 A+B+C。
 - 旧 row 后续写入空 `parent_session_id` 时，lineage fallback 会使用早先非空 parent，而不是被空 parent 截断。
 - local `bank_id` differences in `retain_turns.sqlite3` do not exclude persisted turns; `/retain` submits all matching session lineage turns to the currently configured Hindsight bank.
+- `/undo N` marks the current session's last N active persisted retain rows inactive; manual `/retain` skips inactive rows while still preserving compression siblings that share the same `retain_document_id`.
+- Hindsight rewind handling does not run flush-on-switch, so `/undo` does not enqueue stale buffered turns as a side effect.
 - Manual `/retain` submits a clean item containing `content` and configured `context`, with no extra metadata/tags.
 - 没有 persisted turns 时不提交。
 - `get_tool_schemas()` 不暴露 `hindsight_retain_session`。
@@ -164,7 +181,8 @@ bank_id = current configured bank
 
 ```bash
 python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='
+python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_async_sync.py tests/run_agent/test_memory_sync_interrupted.py tests/gateway/test_undo_rewind_session.py tests/tui_gateway/test_undo_command.py -q -o 'addopts='
 python -m pytest tests/plugins/memory/test_hindsight_provider.py -q
-python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py hermes_cli/commands.py tests/gateway/test_retain_command.py
+python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py gateway/slash_commands.py tui_gateway/server.py hermes_cli/commands.py tests/gateway/test_retain_command.py
 git diff --check
 ```

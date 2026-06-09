@@ -1604,7 +1604,68 @@ class GatewaySlashCommandsMixin:
         # Evict the cached agent so the next turn rebuilds from the active-only
         # transcript and memory providers refresh their per-session caches.
         try:
-            session_key = build_session_key(source)
+            session_key = getattr(session_entry, "session_key", "") or build_session_key(source)
+            rewind_session_id = session_entry.session_id
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            _cache = getattr(self, "_agent_cache", None)
+            cached_agent = None
+            if _cache_lock is not None and _cache is not None:
+                with _cache_lock:
+                    cached_entry = _cache.get(session_key)
+                    cached_agent = cached_entry[0] if isinstance(cached_entry, tuple) else cached_entry
+            notified = False
+            if cached_agent is not None:
+                mm = getattr(cached_agent, "_memory_manager", None)
+                if mm is not None:
+                    try:
+                        if hasattr(mm, "on_session_rewind"):
+                            mm.on_session_rewind(
+                                rewind_session_id,
+                                turns_undone=result["turns_undone"],
+                            )
+                        else:
+                            mm.on_session_switch(
+                                rewind_session_id,
+                                parent_session_id="",
+                                reset=False,
+                                rewound=True,
+                                turns_undone=result["turns_undone"],
+                            )
+                        notified = True
+                    except Exception as e:
+                        logger.debug("undo: memory rewind notification skipped: %s", e)
+            if not notified:
+                try:
+                    from hermes_cli.config import cfg_get, load_config
+                    from hermes_constants import get_hermes_home
+                    from plugins.memory import load_memory_provider
+
+                    config = load_config()
+                    if (cfg_get(config, "memory", "provider") or "").strip() == "hindsight":
+                        provider = load_memory_provider("hindsight")
+                        if provider and provider.is_available() and hasattr(provider, "on_session_rewind"):
+                            init_kwargs = {
+                                "session_id": rewind_session_id,
+                                "platform": source.platform.value if source and source.platform else "gateway",
+                                "hermes_home": str(get_hermes_home()),
+                                "agent_context": "primary",
+                                "gateway_session_key": session_key,
+                            }
+                            for attr in ("user_id", "user_name", "chat_id", "chat_name", "chat_type", "thread_id"):
+                                value = getattr(source, attr, "") if source is not None else ""
+                                if value:
+                                    init_kwargs[attr] = value
+                            provider.initialize(**init_kwargs)
+                            provider.on_session_rewind(
+                                rewind_session_id,
+                                turns_undone=result["turns_undone"],
+                            )
+                            try:
+                                provider.shutdown()
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.debug("undo: fallback memory rewind notification skipped: %s", e)
             self._evict_cached_agent(session_key)
         except Exception as e:
             logger.debug("undo: cached-agent eviction skipped: %s", e)

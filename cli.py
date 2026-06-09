@@ -6585,7 +6585,8 @@ class HermesCLI(CLICommandsMixin):
         Beyond the in-memory ``conversation_history`` slice, this also:
           • soft-deletes the truncated rows in SessionDB (``active=0``) so
             they're hidden from re-prompts and search but kept for audit;
-          • notifies memory providers via ``on_session_switch(rewound=True)``;
+          • notifies memory providers via ``on_session_rewind(session_id, turns_undone=...)``
+            (falling back to ``on_session_switch(rewound=True)`` for older managers);
           • mirrors /branch's agent surgery (system-prompt invalidation +
             flush-index reset);
           • when ``prefill`` is set and an input buffer is available,
@@ -6668,17 +6669,26 @@ class HermesCLI(CLICommandsMixin):
                     self.agent._last_flushed_db_idx = len(self.conversation_history)
                 except Exception:
                     pass
-            # Notify memory providers — same hook /branch fires, with the
-            # rewound flag so per-turn document caches invalidate (#6672, #21910).
+            # Notify memory providers that /undo rewound this same session so
+            # provider-owned per-turn stores (for example Hindsight manual
+            # /retain rows) can exclude the undone turns without treating this
+            # as a session switch.
             try:
                 _mm = getattr(self.agent, "_memory_manager", None)
                 if _mm is not None and self.session_id:
-                    _mm.on_session_switch(
-                        self.session_id,
-                        parent_session_id="",
-                        reset=False,
-                        rewound=True,
-                    )
+                    if hasattr(_mm, "on_session_rewind"):
+                        _mm.on_session_rewind(
+                            self.session_id,
+                            turns_undone=turns_undone,
+                        )
+                    else:
+                        _mm.on_session_switch(
+                            self.session_id,
+                            parent_session_id="",
+                            reset=False,
+                            rewound=True,
+                            turns_undone=turns_undone,
+                        )
             except Exception:
                 pass
 

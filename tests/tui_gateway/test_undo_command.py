@@ -156,11 +156,10 @@ def test_undo_soft_deletes_rows_in_db(server, session_with_history, db):
 def test_undo_notifies_memory_provider(server, session_with_history):
     sid, session_key, _, agent = session_with_history
     _call(server, "command.dispatch", session_id=sid, name="undo", arg="")
-    agent._memory_manager.on_session_switch.assert_called_once()
-    args, kwargs = agent._memory_manager.on_session_switch.call_args
-    assert args[0] == session_key
-    assert kwargs["rewound"] is True
-    assert kwargs["reset"] is False
+    agent._memory_manager.on_session_rewind.assert_called_once_with(
+        session_key,
+        turns_undone=1,
+    )
 
 
 def test_undo_refuses_when_session_busy(server, session_with_history):

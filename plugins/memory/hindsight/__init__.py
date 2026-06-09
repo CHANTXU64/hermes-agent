@@ -1537,11 +1537,23 @@ class HindsightMemoryProvider(MemoryProvider):
             columns = {row[1] for row in conn.execute("PRAGMA table_info(hindsight_retain_turns)").fetchall()}
             if "retain_document_id" not in columns:
                 conn.execute("ALTER TABLE hindsight_retain_turns ADD COLUMN retain_document_id TEXT NOT NULL DEFAULT ''")
+            if "active" not in columns:
+                conn.execute("ALTER TABLE hindsight_retain_turns ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+            if "rewound_at" not in columns:
+                conn.execute("ALTER TABLE hindsight_retain_turns ADD COLUMN rewound_at REAL")
         except Exception as e:
             logger.debug("Hindsight retain store migration skipped/failed: %s", e)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_hindsight_retain_turns_document "
             "ON hindsight_retain_turns(bank_id, retain_document_id, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hindsight_retain_turns_session_active "
+            "ON hindsight_retain_turns(session_id, active, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hindsight_retain_turns_document_active "
+            "ON hindsight_retain_turns(retain_document_id, active, id)"
         )
         return conn
 
@@ -1601,6 +1613,78 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("Hindsight retain store write failed: %s", e, exc_info=True)
 
+    def mark_persisted_turns_rewound(self, session_id: str, turns_undone: int = 1) -> int:
+        """Soft-exclude the last N active persisted turns for a session.
+
+        `/undo N` rewinds N user turns in SessionDB. Hindsight keeps a
+        provider-owned retain-turn store for manual `/retain`, so mirror the
+        rewind there with `active=0` rather than hard-deleting rows.
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0
+        try:
+            limit = int(turns_undone)
+        except (TypeError, ValueError):
+            limit = 1
+        if limit < 1:
+            limit = 1
+        try:
+            with self._retain_store_connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id
+                    FROM hindsight_retain_turns
+                    WHERE session_id = ?
+                      AND active = 1
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (sid, limit),
+                ).fetchall()
+                ids = [int(row[0]) for row in rows]
+                if not ids:
+                    return 0
+                placeholders = ",".join("?" for _ in ids)
+                conn.execute(
+                    f"UPDATE hindsight_retain_turns SET active = 0, rewound_at = ? WHERE id IN ({placeholders})",
+                    (time.time(), *ids),
+                )
+                return len(ids)
+        except Exception as e:
+            logger.warning("Hindsight retain store rewind failed: %s", e, exc_info=True)
+            return 0
+
+    def on_session_rewind(self, session_id: str, *, turns_undone: int = 1, **kwargs) -> None:
+        """Handle `/undo` without flushing buffered turns to Hindsight."""
+        sid = str(session_id or self._session_id or "").strip()
+        if not sid:
+            return
+        marked = self.mark_persisted_turns_rewound(sid, turns_undone)
+        try:
+            count = int(turns_undone)
+        except (TypeError, ValueError):
+            count = 1
+        if count < 1:
+            count = 1
+        if sid == self._session_id:
+            keep = max(0, len(self._session_turns) - count)
+            self._session_turns = self._session_turns[:keep]
+            with self._retain_flush_lock:
+                self._retain_generation += 1
+                self._last_flushed_turn_count = min(self._last_flushed_turn_count, keep)
+                self._last_queued_flush_count = min(self._last_queued_flush_count, keep)
+                self._retain_flush_pending = False
+            self._turn_counter = keep
+            self._turn_index = keep
+        with self._prefetch_lock:
+            self._prefetch_generation += 1
+            self._prefetch_result = ""
+        logger.debug(
+            "Hindsight on_session_rewind: session=%s turns_undone=%s marked=%s",
+            sid, count, marked,
+        )
+
     def _lineage_session_ids(self, session_id: str, fallback_parent_session_id: str = "") -> list[str]:
         current = str(session_id or "").strip()
         if not current:
@@ -1652,6 +1736,7 @@ class HindsightMemoryProvider(MemoryProvider):
                         SELECT session_id, turn_json
                         FROM hindsight_retain_turns
                         WHERE retain_document_id = ?
+                          AND active = 1
                         ORDER BY id ASC
                         """,
                         (retain_document_id,),
@@ -1681,6 +1766,7 @@ class HindsightMemoryProvider(MemoryProvider):
                         SELECT turn_json
                         FROM hindsight_retain_turns
                         WHERE session_id = ?
+                          AND active = 1
                         ORDER BY id ASC
                         """,
                         (sid,),
@@ -2077,6 +2163,12 @@ class HindsightMemoryProvider(MemoryProvider):
         """
         new_id = str(new_session_id or "").strip()
         if not new_id:
+            return
+        if kwargs.get("rewound"):
+            self.on_session_rewind(
+                new_id,
+                turns_undone=kwargs.get("turns_undone", 1),
+            )
             return
 
         # 1. Flush any buffered turns under the OLD identifiers. Snapshot
