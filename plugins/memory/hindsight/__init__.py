@@ -626,6 +626,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_context = "conversation between Hermes Agent and the User"
         self._turn_counter = 0
         self._session_turns: list[str] = []  # accumulates ALL turns for the session
+        # Track retain flush progress. Append-capable APIs only receive turns
+        # after _last_queued_flush_count; legacy/overwrite APIs still resend the
+        # full session. Separate queued/flushed counters let failed async append
+        # jobs roll back safely, and the generation guard prevents old jobs from
+        # mutating a newer session.
         self._last_flushed_turn_count = 0
         self._last_queued_flush_count = 0
         self._retain_flush_pending = False
