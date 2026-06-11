@@ -90,7 +90,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -268,6 +268,38 @@ _SAFE_ENV_KEYS = frozenset({
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
 })
 
+_SAFE_ENV_KEYS_CASE_INSENSITIVE = frozenset({
+    # Windows process/location vars. These are needed by launcher-style tools
+    # such as Docker Desktop's MCP plugin discovery, and do not carry secrets.
+    "ALLUSERSPROFILE",
+    "APPDATA",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "COMMONPROGRAMW6432",
+    "COMPUTERNAME",
+    "COMSPEC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "PUBLIC",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERDOMAIN",
+    "USERNAME",
+    "USERPROFILE",
+    "WINDIR",
+})
+
 # Regex for credential patterns to strip from error messages
 _CREDENTIAL_PATTERN = re.compile(
     r"(?:"
@@ -305,7 +337,11 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     """
     env = {}
     for key, value in os.environ.items():
-        if key in _SAFE_ENV_KEYS or key.startswith("XDG_"):
+        if (
+            key in _SAFE_ENV_KEYS
+            or key.upper() in _SAFE_ENV_KEYS_CASE_INSENSITIVE
+            or key.startswith("XDG_")
+        ):
             env[key] = value
     if user_env:
         env.update(user_env)
@@ -2460,6 +2496,37 @@ def _ensure_mcp_loop():
         _mcp_thread.start()
 
 
+def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
+    """Carry the caller's context-local HERMES_HOME override into ``coro``.
+
+    Returns ``coro`` unchanged when no override is active. Otherwise wraps
+    it so the override is set inside the coroutine's own (task-local)
+    context on the MCP loop and reset when it completes — concurrent calls
+    carrying different scopes don't interfere.
+    """
+    try:
+        from hermes_constants import (
+            get_hermes_home_override,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        home_override = get_hermes_home_override()
+    except Exception:
+        return coro
+    if not home_override:
+        return coro
+
+    async def _scoped():
+        token = set_hermes_home_override(home_override)
+        try:
+            return await coro
+        finally:
+            reset_hermes_home_override(token)
+
+    return _scoped()
+
+
 def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     """Schedule a coroutine on the MCP event loop and block until done.
 
@@ -2482,6 +2549,19 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
         raise RuntimeError("MCP event loop is not running")
 
     coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+
+    # Propagate the context-local HERMES_HOME override onto the MCP loop.
+    # Tasks scheduled via run_coroutine_threadsafe are created INSIDE the
+    # loop thread, so they copy the loop thread's context — not the
+    # scheduling thread's. A per-request profile scope (the dashboard's
+    # ?profile= endpoints, e.g. the MCP "Test server" probe) would silently
+    # vanish here: OAuth token stores and any other get_hermes_home()
+    # resolution inside the coroutine would read the process home instead
+    # of the selected profile's. Re-establish the override inside the
+    # task's own context (task-local — concurrent calls carrying different
+    # scopes don't interfere). No-op when no override is active.
+    coro = _wrap_with_home_override(coro)
+
     future = safe_schedule_threadsafe(
         coro, loop,
         logger=logger,
