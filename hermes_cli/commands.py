@@ -1081,8 +1081,11 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         seen.add(slack_name)
 
     # Reserve common short aliases before canonical commands so Slack's 50-command
-    # cap does not drop documented muscle-memory shortcuts such as /q.
-    priority_aliases = ("btw", "bg", "reset", "q")
+    # cap does not drop the most-used muscle-memory shortcuts. Keep this list
+    # short: every alias consumes a Slack slot that could otherwise carry a
+    # Telegram-visible canonical command, and parity is the higher-priority
+    # contract when the registry grows.
+    priority_aliases = ("btw", "bg", "reset")
     for alias in priority_aliases:
         for cmd in COMMAND_REGISTRY:
             if alias in cmd.aliases and _is_gateway_available(cmd, overrides):
