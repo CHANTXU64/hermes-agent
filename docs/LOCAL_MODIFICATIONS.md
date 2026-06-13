@@ -396,6 +396,7 @@ What changed:
 - Hindsight rewind handling truncates the in-memory retain buffer and invalidates flush state without running the normal session-switch flush, so `/undo` does not itself push stale buffered turns to Hindsight.
 - Only `/retain` is user-facing; no long command aliases are registered.
 - Slack native slash generation keeps Telegram-visible canonical commands ahead of low-priority aliases so the extra fork-only `/retain` command does not push upstream `/debug` out of Slack registration under Slack's 50-command cap.
+- After the 2026-06-14 upstream sync, Slack routes the low-frequency `/blueprint` native command through `/hermes blueprint` on this fork; this preserves native `/retain` and `/debug` slots while keeping `/blueprint` reachable on Slack via the catch-all command.
 - `hindsight_retain_session` is not registered in model-visible tool schemas; CLI/Gateway call the provider directly via `memory_manager.get_provider("hindsight")`, so manual retain works even when `memory_mode="context"` hides Hindsight tools from the model.
 
 Why it matters:
