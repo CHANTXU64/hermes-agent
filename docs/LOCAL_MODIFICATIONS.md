@@ -395,7 +395,7 @@ What changed:
 - `/undo` now calls a dedicated memory rewind hook in CLI, Gateway, and TUI paths; Hindsight mirrors that rewind by soft-excluding the last N active rows in `hindsight_retain_turns` (`active=0`, `rewound_at`) so future manual `/retain` skips undone turns without hard-deleting audit rows.
 - Hindsight rewind handling truncates the in-memory retain buffer and invalidates flush state without running the normal session-switch flush, so `/undo` does not itself push stale buffered turns to Hindsight.
 - Only `/retain` is user-facing; no long command aliases are registered.
-- Slack native slash generation keeps Telegram-visible canonical commands ahead of low-priority aliases so the extra fork-only `/retain` command does not push upstream `/debug` out of Slack registration under Slack's 50-command cap.
+- Slack native slash generation keeps Telegram-visible canonical commands ahead of low-priority aliases so the extra fork-only `/retain` command does not push upstream `/debug` out of Slack registration under Slack's 50-command cap; low-frequency `/credits`, `/insights`, `/disk_cleanup`, and `/lcm` remain reachable through `/hermes <command>` on Slack when native slots are exhausted.
 - `hindsight_retain_session` is not registered in model-visible tool schemas; CLI/Gateway call the provider directly via `memory_manager.get_provider("hindsight")`, so manual retain works even when `memory_mode="context"` hides Hindsight tools from the model.
 
 Why it matters:
