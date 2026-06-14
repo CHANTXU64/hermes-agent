@@ -1054,11 +1054,12 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 # the telegram-parity test reads it so an entry here is a deliberate
 # "Slack-via-/hermes" decision, not a silent clamp.
 #   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
-#   - insights: analytics remain available through /hermes insights so /debug
-#     keeps a native slot after the fork-only /retain command.
+#   - blueprint: low-frequency automation setup; routed via /hermes blueprint on
+#     this fork so the fork-only /retain command can keep native Slack parity
+#     without silently clamping /debug.
 #   - disk_cleanup/lcm: plugin-provided maintenance commands remain available
 #     through /hermes <command> when Slack's native slots are exhausted.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "insights", "disk_cleanup", "lcm"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "blueprint", "disk_cleanup", "lcm"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
