@@ -7470,18 +7470,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif canonical == "retain":
             memory_manager = getattr(self.agent, "_memory_manager", None) if self.agent else None
             provider = memory_manager.get_provider("hindsight") if memory_manager else None
-            if not provider or not (hasattr(provider, "retain_persisted_session_lineage") or hasattr(provider, "flush_retained_turns")):
+            if not provider or not (hasattr(provider, "retain_conversation_messages") or hasattr(provider, "retain_persisted_session_lineage") or hasattr(provider, "flush_retained_turns")):
                 _cprint("  Hindsight memory provider is not active.")
             else:
                 try:
                     data = None
-                    if hasattr(provider, "retain_persisted_session_lineage"):
-                        row = self._session_db.get_session(self.session_id) if self._session_db and self.session_id else {}
+                    row = self._session_db.get_session(self.session_id) if self._session_db and self.session_id else {}
+                    parent_session_id = str((row or {}).get("parent_session_id") or "")
+                    messages = []
+                    if self._session_db and self.session_id and hasattr(provider, "retain_conversation_messages"):
+                        try:
+                            if hasattr(self._session_db, "get_messages_as_conversation"):
+                                messages = self._session_db.get_messages_as_conversation(self.session_id) or []
+                        except Exception:
+                            messages = []
+                        if messages:
+                            data = provider.retain_conversation_messages(
+                                messages,
+                                session_id=self.session_id,
+                                parent_session_id=parent_session_id,
+                            )
+                    if (not data or not data.get("queued")) and hasattr(provider, "retain_persisted_session_lineage"):
                         data = provider.retain_persisted_session_lineage(
                             session_id=self.session_id,
-                            parent_session_id=str((row or {}).get("parent_session_id") or ""),
+                            parent_session_id=parent_session_id,
                         )
-                    elif hasattr(provider, "flush_retained_turns"):
+                    elif data is None and hasattr(provider, "flush_retained_turns"):
                         data = provider.flush_retained_turns()
                     if data is None:
                         data = {"queued": False, "message": "Hindsight memory provider is not active."}

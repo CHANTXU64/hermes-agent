@@ -376,14 +376,15 @@ Files:
 
 Summary:
 
-- Adds a user-triggered `/retain` command that flushes Hindsight's existing buffered conversation turns through the normal automatic retain storage path.
+- Adds a user-triggered `/retain` command that records a full Hindsight session document from Hermes' active transcript while preserving fork-specific Hindsight document lineage.
 
 What changed:
 
 - Added `hindsight_retain_session` / `/retain` for user-triggered Hindsight session retain.
 - Hindsight `sync_turn()` now persists the exact same turn JSON used by automatic retain into a separate SQLite file: `$HERMES_HOME/hindsight/retain_turns.sqlite3`.
 - Persisted retain rows include `retain_document_id`, a stable logical document id inherited across compression-created child sessions.
-- Gateway/CLI `/retain` no longer reconstructs from raw Hermes SessionDB transcript; it asks the provider to read persisted retain turns for the current session lineage.
+- Gateway/CLI `/retain` uses the active Hermes SessionDB transcript as the authoritative content source when available, so interrupted or otherwise orphaned user messages at the start/middle/end of a session are not dropped.
+- Provider-owned `retain_turns.sqlite3` remains the fallback content source and the source for stable `retain_document_id` resolution when preserving compression-created logical documents.
 - Gateway `/retain` resolves the current `session_id` via `SessionStore.get_or_create_session(source)`, matching the normal message path, so `/resume` and gateway restart still point retain at the selected session even before a cached agent exists.
 - Manual retain first groups persisted turns by `retain_document_id`; this preserves a single logical Hindsight document even when compression/session bookkeeping records continuation sessions as siblings rather than a clean parent chain.
 - Parent-chain lookup remains a fallback for older local rows without `retain_document_id`, and ignores empty stored parents when looking for a prior non-empty parent.
@@ -402,10 +403,13 @@ What changed:
 Why it matters:
 
 - The user needs an explicit, user-triggered way to preserve the normal Hindsight session document without changing the automatic retain storage model.
+- Manual `/retain` must not lose user messages that never became completed external-memory turns because a run was interrupted; the Hindsight document must start from the actual first active SessionDB user message.
 
 Merge protection:
 
-- Do not reconstruct manual session retain from raw Hermes SessionDB transcript; the source of truth is provider-owned `$HERMES_HOME/hindsight/retain_turns.sqlite3` rows written by `sync_turn()`.
+- Preserve SessionDB transcript as the primary manual `/retain` content source when available. Do not regress to provider-owned completed-turn rows as the only source; that drops interrupted/orphan user messages such as a session's first user request.
+- Preserve orphan user-message handling in `retain_conversation_messages()` / `_build_turns_from_conversation_messages()`: consecutive user messages must flush the earlier pending user as a single-message turn, and trailing pending users must also be retained. Do not fake an empty assistant response.
+- Preserve provider-owned `$HERMES_HOME/hindsight/retain_turns.sqlite3` as fallback content and as the stable `retain_document_id` resolver for compression-created logical documents.
 - Do not create a separate `manual-session:*` document; use `_resolve_retain_target_for_session()` with the resolved `retain_document_id` so Hindsight append semantics stay aligned with automatic retain.
 - Do not expose `hindsight_retain_session` as a model-visible tool by default; this is a user slash command/provider method.
 - Manual `/retain` must include all sessions that share the same `retain_document_id`, ordered by persisted row id; do not rely solely on `parent_session_id`, because compression continuations can appear as siblings in SessionDB.
@@ -419,6 +423,8 @@ Merge protection:
 
 Verification:
 
+- 2026-06-15 orphan-user transcript fix: `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py -q -o 'addopts=' && python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py && git diff --check` → 138 passed, py_compile passed, diff check passed.
+- 2026-06-15 orphan-user transcript fix: `python -m pytest tests/hermes_cli/test_commands.py tests/run_agent/test_memory_sync_interrupted.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_async_sync.py -q -o 'addopts='` → 195 passed / 1 unrelated `audioop` deprecation warning.
 - `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='` → 260 passed.
 - `python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py hermes_cli/commands.py tests/gateway/test_retain_command.py` → passed.
 - `git diff --check` → passed.

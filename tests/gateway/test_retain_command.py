@@ -38,25 +38,32 @@ def _make_runner():
 
 
 @pytest.mark.asyncio
-async def test_retain_command_uses_persisted_hindsight_lineage_when_available():
+async def test_retain_command_uses_session_transcript_when_available():
     runner = _make_runner()
     source = _make_source()
     session_key = build_session_key(source)
     provider = MagicMock()
-    provider.retain_persisted_session_lineage.return_value = {"queued": True}
+    provider.retain_conversation_messages.return_value = {"queued": True}
     memory_manager = SimpleNamespace(get_provider=lambda name: provider if name == "hindsight" else None)
     agent = SimpleNamespace(_memory_manager=memory_manager, session_id="sid-1")
     runner._agent_cache[session_key] = (agent, "sig")
+    messages = [
+        {"role": "user", "content": "leading interrupted user"},
+        {"role": "user", "content": "next user"},
+        {"role": "assistant", "content": "next assistant"},
+    ]
     db = SimpleNamespace(get_session=lambda sid: {"parent_session_id": "parent-1"})
-    runner.__dict__["session_store"] = SimpleNamespace(_db=db)
+    runner.__dict__["session_store"] = SimpleNamespace(_db=db, load_transcript=MagicMock(return_value=messages))
 
     result = await runner._handle_retain_command(_make_event())
 
     assert result == "Buffered session turns queued for retain."
-    provider.retain_persisted_session_lineage.assert_called_once_with(
+    provider.retain_conversation_messages.assert_called_once_with(
+        messages,
         session_id="sid-1",
         parent_session_id="parent-1",
     )
+    provider.retain_persisted_session_lineage.assert_not_called()
     provider.flush_retained_turns.assert_not_called()
 
 

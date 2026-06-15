@@ -9584,7 +9584,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         provider = candidate
             except Exception:
                 provider = None
-        if not provider or not (hasattr(provider, "retain_persisted_session_lineage") or hasattr(provider, "flush_retained_turns")):
+        if not provider or not (hasattr(provider, "retain_conversation_messages") or hasattr(provider, "retain_persisted_session_lineage") or hasattr(provider, "flush_retained_turns")):
             return "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。"
         try:
             data = None
@@ -9594,22 +9594,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 or getattr(provider, "_session_id", "")
                 or ""
             ).strip()
-            if session_id and hasattr(provider, "retain_persisted_session_lineage"):
-                parent_session_id = ""
-                db = getattr(session_store, "_db", None) if session_store is not None else None
-                if db is not None:
-                    try:
-                        row = db.get_session(session_id)
-                        parent_session_id = str((row or {}).get("parent_session_id") or "")
-                    except Exception:
-                        parent_session_id = ""
+            parent_session_id = ""
+            messages = []
+            db = getattr(session_store, "_db", None) if session_store is not None else None
+            if session_id and db is not None:
+                try:
+                    row = db.get_session(session_id)
+                    parent_session_id = str((row or {}).get("parent_session_id") or "")
+                except Exception:
+                    parent_session_id = ""
+            if session_id and session_store is not None and hasattr(provider, "retain_conversation_messages"):
+                try:
+                    if hasattr(session_store, "load_transcript"):
+                        messages = session_store.load_transcript(session_id) or []
+                    elif db is not None and hasattr(db, "get_messages_as_conversation"):
+                        messages = db.get_messages_as_conversation(session_id) or []
+                except Exception:
+                    messages = []
+                if messages:
+                    data = provider.retain_conversation_messages(
+                        messages,
+                        session_id=session_id,
+                        parent_session_id=parent_session_id,
+                    )
+            if (not data or not data.get("queued")) and session_id and hasattr(provider, "retain_persisted_session_lineage"):
                 data = provider.retain_persisted_session_lineage(
                     session_id=session_id,
                     parent_session_id=parent_session_id,
                 )
-            elif hasattr(provider, "flush_retained_turns"):
+            elif data is None and hasattr(provider, "flush_retained_turns"):
                 data = provider.flush_retained_turns()
-            else:
+            elif data is None:
                 return "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。"
             if data is None:
                 return "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。"

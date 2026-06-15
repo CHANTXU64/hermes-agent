@@ -1513,6 +1513,62 @@ class HindsightMemoryProvider(MemoryProvider):
             },
         ]
 
+    @staticmethod
+    def _stringify_retain_content(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        return json.dumps(content, ensure_ascii=False)
+
+    def _build_orphan_user_turn(self, user_content: str) -> List[Dict[str, str]]:
+        return [
+            {
+                "role": "user",
+                "content": f"{self._retain_user_prefix}: {user_content}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        ]
+
+    def _build_turns_from_conversation_messages(self, messages: List[Dict[str, Any]]) -> List[str]:
+        """Build retain turn JSON from persisted Hermes SessionDB messages.
+
+        SessionDB is the authoritative transcript for manual `/retain`: it
+        contains user messages that may never have become a completed external
+        memory turn because the assistant run was interrupted. Preserve those
+        orphan user messages as single-message turns instead of overwriting them
+        with the next user message.
+        """
+        turns: List[str] = []
+        pending_user = ""
+
+        def _flush_pending_user() -> None:
+            nonlocal pending_user
+            if pending_user:
+                turns.append(json.dumps(self._build_orphan_user_turn(pending_user), ensure_ascii=False))
+                pending_user = ""
+
+        for msg in messages or []:
+            role = str(msg.get("role") or "").strip()
+            content = self._stringify_retain_content(msg.get("content")).strip()
+            if not role or not content:
+                continue
+            if role == "user":
+                _flush_pending_user()
+                pending_user = content
+                continue
+            if role == "assistant" and content.startswith("[Recent Summary"):
+                continue
+            if role != "assistant" or not pending_user:
+                continue
+            if msg.get("tool_calls") or msg.get("finish_reason") == "tool_calls":
+                continue
+            turns.append(json.dumps(self._build_turn_messages(pending_user, content), ensure_ascii=False))
+            pending_user = ""
+
+        _flush_pending_user()
+        return turns
+
     def _retain_store_connect(self) -> sqlite3.Connection:
         self._retain_store_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self._retain_store_path), timeout=30)
@@ -1835,6 +1891,119 @@ class HindsightMemoryProvider(MemoryProvider):
         if merged_tags:
             kwargs["tags"] = merged_tags
         return kwargs
+
+    def retain_conversation_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        session_id: str = "",
+        parent_session_id: str = "",
+    ) -> Dict[str, Any]:
+        """Queue manual retain from the active Hermes SessionDB transcript.
+
+        Unlike the provider-owned retain-turn store, the SessionDB transcript
+        includes interrupted/orphan user messages. Use it as the authoritative
+        content source for manual `/retain` when available; keep the provider
+        store for document-id resolution and as a fallback in callers.
+        """
+        if self._shutting_down.is_set():
+            raise RuntimeError("Hindsight provider is shutting down")
+
+        turns = self._build_turns_from_conversation_messages(messages)
+        if not turns:
+            return {"queued": False, "turn_count": 0, "message": "No conversation turns to retain."}
+
+        target_session_id = str(session_id or self._session_id or "").strip()
+        parent_id = str(parent_session_id or self._parent_session_id or "").strip()
+        retain_document_id = ""
+        lineage: list[str] = []
+        persisted_rows: list[tuple[str, str]] = []
+        if target_session_id:
+            try:
+                with self._retain_store_connect() as conn:
+                    retain_document_id = self._resolve_retain_document_id(conn, target_session_id, parent_id)
+                    if retain_document_id:
+                        rows = conn.execute(
+                            """
+                            SELECT session_id, turn_json
+                            FROM hindsight_retain_turns
+                            WHERE retain_document_id = ?
+                              AND active = 1
+                            ORDER BY id ASC
+                            """,
+                            (retain_document_id,),
+                        ).fetchall()
+                        seen: set[str] = set()
+                        for sid, turn_json in rows:
+                            sid = str(sid or "").strip()
+                            if sid and sid not in seen:
+                                lineage.append(sid)
+                                seen.add(sid)
+                            if turn_json:
+                                persisted_rows.append((sid, str(turn_json)))
+            except Exception as e:
+                logger.warning("Hindsight transcript retain document lookup failed: %s", e, exc_info=True)
+
+        if persisted_rows and target_session_id:
+            transcript_turns = turns
+            merged_turns: list[str] = []
+            inserted_transcript = False
+            for sid, turn_json in persisted_rows:
+                if sid == target_session_id:
+                    if not inserted_transcript:
+                        merged_turns.extend(transcript_turns)
+                        inserted_transcript = True
+                    continue
+                merged_turns.append(turn_json)
+            if not inserted_transcript:
+                merged_turns.extend(transcript_turns)
+                if target_session_id and target_session_id not in lineage:
+                    lineage.append(target_session_id)
+            turns = merged_turns
+
+        fallback_document_id = self._document_id
+        if target_session_id and target_session_id != self._session_id:
+            fallback_document_id = f"{target_session_id}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        document_id, update_mode = self._resolve_retain_target_for_session(retain_document_id or target_session_id, fallback_document_id)
+        content = "[" + ",".join(turns) + "]"
+        bank_id = self._bank_id
+        retain_async_flag = self._retain_async
+        retain_context = self._retain_context
+        num_turns = len(turns)
+
+        def _do_retain() -> None:
+            item: Dict[str, Any] = {"content": content}
+            if retain_context:
+                item["context"] = retain_context
+            if update_mode is not None:
+                item["update_mode"] = update_mode
+            logger.debug(
+                "Hindsight transcript retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
+                bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns,
+            )
+            self._run_hindsight_operation(
+                lambda client: client.aretain_batch(
+                    bank_id=bank_id,
+                    items=[item],
+                    document_id=document_id,
+                    retain_async=retain_async_flag,
+                )
+            )
+            logger.debug("Hindsight transcript retain succeeded")
+
+        self._ensure_writer()
+        self._register_atexit()
+        self._retain_queue.put(_do_retain)
+        result = {
+            "queued": True,
+            "turn_count": num_turns,
+            "document_id": document_id,
+            "update_mode": update_mode,
+            "content_chars": len(content),
+        }
+        if lineage:
+            result["lineage_session_ids"] = lineage
+        return result
 
     def retain_persisted_session_lineage(
         self,

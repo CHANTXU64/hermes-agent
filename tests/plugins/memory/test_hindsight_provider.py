@@ -969,6 +969,79 @@ class TestToolHandlers:
         assert "old bank user" in content
         assert "new bank user" in content
 
+    def test_transcript_retain_preserves_leading_orphan_user_message(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        messages = [
+            {
+                "role": "user",
+                "content": "FIP平台有12个合同信息完善及更正单，全部提交",
+            },
+            {"role": "user", "content": "你在搞什么啊？"},
+            {"role": "assistant", "content": "我停了。"},
+        ]
+
+        info = p.retain_conversation_messages(messages, session_id="test-session")
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["turn_count"] == 2
+        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        turns = json.loads(content)
+        assert len(turns[0]) == 1
+        assert turns[0][0]["role"] == "user"
+        assert turns[0][0]["content"] == "User: FIP平台有12个合同信息完善及更正单，全部提交"
+        assert "timestamp" in turns[0][0]
+        assert turns[1][0]["content"] == "User: 你在搞什么啊？"
+        assert turns[1][1]["content"] == "Assistant: 我停了。"
+        assert content.index("FIP平台") < content.index("你在搞什么啊")
+        assert "Assistant: " not in json.dumps(turns[0], ensure_ascii=False)
+        assert "\\u" not in content
+
+    def test_transcript_retain_keeps_existing_retain_document_sibling_turns(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        p.initialize(session_id="root-session", hermes_home=str(p._retain_store_path.parents[1]), platform="cli")
+        p._client = _make_mock_client()
+        p.sync_turn("root user", "root assistant")
+        p.on_session_switch("child-one", parent_session_id="root-session")
+        p.sync_turn("child one user", "child one assistant")
+        p.on_session_switch("child-two", parent_session_id="root-session")
+        p.sync_turn("stale child two user", "stale child two assistant")
+        messages = [
+            {"role": "user", "content": "child two interrupted first"},
+            {"role": "user", "content": "child two current user"},
+            {"role": "assistant", "content": "child two current assistant"},
+        ]
+
+        info = p.retain_conversation_messages(
+            messages,
+            session_id="child-two",
+            parent_session_id="root-session",
+        )
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["document_id"] == "root-session"
+        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert "root user" in content
+        assert "child one user" in content
+        assert "child two interrupted first" in content
+        assert "child two current user" in content
+        assert "stale child two user" not in content
+
     def test_persisted_retain_without_turns_returns_message(self, provider_with_config):
         p = provider_with_config(auto_retain=False)
 
