@@ -551,6 +551,59 @@ def interruptible_api_call(agent, api_kwargs: dict):
     return result["response"]
 
 
+def _codex_prompt_cache_scope(agent, session_id: str | None) -> str | None:
+    """Return the stable prompt-cache scope for a Codex Responses request."""
+    gateway_key = str(getattr(agent, "_gateway_session_key", "") or "").strip()
+    if gateway_key:
+        return gateway_key
+
+    current = str(session_id or "").strip()
+    if not current:
+        return None
+
+    db = getattr(agent, "_session_db", None)
+    if db is None or not hasattr(db, "get_session"):
+        return current
+
+    root = current
+    seen: set[str] = set()
+    try:
+        for _ in range(100):
+            if not current or current in seen:
+                break
+            seen.add(current)
+            row = db.get_session(current)
+            if not isinstance(row, dict):
+                break
+            parent_id = str(row.get("parent_session_id") or "").strip()
+            if not parent_id:
+                break
+            parent = db.get_session(parent_id)
+            if not isinstance(parent, dict):
+                break
+            if str(parent.get("end_reason") or "") != "compression":
+                break
+
+            # Match SessionDB.get_compression_tip's distinction: compression
+            # children are created after the parent has ended. Delegates and
+            # branches may also use parent_session_id but start while the parent
+            # is live, so they keep their own cache scope.
+            parent_ended = parent.get("ended_at")
+            child_started = row.get("started_at")
+            if parent_ended is not None and child_started is not None:
+                try:
+                    if float(child_started) < float(parent_ended):
+                        break
+                except (TypeError, ValueError):
+                    break
+
+            root = parent_id
+            current = parent_id
+    except Exception:
+        return str(session_id or "").strip() or None
+
+    return root
+
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
@@ -641,12 +694,14 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
                     getattr(agent, "log_prefix", ""), exc,
                 )
 
+        session_id = getattr(agent, "session_id", None)
         return _ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
             tools=tools_for_api,
             reasoning_config=agent.reasoning_config,
-            session_id=getattr(agent, "session_id", None),
+            session_id=session_id,
+            prompt_cache_key=_codex_prompt_cache_scope(agent, session_id),
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,

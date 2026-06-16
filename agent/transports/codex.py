@@ -72,6 +72,7 @@ class ResponsesApiTransport(ProviderTransport):
             instructions: str — system prompt (extracted from messages[0] if not given)
             reasoning_config: dict | None — {effort, enabled}
             session_id: str | None — used for prompt_cache_key + xAI conv header
+            prompt_cache_key: str | None — stable cache scope; falls back to session_id
             max_tokens: int | None — max_output_tokens
             timeout: float | None — per-request timeout forwarded to the SDK
             request_overrides: dict | None — extra kwargs merged in
@@ -152,11 +153,14 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["tool_choice"] = "auto"
             kwargs["parallel_tool_calls"] = True
 
-        session_id = params.get("session_id")
+        session_id = str(params.get("session_id") or "").strip()
+        prompt_cache_key = str(
+            params.get("prompt_cache_key") or session_id or ""
+        ).strip()
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
-        if not is_github_responses and not is_xai_responses and session_id:
-            kwargs["prompt_cache_key"] = session_id
+        if not is_github_responses and not is_xai_responses and prompt_cache_key:
+            kwargs["prompt_cache_key"] = prompt_cache_key
 
         if reasoning_enabled and is_xai_responses:
             from agent.model_metadata import grok_supports_reasoning_effort
@@ -191,6 +195,9 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+            prompt_cache_key = str(
+                kwargs.get("prompt_cache_key") or prompt_cache_key or session_id or ""
+            ).strip()
 
         # xAI Responses API rejects ``service_tier`` (HTTP 400 "Argument not
         # supported: service_tier") — hit when ``/fast`` priority-processing
@@ -218,10 +225,25 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs.pop("timeout", None)
 
         if is_codex_backend:
-            # chatgpt.com/backend-api/codex rejects body-level
-            # ``extra_headers`` with HTTP 400. Correlation/cache routing for
-            # this backend must not be sent through the Responses payload.
-            kwargs.pop("extra_headers", None)
+            existing_extra_headers = kwargs.get("extra_headers")
+            merged_extra_headers: Dict[str, str] = {}
+            if isinstance(existing_extra_headers, dict):
+                merged_extra_headers.update(
+                    {
+                        str(key): str(value)
+                        for key, value in existing_extra_headers.items()
+                        if key and value is not None
+                    }
+                )
+            if session_id:
+                merged_extra_headers.setdefault("session-id", session_id)
+            if prompt_cache_key:
+                merged_extra_headers.setdefault("thread-id", prompt_cache_key)
+                merged_extra_headers.setdefault("x-client-request-id", prompt_cache_key)
+            if merged_extra_headers:
+                kwargs["extra_headers"] = merged_extra_headers
+            else:
+                kwargs.pop("extra_headers", None)
 
         max_tokens = params.get("max_tokens")
         if max_tokens is not None and not is_codex_backend:

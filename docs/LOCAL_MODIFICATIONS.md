@@ -552,6 +552,82 @@ Feature docs: none — TTS provider extension documented in this index.
 Upstream status: fork-only.
 
 
+### 12. Temporary Codex backend prompt-cache routing workaround
+
+Status: active, temporary
+
+Date: 2026-06-16
+
+Files:
+
+- `agent/chat_completion_helpers.py`
+- `agent/transports/codex.py`
+- `tests/agent/transports/test_codex_transport.py`
+- `tests/run_agent/test_run_agent_codex_responses.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- Adds a short-term fork workaround for a Codex backend prompt-cache regression
+  where consecutive tool calls could lose cache after upstream removed Codex
+  backend `extra_headers`.
+
+What changed:
+
+- Codex Responses requests can pass a stable `prompt_cache_key` separate from
+  the physical Hermes `session_id`.
+- Gateway sessions prefer the stable `_gateway_session_key` as the Codex cache
+  thread, so compression-created continuation sessions do not reset the cache
+  scope just because Hermes rotated the physical session row.
+- Non-gateway sessions may fall back to compression lineage so compression
+  children can share the same cache scope as their root session.
+- The Codex backend restores HTTP routing/cache headers that are safe for the
+  chatgpt.com Codex backend:
+  - `session-id`
+  - `thread-id`
+  - `x-client-request-id`
+- The old problematic underscore header name `session_id` must not be restored.
+
+Why it matters:
+
+- The user observed a sharp prompt-cache drop in Hermes on 2026-06-15 to
+  2026-06-16, visible in Langfuse and local session usage.
+- The failure lined up with the upstream change that stripped Codex backend
+  `extra_headers`, plus Hermes using compression-rotated physical session ids as
+  cache keys.
+- This workaround keeps Gateway tool-call chains and compression continuations on
+  a stable Codex cache thread.
+
+Merge protection:
+
+- This is intentionally a temporary fork patch, not a long-term fork feature.
+- Official Hermes will probably fix this class of Codex cache regression soon.
+- If upstream/official Hermes has an equivalent fix and local testing shows
+  prompt caching works after compression and consecutive tool calls, prefer the
+  official upstream implementation and drop this fork modification entirely.
+- Do not fight future upstream merge conflicts to preserve this exact code when
+  upstream has fixed the issue. The safe merge policy is: official working fix
+  wins, this local workaround is abandoned.
+- If upstream has no equivalent fix yet, preserve stable cache routing for Codex
+  backend requests and keep `session_id` out of `extra_headers`.
+
+Verification:
+
+```bash
+git diff --check
+python -m pytest tests/agent/transports/test_codex_transport.py tests/run_agent/test_run_agent_codex_responses.py tests/gateway/test_agent_cache.py -q
+```
+
+Observed local result on 2026-06-16:
+
+- `202 passed` for the focused pytest command above.
+- After gateway restart and a compression boundary, the new continuation session
+  continued receiving cache reads instead of staying at zero cache.
+
+Upstream status: temporary fork workaround; should be removed once upstream has
+a verified official fix.
+
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -597,15 +673,20 @@ deltas are expected in these areas:
   - `hermes_cli/config.py`
   - `hermes_cli/main.py`
   - `tests/tools/test_skills_sync.py`
+- Temporary Codex backend prompt-cache routing workaround:
+  - `agent/chat_completion_helpers.py`
+  - `agent/transports/codex.py`
+  - `tests/agent/transports/test_codex_transport.py`
+  - `tests/run_agent/test_run_agent_codex_responses.py`
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
 
 
 ## Summary statistics
 
-Documented entries: 11 major entries.
+Documented entries: 12 major entries.
 
-Active functional areas: 9.
+Active functional areas: 10.
 
 Historical reverted areas: 1.
 
