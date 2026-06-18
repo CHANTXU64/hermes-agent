@@ -385,8 +385,12 @@ What changed:
 - Persisted retain rows include `retain_document_id`, a stable logical document id inherited across compression-created child sessions.
 - Gateway/CLI `/retain` uses the active Hermes SessionDB transcript as the authoritative content source when available, so interrupted or otherwise orphaned user messages at the start/middle/end of a session are not dropped.
 - Provider-owned `retain_turns.sqlite3` remains the fallback content source and the source for stable `retain_document_id` resolution when preserving compression-created logical documents.
-- Gateway `/retain` resolves the current `session_id` via `SessionStore.get_or_create_session(source)`, matching the normal message path, so `/resume` and gateway restart still point retain at the selected session even before a cached agent exists.
+- Gateway/CLI `/retain` resolves the current `session_id` via `SessionStore.get_or_create_session(source)` or the active CLI session, then loads the full SessionDB parent chain root → current as transcript input. Each message is tagged with its source session id before being sent to the provider.
 - Manual retain first groups persisted turns by `retain_document_id`; this preserves a single logical Hindsight document even when compression/session bookkeeping records continuation sessions as siblings rather than a clean parent chain.
+- When manual transcript retain is called with `parent_session_id`, retain document resolution prefers the earliest parent/root document before any current- or parent-session split document. This prevents later lifecycle rows under a child or intermediate parent session id from hiding the original file uploads, task request, or parent conversation.
+- Manual transcript retain removes only exact parent/child boundary replay overlap after converting messages to retain turns. It drops the longest child prefix that exactly matches the accumulated parent suffix, and does not global-dedupe by content, so legitimate repeated user messages later in the session are preserved.
+- Manual transcript retain requests SessionDB message timestamps and uses each original user/assistant message time in local machine timezone with second precision (`YYYY-MM-DDTHH:MM:SS`) when available; missing timestamps fall back to retain-construction time in the same format.
+- Merge protection: future manual `/retain` changes must keep recursive SessionDB lineage loading for both Gateway and CLI, preserve `_session_id` grouping into the provider, keep original SessionDB message timestamps when available, and keep dedupe limited to exact boundary overlap rather than global text matching.
 - Parent-chain lookup remains a fallback for older local rows without `retain_document_id`, and ignores empty stored parents when looking for a prior non-empty parent.
 - Persisted turn lookup does not filter by the historical local `bank_id`; `/retain` submits matching lineage turns to the bank configured at retain time.
 - Manual `/retain` submits a clean item with `content` and configured `context`, avoiding extra metadata/tags.
@@ -423,7 +427,8 @@ Merge protection:
 
 Verification:
 
-- 2026-06-15 orphan-user transcript fix: `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py -q -o 'addopts=' && python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py && git diff --check` → 138 passed, py_compile passed, diff check passed.
+- 2026-06-17 recursive lineage + boundary replay dedupe fix: `python -m pytest tests/plugins/memory/test_hindsight_provider.py::TestToolHandlers::test_transcript_retain_dedupes_parent_child_boundary_overlap_only tests/gateway/test_retain_command.py::test_retain_command_uses_session_transcript_lineage_when_available -q -o 'addopts='` → 2 passed after first failing with duplicate boundary content and missing `_session_id` lineage tags.
+- 2026-06-18 upstream-sync resolution for recursive lineage + boundary replay dedupe + original timestamp fix: preserved upstream's full `tests/test_hermes_state.py` and added the fork timestamp opt-out regression instead of keeping the bad 28-line replacement; `python -m py_compile agent/transports/codex.py hermes_state.py plugins/memory/hindsight/__init__.py cli.py gateway/run.py tests/agent/transports/test_codex_transport.py tests/test_hermes_state.py tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py tests/cli/test_retain_command.py` passed; `python -m pytest tests/agent/transports/test_codex_transport.py tests/test_hermes_state.py tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py tests/cli/test_retain_command.py tests/run_agent/test_run_agent_codex_responses.py tests/gateway/test_agent_cache.py -q -o 'addopts='` → 630 passed.
 - 2026-06-15 orphan-user transcript fix: `python -m pytest tests/hermes_cli/test_commands.py tests/run_agent/test_memory_sync_interrupted.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_async_sync.py -q -o 'addopts='` → 195 passed / 1 unrelated `audioop` deprecation warning.
 - `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='` → 260 passed.
 - `python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py hermes_cli/commands.py tests/gateway/test_retain_command.py` → passed.
@@ -581,12 +586,14 @@ What changed:
   scope just because Hermes rotated the physical session row.
 - Non-gateway sessions may fall back to compression lineage so compression
   children can share the same cache scope as their root session.
-- The Codex backend restores HTTP routing/cache headers that are safe for the
-  chatgpt.com Codex backend:
-  - `session-id`
-  - `thread-id`
+- The fork originally restored `session-id` / `thread-id` / `x-client-request-id`
+  as a temporary cache-routing workaround. During the 2026-06-18 upstream sync,
+  upstream's official Codex fix was adopted for HTTP header names instead:
+  - `session_id`
   - `x-client-request-id`
-- The old problematic underscore header name `session_id` must not be restored.
+- The fork still passes a stable `prompt_cache_key` body field for gateway and
+  compression cache scope until live cache telemetry proves upstream's official
+  routing fully covers those fork scenarios.
 
 Why it matters:
 
@@ -601,15 +608,15 @@ Why it matters:
 Merge protection:
 
 - This is intentionally a temporary fork patch, not a long-term fork feature.
-- Official Hermes will probably fix this class of Codex cache regression soon.
-- If upstream/official Hermes has an equivalent fix and local testing shows
-  prompt caching works after compression and consecutive tool calls, prefer the
-  official upstream implementation and drop this fork modification entirely.
-- Do not fight future upstream merge conflicts to preserve this exact code when
-  upstream has fixed the issue. The safe merge policy is: official working fix
-  wins, this local workaround is abandoned.
-- If upstream has no equivalent fix yet, preserve stable cache routing for Codex
-  backend requests and keep `session_id` out of `extra_headers`.
+- Official Hermes now has an upstream Codex cache-routing fix (`session_id` +
+  `x-client-request-id` HTTP headers). Header-name conflicts should follow the
+  upstream official implementation, not the old fork-only `session-id` /
+  `thread-id` workaround.
+- Keep the fork's stable `prompt_cache_key` cache-scope body field for gateway
+  and compression lineage until live cache telemetry confirms it is redundant.
+- If future upstream changes provide an equivalent stable cache-scope mechanism
+  for gateway/compression sessions and local telemetry confirms it works, drop
+  the remaining fork cache-scope plumbing and update this entry accordingly.
 
 Verification:
 
@@ -618,14 +625,18 @@ git diff --check
 python -m pytest tests/agent/transports/test_codex_transport.py tests/run_agent/test_run_agent_codex_responses.py tests/gateway/test_agent_cache.py -q
 ```
 
-Observed local result on 2026-06-16:
+Observed local results:
 
-- `202 passed` for the focused pytest command above.
-- After gateway restart and a compression boundary, the new continuation session
-  continued receiving cache reads instead of staying at zero cache.
+- 2026-06-16: `202 passed` for the focused pytest command above. After gateway
+  restart and a compression boundary, the new continuation session continued
+  receiving cache reads instead of staying at zero cache.
+- 2026-06-18 upstream sync: adopted upstream official Codex HTTP header names
+  while retaining stable `prompt_cache_key`; targeted Codex/Hindsight/session
+  tests reported `630 passed`.
 
-Upstream status: temporary fork workaround; should be removed once upstream has
-a verified official fix.
+Upstream status: partially superseded by upstream official Codex header fix;
+remaining fork delta is stable `prompt_cache_key` selection for gateway and
+compression lineage pending live telemetry confirmation.
 
 
 ## Current fork delta checklist

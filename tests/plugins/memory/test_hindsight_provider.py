@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import sys
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -84,6 +85,14 @@ def _make_mock_client():
     client.aretain_batch = AsyncMock()
     client.aclose = AsyncMock()
     return client
+
+
+def _local_seconds(value):
+    if isinstance(value, (int, float)):
+        dt = datetime.fromtimestamp(value, timezone.utc)
+    else:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return dt.astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 class _FakeSessionDB:
@@ -1048,9 +1057,10 @@ class TestToolHandlers:
             {
                 "role": "user",
                 "content": "FIP平台有12个合同信息完善及更正单，全部提交",
+                "timestamp": 1710000000.0,
             },
-            {"role": "user", "content": "你在搞什么啊？"},
-            {"role": "assistant", "content": "我停了。"},
+            {"role": "user", "content": "你在搞什么啊？", "timestamp": "2024-03-09T16:00:01+00:00"},
+            {"role": "assistant", "content": "我停了。", "timestamp": "2024-03-09T16:00:02+00:00"},
         ]
 
         info = p.retain_conversation_messages(messages, session_id="test-session")
@@ -1063,12 +1073,37 @@ class TestToolHandlers:
         assert len(turns[0]) == 1
         assert turns[0][0]["role"] == "user"
         assert turns[0][0]["content"] == "User: FIP平台有12个合同信息完善及更正单，全部提交"
-        assert "timestamp" in turns[0][0]
+        assert turns[0][0]["timestamp"] == _local_seconds(1710000000.0)
         assert turns[1][0]["content"] == "User: 你在搞什么啊？"
+        assert turns[1][0]["timestamp"] == _local_seconds("2024-03-09T16:00:01+00:00")
         assert turns[1][1]["content"] == "Assistant: 我停了。"
+        assert turns[1][1]["timestamp"] == _local_seconds("2024-03-09T16:00:02+00:00")
         assert content.index("FIP平台") < content.index("你在搞什么啊")
         assert "Assistant: " not in json.dumps(turns[0], ensure_ascii=False)
         assert "\\u" not in content
+
+    def test_transcript_retain_uses_sessiondb_private_timestamp(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        messages = [
+            {"role": "user", "content": "original user", "_timestamp": 1710000000.0},
+            {"role": "assistant", "content": "original assistant", "_timestamp": 1710000001.0},
+        ]
+
+        info = p.retain_conversation_messages(messages, session_id="test-session")
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        turn = json.loads(content)[0]
+        assert turn[0]["timestamp"] == _local_seconds(1710000000.0)
+        assert turn[1]["timestamp"] == _local_seconds(1710000001.0)
 
     def test_transcript_retain_keeps_existing_retain_document_sibling_turns(self, provider_with_config, monkeypatch):
         from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
@@ -1107,6 +1142,130 @@ class TestToolHandlers:
         assert "child two interrupted first" in content
         assert "child two current user" in content
         assert "stale child two user" not in content
+
+    def test_transcript_retain_prefers_parent_document_when_current_session_has_split_document(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        p.initialize(session_id="root-session", hermes_home=str(p._retain_store_path.parents[1]), platform="cli")
+        p._client = _make_mock_client()
+        p.sync_turn("root file upload", "root acknowledged")
+        p.on_session_switch("parent-session", parent_session_id="root-session")
+        p.sync_turn("parent instruction", "parent response")
+        p.on_session_switch("current-session", parent_session_id="parent-session")
+        p.sync_turn("current inherited turn", "current inherited response")
+
+        # Simulate the observed production split: the current continuation first
+        # inherited the parent/root retain document, then a later provider
+        # lifecycle wrote rows under the current session's own document. Manual
+        # transcript retain must not let that later current-session document id
+        # hide the parent/root conversation.
+        p._parent_session_id = ""
+        p._retain_document_id = "current-session"
+        p.sync_turn("stale current-only turn", "stale current-only response")
+        messages = [
+            {"role": "user", "content": "current transcript first"},
+            {"role": "assistant", "content": "current transcript response"},
+        ]
+
+        info = p.retain_conversation_messages(
+            messages,
+            session_id="current-session",
+            parent_session_id="parent-session",
+        )
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["document_id"] == "root-session"
+        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert "root file upload" in content
+        assert "parent instruction" in content
+        assert "current inherited turn" not in content
+        assert "stale current-only turn" not in content
+        assert "current transcript first" in content
+
+    def test_transcript_retain_prefers_root_document_when_parent_session_has_split_document(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        p.initialize(session_id="root-session", hermes_home=str(p._retain_store_path.parents[1]), platform="cli")
+        p._client = _make_mock_client()
+        p.sync_turn("root original request", "root response")
+        p.on_session_switch("parent-session", parent_session_id="root-session")
+        p.sync_turn("parent inherited turn", "parent inherited response")
+
+        # A later lifecycle for the parent itself can also create a split
+        # parent-session document. Current descendants must still resolve to
+        # the original root document rather than the parent's latest split doc.
+        p._parent_session_id = ""
+        p._retain_document_id = "parent-session"
+        p.sync_turn("stale parent split turn", "stale parent split response")
+        p.on_session_switch("current-session", parent_session_id="parent-session")
+        p.sync_turn("stale current inherited from split parent", "current inherited response")
+        messages = [
+            {"role": "user", "content": "current transcript after parent split"},
+            {"role": "assistant", "content": "current transcript response"},
+        ]
+
+        info = p.retain_conversation_messages(
+            messages,
+            session_id="current-session",
+            parent_session_id="parent-session",
+        )
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["document_id"] == "root-session"
+        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert "root original request" in content
+        assert "parent inherited turn" in content
+        assert "stale parent split turn" not in content
+        assert "stale current inherited from split parent" not in content
+        assert "current transcript after parent split" in content
+
+    def test_transcript_retain_dedupes_parent_child_boundary_overlap_only(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        messages = [
+            {"_session_id": "root", "role": "user", "content": "first real request"},
+            {"_session_id": "root", "role": "assistant", "content": "first response"},
+            {"_session_id": "root", "role": "user", "content": "boundary instruction"},
+            {"_session_id": "root", "role": "assistant", "content": "boundary response"},
+            {"_session_id": "child", "role": "assistant", "content": "[Recent Summary (d0)]\nsummary"},
+            {"_session_id": "child", "role": "tool", "content": "ignored tool output"},
+            {"_session_id": "child", "role": "user", "content": "boundary instruction"},
+            {"_session_id": "child", "role": "assistant", "content": "boundary response"},
+            {"_session_id": "child", "role": "user", "content": "new child request"},
+            {"_session_id": "child", "role": "assistant", "content": "new child response"},
+            {"_session_id": "child", "role": "user", "content": "boundary instruction"},
+            {"_session_id": "child", "role": "assistant", "content": "legitimate repeated later"},
+        ]
+
+        info = p.retain_conversation_messages(messages, session_id="child", parent_session_id="root")
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert content.count("boundary instruction") == 2
+        assert content.count("boundary response") == 1
+        assert "new child request" in content
+        assert "legitimate repeated later" in content
 
     def test_persisted_retain_without_turns_returns_message(self, provider_with_config):
         p = provider_with_config(auto_retain=False)
@@ -1366,7 +1525,8 @@ class TestSyncTurn:
         assert item["metadata"]["agent_identity"] == "fakeassistantname"
         assert item["metadata"]["turn_index"] == "1"
         assert item["metadata"]["message_count"] == "2"
-        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?\+00:00", content[0][0]["timestamp"])
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", content[0][0]["timestamp"])
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", content[0][1]["timestamp"])
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", item["metadata"]["retained_at"])
 
     def test_sync_turn_buffers_when_auto_retain_off(self, provider_with_config):

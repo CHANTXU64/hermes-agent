@@ -356,6 +356,28 @@ class TestMessageStorage:
         messages = db.get_messages_as_conversation("s1")
         assert messages[0]["timestamp"] == event_ts
 
+    def test_get_messages_as_conversation_can_omit_timestamps(self, db, monkeypatch):
+        db.create_session(session_id="s_timestamp_opt", source="cli")
+        times = iter([1710000000.0, 1710000001.0])
+        monkeypatch.setattr("hermes_state.time.time", lambda: next(times))
+
+        db.append_message("s_timestamp_opt", role="user", content="hello")
+        db.append_message("s_timestamp_opt", role="assistant", content="world")
+
+        default_messages = db.get_messages_as_conversation("s_timestamp_opt")
+        assert default_messages == [
+            {"role": "user", "content": "hello", "timestamp": 1710000000.0},
+            {"role": "assistant", "content": "world", "timestamp": 1710000001.0},
+        ]
+
+        without_timestamps = db.get_messages_as_conversation(
+            "s_timestamp_opt", include_timestamps=False
+        )
+        assert without_timestamps == [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+        ]
+
     def test_message_increments_session_count(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")

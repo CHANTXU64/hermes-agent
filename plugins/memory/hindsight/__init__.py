@@ -1555,18 +1555,50 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_thread_generation = generation
         self._prefetch_thread.start()
 
-    def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
-        now = datetime.now(timezone.utc).isoformat()
+    @staticmethod
+    def _retain_message_timestamp(value: Any = None) -> str:
+        def _local_seconds(dt: datetime) -> str:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+
+        if value is None:
+            return datetime.now().astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+        if isinstance(value, datetime):
+            return _local_seconds(value)
+        if isinstance(value, bool):
+            return datetime.now().astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+        if isinstance(value, (int, float)):
+            seconds = float(value)
+            if abs(seconds) > 10_000_000_000:
+                seconds = seconds / 1000.0
+            return _local_seconds(datetime.fromtimestamp(seconds, timezone.utc))
+        text = str(value).strip()
+        if not text:
+            return datetime.now().astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            return _local_seconds(datetime.fromisoformat(text.replace("Z", "+00:00")))
+        except ValueError:
+            return text
+
+    def _build_turn_messages(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        user_timestamp: Any = None,
+        assistant_timestamp: Any = None,
+    ) -> List[Dict[str, str]]:
         return [
             {
                 "role": "user",
                 "content": f"{self._retain_user_prefix}: {user_content}",
-                "timestamp": now,
+                "timestamp": self._retain_message_timestamp(user_timestamp),
             },
             {
                 "role": "assistant",
                 "content": f"{self._retain_assistant_prefix}: {assistant_content}",
-                "timestamp": now,
+                "timestamp": self._retain_message_timestamp(assistant_timestamp),
             },
         ]
 
@@ -1578,14 +1610,98 @@ class HindsightMemoryProvider(MemoryProvider):
             return content
         return json.dumps(content, ensure_ascii=False)
 
-    def _build_orphan_user_turn(self, user_content: str) -> List[Dict[str, str]]:
+    def _build_orphan_user_turn(self, user_content: str, *, user_timestamp: Any = None) -> List[Dict[str, str]]:
         return [
             {
                 "role": "user",
                 "content": f"{self._retain_user_prefix}: {user_content}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": self._retain_message_timestamp(user_timestamp),
             }
         ]
+
+    def _build_turn_group_from_conversation_messages(self, messages: List[Dict[str, Any]]) -> List[str]:
+        turns: List[str] = []
+        pending_user: tuple[str, Any] | None = None
+
+        def _flush_pending_user() -> None:
+            nonlocal pending_user
+            if pending_user:
+                user_content, user_timestamp = pending_user
+                turns.append(json.dumps(
+                    self._build_orphan_user_turn(user_content, user_timestamp=user_timestamp),
+                    ensure_ascii=False,
+                ))
+                pending_user = None
+
+        for msg in messages or []:
+            role = str(msg.get("role") or "").strip()
+            content = self._stringify_retain_content(msg.get("content")).strip()
+            if not role or not content:
+                continue
+            if role == "user":
+                _flush_pending_user()
+                pending_user = (content, msg.get("_timestamp", msg.get("timestamp")))
+                continue
+            if role == "assistant" and content.startswith("[Recent Summary"):
+                continue
+            if role != "assistant" or not pending_user:
+                continue
+            if msg.get("tool_calls") or msg.get("finish_reason") == "tool_calls":
+                continue
+            user_content, user_timestamp = pending_user
+            turns.append(json.dumps(
+                self._build_turn_messages(
+                    user_content,
+                    content,
+                    user_timestamp=user_timestamp,
+                    assistant_timestamp=msg.get("_timestamp", msg.get("timestamp")),
+                ),
+                ensure_ascii=False,
+            ))
+            pending_user = None
+
+        _flush_pending_user()
+        return turns
+
+    @staticmethod
+    def _retain_turn_canonical(turn_json: str) -> tuple:
+        try:
+            payload = json.loads(turn_json)
+        except Exception:
+            return (("raw", str(turn_json)),)
+        canonical = []
+        if not isinstance(payload, list):
+            return (("raw", str(payload)),)
+        for msg in payload:
+            if not isinstance(msg, dict):
+                canonical.append(("raw", str(msg)))
+                continue
+            canonical.append((str(msg.get("role") or ""), str(msg.get("content") or "")))
+        return tuple(canonical)
+
+    def _dedupe_replayed_turn_groups(self, turn_groups: List[List[str]]) -> List[str]:
+        """Remove only exact parent/child boundary replay overlap.
+
+        Compression/resume can replay the tail of a parent transcript at the
+        start of a child session. Drop the longest child prefix whose retain
+        turns exactly match the already-accumulated suffix. Do not global-dedupe
+        by content: a user may legitimately repeat the same sentence later.
+        """
+        merged: List[str] = []
+        merged_canon: List[tuple] = []
+        for group in turn_groups:
+            if not group:
+                continue
+            group_canon = [self._retain_turn_canonical(turn) for turn in group]
+            overlap = 0
+            max_overlap = min(len(merged_canon), len(group_canon))
+            for size in range(max_overlap, 0, -1):
+                if merged_canon[-size:] == group_canon[:size]:
+                    overlap = size
+                    break
+            merged.extend(group[overlap:])
+            merged_canon.extend(group_canon[overlap:])
+        return merged
 
     def _build_turns_from_conversation_messages(self, messages: List[Dict[str, Any]]) -> List[str]:
         """Build retain turn JSON from persisted Hermes SessionDB messages.
@@ -1596,35 +1712,26 @@ class HindsightMemoryProvider(MemoryProvider):
         orphan user messages as single-message turns instead of overwriting them
         with the next user message.
         """
-        turns: List[str] = []
-        pending_user = ""
+        messages = list(messages or [])
+        if not any(str(msg.get("_session_id") or "").strip() for msg in messages):
+            return self._build_turn_group_from_conversation_messages(messages)
 
-        def _flush_pending_user() -> None:
-            nonlocal pending_user
-            if pending_user:
-                turns.append(json.dumps(self._build_orphan_user_turn(pending_user), ensure_ascii=False))
-                pending_user = ""
+        groups: List[List[Dict[str, Any]]] = []
+        current_sid = object()
+        current_group: List[Dict[str, Any]] = []
+        for msg in messages:
+            sid = str(msg.get("_session_id") or "").strip()
+            marker = sid or current_sid
+            if current_group and marker != current_sid:
+                groups.append(current_group)
+                current_group = []
+            current_group.append(msg)
+            current_sid = marker
+        if current_group:
+            groups.append(current_group)
 
-        for msg in messages or []:
-            role = str(msg.get("role") or "").strip()
-            content = self._stringify_retain_content(msg.get("content")).strip()
-            if not role or not content:
-                continue
-            if role == "user":
-                _flush_pending_user()
-                pending_user = content
-                continue
-            if role == "assistant" and content.startswith("[Recent Summary"):
-                continue
-            if role != "assistant" or not pending_user:
-                continue
-            if msg.get("tool_calls") or msg.get("finish_reason") == "tool_calls":
-                continue
-            turns.append(json.dumps(self._build_turn_messages(pending_user, content), ensure_ascii=False))
-            pending_user = ""
-
-        _flush_pending_user()
-        return turns
+        turn_groups = [self._build_turn_group_from_conversation_messages(group) for group in groups]
+        return self._dedupe_replayed_turn_groups(turn_groups)
 
     def _retain_store_connect(self) -> sqlite3.Connection:
         self._retain_store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1689,15 +1796,40 @@ class HindsightMemoryProvider(MemoryProvider):
         ).fetchone()
         return str(row[0] if row and row[0] else "").strip()
 
+    def _lookup_root_retain_document_id(self, conn: sqlite3.Connection, session_id: str) -> str:
+        """Return the earliest non-empty retain document for a session.
+
+        Continuation sessions can later write split rows under their own
+        session id. For a child resolving through its parent, the first retained
+        document observed for that parent is the inherited logical root; the
+        latest row may be a split child/parent document and must not hide the
+        original session lineage.
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return ""
+        row = conn.execute(
+            """
+            SELECT retain_document_id
+            FROM hindsight_retain_turns
+            WHERE session_id = ?
+              AND retain_document_id != ''
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (sid,),
+        ).fetchone()
+        return str(row[0] if row and row[0] else "").strip()
+
     def _resolve_retain_document_id(self, conn: sqlite3.Connection, session_id: str, parent_session_id: str = "") -> str:
         sid = str(session_id or "").strip()
         parent = str(parent_session_id or "").strip()
+        if parent:
+            parent_doc = self._lookup_root_retain_document_id(conn, parent)
+            return parent_doc or parent
         existing = self._lookup_retain_document_id(conn, sid)
         if existing:
             return existing
-        if parent:
-            parent_doc = self._lookup_retain_document_id(conn, parent)
-            return parent_doc or parent
         return sid
 
     def _persist_retain_turn(self, turn_json: str) -> None:

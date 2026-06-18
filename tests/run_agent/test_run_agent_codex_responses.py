@@ -330,10 +330,10 @@ def test_build_api_kwargs_codex_uses_gateway_key_as_cache_thread(monkeypatch):
 
     assert kwargs["prompt_cache_key"] == "agent:main:telegram:dm:5612546357"
     headers = kwargs.get("extra_headers") or {}
-    assert headers.get("session-id") == "20260615_153111_a37238"
-    assert headers.get("thread-id") == "agent:main:telegram:dm:5612546357"
-    assert headers.get("x-client-request-id") == "agent:main:telegram:dm:5612546357"
-    assert "session_id" not in headers
+    assert headers.get("session_id") == "20260615_153111_a37238"
+    assert headers.get("x-client-request-id") == "20260615_153111_a37238"
+    assert "session-id" not in headers
+    assert "thread-id" not in headers
 
 
 def test_build_api_kwargs_codex_uses_compression_root_as_cache_thread(monkeypatch):
@@ -377,9 +377,10 @@ def test_build_api_kwargs_codex_uses_compression_root_as_cache_thread(monkeypatc
 
     assert kwargs["prompt_cache_key"] == "root-session"
     headers = kwargs.get("extra_headers") or {}
-    assert headers.get("session-id") == "child-session"
-    assert headers.get("thread-id") == "root-session"
-    assert "session_id" not in headers
+    assert headers.get("session_id") == "child-session"
+    assert headers.get("x-client-request-id") == "child-session"
+    assert "session-id" not in headers
+    assert "thread-id" not in headers
 
 
 def test_build_api_kwargs_codex_keeps_non_compression_child_cache_thread(monkeypatch):
@@ -415,7 +416,9 @@ def test_build_api_kwargs_codex_keeps_non_compression_child_cache_thread(monkeyp
 
     assert kwargs["prompt_cache_key"] == "child-session"
     headers = kwargs.get("extra_headers") or {}
-    assert headers.get("thread-id") == "child-session"
+    assert headers.get("session_id") == "child-session"
+    assert headers.get("x-client-request-id") == "child-session"
+    assert "thread-id" not in headers
 
 
 def test_build_api_kwargs_codex_clamps_minimal_effort(monkeypatch):

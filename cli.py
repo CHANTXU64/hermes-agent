@@ -7488,10 +7488,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     row = self._session_db.get_session(self.session_id) if self._session_db and self.session_id else {}
                     parent_session_id = str((row or {}).get("parent_session_id") or "")
                     messages = []
+                    def _session_lineage_root_to_tip(start_session_id: str) -> list[str]:
+                        lineage: list[str] = []
+                        current = str(start_session_id or "").strip()
+                        seen: set[str] = set()
+                        if not self._session_db or not hasattr(self._session_db, "get_session"):
+                            return [current] if current else []
+                        for _ in range(100):
+                            if not current or current in seen:
+                                break
+                            seen.add(current)
+                            lineage.append(current)
+                            try:
+                                row = self._session_db.get_session(current)
+                            except Exception:
+                                break
+                            current = str((row or {}).get("parent_session_id") or "").strip()
+                        return list(reversed(lineage)) or ([str(start_session_id).strip()] if start_session_id else [])
+
+                    def _load_lineage_transcript(start_session_id: str) -> list:
+                        if not self._session_db or not hasattr(self._session_db, "get_messages_as_conversation"):
+                            return []
+                        loaded = []
+                        for sid in _session_lineage_root_to_tip(start_session_id):
+                            try:
+                                try:
+                                    transcript = self._session_db.get_messages_as_conversation(sid, include_timestamps=True) or []
+                                except TypeError:
+                                    transcript = self._session_db.get_messages_as_conversation(sid) or []
+                            except Exception:
+                                return []
+                            for item in transcript:
+                                msg = dict(item)
+                                msg["_session_id"] = sid
+                                loaded.append(msg)
+                        return loaded
+
                     if self._session_db and self.session_id and hasattr(provider, "retain_conversation_messages"):
                         try:
-                            if hasattr(self._session_db, "get_messages_as_conversation"):
-                                messages = self._session_db.get_messages_as_conversation(self.session_id) or []
+                            messages = _load_lineage_transcript(self.session_id)
+                            if not messages and hasattr(self._session_db, "get_messages_as_conversation"):
+                                try:
+                                    messages = self._session_db.get_messages_as_conversation(self.session_id, include_timestamps=True) or []
+                                except TypeError:
+                                    messages = self._session_db.get_messages_as_conversation(self.session_id) or []
                         except Exception:
                             messages = []
                         if messages:
