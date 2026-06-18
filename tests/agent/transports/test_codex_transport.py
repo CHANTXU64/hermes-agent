@@ -169,9 +169,12 @@ class TestCodexBuildKwargs:
         )
 
         assert kw["prompt_cache_key"] == "conv-codex-1"
-        headers = kw.get("extra_headers", {})
-        assert headers.get("session_id") == "conv-codex-1"
-        assert headers.get("x-client-request-id") == "conv-codex-1"
+        assert kw["extra_headers"] == {
+            "session-id": "conv-codex-1",
+            "thread-id": "conv-codex-1",
+            "x-client-request-id": "conv-codex-1",
+        }
+        assert "session_id" not in kw["extra_headers"]
 
     def test_codex_backend_no_headers_without_session_id(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
@@ -197,10 +200,13 @@ class TestCodexBuildKwargs:
             request_overrides={"extra_headers": {"x-test": "1"}},
         )
 
-        headers = kw.get("extra_headers", {})
-        assert headers.get("x-test") == "1"
-        assert headers.get("session_id") == "conv-codex-1"
-        assert headers.get("x-client-request-id") == "conv-codex-1"
+        assert kw["extra_headers"] == {
+            "x-test": "1",
+            "session-id": "conv-codex-1",
+            "thread-id": "conv-codex-1",
+            "x-client-request-id": "conv-codex-1",
+        }
+        assert "session_id" not in kw["extra_headers"]
 
     def test_non_codex_responses_preserves_caller_extra_headers(self, transport):
         messages = [{"role": "user", "content": "Hi"}]

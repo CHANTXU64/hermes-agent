@@ -586,14 +586,15 @@ What changed:
   scope just because Hermes rotated the physical session row.
 - Non-gateway sessions may fall back to compression lineage so compression
   children can share the same cache scope as their root session.
-- The fork originally restored `session-id` / `thread-id` / `x-client-request-id`
-  as a temporary cache-routing workaround. During the 2026-06-18 upstream sync,
-  upstream's official Codex fix was adopted for HTTP header names instead:
-  - `session_id`
-  - `x-client-request-id`
-- The fork still passes a stable `prompt_cache_key` body field for gateway and
-  compression cache scope until live cache telemetry proves upstream's official
-  routing fully covers those fork scenarios.
+- Codex backend HTTP cache-routing headers deliberately use the fork workaround:
+  - `session-id` = physical Hermes session id
+  - `thread-id` = stable `prompt_cache_key`
+  - `x-client-request-id` = stable `prompt_cache_key`
+- During the 2026-06-18 upstream sync, upstream's official `session_id` /
+  `x-client-request-id` header variant was tested and temporarily adopted, but
+  Langfuse later showed it did **not** fully preserve cache affinity in long
+  gateway sessions. Same-turn follow-up calls could still drop to zero cache
+  reads, so the fork restored its own `thread-id`/stable-cache-key routing.
 
 Why it matters:
 
@@ -608,15 +609,22 @@ Why it matters:
 Merge protection:
 
 - This is intentionally a temporary fork patch, not a long-term fork feature.
-- Official Hermes now has an upstream Codex cache-routing fix (`session_id` +
-  `x-client-request-id` HTTP headers). Header-name conflicts should follow the
-  upstream official implementation, not the old fork-only `session-id` /
-  `thread-id` workaround.
-- Keep the fork's stable `prompt_cache_key` cache-scope body field for gateway
-  and compression lineage until live cache telemetry confirms it is redundant.
-- If future upstream changes provide an equivalent stable cache-scope mechanism
-  for gateway/compression sessions and local telemetry confirms it works, drop
-  the remaining fork cache-scope plumbing and update this entry accordingly.
+- Do **not** discard the fork `session-id` / `thread-id` / stable
+  `x-client-request-id` routing merely because upstream has a nominal Codex
+  cache-routing fix. The 2026-06-18 upstream `session_id` /
+  `x-client-request-id` variant was tested in real Langfuse traces and did not
+  fully fix long gateway sessions: same-turn follow-up calls still sometimes
+  dropped to `cache_read_input_tokens=0`.
+- Preserve the fork's stable `prompt_cache_key` body field and matching
+  `thread-id` / `x-client-request-id` headers for gateway and compression
+  lineage.
+- Drop this workaround only after an upstream replacement has been checked
+  carefully against real long-running gateway telemetry and focused tests. At a
+  minimum, verify both cross-turn and same-turn tool-call chains keep high cache
+  reads after memory-context injection, retries, and compression boundaries.
+- If future upstream code conflicts with this area but has not been proven with
+  that telemetry, stop and ask the user instead of assuming the upstream fix is
+  equivalent.
 
 Verification:
 
@@ -630,13 +638,24 @@ Observed local results:
 - 2026-06-16: `202 passed` for the focused pytest command above. After gateway
   restart and a compression boundary, the new continuation session continued
   receiving cache reads instead of staying at zero cache.
-- 2026-06-18 upstream sync: adopted upstream official Codex HTTP header names
-  while retaining stable `prompt_cache_key`; targeted Codex/Hindsight/session
-  tests reported `630 passed`.
+- 2026-06-18 upstream sync: upstream official Codex HTTP header names were
+  temporarily adopted while retaining stable `prompt_cache_key`; targeted
+  Codex/Hindsight/session tests reported `630 passed`, but later Langfuse
+  traces showed the official header variant was insufficient in live long
+  gateway sessions.
+- 2026-06-18 post-sync telemetry: trace
+  `59cc7e9d98edd3ff9fe35f8e4980ec88` / session
+  `20260618_104142_40390af6` had a same-turn follow-up call drop from
+  `input=146,239, cache_read_input_tokens=24,576` to
+  `input=176,230, cache_read_input_tokens=0`; trace
+  `1829d0bdab5e3cd305d395abea4a594f` showed the older fork routing was mostly
+  stable for same-turn follow-ups before the switch, while the official variant
+  later produced another same-turn cliff (`cache_read_input_tokens=0`). This
+  evidence restored the fork header workaround.
 
-Upstream status: partially superseded by upstream official Codex header fix;
-remaining fork delta is stable `prompt_cache_key` selection for gateway and
-compression lineage pending live telemetry confirmation.
+Upstream status: upstream official Codex header fix exists but is not equivalent
+for this fork's long gateway-session cache behavior; active fork workaround
+restored pending real telemetry proof of an upstream replacement.
 
 
 ## Current fork delta checklist

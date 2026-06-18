@@ -284,25 +284,32 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs.pop("timeout", None)
 
         if is_codex_backend:
-            # The Codex backend rejects body-level ``extra_headers`` with
-            # HTTP 400, but the OpenAI SDK's ``extra_headers`` kwarg maps
-            # to actual HTTP request headers (not body fields).  Use the
-            # official upstream header names for cache-scope routing.
-            cache_scope_id = str(session_id or "").strip()
-            if cache_scope_id:
-                existing_extra_headers = kwargs.get("extra_headers")
-                merged_extra_headers: Dict[str, str] = {}
-                if isinstance(existing_extra_headers, dict):
-                    merged_extra_headers.update(
-                        {
-                            str(key): str(value)
-                            for key, value in existing_extra_headers.items()
-                            if key and value is not None
-                        }
-                    )
-                merged_extra_headers["session_id"] = cache_scope_id
-                merged_extra_headers["x-client-request-id"] = cache_scope_id
+            # chatgpt.com/backend-api/codex needs stable HTTP header affinity
+            # for prompt-cache routing.  Upstream's 2026-06-18
+            # session_id/x-client-request-id variant did not fully preserve
+            # cache in long gateway sessions: Langfuse showed same-turn
+            # follow-up calls dropping to zero cache reads.  Keep the fork
+            # workaround until live telemetry proves an upstream replacement is
+            # equivalent for gateway/compression sessions.
+            existing_extra_headers = kwargs.get("extra_headers")
+            merged_extra_headers: Dict[str, str] = {}
+            if isinstance(existing_extra_headers, dict):
+                merged_extra_headers.update(
+                    {
+                        str(key): str(value)
+                        for key, value in existing_extra_headers.items()
+                        if key and value is not None
+                    }
+                )
+            if session_id:
+                merged_extra_headers.setdefault("session-id", session_id)
+            if prompt_cache_key:
+                merged_extra_headers.setdefault("thread-id", prompt_cache_key)
+                merged_extra_headers.setdefault("x-client-request-id", prompt_cache_key)
+            if merged_extra_headers:
                 kwargs["extra_headers"] = merged_extra_headers
+            else:
+                kwargs.pop("extra_headers", None)
 
         max_tokens = params.get("max_tokens")
         if max_tokens is not None and not is_codex_backend:
