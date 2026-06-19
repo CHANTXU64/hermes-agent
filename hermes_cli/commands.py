@@ -124,8 +124,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
-    CommandDef("model", "Switch model for this session", "Configuration",
-               args_hint="[model] [--provider name] [--global] [--refresh]"),
+    CommandDef("model", "Switch model (persists by default)", "Configuration",
+               args_hint="[model] [--provider name] [--global|--session] [--refresh]"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
@@ -216,6 +216,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True),
     CommandDef("usage", "Show token usage and rate limits for the current session", "Info"),
     CommandDef("credits", "Show Nous credit balance and top up", "Info"),
+    CommandDef("billing", "Manage Nous terminal billing — buy credits, auto-reload, limits", "Info"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
@@ -1054,12 +1055,13 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 # the telegram-parity test reads it so an entry here is a deliberate
 # "Slack-via-/hermes" decision, not a silent clamp.
 #   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
+#   - billing: the terminal-billing surface (buy/auto-reload/limit); /hermes billing.
 #   - blueprint: low-frequency automation setup; routed via /hermes blueprint on
 #     this fork so the fork-only /retain command can keep native Slack parity
 #     without silently clamping /debug.
 #   - disk_cleanup/lcm: plugin-provided maintenance commands remain available
 #     through /hermes <command> when Slack's native slots are exhausted.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "blueprint", "disk_cleanup", "lcm"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "blueprint", "disk_cleanup", "lcm"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
