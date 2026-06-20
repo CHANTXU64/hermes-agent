@@ -361,11 +361,14 @@ Files:
 - `agent/memory_manager.py`
 - `agent/memory_provider.py`
 - `plugins/memory/hindsight/__init__.py`
+- `hermes_state.py`
 - `tests/plugins/memory/test_hindsight_provider.py`
+- `tests/test_hermes_state.py`
 - `tests/agent/test_memory_session_switch.py`
 - `hermes_cli/commands.py`
 - `tests/hermes_cli/test_commands.py`
 - `cli.py`
+- `tests/cli/test_retain_command.py`
 - `gateway/run.py`
 - `gateway/slash_commands.py`
 - `tests/gateway/test_retain_command.py`
@@ -390,6 +393,9 @@ What changed:
 - When manual transcript retain is called with `parent_session_id`, retain document resolution prefers the earliest parent/root document before any current- or parent-session split document. This prevents later lifecycle rows under a child or intermediate parent session id from hiding the original file uploads, task request, or parent conversation.
 - Manual transcript retain removes only exact parent/child boundary replay overlap after converting messages to retain turns. It drops the longest child prefix that exactly matches the accumulated parent suffix, and does not global-dedupe by content, so legitimate repeated user messages later in the session are preserved.
 - Manual transcript retain requests SessionDB message timestamps and uses each original user/assistant message time in local machine timezone with second precision (`YYYY-MM-DDTHH:MM:SS`) when available; missing timestamps fall back to retain-construction time in the same format.
+- Manual transcript retain requests SessionDB transcript rows in insertion order (`order_by="id"`) for CLI and Gateway `/retain`, because platform event timestamps can be replayed or backfilled out of order after compression/resume and must not reorder the actual conversation insertion sequence.
+- `SessionDB.get_messages_as_conversation()` keeps its default event-time ordering for normal conversation restore, but supports the explicit `order_by="id"` export path used by manual `/retain`.
+- Transcript retain now treats one user message through the next user message as a segment and pairs it with the last eligible non-tool-call assistant in that segment. This prevents intermediate scratch/progress messages such as `Need template patch.` from swallowing the later user-visible final answer.
 - Merge protection: future manual `/retain` changes must keep recursive SessionDB lineage loading for both Gateway and CLI, preserve `_session_id` grouping into the provider, keep original SessionDB message timestamps when available, and keep dedupe limited to exact boundary overlap rather than global text matching.
 - Parent-chain lookup remains a fallback for older local rows without `retain_document_id`, and ignores empty stored parents when looking for a prior non-empty parent.
 - Persisted turn lookup does not filter by the historical local `bank_id`; `/retain` submits matching lineage turns to the bank configured at retain time.
@@ -414,6 +420,8 @@ Merge protection:
 - Preserve SessionDB transcript as the primary manual `/retain` content source when available. Do not regress to provider-owned completed-turn rows as the only source; that drops interrupted/orphan user messages such as a session's first user request.
 - Preserve orphan user-message handling in `retain_conversation_messages()` / `_build_turns_from_conversation_messages()`: consecutive user messages must flush the earlier pending user as a single-message turn, and trailing pending users must also be retained. Do not fake an empty assistant response.
 - Preserve provider-owned `$HERMES_HOME/hindsight/retain_turns.sqlite3` as fallback content and as the stable `retain_document_id` resolver for compression-created logical documents.
+- Preserve explicit `order_by="id"` SessionDB transcript export in CLI and Gateway `/retain`; do not let platform event timestamps determine manual retain ordering.
+- Preserve last-eligible-assistant pairing within a user segment, while continuing to skip summary assistant messages and assistant tool-call placeholders. Do not regress to first-assistant-wins pairing, which can retain internal scratch text instead of the final visible answer.
 - Do not create a separate `manual-session:*` document; use `_resolve_retain_target_for_session()` with the resolved `retain_document_id` so Hindsight append semantics stay aligned with automatic retain.
 - Do not expose `hindsight_retain_session` as a model-visible tool by default; this is a user slash command/provider method.
 - Manual `/retain` must include all sessions that share the same `retain_document_id`, ordered by persisted row id; do not rely solely on `parent_session_id`, because compression continuations can appear as siblings in SessionDB.
@@ -429,6 +437,7 @@ Verification:
 
 - 2026-06-17 recursive lineage + boundary replay dedupe fix: `python -m pytest tests/plugins/memory/test_hindsight_provider.py::TestToolHandlers::test_transcript_retain_dedupes_parent_child_boundary_overlap_only tests/gateway/test_retain_command.py::test_retain_command_uses_session_transcript_lineage_when_available -q -o 'addopts='` → 2 passed after first failing with duplicate boundary content and missing `_session_id` lineage tags.
 - 2026-06-18 upstream-sync resolution for recursive lineage + boundary replay dedupe + original timestamp fix: preserved upstream's full `tests/test_hermes_state.py` and added the fork timestamp opt-out regression instead of keeping the bad 28-line replacement; `python -m py_compile agent/transports/codex.py hermes_state.py plugins/memory/hindsight/__init__.py cli.py gateway/run.py tests/agent/transports/test_codex_transport.py tests/test_hermes_state.py tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py tests/cli/test_retain_command.py` passed; `python -m pytest tests/agent/transports/test_codex_transport.py tests/test_hermes_state.py tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py tests/cli/test_retain_command.py tests/run_agent/test_run_agent_codex_responses.py tests/gateway/test_agent_cache.py -q -o 'addopts='` → 630 passed.
+- 2026-06-20 transcript completeness fix for Document `20260619_183111_1f26c39e`: added regression coverage for `order_by="id"`, CLI/Gateway manual `/retain` using insertion order, and last-eligible-assistant pairing; `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py tests/cli/test_retain_command.py tests/test_hermes_state.py -q` → 439 passed; `git diff --check` → passed. Local sample reconstruction for root `20260619_183111_1f26c39e` + child `20260619_185935_ad6649` contained `已落地` and `继续进化了一轮`, and excluded `Need template patch`.
 - 2026-06-15 orphan-user transcript fix: `python -m pytest tests/hermes_cli/test_commands.py tests/run_agent/test_memory_sync_interrupted.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_async_sync.py -q -o 'addopts='` → 195 passed / 1 unrelated `audioop` deprecation warning.
 - `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='` → 260 passed.
 - `python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py hermes_cli/commands.py tests/gateway/test_retain_command.py` → passed.
@@ -668,11 +677,14 @@ deltas are expected in these areas:
   - `agent/memory_manager.py`
   - `agent/memory_provider.py`
   - `plugins/memory/hindsight/__init__.py`
+  - `hermes_state.py`
   - `tests/plugins/memory/test_hindsight_provider.py`
+  - `tests/test_hermes_state.py`
   - `tests/agent/test_memory_session_switch.py`
   - `hermes_cli/commands.py`
   - `tests/hermes_cli/test_commands.py`
   - `cli.py`
+  - `tests/cli/test_retain_command.py`
   - `gateway/run.py`
   - `gateway/slash_commands.py`
   - `tests/gateway/test_retain_command.py`

@@ -10268,9 +10268,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for sid in _session_lineage_root_to_tip(start_session_id):
                     try:
                         try:
-                            transcript = db.get_messages_as_conversation(sid, include_timestamps=True) or []
+                            transcript = db.get_messages_as_conversation(sid, include_timestamps=True, order_by="id") or []
                         except TypeError:
-                            transcript = db.get_messages_as_conversation(sid) or []
+                            try:
+                                transcript = db.get_messages_as_conversation(sid, include_timestamps=True) or []
+                            except TypeError:
+                                transcript = db.get_messages_as_conversation(sid) or []
                     except Exception:
                         return []
                     for msg in transcript:
@@ -10286,9 +10289,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         messages = session_store.load_transcript(session_id) or []
                     elif not messages and db is not None and hasattr(db, "get_messages_as_conversation"):
                         try:
-                            messages = db.get_messages_as_conversation(session_id, include_timestamps=True) or []
+                            messages = db.get_messages_as_conversation(session_id, include_timestamps=True, order_by="id") or []
                         except TypeError:
-                            messages = db.get_messages_as_conversation(session_id) or []
+                            try:
+                                messages = db.get_messages_as_conversation(session_id, include_timestamps=True) or []
+                            except TypeError:
+                                messages = db.get_messages_as_conversation(session_id) or []
                 except Exception:
                     messages = []
                 if messages:

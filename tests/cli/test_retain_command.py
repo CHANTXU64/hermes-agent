@@ -49,8 +49,8 @@ def test_cli_retain_uses_session_transcript_lineage_when_available(capsys):
     assert [m["_session_id"] for m in messages] == [
         "root-sid", "root-sid", "child-sid", "child-sid", "child-sid"
     ]
-    assert session_db.get_messages_as_conversation.call_args_list[0].kwargs == {"include_timestamps": True}
-    assert session_db.get_messages_as_conversation.call_args_list[1].kwargs == {"include_timestamps": True}
+    assert session_db.get_messages_as_conversation.call_args_list[0].kwargs == {"include_timestamps": True, "order_by": "id"}
+    assert session_db.get_messages_as_conversation.call_args_list[1].kwargs == {"include_timestamps": True, "order_by": "id"}
     assert provider.retain_conversation_messages.call_args.kwargs == {
         "session_id": "child-sid",
         "parent_session_id": "root-sid",

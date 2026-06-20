@@ -3003,6 +3003,7 @@ class SessionDB:
         include_ancestors: bool = False,
         include_inactive: bool = False,
         include_timestamps: bool = True,
+        order_by: str = "timestamp",
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -3011,11 +3012,17 @@ class SessionDB:
         By default only active messages are returned. Pass
         ``include_inactive=True`` to load soft-deleted (rewound) rows
         as well. See :meth:`rewind_to_message`.
+
+        ``order_by='timestamp'`` preserves event-time replay for normal
+        conversation restore. ``order_by='id'`` preserves insertion order for
+        transcript export/retain paths where platform event timestamps can be
+        replayed or backfilled out of order.
         """
         session_ids = [session_id]
         if include_ancestors:
             session_ids = self._session_lineage_root_to_tip(session_id)
 
+        order_clause = "id" if str(order_by or "").strip().lower() == "id" else "timestamp, id"
         active_clause = "" if include_inactive else " AND active = 1"
         with self._lock:
             placeholders = ",".join("?" for _ in session_ids)
@@ -3024,7 +3031,7 @@ class SessionDB:
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp "
                 f"FROM messages WHERE session_id IN ({placeholders})"
-                f"{active_clause} ORDER BY timestamp, id",
+                f"{active_clause} ORDER BY {order_clause}",
                 tuple(session_ids),
             ).fetchall()
 

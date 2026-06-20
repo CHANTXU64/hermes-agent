@@ -1229,6 +1229,35 @@ class TestToolHandlers:
         assert turn[0]["timestamp"] == _local_seconds(1710000000.0)
         assert turn[1]["timestamp"] == _local_seconds(1710000001.0)
 
+    def test_transcript_retain_pairs_user_with_last_assistant_in_segment(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        messages = [
+            {"role": "user", "content": "好", "timestamp": 1710000000.0},
+            {"role": "assistant", "content": "Need template patch.", "timestamp": 1710000001.0},
+            {"role": "assistant", "content": "Need testing strategy patch.", "timestamp": 1710000002.0},
+            {"role": "assistant", "content": "已落地。正式结果", "timestamp": 1710000003.0},
+        ]
+
+        info = p.retain_conversation_messages(messages, session_id="test-session")
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        turns = json.loads(content)
+        assert len(turns) == 1
+        assert turns[0][0]["content"] == "User: 好"
+        assert turns[0][1]["content"] == "Assistant: 已落地。正式结果"
+        assert turns[0][1]["timestamp"] == _local_seconds(1710000003.0)
+        assert "Need template patch" not in content
+        assert "Need testing strategy patch" not in content
+
     def test_transcript_retain_keeps_existing_retain_document_sibling_turns(self, provider_with_config, monkeypatch):
         from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
         with _append_capability_lock:

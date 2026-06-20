@@ -1646,16 +1646,31 @@ class HindsightMemoryProvider(MemoryProvider):
     def _build_turn_group_from_conversation_messages(self, messages: List[Dict[str, Any]]) -> List[str]:
         turns: List[str] = []
         pending_user: tuple[str, Any] | None = None
+        pending_assistant: tuple[str, Any] | None = None
 
-        def _flush_pending_user() -> None:
-            nonlocal pending_user
-            if pending_user:
-                user_content, user_timestamp = pending_user
+        def _flush_pending_turn() -> None:
+            nonlocal pending_user, pending_assistant
+            if not pending_user:
+                return
+            user_content, user_timestamp = pending_user
+            if pending_assistant:
+                assistant_content, assistant_timestamp = pending_assistant
+                turns.append(json.dumps(
+                    self._build_turn_messages(
+                        user_content,
+                        assistant_content,
+                        user_timestamp=user_timestamp,
+                        assistant_timestamp=assistant_timestamp,
+                    ),
+                    ensure_ascii=False,
+                ))
+            else:
                 turns.append(json.dumps(
                     self._build_orphan_user_turn(user_content, user_timestamp=user_timestamp),
                     ensure_ascii=False,
                 ))
-                pending_user = None
+            pending_user = None
+            pending_assistant = None
 
         for msg in messages or []:
             role = str(msg.get("role") or "").strip()
@@ -1663,8 +1678,9 @@ class HindsightMemoryProvider(MemoryProvider):
             if not role or not content:
                 continue
             if role == "user":
-                _flush_pending_user()
+                _flush_pending_turn()
                 pending_user = (content, msg.get("_timestamp", msg.get("timestamp")))
+                pending_assistant = None
                 continue
             if role == "assistant" and content.startswith("[Recent Summary"):
                 continue
@@ -1672,19 +1688,13 @@ class HindsightMemoryProvider(MemoryProvider):
                 continue
             if msg.get("tool_calls") or msg.get("finish_reason") == "tool_calls":
                 continue
-            user_content, user_timestamp = pending_user
-            turns.append(json.dumps(
-                self._build_turn_messages(
-                    user_content,
-                    content,
-                    user_timestamp=user_timestamp,
-                    assistant_timestamp=msg.get("_timestamp", msg.get("timestamp")),
-                ),
-                ensure_ascii=False,
-            ))
-            pending_user = None
+            # A single user turn can have intermediate assistant scratch or
+            # progress messages before the final user-visible response is
+            # persisted. Keep the last eligible assistant in the segment rather
+            # than letting the first one swallow the real final response.
+            pending_assistant = (content, msg.get("_timestamp", msg.get("timestamp")))
 
-        _flush_pending_user()
+        _flush_pending_turn()
         return turns
 
     @staticmethod

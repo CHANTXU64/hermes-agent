@@ -553,6 +553,29 @@ class TestMessageStorage:
             {"role": "assistant", "content": "world"},
         ]
 
+    def test_get_messages_as_conversation_can_order_by_insert_id(self, db):
+        db.create_session(session_id="s_order_id", source="discord")
+        db.append_message("s_order_id", role="user", content="first inserted", timestamp=200.0)
+        db.append_message("s_order_id", role="assistant", content="first response", timestamp=201.0)
+        db.append_message("s_order_id", role="user", content="late inserted but old event ts", timestamp=100.0)
+        db.append_message("s_order_id", role="assistant", content="late response", timestamp=101.0)
+
+        default_messages = db.get_messages_as_conversation("s_order_id")
+        id_ordered_messages = db.get_messages_as_conversation("s_order_id", order_by="id")
+
+        assert [m["content"] for m in default_messages] == [
+            "late inserted but old event ts",
+            "late response",
+            "first inserted",
+            "first response",
+        ]
+        assert [m["content"] for m in id_ordered_messages] == [
+            "first inserted",
+            "first response",
+            "late inserted but old event ts",
+            "late response",
+        ]
+
     def test_message_increments_session_count(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")

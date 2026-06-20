@@ -7738,9 +7738,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         for sid in _session_lineage_root_to_tip(start_session_id):
                             try:
                                 try:
-                                    transcript = self._session_db.get_messages_as_conversation(sid, include_timestamps=True) or []
+                                    transcript = self._session_db.get_messages_as_conversation(sid, include_timestamps=True, order_by="id") or []
                                 except TypeError:
-                                    transcript = self._session_db.get_messages_as_conversation(sid) or []
+                                    try:
+                                        transcript = self._session_db.get_messages_as_conversation(sid, include_timestamps=True) or []
+                                    except TypeError:
+                                        transcript = self._session_db.get_messages_as_conversation(sid) or []
                             except Exception:
                                 return []
                             for item in transcript:
@@ -7754,9 +7757,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             messages = _load_lineage_transcript(self.session_id)
                             if not messages and hasattr(self._session_db, "get_messages_as_conversation"):
                                 try:
-                                    messages = self._session_db.get_messages_as_conversation(self.session_id, include_timestamps=True) or []
+                                    messages = self._session_db.get_messages_as_conversation(self.session_id, include_timestamps=True, order_by="id") or []
                                 except TypeError:
-                                    messages = self._session_db.get_messages_as_conversation(self.session_id) or []
+                                    try:
+                                        messages = self._session_db.get_messages_as_conversation(self.session_id, include_timestamps=True) or []
+                                    except TypeError:
+                                        messages = self._session_db.get_messages_as_conversation(self.session_id) or []
                         except Exception:
                             messages = []
                         if messages:

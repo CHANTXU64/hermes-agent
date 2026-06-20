@@ -112,8 +112,8 @@ async def test_retain_command_uses_session_transcript_lineage_when_available():
         "root-sid", "root-sid", "root-sid", "root-sid",
         "child-sid", "child-sid", "child-sid", "child-sid", "child-sid",
     ]
-    assert db.get_messages_as_conversation.call_args_list[0].kwargs == {"include_timestamps": True}
-    assert db.get_messages_as_conversation.call_args_list[1].kwargs == {"include_timestamps": True}
+    assert db.get_messages_as_conversation.call_args_list[0].kwargs == {"include_timestamps": True, "order_by": "id"}
+    assert db.get_messages_as_conversation.call_args_list[1].kwargs == {"include_timestamps": True, "order_by": "id"}
     assert provider.retain_conversation_messages.call_args.kwargs == {
         "session_id": "child-sid",
         "parent_session_id": "root-sid",
