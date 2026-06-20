@@ -1190,12 +1190,26 @@ class HindsightMemoryProvider(MemoryProvider):
         return self._api_url or ""
 
     def _resolve_retain_target_for_session(self, session_id: str, fallback_document_id: str) -> tuple[str, str | None]:
-        """Pick (document_id, update_mode) for a specific session."""
+        """Pick (document_id, update_mode) for incremental append retains."""
         if not session_id:
             return fallback_document_id, None
         if _check_api_supports_update_mode_append(self._probe_url(), self._api_key):
             return session_id, "append"
         return fallback_document_id, None
+
+    def _resolve_full_retain_target_for_session(self, session_id: str, fallback_document_id: str) -> tuple[str, str | None]:
+        """Pick (document_id, update_mode) for full manual session retains.
+
+        Manual `/retain` submits the complete reconstructed session document, so
+        retries must replace the logical document instead of appending another
+        copy. Legacy APIs without explicit update modes already replace on
+        stable document-id upsert, so keep the stable session id there too.
+        """
+        if not session_id:
+            return fallback_document_id, None
+        if _check_api_supports_update_mode_append(self._probe_url(), self._api_key):
+            return session_id, "replace"
+        return session_id, None
 
     def _resolve_retain_target(self, fallback_document_id: str) -> tuple[str, str | None]:
         """Pick (document_id, update_mode) based on live API capability.
@@ -2169,7 +2183,8 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("Hindsight transcript retain document lookup failed: %s", e, exc_info=True)
 
-        if persisted_rows and target_session_id:
+        has_lineage_transcript = any(str(msg.get("_session_id") or "").strip() for msg in messages)
+        if persisted_rows and target_session_id and not has_lineage_transcript:
             transcript_turns = turns
             merged_turns: list[str] = []
             inserted_transcript = False
@@ -2189,7 +2204,7 @@ class HindsightMemoryProvider(MemoryProvider):
         fallback_document_id = self._document_id
         if target_session_id and target_session_id != self._session_id:
             fallback_document_id = f"{target_session_id}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-        document_id, update_mode = self._resolve_retain_target_for_session(retain_document_id or target_session_id, fallback_document_id)
+        document_id, update_mode = self._resolve_full_retain_target_for_session(retain_document_id or target_session_id, fallback_document_id)
         content = "[" + ",".join(turns) + "]"
         bank_id = self._bank_id
         retain_async_flag = self._retain_async
@@ -2252,7 +2267,7 @@ class HindsightMemoryProvider(MemoryProvider):
         fallback_document_id = self._document_id
         if target_session_id and target_session_id != self._session_id:
             fallback_document_id = f"{target_session_id}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-        document_id, update_mode = self._resolve_retain_target_for_session(retain_document_id or target_session_id, fallback_document_id)
+        document_id, update_mode = self._resolve_full_retain_target_for_session(retain_document_id or target_session_id, fallback_document_id)
         content = "[" + ",".join(turns) + "]"
         bank_id = self._bank_id
         retain_async_flag = self._retain_async

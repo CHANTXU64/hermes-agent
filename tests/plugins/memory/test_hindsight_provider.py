@@ -779,7 +779,7 @@ class TestToolHandlers:
         p._retain_queue.join()
         call_kwargs = p._client.aretain_batch.call_args.kwargs
         assert call_kwargs["bank_id"] == "test-bank"
-        assert call_kwargs["document_id"].startswith("test-session-")
+        assert call_kwargs["document_id"] == "test-session"
         item = call_kwargs["items"][0]
         assert "metadata" not in item
         assert "tags" not in item
@@ -990,7 +990,7 @@ class TestToolHandlers:
         kw = p._client.aretain_batch.call_args.kwargs
         assert kw["document_id"] == "root-session"
         item = kw["items"][0]
-        assert item["update_mode"] == "append"
+        assert item["update_mode"] == "replace"
         assert "metadata" not in item
         assert "tags" not in item
         assert item["context"] == p._retain_context
@@ -1257,6 +1257,60 @@ class TestToolHandlers:
         assert turns[0][1]["timestamp"] == _local_seconds(1710000003.0)
         assert "Need template patch" not in content
         assert "Need testing strategy patch" not in content
+
+    def test_transcript_retain_full_lineage_is_authoritative_and_replaces_document(self, provider_with_config, monkeypatch):
+        from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+        with _append_capability_lock:
+            _append_capability_cache.clear()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(auto_retain=False)
+        p.initialize(session_id="root-session", hermes_home=str(p._retain_store_path.parents[1]), platform="cli")
+        p._client = _make_mock_client()
+        p.sync_turn("persisted stale root", "persisted stale root assistant")
+        p.on_session_switch("parent-session", parent_session_id="root-session")
+        p.sync_turn("persisted stale parent", "persisted stale parent assistant")
+        p.on_session_switch("current-session", parent_session_id="parent-session")
+        p.sync_turn("persisted stale current", "persisted stale current assistant")
+        messages = [
+            {"_session_id": "root-session", "role": "user", "content": "transcript root request"},
+            {"_session_id": "root-session", "role": "assistant", "content": "transcript root response"},
+            {"_session_id": "parent-session", "role": "assistant", "content": "[Recent Summary (d0)]\nsummary"},
+            {"_session_id": "parent-session", "role": "user", "content": "transcript parent request"},
+            {"_session_id": "parent-session", "role": "assistant", "content": "transcript parent response"},
+            {"_session_id": "current-session", "role": "user", "content": "transcript current request"},
+            {"_session_id": "current-session", "role": "assistant", "content": "Need template patch."},
+            {"_session_id": "current-session", "role": "assistant", "content": "transcript current final response"},
+        ]
+
+        info = p.retain_conversation_messages(
+            messages,
+            session_id="current-session",
+            parent_session_id="parent-session",
+        )
+        p._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["document_id"] == "root-session"
+        assert info["update_mode"] == "replace"
+        assert info["turn_count"] == 3
+        kw = p._client.aretain_batch.call_args.kwargs
+        assert kw["document_id"] == "root-session"
+        item = kw["items"][0]
+        assert item["update_mode"] == "replace"
+        content = item["content"]
+        turns = json.loads(content)
+        assert len(turns) == 3
+        assert "transcript root request" in content
+        assert "transcript parent request" in content
+        assert "transcript current request" in content
+        assert "transcript current final response" in content
+        assert "Need template patch" not in content
+        assert "persisted stale root" not in content
+        assert "persisted stale parent" not in content
+        assert "persisted stale current" not in content
 
     def test_transcript_retain_keeps_existing_retain_document_sibling_turns(self, provider_with_config, monkeypatch):
         from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
