@@ -170,11 +170,11 @@ class TestCodexBuildKwargs:
 
         assert kw["prompt_cache_key"] == "conv-codex-1"
         assert kw["extra_headers"] == {
-            "session-id": "conv-codex-1",
+            "session_id": "conv-codex-1",
             "thread-id": "conv-codex-1",
             "x-client-request-id": "conv-codex-1",
         }
-        assert "session_id" not in kw["extra_headers"]
+        assert "session-id" not in kw["extra_headers"]
 
     def test_codex_backend_no_headers_without_session_id(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
@@ -202,11 +202,11 @@ class TestCodexBuildKwargs:
 
         assert kw["extra_headers"] == {
             "x-test": "1",
-            "session-id": "conv-codex-1",
+            "session_id": "conv-codex-1",
             "thread-id": "conv-codex-1",
             "x-client-request-id": "conv-codex-1",
         }
-        assert "session_id" not in kw["extra_headers"]
+        assert "session-id" not in kw["extra_headers"]
 
     def test_non_codex_responses_preserves_caller_extra_headers(self, transport):
         messages = [{"role": "user", "content": "Hi"}]

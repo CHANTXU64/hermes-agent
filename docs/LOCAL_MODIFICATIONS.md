@@ -599,8 +599,10 @@ What changed:
   scope just because Hermes rotated the physical session row.
 - Non-gateway sessions may fall back to compression lineage so compression
   children can share the same cache scope as their root session.
-- Codex backend HTTP cache-routing headers deliberately use the fork workaround:
-  - `session-id` = physical Hermes session id
+- Codex backend HTTP cache-routing headers keep the fork's stable logical
+  prompt-cache routing while aligning the physical-session header spelling with
+  upstream:
+  - `session_id` = physical Hermes session id
   - `thread-id` = stable `prompt_cache_key`
   - `x-client-request-id` = stable `prompt_cache_key`
 - During the 2026-06-18 upstream sync, upstream's official `session_id` /
@@ -622,7 +624,7 @@ Why it matters:
 Merge protection:
 
 - This is intentionally a temporary fork patch, not a long-term fork feature.
-- Do **not** discard the fork `session-id` / `thread-id` / stable
+- Do **not** discard the fork `session_id` / `thread-id` / stable
   `x-client-request-id` routing merely because upstream has a nominal Codex
   cache-routing fix. The 2026-06-18 upstream `session_id` /
   `x-client-request-id` variant was tested in real Langfuse traces and did not
@@ -665,6 +667,10 @@ Observed local results:
   stable for same-turn follow-ups before the switch, while the official variant
   later produced another same-turn cliff (`cache_read_input_tokens=0`). This
   evidence restored the fork header workaround.
+- 2026-06-24 physical-session header spelling alignment: switched the physical
+  Hermes session header from `session-id` to upstream spelling `session_id`
+  while retaining the stable `thread-id` / `x-client-request-id` values from
+  `prompt_cache_key`. `python -m py_compile agent/transports/codex.py tests/agent/transports/test_codex_transport.py tests/run_agent/test_run_agent_codex_responses.py` → passed; `python -m pytest tests/agent/transports/test_codex_transport.py tests/run_agent/test_run_agent_codex_responses.py -q -o 'addopts='` → 139 passed, 1 unrelated `audioop` deprecation warning; `git diff --check` → passed.
 
 Upstream status: upstream official Codex header fix exists but is not equivalent
 for this fork's long gateway-session cache behavior; active fork workaround

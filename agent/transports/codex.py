@@ -285,12 +285,9 @@ class ResponsesApiTransport(ProviderTransport):
 
         if is_codex_backend:
             # chatgpt.com/backend-api/codex needs stable HTTP header affinity
-            # for prompt-cache routing.  Upstream's 2026-06-18
-            # session_id/x-client-request-id variant did not fully preserve
-            # cache in long gateway sessions: Langfuse showed same-turn
-            # follow-up calls dropping to zero cache reads.  Keep the fork
-            # workaround until live telemetry proves an upstream replacement is
-            # equivalent for gateway/compression sessions.
+            # for prompt-cache routing. Keep the fork's stable logical
+            # prompt_cache_key/thread routing, but use upstream's official
+            # ``session_id`` header spelling for the physical Hermes session.
             existing_extra_headers = kwargs.get("extra_headers")
             merged_extra_headers: Dict[str, str] = {}
             if isinstance(existing_extra_headers, dict):
@@ -302,10 +299,11 @@ class ResponsesApiTransport(ProviderTransport):
                     }
                 )
             if session_id:
-                merged_extra_headers.setdefault("session-id", session_id)
+                merged_extra_headers["session_id"] = session_id
+                merged_extra_headers.pop("session-id", None)
             if prompt_cache_key:
-                merged_extra_headers.setdefault("thread-id", prompt_cache_key)
-                merged_extra_headers.setdefault("x-client-request-id", prompt_cache_key)
+                merged_extra_headers["thread-id"] = prompt_cache_key
+                merged_extra_headers["x-client-request-id"] = prompt_cache_key
             if merged_extra_headers:
                 kwargs["extra_headers"] = merged_extra_headers
             else:
