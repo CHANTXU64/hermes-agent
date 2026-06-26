@@ -1285,6 +1285,46 @@ def test_chat_messages_to_responses_input_accepts_call_pipe_fc_ids(monkeypatch):
     assert function_output["call_id"] == "call_pair123"
 
 
+def test_chat_messages_to_responses_input_preserves_developer_tail(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+    items = _chat_messages_to_responses_input(
+        [
+            {"role": "user", "content": "Clean user text"},
+            {"role": "developer", "content": "<memory-context>remembered fact</memory-context>"},
+        ]
+    )
+
+    assert items == [
+        {"role": "user", "content": "Clean user text"},
+        {"role": "developer", "content": "<memory-context>remembered fact</memory-context>"},
+    ]
+
+
+def test_preflight_codex_api_kwargs_allows_developer_input_item(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+
+    preflight = _preflight_codex_api_kwargs(
+        {
+            "model": "gpt-5-codex",
+            "instructions": "You are Hermes.",
+            "input": [
+                {"role": "user", "content": "Clean user text"},
+                {"role": "developer", "content": "<memory-context>remembered fact</memory-context>"},
+            ],
+            "tools": [],
+            "store": False,
+        }
+    )
+
+    assert preflight["input"][-1] == {
+        "role": "developer",
+        "content": "<memory-context>remembered fact</memory-context>",
+    }
+
+
 def test_preflight_codex_api_kwargs_strips_optional_function_call_id(monkeypatch):
     agent = _build_agent(monkeypatch)
     from agent.codex_responses_adapter import _preflight_codex_api_kwargs

@@ -552,8 +552,18 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        # The app-server protocol currently sends a text-only turn/start input
+        # and does not expose a per-turn OpenAI Responses ``instructions`` slot.
+        # Keep durable Hermes history clean, but pass prefetched recall as the
+        # same ephemeral user suffix used by non-Responses runtimes.
+        codex_app_user_message = user_message
+        _memory_context_block = build_memory_context_block(_ext_prefetch_cache)
+        if _memory_context_block and isinstance(codex_app_user_message, str):
+            codex_app_user_message = (
+                codex_app_user_message + "\n\n" + _memory_context_block
+            )
         return agent._run_codex_app_server_turn(
-            user_message=user_message,
+            user_message=codex_app_user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
@@ -709,27 +719,92 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        def _uses_openai_memory_developer_tail() -> bool:
+            """Return True when the active runtime accepts Responses developer input."""
+            if agent.api_mode != "codex_responses":
+                return False
+            provider = str(getattr(agent, "provider", "") or "").strip().lower()
+            host = str(getattr(agent, "_base_url_hostname", "") or "").strip().lower()
+            base = str(getattr(agent, "_base_url_lower", "") or "").strip().lower()
+            return (
+                provider in {"openai", "openai-codex"}
+                or host == "api.openai.com"
+                or (host == "chatgpt.com" and "/backend-api/codex" in base)
+            )
+
+        _memory_context_block = build_memory_context_block(_ext_prefetch_cache)
+
+        def _api_messages_with_memory_for_current_runtime(base_messages: list[dict]) -> list[dict]:
+            """Inject prefetched memory into the provider-specific request copy."""
+            if not _memory_context_block:
+                # Still copy to strip the current-turn marker before the wire.
+                return [
+                    {k: v for k, v in m.items() if k != "_current_turn_user"}
+                    if isinstance(m, dict) else m
+                    for m in base_messages
+                ]
+
+            request_messages = [
+                dict(m) if isinstance(m, dict) else m
+                for m in base_messages
+            ]
+            if _uses_openai_memory_developer_tail():
+                # Keep the system/instructions prefix and user transcript
+                # byte-stable for prompt caching. OpenAI/Codex Responses accepts
+                # role="developer" input items, so the current-turn recall context
+                # can live at the tail of the request without entering durable
+                # history or rewriting any replayed user message.
+                request_messages.append({
+                    "role": "developer",
+                    "content": _memory_context_block,
+                })
+            else:
+                injected = False
+                for msg in request_messages:
+                    if not isinstance(msg, dict) or not msg.get("_current_turn_user"):
+                        continue
+                    base_content = msg.get("content", "")
+                    if isinstance(base_content, str):
+                        msg["content"] = base_content + "\n\n" + _memory_context_block
+                    elif isinstance(base_content, list):
+                        # Multimodal chat-completions turns must keep recall on
+                        # the current user item. Falling back to an earlier text
+                        # user would associate memory with the wrong turn and
+                        # poison the replay prefix.
+                        msg["content"] = list(base_content) + [
+                            {"type": "text", "text": _memory_context_block}
+                        ]
+                    else:
+                        msg["content"] = str(base_content or "") + "\n\n" + _memory_context_block
+                    injected = True
+                    break
+                if not injected:
+                    # Defensive fallback: preserve memory context even if a future
+                    # refactor drops the current-turn marker.
+                    for msg in reversed(request_messages):
+                        if isinstance(msg, dict) and msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                            msg["content"] = msg["content"] + "\n\n" + _memory_context_block
+                            break
+            for msg in request_messages:
+                if isinstance(msg, dict):
+                    msg.pop("_current_turn_user", None)
+            return request_messages
+
         api_messages = []
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
 
-            # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated, so nothing leaks into session persistence.
+            # Inject plugin-provided ephemeral context into the current turn's
+            # user message. External memory recall is injected later into the
+            # per-provider request copy: OpenAI/Codex Responses uses a tail
+            # developer input item, while other runtimes keep the legacy
+            # user-message suffix.
             if idx == current_turn_user_idx and msg.get("role") == "user":
-                _injections = []
-                if _ext_prefetch_cache:
-                    _fenced = build_memory_context_block(_ext_prefetch_cache)
-                    if _fenced:
-                        _injections.append(_fenced)
+                api_msg["_current_turn_user"] = True
                 if _plugin_user_context:
-                    _injections.append(_plugin_user_context)
-                if _injections:
                     _base = api_msg.get("content", "")
                     if isinstance(_base, str):
-                        api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
+                        api_msg["content"] = _base + "\n\n" + _plugin_user_context
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved
@@ -756,10 +831,13 @@ def run_conversation(
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
-        # External recall context is injected into the user message, not the system
-        # prompt, so the stable cache prefix remains unchanged.
+        # External recall context is not added to durable history. We inject
+        # it into a provider-specific request copy before sizing/logging and
+        # again per retry attempt (fallback can change the active runtime):
+        # OpenAI/Codex Responses gets it as a tail developer input item, while
+        # other runtimes keep the legacy user-message suffix.
         #
-        # NOTE: Plugin context from pre_llm_call hooks is injected into the
+        # NOTE: Plugin context from pre_llm_call hooks is still injected into the
         # user message (see injection block above), NOT the system prompt.
         # This is intentional — system prompt modifications break the prompt
         # cache prefix.  The system prompt is reserved for Hermes internals.
@@ -853,11 +931,19 @@ def run_conversation(
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
 
+        def _build_request_api_messages_for_current_runtime() -> list[dict]:
+            """Return the exact provider-request message copy for this attempt."""
+            request_api_messages = _api_messages_with_memory_for_current_runtime(api_messages)
+            _sanitize_messages_surrogates(request_api_messages)
+            return request_api_messages
+
+        request_api_messages_for_estimate = _build_request_api_messages_for_current_runtime()
+
         # Calculate approximate request size for logging
-        total_chars = sum(len(str(msg)) for msg in api_messages)
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
+        total_chars = sum(len(str(msg)) for msg in request_api_messages_for_estimate)
+        approx_tokens = estimate_messages_tokens_rough(request_api_messages_for_estimate)
         approx_request_tokens = estimate_request_tokens_rough(
-            api_messages, tools=agent.tools or None
+            request_api_messages_for_estimate, tools=agent.tools or None
         )
 
         _runtime_context_error = _ollama_context_limit_error(
@@ -882,7 +968,7 @@ def run_conversation(
         
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
-            agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
+            agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(request_api_messages_for_estimate)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
             agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
         else:
             # Animated thinking spinner in quiet mode
@@ -901,7 +987,7 @@ def run_conversation(
         
         # Log request details if verbose
         if agent.verbose_logging:
-            logging.debug(f"API Request - Model: {agent.model}, Messages: {len(messages)}, Tools: {len(agent.tools) if agent.tools else 0}")
+            logging.debug(f"API Request - Model: {agent.model}, Messages: {len(request_api_messages_for_estimate)}, Tools: {len(agent.tools) if agent.tools else 0}")
             logging.debug(f"Last message role: {messages[-1]['role'] if messages else 'none'}")
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
@@ -975,8 +1061,11 @@ def run_conversation(
                 # echo-back pad for the *current* provider here (idempotent no-op
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
-                agent._reapply_reasoning_echo_for_provider(api_messages)
-                api_kwargs = agent._build_api_kwargs(api_messages)
+                request_api_messages = _build_request_api_messages_for_current_runtime()
+                agent._reapply_reasoning_echo_for_provider(request_api_messages)
+                request_total_chars = sum(len(str(msg)) for msg in request_api_messages)
+                request_approx_tokens = estimate_messages_tokens_rough(request_api_messages)
+                api_kwargs = agent._build_api_kwargs(request_api_messages)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -1014,7 +1103,7 @@ def run_conversation(
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
                         if not isinstance(request_messages, list):
-                            request_messages = api_messages
+                            request_messages = request_api_messages
                         # Shallow-copy the outer list so plugins that retain the
                         # reference for async snapshotting don't observe later
                         # mutations of api_messages.  The inner dicts are not
@@ -1049,10 +1138,10 @@ def run_conversation(
                             request_messages=list(request_messages)
                             if isinstance(request_messages, list)
                             else [],
-                            message_count=len(api_messages),
+                            message_count=len(request_api_messages),
                             tool_count=len(agent.tools or []),
-                            approx_input_tokens=approx_tokens,
-                            request_char_count=total_chars,
+                            approx_input_tokens=request_approx_tokens,
+                            request_char_count=request_total_chars,
                             max_tokens=agent.max_tokens,
                             started_at=api_start_time,
                             middleware_trace=list(_llm_middleware_trace),

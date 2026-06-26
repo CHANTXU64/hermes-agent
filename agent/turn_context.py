@@ -13,11 +13,10 @@ returns one. ``run_conversation`` is left to unpack the context and run the loop
 shrinking the orchestrator by the full prologue.
 
 The builder still mutates ``agent`` heavily (counters, thread id, cached prompt,
-session DB) exactly as the inline code did — those side effects are the point. The
-``TurnContext`` it returns carries only the *locals* the loop reads back.
-
-Behavior is identical to the original inline prologue; this is a pure
-move-and-name refactor with no semantic change.
+session DB) exactly as the original inline prologue did — those side effects are
+the point. ``TurnContext`` carries only the locals the loop reads back, including
+raw external-memory prefetch text that the loop injects into the provider-specific
+request shape without mutating durable conversation history.
 """
 
 from __future__ import annotations
@@ -57,7 +56,8 @@ class TurnContext:
     should_review_memory: bool = False
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
     plugin_user_context: str = ""
-    # External-memory prefetch result, reused across loop iterations.
+    # Raw external-memory prefetch text used for provider-specific request
+    # injection; retained for diagnostics/backward-compatible tests.
     ext_prefetch_cache: str = ""
 
 
@@ -384,7 +384,11 @@ def build_turn_context(
         except Exception:
             pass
 
-    # External memory provider: prefetch once before the tool loop.
+    # External memory provider: prefetch once before the tool loop. The loop
+    # injects this raw context into the outgoing provider request only:
+    # OpenAI/Codex Responses gets it as a tail developer input item; other
+    # runtimes keep the legacy user-message suffix. The durable ``messages``
+    # list stays clean.
     ext_prefetch_cache = ""
     if agent._memory_manager:
         try:

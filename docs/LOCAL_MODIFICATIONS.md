@@ -580,15 +580,21 @@ Files:
 
 - `agent/chat_completion_helpers.py`
 - `agent/transports/codex.py`
+- `agent/conversation_loop.py`
+- `agent/turn_context.py`
+- `agent/codex_responses_adapter.py`
+- `agent/memory_manager.py`
 - `tests/agent/transports/test_codex_transport.py`
+- `tests/agent/test_memory_provider.py`
+- `tests/run_agent/test_run_agent.py`
 - `tests/run_agent/test_run_agent_codex_responses.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
 Summary:
 
-- Adds a short-term fork workaround for a Codex backend prompt-cache regression
-  where consecutive tool calls could lose cache after upstream removed Codex
-  backend `extra_headers`.
+- Adds a short-term fork workaround for Codex prompt-cache regressions where
+  consecutive tool calls, compression continuations, or dynamic memory-context
+  injection can otherwise lose cache affinity.
 
 What changed:
 
@@ -610,6 +616,17 @@ What changed:
   Langfuse later showed it did **not** fully preserve cache affinity in long
   gateway sessions. Same-turn follow-up calls could still drop to zero cache
   reads, so the fork restored its own `thread-id`/stable-cache-key routing.
+- OpenAI/Codex Responses auto-recall now injects prefetched `<memory-context>`
+  as a tail `role="developer"` input item instead of appending it to the current
+  user message. Non-OpenAI Responses runtimes keep the legacy ephemeral user
+  suffix; `codex_app_server` also keeps the suffix because that protocol does
+  not expose a per-turn Responses developer input slot.
+- Codex Responses chat-to-input conversion and preflight validation accept
+  `role="developer"` input items and preserve them as `input_text` content.
+- The memory-context system note wording was weakened from
+  `authoritative reference data` / `should inform all responses` to: `This is
+  the agent's persistent memory from prior sessions, for reference only.`
+  Sanitization still strips both the old and new notes.
 
 Why it matters:
 
@@ -620,6 +637,12 @@ Why it matters:
   cache keys.
 - This workaround keeps Gateway tool-call chains and compression continuations on
   a stable Codex cache thread.
+- Keeping recalled memory out of `instructions` and the current user message
+  preserves the stable prompt prefix and avoids treating old memory as fresh user
+  discourse.
+- The user wants persistent memory to remain available as historical reference,
+  not promoted into a stronger instruction such as `authoritative` or `should
+  inform all responses`.
 
 Merge protection:
 
@@ -633,6 +656,18 @@ Merge protection:
 - Preserve the fork's stable `prompt_cache_key` body field and matching
   `thread-id` / `x-client-request-id` headers for gateway and compression
   lineage.
+- Preserve tail `role="developer"` memory-context injection for OpenAI/Codex
+  Responses runtimes. Do not move that recalled memory back into
+  `instructions` or the current user message unless live cache evidence and
+  behavior tests show the replacement is equivalent.
+- Preserve the fallback path that appends recalled memory to the current user
+  turn only for runtimes that cannot accept Responses developer input.
+- Preserve the exact weak memory-context note wording unless the user explicitly
+  approves stronger wording: `This is the agent's persistent memory from prior
+  sessions, for reference only.`
+- Preserve tests that prove developer input items survive Codex Responses
+  conversion/preflight and that memory does not enter `instructions` or the
+  current user suffix on OpenAI/Codex Responses.
 - Drop this workaround only after an upstream replacement has been checked
   carefully against real long-running gateway telemetry and focused tests. At a
   minimum, verify both cross-turn and same-turn tool-call chains keep high cache
@@ -671,6 +706,14 @@ Observed local results:
   Hermes session header from `session-id` to upstream spelling `session_id`
   while retaining the stable `thread-id` / `x-client-request-id` values from
   `prompt_cache_key`. `python -m py_compile agent/transports/codex.py tests/agent/transports/test_codex_transport.py tests/run_agent/test_run_agent_codex_responses.py` → passed; `python -m pytest tests/agent/transports/test_codex_transport.py tests/run_agent/test_run_agent_codex_responses.py -q -o 'addopts='` → 139 passed, 1 unrelated `audioop` deprecation warning; `git diff --check` → passed.
+- 2026-06-26 OpenAI/Codex Responses developer-tail memory injection: targeted
+  request-shape tests for developer-tail recall, chat-completions fallback,
+  Responses developer conversion, developer preflight acceptance, and optional
+  function-call-id stripping reported `5 passed`; memory-context wrapper tests
+  reported `6 passed`; combined scrubber/developer-tail focused regression
+  reported `28 passed, 1 unrelated audioop deprecation warning`; `python -m
+  py_compile agent/memory_manager.py tests/agent/test_memory_provider.py` and
+  `git diff --check` passed.
 
 Upstream status: upstream official Codex header fix exists but is not equivalent
 for this fork's long gateway-session cache behavior; active fork workaround
@@ -728,7 +771,13 @@ deltas are expected in these areas:
 - Temporary Codex backend prompt-cache routing workaround:
   - `agent/chat_completion_helpers.py`
   - `agent/transports/codex.py`
+  - `agent/conversation_loop.py`
+  - `agent/turn_context.py`
+  - `agent/codex_responses_adapter.py`
+  - `agent/memory_manager.py`
   - `tests/agent/transports/test_codex_transport.py`
+  - `tests/agent/test_memory_provider.py`
+  - `tests/run_agent/test_run_agent.py`
   - `tests/run_agent/test_run_agent_codex_responses.py`
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
