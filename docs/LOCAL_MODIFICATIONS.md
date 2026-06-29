@@ -62,48 +62,6 @@ Merge protection:
 
 Upstream status: fork-only.
 
-### 2. MoA custom provider support
-
-Date: 2026-04-20
-
-Commits:
-
-- `5c5ffe04` — provider-agnostic MoA adaptation
-- `e60e548b` — tests for the provider-agnostic architecture
-- `a0fc0fa0` — custom endpoint 401 authentication fix
-
-Files:
-
-- `tools/mixture_of_agents_tool.py`
-- `tests/tools/test_mixture_of_agents_tool.py`
-- `hermes_cli/config.py`
-- `hermes_cli/runtime_provider.py`
-
-What changed:
-
-- MoA can resolve custom providers instead of assuming OpenRouter/OpenAI-style
-  defaults.
-- Runtime provider resolution supports configured `model.base_url` and custom
-  provider credentials.
-- Tests were updated for the provider-agnostic routing behavior.
-- The 401 failure path for custom endpoints was fixed.
-
-Why it matters:
-
-- The user's runtime uses custom providers; MoA must not fall back to OpenRouter
-  without the right credentials.
-- A merge that drops this support can make MoA fail with 401 errors.
-
-Merge protection:
-
-- Preserve custom provider resolution and credential fallback behavior.
-- Preserve MoA config defaults in `hermes_cli/config.py` unless upstream has a
-  verified equivalent.
-- Test or inspect `tools/mixture_of_agents_tool.py` and
-  `hermes_cli/runtime_provider.py` after conflicts.
-
-Upstream status: fork adaptation plus fork-only auth fixes.
-
 ### 3. MLX Whisper local STT provider
 
 Date: 2026-04-20
@@ -297,6 +255,43 @@ Upstream status: fork-only.
 
 ## Historical / reverted modifications
 
+### 2. MoA custom provider support
+
+Status: abandoned / superseded by upstream MoA architecture
+
+Date: 2026-04-20 to 2026-06-29
+
+Historical commits:
+
+- `5c5ffe04` — provider-agnostic MoA adaptation
+- `e60e548b` — tests for the provider-agnostic architecture
+- `a0fc0fa0` — custom endpoint 401 authentication fix
+
+Historical files:
+
+- `tools/mixture_of_agents_tool.py` — removed during the 2026-06-29 upstream sync
+- `tests/tools/test_mixture_of_agents_tool.py` — removed during the 2026-06-29 upstream sync
+- `hermes_cli/config.py`
+- `hermes_cli/runtime_provider.py`
+
+Current status:
+
+- Upstream replaced the old MoA model tool with the official MoA virtual-provider
+  architecture: presets, model picker integration, `agent/moa_loop.py`,
+  `hermes_cli/moa_config.py`, `hermes_cli/moa_cmd.py`, and related tests/docs.
+- On 2026-06-29 the user explicitly decided: "MoA 的以官方为准吧，放弃我们自己的Fork修改".
+- The old fork `mixture_of_agents_tool` and its tests must not be resurrected as
+  active fork behavior.
+
+Merge protection:
+
+- Future upstream syncs should keep the official MoA architecture as canonical.
+- If custom-provider MoA behavior breaks again, fix it in the official MoA
+  virtual-provider / runtime-provider path, not by reviving
+  `tools/mixture_of_agents_tool.py`.
+- Treat mentions of the old MoA tool as historical evidence only.
+
+Upstream status: superseded by upstream official MoA.
 
 ### 8. Review prompt / `skill_manage` config overrides
 
@@ -407,8 +402,8 @@ What changed:
 - `/undo` now calls a dedicated memory rewind hook in CLI, Gateway, and TUI paths; Hindsight mirrors that rewind by soft-excluding the last N active rows in `hindsight_retain_turns` (`active=0`, `rewound_at`) so future manual `/retain` skips undone turns without hard-deleting audit rows.
 - Hindsight rewind handling truncates the in-memory retain buffer and invalidates flush state without running the normal session-switch flush, so `/undo` does not itself push stale buffered turns to Hindsight.
 - Only `/retain` is user-facing; no long command aliases are registered.
-- Slack native slash generation keeps Telegram-visible canonical commands ahead of low-priority aliases so the extra fork-only `/retain` command does not push upstream `/debug` out of Slack registration under Slack's 50-command cap.
-- Slack routes low-frequency `/billing`, `/blueprint`, `/credits`, `/disk_cleanup`, and `/lcm` through `/hermes <command>` on this fork when native slots are exhausted; this preserves native `/retain` and `/debug` slots while keeping those commands reachable on Slack.
+- Slack native slash generation keeps Telegram-visible canonical commands ahead of low-priority aliases so the extra fork-only `/retain` command keeps a native Slack slot under Slack's 50-command cap.
+- Slack routes low-frequency or high-cost commands such as `/billing`, `/blueprint`, `/credits`, `/moa`, `/debug`, `/disk-cleanup` / `/disk_cleanup`, and `/lcm` through `/hermes <command>` on this fork when native slots are exhausted; this preserves native `/retain` while keeping those commands reachable on Slack.
 - `hindsight_retain_session` is not registered in model-visible tool schemas; CLI/Gateway call the provider directly via `memory_manager.get_provider("hindsight")`, so manual retain works even when `memory_mode="context"` hides Hindsight tools from the model.
 
 Why it matters:
@@ -745,11 +740,6 @@ deltas are expected in these areas:
   - `tui_gateway/server.py`
   - `tests/tui_gateway/test_undo_command.py`
   - `docs/chantxu64/hindsight-manual-retain.md`
-- MoA custom provider support:
-  - `tools/mixture_of_agents_tool.py`
-  - `tests/tools/test_mixture_of_agents_tool.py`
-  - `hermes_cli/config.py`
-  - `hermes_cli/runtime_provider.py`
 - MLX Whisper STT / custom STT API / custom Qwen TTS API:
   - `tools/transcription_tools.py`
   - `tools/tts_tool.py`
@@ -787,9 +777,9 @@ deltas are expected in these areas:
 
 Documented entries: 12 major entries.
 
-Active functional areas: 10.
+Active functional areas: 9.
 
-Historical reverted areas: 1.
+Historical reverted / abandoned areas: 2.
 
 Fork-only non-merge commits represented here: see
 `git log --no-merges upstream/main..HEAD`.

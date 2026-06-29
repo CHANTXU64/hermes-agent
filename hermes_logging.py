@@ -210,7 +210,11 @@ class _ComponentFilter(logging.Filter):
 # Logger name prefixes that belong to each component.
 # Used by _ComponentFilter and exposed for ``hermes logs --component``.
 COMPONENT_PREFIXES = {
-    "gateway": ("gateway", "hermes_plugins"),
+    # ``plugins.platforms`` covers messaging-platform adapters that migrated
+    # out of ``gateway/platforms/`` into bundled plugins (#41112) — they are
+    # still gateway components and their logs belong in gateway.log / match
+    # ``hermes logs --component gateway``.
+    "gateway": ("gateway", "hermes_plugins", "plugins.platforms"),
     "agent": ("agent", "run_agent", "model_tools", "batch_runner"),
     "tools": ("tools",),
     "cli": ("hermes_cli", "cli"),
@@ -548,11 +552,11 @@ def _read_logging_config():
     Returns ``(level, max_size_mb, backup_count)`` — any may be ``None``.
     """
     try:
-        import yaml
+        from utils import fast_safe_load
         config_path = get_config_path()
         if config_path.exists():
             with open(config_path, "r", encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
+                cfg = fast_safe_load(f) or {}
             # Managed scope: an administrator can pin logging.* too. Overlay via
             # the shared helper (fail-open) since this reads config.yaml directly.
             try:

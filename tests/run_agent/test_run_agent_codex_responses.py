@@ -382,7 +382,7 @@ def test_build_api_kwargs_codex_uses_compression_root_as_cache_thread(monkeypatc
     assert "session-id" not in headers
 
 
-def test_build_api_kwargs_codex_keeps_non_compression_child_cache_thread(monkeypatch):
+def test_build_api_kwargs_codex_content_addresses_non_compression_child_cache_thread(monkeypatch):
     class FakeSessionDB:
         def __init__(self):
             self.rows = {
@@ -413,9 +413,13 @@ def test_build_api_kwargs_codex_keeps_non_compression_child_cache_thread(monkeyp
         ]
     )
 
-    assert kwargs["prompt_cache_key"] == "child-session"
+    pck = kwargs["prompt_cache_key"]
+    assert pck.startswith("pck_")
+    assert pck not in {"child-session", "parent-session"}
     headers = kwargs.get("extra_headers") or {}
-    assert headers.get("thread-id") == "child-session"
+    assert headers.get("session_id") == "child-session"
+    assert headers.get("thread-id") == pck
+    assert headers.get("x-client-request-id") == pck
 
 
 def test_build_api_kwargs_codex_clamps_minimal_effort(monkeypatch):

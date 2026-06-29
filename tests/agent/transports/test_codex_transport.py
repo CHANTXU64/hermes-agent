@@ -83,13 +83,34 @@ class TestCodexBuildKwargs:
         )
         assert "reasoning" not in kw or kw.get("include") == []
 
-    def test_session_id_sets_cache_key(self, transport):
+    def test_cache_key_is_content_addressed_not_session_id(self, transport):
+        """prompt_cache_key is content-addressed from the static prefix
+        (instructions + tools), not the session_id. This keeps recurring cron
+        jobs — whose session_id carries a per-fire timestamp — on a stable warm
+        cache key. The key is a 'pck_' hash and must NOT equal session_id."""
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
             model="gpt-5.4", messages=messages, tools=[],
-            session_id="test-session-123",
+            session_id="cron_job42_20260624_143000",
         )
-        assert kw.get("prompt_cache_key") == "test-session-123"
+        pck = kw.get("prompt_cache_key", "")
+        assert pck.startswith("pck_")
+        assert pck != "cron_job42_20260624_143000"
+
+    def test_cache_key_stable_across_session_ids(self, transport):
+        """Same static prefix + different session_id (e.g. two cron fires of the
+        same job) must yield the same prompt_cache_key — the whole point of the
+        fix: repeated fires reuse the warm prefix instead of going cold."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw1 = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="cron_job42_20260624_143000",
+        )
+        kw2 = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="cron_job42_20260624_143500",
+        )
+        assert kw1["prompt_cache_key"] == kw2["prompt_cache_key"]
 
     def test_github_responses_no_cache_key(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
@@ -118,7 +139,12 @@ class TestCodexBuildKwargs:
             is_xai_responses=True,
         )
         assert "prompt_cache_key" not in kw
-        assert kw.get("extra_body", {}).get("prompt_cache_key") == "conv-xai-1"
+        # Body-level prompt_cache_key is content-addressed (pck_ hash), not the
+        # raw session_id, so recurring cron fires stay on a stable warm key.
+        eb_pck = kw.get("extra_body", {}).get("prompt_cache_key", "")
+        assert eb_pck.startswith("pck_")
+        assert eb_pck != "conv-xai-1"
+        # x-grok-conv-id stays the session/transcript id, not the cache key.
         assert kw.get("extra_headers", {}).get("x-grok-conv-id") == "conv-xai-1"
 
     def test_xai_responses_extra_body_preserves_caller_fields(self, transport):
@@ -155,9 +181,10 @@ class TestCodexBuildKwargs:
         )
         assert "max_output_tokens" not in kw
 
-    def test_codex_backend_sets_cache_routing_headers(self, transport):
-        """Codex backend sends session_id / x-client-request-id as HTTP
-        headers (via extra_headers) for cache-scope routing."""
+    def test_codex_backend_sets_content_addressed_cache_routing_headers(self, transport):
+        """Codex backend uses the content-addressed prompt cache key for the
+        logical cache-thread headers when no fork-stable gateway/compression
+        scope is supplied, while the physical session_id header stays raw."""
         messages = [{"role": "user", "content": "Hi"}]
 
         kw = transport.build_kwargs(
@@ -168,15 +195,40 @@ class TestCodexBuildKwargs:
             is_codex_backend=True,
         )
 
-        assert kw["prompt_cache_key"] == "conv-codex-1"
+        pck = kw["prompt_cache_key"]
+        assert pck.startswith("pck_")
+        assert pck != "conv-codex-1"
         assert kw["extra_headers"] == {
             "session_id": "conv-codex-1",
-            "thread-id": "conv-codex-1",
-            "x-client-request-id": "conv-codex-1",
+            "thread-id": pck,
+            "x-client-request-id": pck,
         }
         assert "session-id" not in kw["extra_headers"]
 
-    def test_codex_backend_no_headers_without_session_id(self, transport):
+    def test_codex_backend_explicit_prompt_cache_key_keeps_stable_thread(self, transport):
+        """Gateway/compression callers can still provide a logical cache scope
+        that wins over the content hash for the body field and Codex thread
+        headers, while session_id remains the physical Hermes session."""
+        messages = [{"role": "user", "content": "Hi"}]
+
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            session_id="physical-child-session",
+            prompt_cache_key="agent:main:telegram:dm:123",
+            is_codex_backend=True,
+        )
+
+        assert kw["prompt_cache_key"] == "agent:main:telegram:dm:123"
+        assert kw["extra_headers"] == {
+            "session_id": "physical-child-session",
+            "thread-id": "agent:main:telegram:dm:123",
+            "x-client-request-id": "agent:main:telegram:dm:123",
+        }
+        assert "session-id" not in kw["extra_headers"]
+
+    def test_codex_backend_content_thread_headers_without_session_id(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
 
         kw = transport.build_kwargs(
@@ -186,7 +238,13 @@ class TestCodexBuildKwargs:
             is_codex_backend=True,
         )
 
-        assert "extra_headers" not in kw
+        pck = kw["prompt_cache_key"]
+        assert pck.startswith("pck_")
+        assert kw["extra_headers"] == {
+            "thread-id": pck,
+            "x-client-request-id": pck,
+        }
+        assert "session_id" not in kw["extra_headers"]
 
     def test_codex_backend_preserves_caller_extra_headers(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
@@ -200,11 +258,13 @@ class TestCodexBuildKwargs:
             request_overrides={"extra_headers": {"x-test": "1"}},
         )
 
+        pck = kw["prompt_cache_key"]
+        assert pck.startswith("pck_")
         assert kw["extra_headers"] == {
             "x-test": "1",
             "session_id": "conv-codex-1",
-            "thread-id": "conv-codex-1",
-            "x-client-request-id": "conv-codex-1",
+            "thread-id": pck,
+            "x-client-request-id": pck,
         }
         assert "session-id" not in kw["extra_headers"]
 
