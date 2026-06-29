@@ -575,6 +575,41 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    current_turn_user_msg = None
+
+    def _reanchor_current_turn_user_idx() -> None:
+        """Keep the current-user cursor aligned after message repair/compression."""
+        nonlocal current_turn_user_idx, current_turn_user_msg
+
+        if (
+            current_turn_user_msg is not None
+            and any(msg is current_turn_user_msg for msg in messages)
+        ):
+            for idx, msg in enumerate(messages):
+                if msg is current_turn_user_msg:
+                    current_turn_user_idx = idx
+                    agent._persist_user_message_idx = idx
+                    return
+
+        if (
+            isinstance(current_turn_user_idx, int)
+            and 0 <= current_turn_user_idx < len(messages)
+            and isinstance(messages[current_turn_user_idx], dict)
+            and messages[current_turn_user_idx].get("role") == "user"
+        ):
+            current_turn_user_msg = messages[current_turn_user_idx]
+            agent._persist_user_message_idx = current_turn_user_idx
+            return
+
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                current_turn_user_idx = idx
+                current_turn_user_msg = msg
+                agent._persist_user_message_idx = idx
+                return
+
+    _reanchor_current_turn_user_idx()
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -762,13 +797,14 @@ def run_conversation(
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
         repaired_seq = repair_message_sequence_with_cursor(agent, messages)
         if repaired_seq > 0:
+            _reanchor_current_turn_user_idx()
             request_logger.info(
                 "Repaired %s message-alternation violations before request (session=%s)",
                 repaired_seq,
                 agent.session_id or "-",
             )
 
-        def _uses_openai_memory_developer_tail() -> bool:
+        def _uses_openai_memory_developer_after_user() -> bool:
             """Return True when the active runtime accepts Responses developer input."""
             if agent.api_mode != "codex_responses":
                 return False
@@ -782,13 +818,69 @@ def run_conversation(
             )
 
         _memory_context_block = build_memory_context_block(_ext_prefetch_cache)
+        _openai_memory_developer = _uses_openai_memory_developer_after_user()
+        _memory_contexts_by_user_idx: dict[int, str] = {}
+        if _openai_memory_developer:
+            # Request-only developer memory must be replayed at the same
+            # user-turn slots on later turns.  Otherwise the next turn rebuilds
+            # durable history without the previous developer item and rewrites
+            # that prefix position with assistant/tool/user items, causing a
+            # prompt-cache miss even though prompt_cache_key stayed stable.
+            raw_contexts = (
+                getattr(agent, "_codex_request_memory_contexts_by_user_idx", None)
+                if conversation_history
+                else None
+            )
+            if isinstance(raw_contexts, dict):
+                for raw_idx, raw_entry in raw_contexts.items():
+                    try:
+                        stored_idx = int(raw_idx)
+                    except (TypeError, ValueError):
+                        continue
+                    if stored_idx < 0 or stored_idx >= len(messages):
+                        continue
+                    msg = messages[stored_idx]
+                    if not isinstance(msg, dict) or msg.get("role") != "user":
+                        continue
+                    if isinstance(raw_entry, dict):
+                        context = raw_entry.get("context")
+                        expected_content = raw_entry.get("content")
+                    else:
+                        context = raw_entry
+                        expected_content = None
+                    if not isinstance(context, str) or not context:
+                        continue
+                    if expected_content is not None and msg.get("content") != expected_content:
+                        continue
+                    _memory_contexts_by_user_idx[stored_idx] = context
+            if _memory_context_block:
+                _memory_contexts_by_user_idx[current_turn_user_idx] = _memory_context_block
+            setattr(
+                agent,
+                "_codex_request_memory_contexts_by_user_idx",
+                {
+                    idx: {
+                        "content": messages[idx].get("content"),
+                        "context": context,
+                    }
+                    for idx, context in _memory_contexts_by_user_idx.items()
+                    if 0 <= idx < len(messages) and isinstance(messages[idx], dict)
+                },
+            )
 
         def _api_messages_with_memory_for_current_runtime(base_messages: list[dict]) -> list[dict]:
             """Inject prefetched memory into the provider-specific request copy."""
-            if not _memory_context_block:
-                # Still copy to strip the current-turn marker before the wire.
+            has_replay_markers = any(
+                isinstance(m, dict) and m.get("_memory_context_after_user")
+                for m in base_messages
+            )
+            if not _memory_context_block and not has_replay_markers:
+                # Still copy to strip internal markers before the wire.
                 return [
-                    {k: v for k, v in m.items() if k != "_current_turn_user"}
+                    {
+                        k: v for k, v in m.items()
+                        if k not in {"_current_turn_user", "_memory_context_after_user"}
+                    }
                     if isinstance(m, dict) else m
                     for m in base_messages
                 ]
@@ -797,57 +889,93 @@ def run_conversation(
                 dict(m) if isinstance(m, dict) else m
                 for m in base_messages
             ]
-            if _uses_openai_memory_developer_tail():
-                # Keep the system/instructions prefix and user transcript
-                # byte-stable for prompt caching. OpenAI/Codex Responses accepts
-                # role="developer" input items, so the current-turn recall context
-                # can live at the tail of the request without entering durable
-                # history or rewriting any replayed user message.
-                request_messages.append({
-                    "role": "developer",
-                    "content": _memory_context_block,
-                })
-            else:
-                injected = False
+            if _openai_memory_developer:
+                output_messages = []
+                inserted_current = False
                 for msg in request_messages:
-                    if not isinstance(msg, dict) or not msg.get("_current_turn_user"):
-                        continue
-                    base_content = msg.get("content", "")
-                    if isinstance(base_content, str):
-                        msg["content"] = base_content + "\n\n" + _memory_context_block
-                    elif isinstance(base_content, list):
-                        # Multimodal chat-completions turns must keep recall on
-                        # the current user item. Falling back to an earlier text
-                        # user would associate memory with the wrong turn and
-                        # poison the replay prefix.
-                        msg["content"] = list(base_content) + [
-                            {"type": "text", "text": _memory_context_block}
-                        ]
-                    else:
-                        msg["content"] = str(base_content or "") + "\n\n" + _memory_context_block
-                    injected = True
-                    break
-                if not injected:
-                    # Defensive fallback: preserve memory context even if a future
-                    # refactor drops the current-turn marker.
-                    for msg in reversed(request_messages):
-                        if isinstance(msg, dict) and msg.get("role") == "user" and isinstance(msg.get("content"), str):
-                            msg["content"] = msg["content"] + "\n\n" + _memory_context_block
+                    context_after_user = None
+                    is_current_user = False
+                    if isinstance(msg, dict):
+                        is_current_user = bool(msg.get("_current_turn_user"))
+                        context_after_user = msg.pop("_memory_context_after_user", None)
+                        msg.pop("_current_turn_user", None)
+                    output_messages.append(msg)
+                    if isinstance(context_after_user, str) and context_after_user:
+                        output_messages.append({
+                            "role": "developer",
+                            "content": context_after_user,
+                        })
+                        if is_current_user:
+                            inserted_current = True
+                if _memory_context_block and not inserted_current:
+                    current_developer_msg = {
+                        "role": "developer",
+                        "content": _memory_context_block,
+                    }
+                    insert_at = None
+                    for idx in range(len(output_messages) - 1, -1, -1):
+                        msg = output_messages[idx]
+                        if isinstance(msg, dict) and msg.get("role") == "user":
+                            insert_at = idx + 1
                             break
+                    if insert_at is None:
+                        output_messages.append(current_developer_msg)
+                    else:
+                        output_messages.insert(insert_at, current_developer_msg)
+                return output_messages
+
+            injected = False
+            for msg in request_messages:
+                if not isinstance(msg, dict) or not msg.get("_current_turn_user"):
+                    continue
+                base_content = msg.get("content", "")
+                if isinstance(base_content, str):
+                    msg["content"] = base_content + "\n\n" + _memory_context_block
+                elif isinstance(base_content, list):
+                    # Multimodal chat-completions turns must keep recall on
+                    # the current user item. Falling back to an earlier text
+                    # user would associate memory with the wrong turn and
+                    # poison the replay prefix.
+                    msg["content"] = list(base_content) + [
+                        {"type": "text", "text": _memory_context_block}
+                    ]
+                else:
+                    msg["content"] = str(base_content or "") + "\n\n" + _memory_context_block
+                injected = True
+                break
+            if not injected:
+                # Defensive fallback: preserve memory context even if a future
+                # refactor drops the current-turn marker.
+                for msg in reversed(request_messages):
+                    if isinstance(msg, dict) and msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                        msg["content"] = msg["content"] + "\n\n" + _memory_context_block
+                        break
             for msg in request_messages:
                 if isinstance(msg, dict):
                     msg.pop("_current_turn_user", None)
+                    msg.pop("_memory_context_after_user", None)
             return request_messages
 
         api_messages = []
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
 
+            # Mark user turns that need request-only memory replay.  For Codex
+            # Responses this includes prior turns as well as the current turn,
+            # so later requests keep the previous prompt prefix append-like
+            # without persisting memory blocks into durable history.
+            if (
+                _openai_memory_developer
+                and idx in _memory_contexts_by_user_idx
+                and msg.get("role") == "user"
+            ):
+                api_msg["_memory_context_after_user"] = _memory_contexts_by_user_idx[idx]
+
             # Inject plugin-provided ephemeral context into the current turn's
             # user message. External memory recall is injected later into the
-            # per-provider request copy: OpenAI/Codex Responses uses a tail
-            # developer input item, while other runtimes keep the legacy
-            # user-message suffix.
+            # per-provider request copy: OpenAI/Codex Responses places a
+            # developer input item immediately after each marked user message,
+            # while other runtimes keep the legacy user-message suffix.
             if idx == current_turn_user_idx and msg.get("role") == "user":
                 api_msg["_current_turn_user"] = True
                 if _plugin_user_context:
@@ -883,8 +1011,9 @@ def run_conversation(
         # External recall context is not added to durable history. We inject
         # it into a provider-specific request copy before sizing/logging and
         # again per retry attempt (fallback can change the active runtime):
-        # OpenAI/Codex Responses gets it as a tail developer input item, while
-        # other runtimes keep the legacy user-message suffix.
+        # OpenAI/Codex Responses gets it as a developer input item immediately
+        # after the current user message, while other runtimes keep the legacy
+        # user-message suffix.
         #
         # NOTE: Plugin context from pre_llm_call hooks is still injected into the
         # user message (see injection block above), NOT the system prompt.

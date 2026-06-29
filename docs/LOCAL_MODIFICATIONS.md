@@ -612,10 +612,13 @@ What changed:
   gateway sessions. Same-turn follow-up calls could still drop to zero cache
   reads, so the fork restored its own `thread-id`/stable-cache-key routing.
 - OpenAI/Codex Responses auto-recall now injects prefetched `<memory-context>`
-  as a tail `role="developer"` input item instead of appending it to the current
-  user message. Non-OpenAI Responses runtimes keep the legacy ephemeral user
-  suffix; `codex_app_server` also keeps the suffix because that protocol does
-  not expose a per-turn Responses developer input slot.
+  as `role="developer"` input items immediately after the relevant user
+  messages instead of appending it to the current user text. Prior request-only
+  developer memory slots are replayed at the same user-turn positions on later
+  turns so the Codex prompt-cache prefix stays append-like across tool loops and
+  the following user turn. Non-OpenAI Responses runtimes keep the legacy
+  ephemeral user suffix; `codex_app_server` also keeps the suffix because that
+  protocol does not expose a per-turn Responses developer input slot.
 - Codex Responses chat-to-input conversion and preflight validation accept
   `role="developer"` input items and preserve them as `input_text` content.
 - The memory-context system note wording was weakened from
@@ -651,18 +654,20 @@ Merge protection:
 - Preserve the fork's stable `prompt_cache_key` body field and matching
   `thread-id` / `x-client-request-id` headers for gateway and compression
   lineage.
-- Preserve tail `role="developer"` memory-context injection for OpenAI/Codex
-  Responses runtimes. Do not move that recalled memory back into
-  `instructions` or the current user message unless live cache evidence and
-  behavior tests show the replacement is equivalent.
+- Preserve after-user `role="developer"` memory-context injection and replay of
+  prior request-only developer slots for OpenAI/Codex Responses runtimes. Do not
+  move recalled memory back into `instructions`, the current user message text,
+  or the request tail unless live cache evidence and behavior tests show the
+  replacement is equivalent.
 - Preserve the fallback path that appends recalled memory to the current user
   turn only for runtimes that cannot accept Responses developer input.
 - Preserve the exact weak memory-context note wording unless the user explicitly
   approves stronger wording: `This is the agent's persistent memory from prior
   sessions, for reference only.`
 - Preserve tests that prove developer input items survive Codex Responses
-  conversion/preflight and that memory does not enter `instructions` or the
-  current user suffix on OpenAI/Codex Responses.
+  conversion/preflight, that memory does not enter `instructions` or the current
+  user suffix on OpenAI/Codex Responses, and that same-turn plus next-turn tool
+  chains do not rewrite prior developer-memory prefix slots.
 - Drop this workaround only after an upstream replacement has been checked
   carefully against real long-running gateway telemetry and focused tests. At a
   minimum, verify both cross-turn and same-turn tool-call chains keep high cache
@@ -701,14 +706,47 @@ Observed local results:
   Hermes session header from `session-id` to upstream spelling `session_id`
   while retaining the stable `thread-id` / `x-client-request-id` values from
   `prompt_cache_key`. `python -m py_compile agent/transports/codex.py tests/agent/transports/test_codex_transport.py tests/run_agent/test_run_agent_codex_responses.py` → passed; `python -m pytest tests/agent/transports/test_codex_transport.py tests/run_agent/test_run_agent_codex_responses.py -q -o 'addopts='` → 139 passed, 1 unrelated `audioop` deprecation warning; `git diff --check` → passed.
-- 2026-06-26 OpenAI/Codex Responses developer-tail memory injection: targeted
-  request-shape tests for developer-tail recall, chat-completions fallback,
+- 2026-06-26 OpenAI/Codex Responses developer memory injection: targeted
+  request-shape tests for developer recall, chat-completions fallback,
   Responses developer conversion, developer preflight acceptance, and optional
   function-call-id stripping reported `5 passed`; memory-context wrapper tests
-  reported `6 passed`; combined scrubber/developer-tail focused regression
-  reported `28 passed, 1 unrelated audioop deprecation warning`; `python -m
-  py_compile agent/memory_manager.py tests/agent/test_memory_provider.py` and
-  `git diff --check` passed.
+  reported `6 passed`; combined scrubber/developer focused regression reported
+  `28 passed, 1 unrelated audioop deprecation warning`; `python -m py_compile
+  agent/memory_manager.py tests/agent/test_memory_provider.py` and `git diff
+  --check` passed.
+- 2026-06-29 same-turn Codex tool-loop placement fix: moved that ephemeral
+  developer memory item from the request tail to immediately after the current
+  user item, so follow-up tool-loop requests keep the memory block before newly
+  appended assistant/tool items instead of moving the previous tail. RED test:
+  `tests/fork/test_codex_memory_context_isolation.py::test_auto_memory_recall_codex_developer_stays_after_user_across_tool_loop`
+  failed with `developer_index == 3` instead of `1` before the fix.
+- 2026-06-29 next-turn Codex memory replay fix for Langfuse trace
+  `aa645114645bf98925dcb9debfaa92a2`: added a regression that reproduces the
+  prior request's developer-memory slot being rewritten by a replayed
+  `reasoning` item on the following user turn. RED test
+  `tests/fork/test_codex_memory_context_isolation.py::test_auto_memory_recall_codex_replays_prior_turn_developer_for_cache_affinity`
+  failed before the fix with the second-turn item at that slot equal to
+  `{"type": "reasoning", ...}` instead of the prior `role="developer"` memory
+  item. After the fix: `python -m pytest tests/fork/test_codex_memory_context_isolation.py tests/fork/test_codex_prompt_cache.py tests/run_agent/test_run_agent_codex_responses.py -q -o 'addopts='`
+  → 93 passed; `python -m pytest tests/fork -q -o 'addopts='` → 300 passed;
+  `python -m py_compile agent/conversation_loop.py agent/turn_context.py tests/fork/test_codex_memory_context_isolation.py` and `git diff --check` passed.
+- 2026-06-29 repaired-user preflight dump fix for the same trace: live dumps
+  after 16:05 still showed tail `role="developer"` because
+  `repair_message_sequence_with_cursor()` can remove/merge messages before the
+  current user while `current_turn_user_idx` kept its pre-repair value. The
+  memory marker then missed the current user and the defensive fallback appended
+  the developer memory item at the request tail after reasoning/tool history.
+  The fork now re-anchors the current-user cursor after repair and the Codex
+  fallback inserts memory after the last user instead of at the tail. RED test
+  `tests/fork/test_codex_memory_context_isolation.py::test_auto_memory_recall_codex_preflight_dump_keeps_developer_after_repaired_user`
+  captures the final `HERMES_DUMP_REQUESTS` preflight body and failed before the
+  fix with the developer item at the tail. Verification: `HERMES_DUMP_REQUESTS=0
+  HERMES_HOME=/tmp/hermes-verify-memory-context venv/bin/python -m pytest
+  tests/fork/test_codex_memory_context_isolation.py tests/run_agent/test_run_agent_codex_responses.py -q -o 'addopts='`
+  → 88 passed; `HERMES_DUMP_REQUESTS=0 HERMES_HOME=/tmp/hermes-verify-fork
+  venv/bin/python -m pytest tests/fork -q -o 'addopts='` → 301 passed;
+  `venv/bin/python -m py_compile agent/conversation_loop.py agent/turn_context.py tests/fork/test_codex_memory_context_isolation.py`
+  and `git diff --check` passed.
 
 Upstream status: upstream official Codex header fix exists but is not equivalent
 for this fork's long gateway-session cache behavior; active fork workaround

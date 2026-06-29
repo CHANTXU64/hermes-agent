@@ -467,9 +467,10 @@ def build_turn_context(
 
     # External memory provider: prefetch once before the tool loop. The loop
     # injects this raw context into the outgoing provider request only:
-    # OpenAI/Codex Responses gets it as a tail developer input item; other
-    # runtimes keep the legacy user-message suffix. The durable ``messages``
-    # list stays clean.
+    # OpenAI/Codex Responses gets developer input items after the relevant
+    # user messages and replays prior request-only memory slots for cache
+    # affinity; other runtimes keep the legacy user-message suffix. The
+    # durable ``messages`` list stays clean.
     ext_prefetch_cache = ""
     if agent._memory_manager:
         try:
