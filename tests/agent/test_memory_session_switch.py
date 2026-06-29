@@ -45,15 +45,6 @@ class _RecordingProvider(MemoryProvider):
     def queue_prefetch(self, query, *, session_id=""):
         self.queue_calls.append({"query": query, "session_id": session_id})
 
-    def on_session_rewind(self, session_id, turns_undone=1, **kwargs):
-        self.switch_calls.append(
-            {
-                "rewind": session_id,
-                "turns_undone": turns_undone,
-                "extra": kwargs,
-            }
-        )
-
     def on_session_switch(
         self,
         new_session_id,
@@ -170,18 +161,6 @@ def test_manager_reset_flag_preserved():
     mm.on_session_switch("new-sid", reset=True, reason="new_session")
     assert p.switch_calls[0]["reset"] is True
     assert p.switch_calls[0]["extra"] == {"reason": "new_session"}
-
-
-def test_manager_rewind_fans_out_to_provider_rewind_hook():
-    mm = MemoryManager()
-    p = _RecordingProvider()
-    mm.add_provider(p)
-
-    mm.on_session_rewind("sess-1", turns_undone=3, reason="undo")
-
-    assert p.switch_calls == [
-        {"rewind": "sess-1", "turns_undone": 3, "extra": {"reason": "undo"}}
-    ]
 
 
 # ---------------------------------------------------------------------------

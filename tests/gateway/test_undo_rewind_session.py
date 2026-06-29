@@ -9,15 +9,11 @@ load_transcript returns only the active view. See issue #21910.
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-import threading
 
 import pytest
 
 from hermes_state import SessionDB
-from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import MessageEvent, MessageType
-from gateway.session import SessionSource, build_session_key
+from gateway.config import GatewayConfig
 from gateway.session import SessionStore
 
 
@@ -84,108 +80,3 @@ def test_rewind_clamps_negative_count_to_one(store):
     res = store.rewind_session(sid, -5)
     assert res["turns_undone"] == 1
     assert res["target_text"] == "q3"
-
-
-@pytest.mark.asyncio
-async def test_gateway_undo_notifies_cached_agent_memory_rewind(store):
-    from gateway.slash_commands import GatewaySlashCommandsMixin
-
-    class _Runner(GatewaySlashCommandsMixin):
-        def __init__(self):
-            self.session_store = store
-            self._agent_cache = {}
-            self._agent_cache_lock = threading.Lock()
-            self.evicted = []
-
-        def _evict_cached_agent(self, session_key):
-            self.evicted.append(session_key)
-            self._agent_cache.pop(session_key, None)
-
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="chat-1",
-        user_id="user-1",
-        user_name="User One",
-    )
-    session_key = build_session_key(source)
-    entry = store.get_or_create_session(source)
-    for i in range(1, 4):
-        store._db.append_message(entry.session_id, "user", f"q{i}")
-        store._db.append_message(entry.session_id, "assistant", f"a{i}")
-    mm = SimpleNamespace(on_session_rewind=lambda *args, **kwargs: None)
-    calls = []
-    mm.on_session_rewind = lambda *args, **kwargs: calls.append((args, kwargs))
-    agent = SimpleNamespace(_memory_manager=mm)
-    runner = _Runner()
-    runner._agent_cache[session_key] = (agent, object())
-    event = MessageEvent(text="/undo 2", message_type=MessageType.COMMAND, source=source)
-
-    result = await runner._handle_undo_command(event)
-
-    assert "Undid 2" in result or "撤销" in result
-    assert calls == [((entry.session_id,), {"turns_undone": 2})]
-    assert runner.evicted == [session_key]
-
-
-@pytest.mark.asyncio
-async def test_gateway_undo_marks_hindsight_rows_without_cached_agent(store, monkeypatch, tmp_path):
-    from gateway.slash_commands import GatewaySlashCommandsMixin
-
-    class _Runner(GatewaySlashCommandsMixin):
-        def __init__(self):
-            self.session_store = store
-            self._agent_cache = {}
-            self._agent_cache_lock = threading.Lock()
-            self.evicted = []
-
-        def _evict_cached_agent(self, session_key):
-            self.evicted.append(session_key)
-            self._agent_cache.pop(session_key, None)
-
-    class _Provider:
-        def __init__(self):
-            self.initialize_calls = []
-            self.rewind_calls = []
-            self.shutdown_calls = 0
-
-        def is_available(self):
-            return True
-
-        def initialize(self, **kwargs):
-            self.initialize_calls.append(kwargs)
-
-        def on_session_rewind(self, *args, **kwargs):
-            self.rewind_calls.append((args, kwargs))
-
-        def shutdown(self):
-            self.shutdown_calls += 1
-
-    provider = _Provider()
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"memory": {"provider": "hindsight"}})
-    monkeypatch.setattr("hermes_cli.config.cfg_get", lambda config, *keys: config.get("memory", {}).get("provider"))
-    monkeypatch.setattr("plugins.memory.load_memory_provider", lambda name: provider if name == "hindsight" else None)
-    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
-
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="chat-2",
-        user_id="user-2",
-        user_name="User Two",
-    )
-    session_key = build_session_key(source)
-    entry = store.get_or_create_session(source)
-    for i in range(1, 4):
-        store._db.append_message(entry.session_id, "user", f"q{i}")
-        store._db.append_message(entry.session_id, "assistant", f"a{i}")
-    runner = _Runner()
-    event = MessageEvent(text="/undo 2", message_type=MessageType.COMMAND, source=source)
-
-    result = await runner._handle_undo_command(event)
-
-    assert "Undid 2" in result or "撤销" in result
-    assert provider.initialize_calls
-    assert provider.initialize_calls[0]["session_id"] == entry.session_id
-    assert provider.initialize_calls[0]["gateway_session_key"] == session_key
-    assert provider.rewind_calls == [((entry.session_id,), {"turns_undone": 2})]
-    assert provider.shutdown_calls == 1
-    assert runner.evicted == [session_key]

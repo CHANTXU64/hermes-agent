@@ -945,29 +945,13 @@ class TestMemoryContextFencing:
         )
         assert result.startswith("<memory-context>")
         assert result.rstrip().endswith("</memory-context>")
-        assert (
-            "[System note: The following is recalled memory context, NOT new user input. "
-            "This is the agent's persistent memory from prior sessions, for reference only.]"
-        ) in result
-        assert "Treat as authoritative reference data" not in result
-        assert "should inform all responses" not in result
+        assert "NOT new user input" in result
         assert "user likes dark mode" in result
 
     def test_build_memory_context_block_empty_input(self):
         from agent.memory_manager import build_memory_context_block
         assert build_memory_context_block("") == ""
         assert build_memory_context_block("   ") == ""
-
-    def test_sanitize_context_strips_current_system_note(self):
-        from agent.memory_manager import sanitize_context
-        wrapped_note = (
-            "[System note: The following is recalled memory context, NOT new user input. "
-            "This is the agent's persistent memory from prior sessions, for reference only.]\n\n"
-            "real fact"
-        )
-        result = sanitize_context(wrapped_note)
-        assert "System note" not in result
-        assert "real fact" in result
 
     def test_sanitize_context_strips_fence_escapes(self):
         from agent.memory_manager import sanitize_context

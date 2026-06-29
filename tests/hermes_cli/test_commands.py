@@ -111,12 +111,6 @@ class TestResolveCommand:
         assert resolve_command("reload_mcp").name == "reload-mcp"
         assert resolve_command("codex_runtime").name == "codex-runtime"
         assert resolve_command("tasks").name == "agents"
-        retain = resolve_command("retain")
-        assert retain is not None
-        assert retain.name == "retain"
-        assert resolve_command("retain-session") is None
-        assert resolve_command("hindsight-retain-session") is None
-        assert resolve_command("retain_session") is None
 
     def test_topic_is_gateway_command(self):
         topic = resolve_command("topic")

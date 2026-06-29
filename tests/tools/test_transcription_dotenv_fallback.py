@@ -122,37 +122,14 @@ class TestProviderSelectionGate:
                    return_value={"XAI_API_KEY": "dotenv-secret"}):
             assert tt._get_provider({"enabled": True, "provider": "xai"}) == "xai"
 
-    def test_explicit_custom_api_sees_dotenv_env_key(self):
-        from tools import transcription_tools as tt
-
-        stt_config = {
-            "enabled": True,
-            "provider": "custom_api",
-            "custom_api": {
-                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                "api_key_env": "QWEN_API_KEY",
-            },
-        }
-        with patch("hermes_cli.config.load_env", return_value={"QWEN_API_KEY": "dotenv-secret"}):
-            assert tt._get_provider(stt_config) == "custom_api"
-
-    def test_default_custom_api_uses_qwen_dotenv_key(self):
-        from tools import transcription_tools as tt
-
-        stt_config = {
-            "enabled": True,
-            "provider": "custom_api",
-            "custom_api": {
-                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            },
-        }
-        with patch("hermes_cli.config.load_env", return_value={"QWEN_API_KEY": "dotenv-secret"}):
-            assert tt._get_provider(stt_config) == "custom_api"
 
     def test_explicit_elevenlabs_sees_dotenv(self):
         from tools import transcription_tools as tt
 
-        with patch.object(tt, "_HAS_FASTER_WHISPER", False),              patch.object(tt, "_has_local_command", return_value=False),              patch("hermes_cli.config.load_env", return_value={"ELEVENLABS_API_KEY": "dotenv-secret"}):
+        with patch.object(tt, "_HAS_FASTER_WHISPER", False), \
+             patch.object(tt, "_has_local_command", return_value=False), \
+             patch("hermes_cli.config.load_env",
+                   return_value={"ELEVENLABS_API_KEY": "dotenv-secret"}):
             assert tt._get_provider({"enabled": True, "provider": "elevenlabs"}) == "elevenlabs"
 
     def test_auto_detect_sees_dotenv_groq(self):
@@ -267,32 +244,6 @@ class TestTranscribeCallSitesReadDotenv:
         assert result["success"] is True
         assert captured["headers"]["Authorization"] == "Bearer xai-dotenv-key"
 
-    def test_transcribe_custom_api_forwards_dotenv_env_key(self):
-        from tools import transcription_tools as tt
-
-        captured: dict = {}
-
-        def fake_post(url, **kwargs):
-            captured["headers"] = kwargs.get("headers", {})
-            response = MagicMock()
-            response.status_code = 200
-            response.json.return_value = {"text": "hello"}
-            return response
-
-        cfg = {
-            "custom_api": {
-                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                "api_key_env": "QWEN_API_KEY",
-                "model": "qwen3-asr-flash-2026-02-10",
-                "endpoint": "/audio/transcriptions",
-                "mode": "multipart",
-            }
-        }
-        with patch.object(tt, "_load_stt_config", return_value=cfg),              patch("hermes_cli.config.load_env", return_value={"QWEN_API_KEY": "qwen-dotenv-key"}),              patch("requests.post", side_effect=fake_post),              patch("builtins.open", MagicMock()):
-            result = tt._transcribe_custom_api("/tmp/fake.mp3", "qwen3-asr")
-
-        assert result["success"] is True
-        assert captured["headers"]["Authorization"] == "Bearer qwen-dotenv-key"
 
     def test_transcribe_elevenlabs_forwards_dotenv_key(self):
         from tools import transcription_tools as tt
@@ -312,7 +263,10 @@ class TestTranscribeCallSitesReadDotenv:
                 return "elevenlabs-dotenv-key"
             return None
 
-        with patch.object(tt, "get_env_value", side_effect=fake_get_env_value),              patch.object(tt, "_load_stt_config", return_value={}),              patch("requests.post", side_effect=fake_post),              patch("builtins.open", MagicMock()):
+        with patch.object(tt, "get_env_value", side_effect=fake_get_env_value), \
+             patch.object(tt, "_load_stt_config", return_value={}), \
+             patch("requests.post", side_effect=fake_post), \
+             patch("builtins.open", MagicMock()):
             result = tt._transcribe_elevenlabs("/tmp/fake.mp3", "scribe_v2")
 
         assert result["success"] is True

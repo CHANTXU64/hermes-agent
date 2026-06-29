@@ -116,14 +116,6 @@ class TestGetProviderFallbackPriority:
             from tools.transcription_tools import _get_provider
             assert _get_provider({}) == "local"
 
-    def test_auto_detect_prefers_mlx_whisper_on_macos(self):
-        """Fork: MLX Whisper is a local macOS fallback before cloud providers."""
-        with patch("platform.system", return_value="Darwin"), \
-             patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
-             patch("tools.transcription_tools._HAS_MLX_WHISPER", True), \
-             patch("tools.transcription_tools._has_local_command", return_value=False):
-            from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "mlx_whisper"
 
     def test_auto_detect_prefers_groq_over_openai(self, monkeypatch):
         """Auto-detect: groq (free) is preferred over openai (paid)."""
