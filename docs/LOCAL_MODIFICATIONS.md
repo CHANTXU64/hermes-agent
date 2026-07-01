@@ -363,10 +363,10 @@ Files:
 - `hermes_cli/commands.py`
 - `tests/hermes_cli/test_commands.py`
 - `cli.py`
-- `tests/cli/test_retain_command.py`
+- `tests/fork/test_cli_retain_command.py`
 - `gateway/run.py`
 - `gateway/slash_commands.py`
-- `tests/gateway/test_retain_command.py`
+- `tests/fork/test_gateway_retain_command.py`
 - `tests/gateway/test_undo_rewind_session.py`
 - `tui_gateway/server.py`
 - `tests/tui_gateway/test_undo_command.py`
@@ -374,25 +374,20 @@ Files:
 
 Summary:
 
-- Adds a user-triggered `/retain` command that records a full Hindsight session document from Hermes' active transcript while preserving fork-specific Hindsight document lineage.
+- Adds a user-triggered `/retain` command that records a full Hindsight session document from Hindsight's provider-owned retain-turn SQLite store while preserving fork-specific Hindsight document lineage.
 
 What changed:
 
 - Added `hindsight_retain_session` / `/retain` for user-triggered Hindsight session retain.
 - Hindsight `sync_turn()` now persists the exact same turn JSON used by automatic retain into a separate SQLite file: `$HERMES_HOME/hindsight/retain_turns.sqlite3`.
 - Persisted retain rows include `retain_document_id`, a stable logical document id inherited across compression-created child sessions.
-- Gateway/CLI `/retain` uses the active Hermes SessionDB transcript as the authoritative content source when available, so interrupted or otherwise orphaned user messages at the start/middle/end of a session are not dropped.
-- Provider-owned `retain_turns.sqlite3` remains the fallback content source and the source for stable `retain_document_id` resolution when preserving compression-created logical documents.
-- Gateway/CLI `/retain` resolves the current `session_id` via `SessionStore.get_or_create_session(source)` or the active CLI session, then loads the full SessionDB parent chain root → current as transcript input. Each message is tagged with its source session id before being sent to the provider.
-- When a tagged SessionDB lineage transcript is available, that transcript is the authoritative retained content; persisted retain rows are used for stable document-id resolution only, not merged back into the content. This prevents stale provider-owned rows from duplicating compression replay or swallowing later final assistant turns.
-- Manual retain groups persisted turns by `retain_document_id` only for the provider-store fallback / untagged transcript compatibility path; this preserves a single logical Hindsight document even when compression/session bookkeeping records continuation sessions as siblings rather than a clean parent chain.
-- When manual transcript retain is called with `parent_session_id`, retain document resolution prefers the earliest parent/root document before any current- or parent-session split document. This prevents later lifecycle rows under a child or intermediate parent session id from hiding the original file uploads, task request, or parent conversation.
-- Manual transcript retain removes only exact parent/child boundary replay overlap after converting messages to retain turns. It drops the longest child prefix that exactly matches the accumulated parent suffix, and does not global-dedupe by content, so legitimate repeated user messages later in the session are preserved.
-- Manual transcript retain requests SessionDB message timestamps and uses each original user/assistant message time in local machine timezone with second precision (`YYYY-MM-DDTHH:MM:SS`) when available; missing timestamps fall back to retain-construction time in the same format.
-- Manual transcript retain requests SessionDB transcript rows in insertion order (`order_by="id"`) for CLI and Gateway `/retain`, because platform event timestamps can be replayed or backfilled out of order after compression/resume and must not reorder the actual conversation insertion sequence.
-- `SessionDB.get_messages_as_conversation()` keeps its default event-time ordering for normal conversation restore, but supports the explicit `order_by="id"` export path used by manual `/retain`.
-- Transcript retain now treats one user message through the next user message as a segment and pairs it with the last eligible non-tool-call assistant in that segment. This prevents intermediate scratch/progress messages such as `Need template patch.` from swallowing the later user-visible final answer.
-- Merge protection: future manual `/retain` changes must keep recursive SessionDB lineage loading for both Gateway and CLI, preserve `_session_id` grouping into the provider, keep original SessionDB message timestamps when available, and keep dedupe limited to exact boundary overlap rather than global text matching.
+- Gateway/CLI `/retain` uses SessionDB only to resolve the active `session_id`, `parent_session_id`, and optional title; SessionDB transcript rows are not a content source.
+- Provider-owned `$HERMES_HOME/hindsight/retain_turns.sqlite3` is the sole manual `/retain` content source. It stores the same turn JSON generated by Hindsight `sync_turn()` for automatic retain.
+- Gateway/CLI `/retain` directly calls `retain_persisted_session_lineage(...)`; it must not call `retain_conversation_messages(...)`, `SessionDB.get_messages_as_conversation(...)`, or `SessionStore.load_transcript(...)` to build manual retain content.
+- Manual retain groups persisted turns by stable `retain_document_id`; this preserves a single logical Hindsight document even when compression/session bookkeeping records continuation sessions as siblings rather than a clean parent chain.
+- Persisted retain lookup uses only `active=1` rows, so `/undo`-rewound rows are skipped while retained for local audit.
+- If no persisted rows exist, manual `/retain` returns `No persisted turns to retain.` rather than falling back to SessionDB or LCM/compression summaries.
+- Historical note: the 2026-06-15 SessionDB-primary path was added to preserve interrupted/orphan user messages, but it allowed LCM `[Recent Summary ...]` rows to replace Hindsight documents. Do not revive that path in merge conflict resolution.
 - Parent-chain lookup remains a fallback for older local rows without `retain_document_id`, and ignores empty stored parents when looking for a prior non-empty parent.
 - Persisted turn lookup does not filter by the historical local `bank_id`; `/retain` submits matching lineage turns to the bank configured at retain time.
 - Manual `/retain` submits a clean item with `content`, configured `context`, and `update_mode="replace"` when the API supports explicit update modes. Automatic/incremental retain still uses `append` for new-turn deltas.
@@ -409,20 +404,19 @@ What changed:
 Why it matters:
 
 - The user needs an explicit, user-triggered way to preserve the normal Hindsight session document without changing the automatic retain storage model.
-- Manual `/retain` must not lose user messages that never became completed external-memory turns because a run was interrupted; the Hindsight document must start from the actual first active SessionDB user message.
+- Manual `/retain` must preserve the exact Hindsight turn payloads that were already captured by the provider, and must not reconstruct content from SessionDB because SessionDB may contain LCM/compression summaries instead of original turns.
+- Interrupted/orphan user messages that never reached Hindsight `sync_turn()` are intentionally outside this manual retain path; do not reintroduce SessionDB reconstruction to cover them unless a new design stores those orphan turns in `retain_turns.sqlite3` first.
 
 Merge protection:
 
-- Preserve SessionDB transcript as the primary manual `/retain` content source when available. Do not regress to provider-owned completed-turn rows as the only source; that drops interrupted/orphan user messages such as a session's first user request.
-- Preserve orphan user-message handling in `retain_conversation_messages()` / `_build_turns_from_conversation_messages()`: consecutive user messages must flush the earlier pending user as a single-message turn, and trailing pending users must also be retained. Do not fake an empty assistant response.
-- Preserve provider-owned `$HERMES_HOME/hindsight/retain_turns.sqlite3` as fallback content and as the stable `retain_document_id` resolver for compression-created logical documents.
-- When CLI/Gateway passes a tagged root→tip SessionDB lineage transcript, preserve that transcript as the complete content authority; do not merge provider-owned persisted turns back into that content, because stale persisted rows can duplicate compression replay or omit later visible assistant replies.
+- Preserve provider-owned `$HERMES_HOME/hindsight/retain_turns.sqlite3` as the only manual `/retain` content source and as the stable `retain_document_id` resolver for compression-created logical documents.
+- CLI/Gateway `/retain` must not read SessionDB transcript content, must not call `retain_conversation_messages(...)`, and must not fall back to SessionDB when persisted rows are absent.
+- SessionDB use in `/retain` is limited to locating the active session and parent/title metadata needed to find persisted rows. LCM `[Recent Summary ...]` rows must never be sent to Hindsight as retained content.
+- Future attempts to preserve interrupted/orphan user messages must first persist those turns into `retain_turns.sqlite3`; do not revive the 2026-06-15 SessionDB-primary path.
 - Preserve manual full-session retain as `replace` on APIs with explicit update modes. Only automatic/incremental flush paths should use `append`.
-- Preserve explicit `order_by="id"` SessionDB transcript export in CLI and Gateway `/retain`; do not let platform event timestamps determine manual retain ordering.
-- Preserve last-eligible-assistant pairing within a user segment, while continuing to skip summary assistant messages and assistant tool-call placeholders. Do not regress to first-assistant-wins pairing, which can retain internal scratch text instead of the final visible answer.
 - Do not create a separate `manual-session:*` document; use the stable resolved `retain_document_id` so manual full-session retain replaces the logical Hindsight document while automatic retain append deltas remain separate.
 - Do not expose `hindsight_retain_session` as a model-visible tool by default; this is a user slash command/provider method.
-- Provider-store fallback manual `/retain` must include all sessions that share the same `retain_document_id`, ordered by persisted row id; do not rely solely on `parent_session_id`, because compression continuations can appear as siblings in SessionDB. Tagged SessionDB lineage transcript retains already carry their own root→tip content and must not be re-expanded from persisted rows.
+- Provider-store manual `/retain` must include all sessions that share the same `retain_document_id`, ordered by persisted row id; do not rely solely on `parent_session_id`, because compression continuations can appear as siblings in SessionDB.
 - Gateway `/retain` must resolve the active session from `SessionStore.get_or_create_session(source)` before consulting cached agents, mirroring the normal message path after `/resume` or gateway restart.
 - Manual `/retain` must not filter persisted turns by historical local `bank_id`; the current provider config determines the API target bank.
 - Manual `/retain` payload items should stay clean (`content`, configured `context`, and `update_mode` only when needed), without extra metadata/tags.
@@ -433,18 +427,19 @@ Merge protection:
 
 Verification:
 
-- 2026-06-17 recursive lineage + boundary replay dedupe fix: `python -m pytest tests/plugins/memory/test_hindsight_provider.py::TestToolHandlers::test_transcript_retain_dedupes_parent_child_boundary_overlap_only tests/gateway/test_retain_command.py::test_retain_command_uses_session_transcript_lineage_when_available -q -o 'addopts='` → 2 passed after first failing with duplicate boundary content and missing `_session_id` lineage tags.
-- 2026-06-18 upstream-sync resolution for recursive lineage + boundary replay dedupe + original timestamp fix: preserved upstream's full `tests/test_hermes_state.py` and added the fork timestamp opt-out regression instead of keeping the bad 28-line replacement; `python -m py_compile agent/transports/codex.py hermes_state.py plugins/memory/hindsight/__init__.py cli.py gateway/run.py tests/agent/transports/test_codex_transport.py tests/test_hermes_state.py tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py tests/cli/test_retain_command.py` passed; `python -m pytest tests/agent/transports/test_codex_transport.py tests/test_hermes_state.py tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py tests/cli/test_retain_command.py tests/run_agent/test_run_agent_codex_responses.py tests/gateway/test_agent_cache.py -q -o 'addopts='` → 630 passed.
-- 2026-06-20 transcript completeness fix for Document `20260619_183111_1f26c39e`: added regression coverage for `order_by="id"`, CLI/Gateway manual `/retain` using insertion order, and last-eligible-assistant pairing; `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py tests/cli/test_retain_command.py tests/test_hermes_state.py -q` → 439 passed; `git diff --check` → passed. Local sample reconstruction for root `20260619_183111_1f26c39e` + child `20260619_185935_ad6649` contained `已落地` and `继续进化了一轮`, and excluded `Need template patch`.
-- 2026-06-20 manual full-session replace fix for Document `20260620_154051_8e27678d`: added regression coverage that tagged SessionDB root→tip lineage transcripts are authoritative, do not merge stale persisted retain rows, and manual full-session retains use `update_mode="replace"`; `python -m pytest tests/plugins/memory/test_hindsight_provider.py -q -o 'addopts='` → 154 passed; `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/gateway/test_retain_command.py tests/cli/test_retain_command.py tests/test_hermes_state.py -q` → 440 passed; `git diff --check` → passed.
+- 2026-07-01 SQLite-only manual `/retain` content-source fix: new Gateway/CLI regressions first failed while `/retain` called `retain_conversation_messages(...)`; after the fix, `python -m pytest tests/fork/test_gateway_retain_command.py tests/fork/test_cli_retain_command.py tests/fork/test_hindsight_provider_regressions.py -q -o 'addopts='` → 49 passed, and `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_async_sync.py tests/run_agent/test_memory_sync_interrupted.py tests/gateway/test_undo_rewind_session.py tests/tui_gateway/test_undo_command.py -q -o 'addopts='` → 167 passed.
+- 2026-06-17 recursive lineage + boundary replay dedupe fix: `python -m pytest tests/plugins/memory/test_hindsight_provider.py::TestToolHandlers::test_transcript_retain_dedupes_parent_child_boundary_overlap_only tests/fork/test_gateway_retain_command.py::test_retain_command_uses_session_transcript_lineage_when_available -q -o 'addopts='` → 2 passed after first failing with duplicate boundary content and missing `_session_id` lineage tags.
+- 2026-06-18 upstream-sync resolution for recursive lineage + boundary replay dedupe + original timestamp fix: preserved upstream's full `tests/test_hermes_state.py` and added the fork timestamp opt-out regression instead of keeping the bad 28-line replacement; `python -m py_compile agent/transports/codex.py hermes_state.py plugins/memory/hindsight/__init__.py cli.py gateway/run.py tests/agent/transports/test_codex_transport.py tests/test_hermes_state.py tests/plugins/memory/test_hindsight_provider.py tests/fork/test_gateway_retain_command.py tests/fork/test_cli_retain_command.py` passed; `python -m pytest tests/agent/transports/test_codex_transport.py tests/test_hermes_state.py tests/plugins/memory/test_hindsight_provider.py tests/fork/test_gateway_retain_command.py tests/fork/test_cli_retain_command.py tests/run_agent/test_run_agent_codex_responses.py tests/gateway/test_agent_cache.py -q -o 'addopts='` → 630 passed.
+- 2026-06-20 transcript completeness fix for Document `20260619_183111_1f26c39e`: added regression coverage for `order_by="id"`, CLI/Gateway manual `/retain` using insertion order, and last-eligible-assistant pairing; `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/fork/test_gateway_retain_command.py tests/fork/test_cli_retain_command.py tests/test_hermes_state.py -q` → 439 passed; `git diff --check` → passed. Local sample reconstruction for root `20260619_183111_1f26c39e` + child `20260619_185935_ad6649` contained `已落地` and `继续进化了一轮`, and excluded `Need template patch`.
+- 2026-06-20 manual full-session replace fix for Document `20260620_154051_8e27678d`: added regression coverage that tagged SessionDB root→tip lineage transcripts are authoritative, do not merge stale persisted retain rows, and manual full-session retains use `update_mode="replace"`; `python -m pytest tests/plugins/memory/test_hindsight_provider.py -q -o 'addopts='` → 154 passed; `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/fork/test_gateway_retain_command.py tests/fork/test_cli_retain_command.py tests/test_hermes_state.py -q` → 440 passed; `git diff --check` → passed.
 - 2026-06-15 orphan-user transcript fix: `python -m pytest tests/hermes_cli/test_commands.py tests/run_agent/test_memory_sync_interrupted.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_async_sync.py -q -o 'addopts='` → 195 passed / 1 unrelated `audioop` deprecation warning.
-- `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='` → 260 passed.
-- `python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py hermes_cli/commands.py tests/gateway/test_retain_command.py` → passed.
+- `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/hermes_cli/test_commands.py tests/fork/test_gateway_retain_command.py -q -o 'addopts='` → 260 passed.
+- `python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py hermes_cli/commands.py tests/fork/test_gateway_retain_command.py` → passed.
 - `git diff --check` → passed.
 - `python -m pytest tests/plugins/memory/test_hindsight_provider.py -q` → 127 passed after adding `retain_document_id` grouping.
 - 2026-06-09 conflict resolution against upstream `09d66037f`: `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/run_agent/test_memory_sync_interrupted.py -q -o 'addopts='` → 158 passed, 1 unrelated `audioop` deprecation warning.
 - Rewind filtering update: `python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_async_sync.py tests/run_agent/test_memory_sync_interrupted.py tests/gateway/test_undo_rewind_session.py tests/tui_gateway/test_undo_command.py -q -o 'addopts='` → 186 passed.
-- Rewind filtering update: `python -m pytest tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='` → 148 passed.
+- Rewind filtering update: `python -m pytest tests/hermes_cli/test_commands.py tests/fork/test_gateway_retain_command.py -q -o 'addopts='` → 148 passed.
 
 Feature docs: `docs/chantxu64/hindsight-manual-retain.md`.
 
@@ -770,10 +765,10 @@ deltas are expected in these areas:
   - `hermes_cli/commands.py`
   - `tests/hermes_cli/test_commands.py`
   - `cli.py`
-  - `tests/cli/test_retain_command.py`
+  - `tests/fork/test_cli_retain_command.py`
   - `gateway/run.py`
   - `gateway/slash_commands.py`
-  - `tests/gateway/test_retain_command.py`
+  - `tests/fork/test_gateway_retain_command.py`
   - `tests/gateway/test_undo_rewind_session.py`
   - `tui_gateway/server.py`
   - `tests/tui_gateway/test_undo_command.py`

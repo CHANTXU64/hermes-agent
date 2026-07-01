@@ -11204,7 +11204,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         provider = candidate
             except Exception:
                 provider = None
-        if not provider or not (hasattr(provider, "retain_conversation_messages") or hasattr(provider, "retain_persisted_session_lineage") or hasattr(provider, "flush_retained_turns")):
+        if not provider or not hasattr(provider, "retain_persisted_session_lineage"):
             return "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。"
         try:
             data = None
@@ -11215,7 +11215,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 or ""
             ).strip()
             parent_session_id = ""
-            messages = []
             db = getattr(session_store, "_db", None) if session_store is not None else None
             if session_id and db is not None:
                 try:
@@ -11223,78 +11222,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     parent_session_id = str((row or {}).get("parent_session_id") or "")
                 except Exception:
                     parent_session_id = ""
-
-            def _session_lineage_root_to_tip(start_session_id: str) -> list[str]:
-                lineage: list[str] = []
-                current = str(start_session_id or "").strip()
-                seen: set[str] = set()
-                if db is None or not hasattr(db, "get_session"):
-                    return [current] if current else []
-                for _ in range(100):
-                    if not current or current in seen:
-                        break
-                    seen.add(current)
-                    lineage.append(current)
-                    try:
-                        row = db.get_session(current)
-                    except Exception:
-                        break
-                    current = str((row or {}).get("parent_session_id") or "").strip()
-                return list(reversed(lineage)) or ([str(start_session_id).strip()] if start_session_id else [])
-
-            def _load_lineage_transcript(start_session_id: str) -> list:
-                if db is None or not hasattr(db, "get_messages_as_conversation"):
-                    return []
-                loaded = []
-                for sid in _session_lineage_root_to_tip(start_session_id):
-                    try:
-                        try:
-                            transcript = db.get_messages_as_conversation(sid, include_timestamps=True, order_by="id") or []
-                        except TypeError:
-                            try:
-                                transcript = db.get_messages_as_conversation(sid, include_timestamps=True) or []
-                            except TypeError:
-                                transcript = db.get_messages_as_conversation(sid) or []
-                    except Exception:
-                        return []
-                    for msg in transcript:
-                        item = dict(msg)
-                        item["_session_id"] = sid
-                        loaded.append(item)
-                return loaded
-
-            if session_id and hasattr(provider, "retain_conversation_messages"):
-                try:
-                    messages = _load_lineage_transcript(session_id)
-                    if not messages and session_store is not None and hasattr(session_store, "load_transcript"):
-                        messages = session_store.load_transcript(session_id) or []
-                    elif not messages and db is not None and hasattr(db, "get_messages_as_conversation"):
-                        try:
-                            messages = db.get_messages_as_conversation(session_id, include_timestamps=True, order_by="id") or []
-                        except TypeError:
-                            try:
-                                messages = db.get_messages_as_conversation(session_id, include_timestamps=True) or []
-                            except TypeError:
-                                messages = db.get_messages_as_conversation(session_id) or []
-                except Exception:
-                    messages = []
-                if messages:
-                    data = provider.retain_conversation_messages(
-                        messages,
-                        session_id=session_id,
-                        parent_session_id=parent_session_id,
-                    )
-            if (not data or not data.get("queued")) and session_id and hasattr(provider, "retain_persisted_session_lineage"):
+            if session_id and hasattr(provider, "retain_persisted_session_lineage"):
                 data = provider.retain_persisted_session_lineage(
                     session_id=session_id,
                     parent_session_id=parent_session_id,
                 )
-            elif data is None and hasattr(provider, "flush_retained_turns"):
-                data = provider.flush_retained_turns()
             elif data is None:
-                return "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。"
+                data = {"queued": False, "message": "No persisted turns to retain."}
             if data is None:
-                return "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。"
+                data = {"queued": False, "message": "No persisted turns to retain."}
             if not data.get("queued"):
                 return str(data.get("message") or "No buffered turns to retain.")
             return "Buffered session turns queued for retain."

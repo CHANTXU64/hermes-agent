@@ -18,9 +18,9 @@ def _make_cli_stub(provider, session_db):
     return cli
 
 
-def test_cli_retain_uses_session_transcript_lineage_when_available(capsys):
+def test_cli_retain_uses_persisted_turn_store_not_sessiondb_transcript(capsys):
     provider = MagicMock()
-    provider.retain_conversation_messages.return_value = {"queued": True}
+    provider.retain_persisted_session_lineage.return_value = {"queued": True}
     sessions = {
         "root-sid": {"parent_session_id": ""},
         "child-sid": {"parent_session_id": "root-sid"},
@@ -44,15 +44,36 @@ def test_cli_retain_uses_session_transcript_lineage_when_available(capsys):
 
     assert cli.process_command("/retain") is True
 
-    provider.retain_conversation_messages.assert_called_once()
-    messages = provider.retain_conversation_messages.call_args.args[0]
-    assert [m["_session_id"] for m in messages] == [
-        "root-sid", "root-sid", "child-sid", "child-sid", "child-sid"
-    ]
-    assert session_db.get_messages_as_conversation.call_args_list[0].kwargs == {"include_timestamps": True, "order_by": "id"}
-    assert session_db.get_messages_as_conversation.call_args_list[1].kwargs == {"include_timestamps": True, "order_by": "id"}
-    assert provider.retain_conversation_messages.call_args.kwargs == {
-        "session_id": "child-sid",
-        "parent_session_id": "root-sid",
-    }
+    provider.retain_persisted_session_lineage.assert_called_once_with(
+        session_id="child-sid",
+        parent_session_id="root-sid",
+    )
+    provider.retain_conversation_messages.assert_not_called()
+    session_db.get_messages_as_conversation.assert_not_called()
     assert "Buffered session turns queued for retain." in capsys.readouterr().out
+
+
+def test_cli_retain_does_not_fallback_to_flush_when_persisted_store_empty(capsys):
+    provider = SimpleNamespace(
+        retain_persisted_session_lineage=MagicMock(
+            return_value={"queued": False, "message": "No persisted turns to retain."}
+        ),
+        flush_retained_turns=MagicMock(return_value={"queued": True}),
+    )
+    session_db = SimpleNamespace(
+        get_session=lambda sid: {"parent_session_id": "root-sid"},
+        get_messages_as_conversation=MagicMock(return_value=[
+            {"role": "user", "content": "[Recent Summary (d0)]\nsummary"},
+        ]),
+    )
+    cli = _make_cli_stub(provider, session_db)
+
+    assert cli.process_command("/retain") is True
+
+    provider.retain_persisted_session_lineage.assert_called_once_with(
+        session_id="child-sid",
+        parent_session_id="root-sid",
+    )
+    provider.flush_retained_turns.assert_not_called()
+    session_db.get_messages_as_conversation.assert_not_called()
+    assert "No persisted turns to retain." in capsys.readouterr().out

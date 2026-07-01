@@ -8340,81 +8340,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif canonical == "retain":
             memory_manager = getattr(self.agent, "_memory_manager", None) if self.agent else None
             provider = memory_manager.get_provider("hindsight") if memory_manager else None
-            if not provider or not (hasattr(provider, "retain_conversation_messages") or hasattr(provider, "retain_persisted_session_lineage") or hasattr(provider, "flush_retained_turns")):
+            if not provider or not hasattr(provider, "retain_persisted_session_lineage"):
                 _cprint("  Hindsight memory provider is not active.")
             else:
                 try:
                     data = None
                     row = self._session_db.get_session(self.session_id) if self._session_db and self.session_id else {}
                     parent_session_id = str((row or {}).get("parent_session_id") or "")
-                    messages = []
-                    def _session_lineage_root_to_tip(start_session_id: str) -> list[str]:
-                        lineage: list[str] = []
-                        current = str(start_session_id or "").strip()
-                        seen: set[str] = set()
-                        if not self._session_db or not hasattr(self._session_db, "get_session"):
-                            return [current] if current else []
-                        for _ in range(100):
-                            if not current or current in seen:
-                                break
-                            seen.add(current)
-                            lineage.append(current)
-                            try:
-                                row = self._session_db.get_session(current)
-                            except Exception:
-                                break
-                            current = str((row or {}).get("parent_session_id") or "").strip()
-                        return list(reversed(lineage)) or ([str(start_session_id).strip()] if start_session_id else [])
-
-                    def _load_lineage_transcript(start_session_id: str) -> list:
-                        if not self._session_db or not hasattr(self._session_db, "get_messages_as_conversation"):
-                            return []
-                        loaded = []
-                        for sid in _session_lineage_root_to_tip(start_session_id):
-                            try:
-                                try:
-                                    transcript = self._session_db.get_messages_as_conversation(sid, include_timestamps=True, order_by="id") or []
-                                except TypeError:
-                                    try:
-                                        transcript = self._session_db.get_messages_as_conversation(sid, include_timestamps=True) or []
-                                    except TypeError:
-                                        transcript = self._session_db.get_messages_as_conversation(sid) or []
-                            except Exception:
-                                return []
-                            for item in transcript:
-                                msg = dict(item)
-                                msg["_session_id"] = sid
-                                loaded.append(msg)
-                        return loaded
-
-                    if self._session_db and self.session_id and hasattr(provider, "retain_conversation_messages"):
-                        try:
-                            messages = _load_lineage_transcript(self.session_id)
-                            if not messages and hasattr(self._session_db, "get_messages_as_conversation"):
-                                try:
-                                    messages = self._session_db.get_messages_as_conversation(self.session_id, include_timestamps=True, order_by="id") or []
-                                except TypeError:
-                                    try:
-                                        messages = self._session_db.get_messages_as_conversation(self.session_id, include_timestamps=True) or []
-                                    except TypeError:
-                                        messages = self._session_db.get_messages_as_conversation(self.session_id) or []
-                        except Exception:
-                            messages = []
-                        if messages:
-                            data = provider.retain_conversation_messages(
-                                messages,
-                                session_id=self.session_id,
-                                parent_session_id=parent_session_id,
-                            )
-                    if (not data or not data.get("queued")) and hasattr(provider, "retain_persisted_session_lineage"):
+                    if self.session_id and hasattr(provider, "retain_persisted_session_lineage"):
                         data = provider.retain_persisted_session_lineage(
                             session_id=self.session_id,
                             parent_session_id=parent_session_id,
                         )
-                    elif data is None and hasattr(provider, "flush_retained_turns"):
-                        data = provider.flush_retained_turns()
                     if data is None:
-                        data = {"queued": False, "message": "Hindsight memory provider is not active."}
+                        data = {"queued": False, "message": "No persisted turns to retain."}
                     msg = data.get("message") if not data.get("queued") else "Buffered session turns queued for retain."
                 except Exception as e:
                     msg = f"Failed to retain session: {e}"

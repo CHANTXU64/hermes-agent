@@ -33,6 +33,8 @@ hindsight_retain_turns
 - `turn_index`
 - `turn_json`
 - `created_at`
+- `active`
+- `rewound_at`
 
 `turn_json` 是自动 retain 同源格式：
 
@@ -166,6 +168,8 @@ bank_id = current configured bank
 - `/retain` Gateway handler 可从 cached agent 找到 Hindsight provider。
 - `/retain` Gateway handler 在没有 cached agent 时，会按普通消息路径从 `SessionStore` 解析当前 resumed/restarted session，并按当前 `memory.provider=hindsight` 加载 provider。
 - Gateway `/retain` 调用 provider 的 persisted lineage retain，而不是读取原始 SessionDB transcript。
+- CLI `/retain` 调用 provider 的 persisted lineage retain，而不是读取原始 SessionDB transcript。
+- 即使 SessionDB 中存在 LCM/压缩生成的 `[Recent Summary ...]` 消息，`/retain` 也不会把它当作 Hindsight Document 内容源。
 - `sync_turn()` 会持久化和自动 retain 同源的 turn payload。
 - Manual `/retain` 会按 `retain_document_id` 聚合同一压缩 logical document；即使 B/C 在 SessionDB 中表现为 siblings，也能从 C retain 到 A+B+C。
 - 旧 row 后续写入空 `parent_session_id` 时，lineage fallback 会使用早先非空 parent，而不是被空 parent 截断。
@@ -181,9 +185,9 @@ bank_id = current configured bank
 验证命令：
 
 ```bash
-python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/hermes_cli/test_commands.py tests/gateway/test_retain_command.py -q -o 'addopts='
+python -m pytest tests/fork/test_gateway_retain_command.py tests/fork/test_cli_retain_command.py tests/fork/test_hindsight_provider_regressions.py -q -o 'addopts='
 python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_async_sync.py tests/run_agent/test_memory_sync_interrupted.py tests/gateway/test_undo_rewind_session.py tests/tui_gateway/test_undo_command.py -q -o 'addopts='
 python -m pytest tests/plugins/memory/test_hindsight_provider.py -q
-python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py gateway/slash_commands.py tui_gateway/server.py hermes_cli/commands.py tests/gateway/test_retain_command.py
+python -m py_compile plugins/memory/hindsight/__init__.py cli.py gateway/run.py gateway/slash_commands.py tui_gateway/server.py hermes_cli/commands.py tests/fork/test_gateway_retain_command.py tests/fork/test_cli_retain_command.py
 git diff --check
 ```

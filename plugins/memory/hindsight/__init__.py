@@ -1828,13 +1828,12 @@ class HindsightMemoryProvider(MemoryProvider):
         return merged
 
     def _build_turns_from_conversation_messages(self, messages: List[Dict[str, Any]]) -> List[str]:
-        """Build retain turn JSON from persisted Hermes SessionDB messages.
+        """Build retain turn JSON from an explicit transcript payload.
 
-        SessionDB is the authoritative transcript for manual `/retain`: it
-        contains user messages that may never have become a completed external
-        memory turn because the assistant run was interrupted. Preserve those
-        orphan user messages as single-message turns instead of overwriting them
-        with the next user message.
+        This helper is retained for compatibility with callers that deliberately
+        pass a transcript. It is not the authoritative path for user-facing
+        manual `/retain`: that command must read provider-owned persisted turns
+        from `retain_turns.sqlite3` via `retain_persisted_session_lineage()`.
         """
         messages = list(messages or [])
         if not any(str(msg.get("_session_id") or "").strip() for msg in messages):
@@ -2214,12 +2213,14 @@ class HindsightMemoryProvider(MemoryProvider):
         session_id: str = "",
         parent_session_id: str = "",
     ) -> Dict[str, Any]:
-        """Queue manual retain from the active Hermes SessionDB transcript.
+        """Queue retain from an explicit caller-provided transcript.
 
-        Unlike the provider-owned retain-turn store, the SessionDB transcript
-        includes interrupted/orphan user messages. Use it as the authoritative
-        content source for manual `/retain` when available; keep the provider
-        store for document-id resolution and as a fallback in callers.
+        This is a compatibility helper for callers that intentionally provide a
+        transcript. User-facing manual `/retain` must not call this path:
+        manual `/retain` content is authoritative only when it comes from the
+        provider-owned `retain_turns.sqlite3` store via
+        `retain_persisted_session_lineage()`. SessionDB transcripts can contain
+        LCM/compression summaries and must not be used as retained content.
         """
         if self._shutting_down.is_set():
             raise RuntimeError("Hindsight provider is shutting down")
