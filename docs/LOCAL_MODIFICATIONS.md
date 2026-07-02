@@ -107,7 +107,7 @@ Files:
 
 - `tools/safe_cmd_rewrite.py`
 - `tools/terminal_tool.py`
-- `tests/tools/test_safe_cmd_rewrite.py`
+- `tests/fork/test_safe_cmd_rewrite.py`
 - `pyproject.toml`
 
 What changed:
@@ -117,6 +117,12 @@ What changed:
   - `rm ...` becomes `trash ...`
   - `mv ...` becomes `gmv -b ...`
   - `cp ...` becomes `gcp -b ...`
+- SSH terminal backend and explicit `ssh host ...` remote commands are also
+  rewritten with the same safety contract as local terminal execution:
+  `rm` becomes `trash`, `mv` becomes `gmv -b`, and `cp` becomes `gcp -b`.
+- `docker exec ... <file-op>` inside SSH/remote commands is rewritten for file
+  operations, while non-exec Docker subcommands such as `docker rm`,
+  `docker rmi`, and `docker cp` are intentionally not rewritten.
 - The implementation uses `bashlex` AST parsing when available.
 - It handles common shell structures, wrappers, env prefixes, and option
   separators.
@@ -134,7 +140,7 @@ Merge protection:
 - Preserve the import and call path from `tools/terminal_tool.py` into
   `tools/safe_cmd_rewrite.py`.
 - Preserve `bashlex` in `pyproject.toml` unless replaced by an equivalent parser.
-- Run `tests/tools/test_safe_cmd_rewrite.py` after resolving conflicts touching
+- Run `tests/fork/test_safe_cmd_rewrite.py` after resolving conflicts touching
   terminal execution.
 
 Upstream status: fork-only.
@@ -784,7 +790,7 @@ deltas are expected in these areas:
 - Safe command rewrite:
   - `tools/safe_cmd_rewrite.py`
   - `tools/terminal_tool.py`
-  - `tests/tools/test_safe_cmd_rewrite.py`
+  - `tests/fork/test_safe_cmd_rewrite.py`
   - `pyproject.toml`
 - Disable newly bundled skills by default when configured:
   - `tools/skills_sync.py`

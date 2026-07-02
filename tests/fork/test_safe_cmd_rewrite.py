@@ -14,8 +14,14 @@ Covers:
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
 import pytest
 
+import tools.safe_cmd_rewrite as safe_rewrite
 from tools.safe_cmd_rewrite import (
     _add_backup_flag,
     _find_keyword,
@@ -434,11 +440,11 @@ class TestShellStructures:
 # Sandbox environment tests
 # ===========================================================================
 
-class TestSandboxSkip:
-    """Test that sandbox environments skip rewriting entirely."""
+class TestBackendRewritePolicy:
+    """Test backend-specific rewrite policy."""
 
     @pytest.mark.parametrize("env_type", [
-        "docker", "modal", "singularity", "daytona", "ssh",
+        "docker", "modal", "singularity", "daytona",
         "DOCKER", "Docker",
     ])
     def test_sandbox_skip(self, env_type):
@@ -449,6 +455,345 @@ class TestSandboxSkip:
 
     def test_unknown_env_does_rewrite(self):
         assert safe_command_rewrite("rm file", env_type="k8s") == "trash file"
+
+    def test_ssh_backend_rewrites_with_same_commands_as_local(self):
+        cmd = "rm -rf old && mv src dst && cp -r src2 dst2"
+        expected = "trash old && gmv -b src dst && gcp -b -r src2 dst2"
+        assert safe_command_rewrite(cmd, env_type="ssh") == expected
+
+    def test_ssh_backend_rewrites_sudo_absolute_paths_and_env_prefixes(self):
+        cmd = "sudo /usr/bin/rm -rf /tmp/a; FOO=bar mv a b; sudo cp a b"
+        expected = "sudo trash /tmp/a; FOO=bar gmv -b a b; sudo gcp -b a b"
+        assert safe_command_rewrite(cmd, env_type="ssh") == expected
+
+    def test_ssh_backend_rewrites_shell_structures(self):
+        cmd = "if [ -d old ]; then rm -rf old; else cp -r old backup; fi"
+        expected = "if [ -d old ]; then trash old; else gcp -b -r old backup; fi"
+        assert safe_command_rewrite(cmd, env_type="ssh") == expected
+
+    @pytest.mark.parametrize("cmd", [
+        "docker rm container",
+        "docker rmi image",
+        "sudo docker rm container",
+        "sudo docker rmi image",
+        "sudo docker cp local.txt container:/tmp/local.txt",
+        "sudo -n docker rm container",
+        "sudo -u root docker cp local.txt container:/tmp/local.txt",
+        "env FOO=bar docker rm container",
+        "nice docker cp local.txt container:/tmp/local.txt",
+        "timeout 5 docker rm container",
+        "stdbuf -oL docker rm container",
+        "stdbuf -oL docker cp local.txt container:/tmp/local.txt",
+        "ionice -c 3 docker rm container",
+        "chroot /mnt docker rm container",
+        "chroot /mnt docker cp local.txt container:/tmp/local.txt",
+        "xargs docker rm container",
+        "xargs docker cp local.txt container:/tmp/local.txt",
+    ])
+    def test_ssh_backend_keeps_non_exec_docker_subcommands(self, cmd):
+        assert safe_command_rewrite(cmd, env_type="ssh") == cmd
+
+    @pytest.mark.parametrize("cmd,expected", [
+        (
+            "docker exec app rm -rf /tmp/demo",
+            "docker exec app trash /tmp/demo",
+        ),
+        (
+            "sudo docker exec -u root app mv /tmp/a /tmp/b",
+            "sudo docker exec -u root app gmv -b /tmp/a /tmp/b",
+        ),
+        (
+            "sudo -n docker exec app cp /tmp/a /tmp/b",
+            "sudo -n docker exec app gcp -b /tmp/a /tmp/b",
+        ),
+        (
+            "sudo -u root docker exec app rm -rf /tmp/demo",
+            "sudo -u root docker exec app trash /tmp/demo",
+        ),
+        (
+            "docker exec app sudo -n rm -rf /tmp/demo",
+            "docker exec app sudo -n trash /tmp/demo",
+        ),
+        (
+            "docker exec app env FOO=bar cp /tmp/a /tmp/b",
+            "docker exec app env FOO=bar gcp -b /tmp/a /tmp/b",
+        ),
+        (
+            "env FOO=bar docker exec app mv /tmp/a /tmp/b",
+            "env FOO=bar docker exec app gmv -b /tmp/a /tmp/b",
+        ),
+        (
+            "timeout 5 docker exec app cp /tmp/a /tmp/b",
+            "timeout 5 docker exec app gcp -b /tmp/a /tmp/b",
+        ),
+        (
+            "stdbuf -oL docker exec app cp /tmp/a /tmp/b",
+            "stdbuf -oL docker exec app gcp -b /tmp/a /tmp/b",
+        ),
+        (
+            "ionice -c 3 docker exec app rm -rf /tmp/demo",
+            "ionice -c 3 docker exec app trash /tmp/demo",
+        ),
+        (
+            "chroot /mnt docker exec app mv /tmp/a /tmp/b",
+            "chroot /mnt docker exec app gmv -b /tmp/a /tmp/b",
+        ),
+        (
+            "xargs docker exec app cp /tmp/a /tmp/b",
+            "xargs docker exec app gcp -b /tmp/a /tmp/b",
+        ),
+        (
+            "docker exec app sh -lc 'rm -rf /tmp/demo && cp -r /tmp/a /tmp/b'",
+            "docker exec app sh -lc 'trash /tmp/demo && gcp -b -r /tmp/a /tmp/b'",
+        ),
+        (
+            'docker exec app sh -lc "printf \\"x\\"; rm -rf /tmp/demo"',
+            'docker exec app sh -lc "printf \\"x\\"; trash /tmp/demo"',
+        ),
+    ])
+    def test_ssh_backend_rewrites_file_ops_inside_docker_exec(self, cmd, expected):
+        assert safe_command_rewrite(cmd, env_type="ssh") == expected
+
+
+class TestExplicitSshCommandRewriting:
+    """Explicit `ssh host ...` commands should rewrite the remote command."""
+
+    @pytest.mark.parametrize("cmd,expected", [
+        (
+            "ssh arch-linux rm -rf /tmp/demo",
+            "ssh arch-linux trash /tmp/demo",
+        ),
+        (
+            "ssh arch-linux 'sudo rm -rf /tmp/demo'",
+            "ssh arch-linux 'sudo trash /tmp/demo'",
+        ),
+        (
+            'ssh arch-linux "printf \\"x\\"; rm -rf /tmp/demo"',
+            'ssh arch-linux "printf \\"x\\"; trash /tmp/demo"',
+        ),
+        (
+            'ssh -p 22 arch-linux "mv /tmp/a /tmp/b"',
+            'ssh -p 22 arch-linux "gmv -b /tmp/a /tmp/b"',
+        ),
+        (
+            "ssh -o BatchMode=yes arch-linux 'cp -r /tmp/a /tmp/b'",
+            "ssh -o BatchMode=yes arch-linux 'gcp -b -r /tmp/a /tmp/b'",
+        ),
+        (
+            "ssh arch-linux 'docker exec app rm -rf /tmp/demo'",
+            "ssh arch-linux 'docker exec app trash /tmp/demo'",
+        ),
+        (
+            "ssh arch-linux 'docker exec app sudo -n rm -rf /tmp/demo'",
+            "ssh arch-linux 'docker exec app sudo -n trash /tmp/demo'",
+        ),
+        (
+            "ssh arch-linux 'docker exec app env FOO=bar cp /tmp/a /tmp/b'",
+            "ssh arch-linux 'docker exec app env FOO=bar gcp -b /tmp/a /tmp/b'",
+        ),
+        (
+            "stdbuf -oL ssh arch-linux docker exec app cp /tmp/a /tmp/b",
+            "stdbuf -oL ssh arch-linux docker exec app gcp -b /tmp/a /tmp/b",
+        ),
+        (
+            "ionice -c 3 ssh arch-linux docker exec app rm -rf /tmp/demo",
+            "ionice -c 3 ssh arch-linux docker exec app trash /tmp/demo",
+        ),
+    ])
+    def test_explicit_ssh_remote_command_rewritten(self, cmd, expected):
+        assert safe_command_rewrite(cmd, env_type="local") == expected
+
+    @pytest.mark.parametrize("cmd", [
+        "ssh arch-linux 'docker rm container'",
+        "ssh arch-linux 'docker rmi image'",
+        "ssh arch-linux 'sudo docker rm container'",
+        "ssh arch-linux 'sudo docker rmi image'",
+        "ssh arch-linux 'sudo docker cp local.txt container:/tmp/local.txt'",
+        "ssh arch-linux 'sudo -n docker rm container'",
+        "ssh arch-linux 'sudo -u root docker cp local.txt container:/tmp/local.txt'",
+        "sudo ssh arch-linux docker rm container",
+        "sudo -n ssh arch-linux docker cp local.txt container:/tmp/local.txt",
+        "env FOO=bar ssh arch-linux docker rm container",
+        "timeout 5 ssh arch-linux docker cp local.txt container:/tmp/local.txt",
+        "stdbuf -oL ssh arch-linux docker rm container",
+        "stdbuf -oL ssh arch-linux docker cp local.txt container:/tmp/local.txt",
+        "ionice -c 3 ssh arch-linux docker rm container",
+        "chroot /mnt ssh arch-linux docker cp local.txt container:/tmp/local.txt",
+        "xargs ssh arch-linux docker rm container",
+        "scp file arch-linux:/tmp/file",
+        "rsync -av file arch-linux:/tmp/file",
+    ])
+    def test_explicit_ssh_non_file_deletes_and_copy_tools_are_not_rewritten(self, cmd):
+        assert safe_command_rewrite(cmd, env_type="local") == cmd
+
+
+class TestFallbackExplicitSshCommandRewriting:
+    """Regex fallback should preserve explicit SSH rewrite policy."""
+
+    @pytest.mark.parametrize("cmd,expected", [
+        (
+            "ssh arch-linux rm -rf /tmp/demo",
+            "ssh arch-linux trash /tmp/demo",
+        ),
+        (
+            "ssh arch-linux 'sudo rm -rf /tmp/demo'",
+            "ssh arch-linux 'sudo trash /tmp/demo'",
+        ),
+        (
+            'ssh arch-linux "printf \\"x\\"; rm -rf /tmp/demo"',
+            'ssh arch-linux "printf \\"x\\" ; trash /tmp/demo"',
+        ),
+        (
+            "ssh arch-linux 'sudo -n rm -rf /tmp/demo'",
+            "ssh arch-linux 'sudo -n trash /tmp/demo'",
+        ),
+        (
+            "ssh arch-linux sudo -u root cp /tmp/a /tmp/b",
+            "ssh arch-linux sudo -u root gcp -b /tmp/a /tmp/b",
+        ),
+        (
+            "ssh arch-linux 'env FOO=bar mv /tmp/a /tmp/b'",
+            "ssh arch-linux 'env FOO=bar gmv -b /tmp/a /tmp/b'",
+        ),
+        (
+            'ssh arch-linux "mv /tmp/a /tmp/b"',
+            'ssh arch-linux "gmv -b /tmp/a /tmp/b"',
+        ),
+        (
+            "ssh arch-linux 'cp -r /tmp/a /tmp/b'",
+            "ssh arch-linux 'gcp -b -r /tmp/a /tmp/b'",
+        ),
+        (
+            "ssh arch-linux 'docker exec app cp /tmp/a /tmp/b'",
+            "ssh arch-linux 'docker exec app gcp -b /tmp/a /tmp/b'",
+        ),
+        (
+            "ssh arch-linux 'docker exec app sudo -n rm -rf /tmp/demo'",
+            "ssh arch-linux 'docker exec app sudo -n trash /tmp/demo'",
+        ),
+        (
+            "ssh arch-linux 'docker exec app env FOO=bar cp /tmp/a /tmp/b'",
+            "ssh arch-linux 'docker exec app env FOO=bar gcp -b /tmp/a /tmp/b'",
+        ),
+        (
+            "ssh arch-linux \"docker exec app sh -lc 'rm -rf /tmp/demo && cp -r /tmp/a /tmp/b'\"",
+            "ssh arch-linux \"docker exec app sh -lc 'trash /tmp/demo && gcp -b -r /tmp/a /tmp/b'\"",
+        ),
+        (
+            "ssh arch-linux \"docker exec app sh -lc 'printf \\\"x\\\"; rm -rf /tmp/demo'\"",
+            "ssh arch-linux \"docker exec app sh -lc 'printf \\\"x\\\" ; trash /tmp/demo'\"",
+        ),
+        (
+            "stdbuf -oL ssh arch-linux docker exec app cp /tmp/a /tmp/b",
+            "stdbuf -oL ssh arch-linux docker exec app gcp -b /tmp/a /tmp/b",
+        ),
+    ])
+    def test_fallback_explicit_ssh_remote_command_rewritten(
+        self,
+        monkeypatch,
+        cmd,
+        expected,
+    ):
+        monkeypatch.setattr(safe_rewrite, "_HAS_BASHLEX", False)
+        assert safe_rewrite.safe_command_rewrite(cmd, env_type="local") == expected
+
+    @pytest.mark.parametrize("cmd", [
+        "ssh arch-linux 'docker rm container'",
+        "ssh arch-linux 'docker rmi image'",
+        "ssh arch-linux 'sudo docker cp local.txt container:/tmp/local.txt'",
+        "stdbuf -oL ssh arch-linux docker rm container",
+        "ionice -c 3 ssh arch-linux docker cp local.txt container:/tmp/local.txt",
+    ])
+    def test_fallback_explicit_ssh_non_exec_docker_subcommands_not_rewritten(
+        self,
+        monkeypatch,
+        cmd,
+    ):
+        monkeypatch.setattr(safe_rewrite, "_HAS_BASHLEX", False)
+        assert safe_rewrite.safe_command_rewrite(cmd, env_type="local") == cmd
+
+
+class TestFallbackBackendRewritePolicy:
+    """Regex fallback should match SSH backend rewrite policy."""
+
+    @pytest.mark.parametrize("cmd,expected", [
+        (
+            "sudo -n rm -rf /tmp/demo",
+            "sudo -n trash /tmp/demo",
+        ),
+        (
+            "sudo -u root cp /tmp/a /tmp/b",
+            "sudo -u root gcp -b /tmp/a /tmp/b",
+        ),
+        (
+            "env FOO=bar mv /tmp/a /tmp/b",
+            "env FOO=bar gmv -b /tmp/a /tmp/b",
+        ),
+        (
+            "docker exec app sh -lc 'rm -rf /tmp/demo && cp -r /tmp/a /tmp/b'",
+            "docker exec app sh -lc 'trash /tmp/demo && gcp -b -r /tmp/a /tmp/b'",
+        ),
+        (
+            "docker exec app sudo -n rm -rf /tmp/demo",
+            "docker exec app sudo -n trash /tmp/demo",
+        ),
+        (
+            "docker exec app env FOO=bar cp /tmp/a /tmp/b",
+            "docker exec app env FOO=bar gcp -b /tmp/a /tmp/b",
+        ),
+        (
+            'docker exec app sh -lc "printf \\"x\\"; rm -rf /tmp/demo"',
+            'docker exec app sh -lc "printf \\"x\\" ; trash /tmp/demo"',
+        ),
+    ])
+    def test_fallback_ssh_backend_rewrites_wrapped_file_ops(
+        self,
+        monkeypatch,
+        cmd,
+        expected,
+    ):
+        monkeypatch.setattr(safe_rewrite, "_HAS_BASHLEX", False)
+        assert safe_rewrite.safe_command_rewrite(cmd, env_type="ssh") == expected
+
+
+class TestFallbackImportWithoutBashlex:
+    """The module should import and use fallback rewriting if bashlex is absent."""
+
+    def test_module_imports_and_rewrites_when_bashlex_unavailable(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        script = textwrap.dedent(
+            """
+            import importlib.abc
+            import sys
+
+            class BlockBashlex(importlib.abc.MetaPathFinder):
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "bashlex" or fullname.startswith("bashlex."):
+                        raise ModuleNotFoundError(fullname)
+                    return None
+
+            sys.meta_path.insert(0, BlockBashlex())
+
+            import tools.safe_cmd_rewrite as s
+
+            print(f"HAS_BASHLEX={s._HAS_BASHLEX}")
+            print(s.safe_command_rewrite("ssh arch-linux rm -rf /tmp/demo", env_type="local"))
+            print(s.safe_command_rewrite("sudo -n rm -rf /tmp/demo", env_type="ssh"))
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == [
+            "HAS_BASHLEX=False",
+            "ssh arch-linux trash /tmp/demo",
+            "sudo -n trash /tmp/demo",
+        ]
 
 
 # ===========================================================================
@@ -510,6 +855,27 @@ class TestNegativeRmAsArgument:
     ])
     def test_rm_as_argument(self, cmd):
         assert safe_command_rewrite(cmd) == cmd
+
+
+class TestNegativeWrappedRmAsArgument:
+    """Wrapper commands should not make later rm/mv/cp-like arguments eligible."""
+
+    @pytest.mark.parametrize("cmd", [
+        "sudo echo rm -rf /tmp/demo",
+        "timeout 5 echo cp /tmp/a /tmp/b",
+        "ssh arch-linux sudo echo rm -rf /tmp/demo",
+    ])
+    def test_ast_wrapped_non_destructive_command_arguments(self, cmd):
+        assert safe_command_rewrite(cmd) == cmd
+
+    @pytest.mark.parametrize("cmd", [
+        "sudo echo rm -rf /tmp/demo",
+        "timeout 5 echo cp /tmp/a /tmp/b",
+        "ssh arch-linux sudo echo rm -rf /tmp/demo",
+    ])
+    def test_fallback_wrapped_non_destructive_command_arguments(self, monkeypatch, cmd):
+        monkeypatch.setattr(safe_rewrite, "_HAS_BASHLEX", False)
+        assert safe_rewrite.safe_command_rewrite(cmd) == cmd
 
 
 class TestNegativeRmInStrings:

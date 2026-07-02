@@ -4,9 +4,9 @@ Uses bashlex AST parser to correctly identify rm/mv/cp commands in shell
 syntax, avoiding false positives from strings, subcommands, etc.
 
 Rewrites:
-  rm [flags] files  →  trash files
-  mv [flags] src dst  →  gmv -b [flags] src dst
-  cp [flags] src dst  →  gcp -b [flags] src dst
+  local: rm [flags] files  →  trash files
+  local: mv/cp [flags] src dst  →  gmv/gcp -b [flags] src dst
+  ssh: same as local — rm → trash; mv/cp → gmv/gcp -b
 
 Rules:
 - trash does not support -r/-f; these flags are stripped.
@@ -18,7 +18,8 @@ Rules:
 - Command substitution $(...) and subshells (...) are parsed and rewritten.
 - Strings containing 'rm' are correctly ignored (AST distinguishes string args).
 - VCS subcommands (git rm, hg rm, etc.) are NOT rewritten.
-- Sandbox environments (docker/modal/singularity/daytona/ssh) skip rewriting entirely.
+- Sandbox environments (docker/modal/singularity/daytona) skip rewriting entirely.
+- SSH backends and explicit ssh remote commands rewrite remote file operations.
 
 Known limitations:
 - Malformed shell commands (e.g. double ;; outside case) may not be parsed
@@ -31,13 +32,15 @@ Known limitations:
 from __future__ import annotations
 
 import re
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
+bashlex: Any
 try:
     import bashlex
     import bashlex.ast
     _HAS_BASHLEX = True
 except ImportError:
+    bashlex = None  # type: ignore[assignment]
     _HAS_BASHLEX = False
 
 # ---------------------------------------------------------------------------
@@ -45,13 +48,70 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _SANDBOX_ENVS: frozenset[str] = frozenset({
-    "docker", "modal", "singularity", "daytona", "ssh",
+    "docker", "modal", "singularity", "daytona",
+})
+
+
+class _RewriteCommands:
+    """Concrete command names for one execution context."""
+
+    def __init__(self, rm: str, mv: str, cp: str) -> None:
+        self.rm = rm
+        self.mv = mv
+        self.cp = cp
+
+
+_LOCAL_COMMANDS = _RewriteCommands(rm="trash", mv="gmv", cp="gcp")
+_SSH_COMMANDS = _LOCAL_COMMANDS
+
+
+_SHELL_NAMES: frozenset[str] = frozenset({"sh", "bash", "zsh"})
+_SSH_OPTIONS_TAKING_ARG: frozenset[str] = frozenset({
+    "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L",
+    "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w",
+})
+_SUDO_OPTIONS_TAKING_ARG: frozenset[str] = frozenset({
+    "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
+    "-C", "--close-from", "-r", "--role", "-t", "--type",
+})
+_ENV_OPTIONS_TAKING_ARG: frozenset[str] = frozenset({
+    "-u", "--unset", "-S", "--split-string",
+})
+_NICE_OPTIONS_TAKING_ARG: frozenset[str] = frozenset({"-n", "--adjustment"})
+_TIMEOUT_OPTIONS_TAKING_ARG: frozenset[str] = frozenset({
+    "-s", "--signal", "-k", "--kill-after",
+})
+_STDBUF_OPTIONS_TAKING_ARG: frozenset[str] = frozenset({
+    "-i", "--input", "-o", "--output", "-e", "--error",
+})
+_IONICE_OPTIONS_TAKING_ARG: frozenset[str] = frozenset({
+    "-c", "--class", "-n", "--classdata", "-p", "--pid",
+})
+_CHROOT_OPTIONS_TAKING_ARG: frozenset[str] = frozenset({
+    "--userspec", "--groups",
+})
+_XARGS_OPTIONS_TAKING_ARG: frozenset[str] = frozenset({
+    "-E", "--eof", "-I", "--replace", "-L", "--max-lines", "-l",
+    "-n", "--max-args", "-P", "--max-procs", "-s", "--max-chars",
+    "-d", "--delimiter",
+})
+_DOCKER_EXEC_OPTIONS_TAKING_ARG: frozenset[str] = frozenset({
+    "-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir",
+    "--detach-keys",
 })
 
 
 def _is_sandbox(env_type: str) -> bool:
     """Return True if the environment is a sandbox where rewriting should be skipped."""
     return env_type.lower() in _SANDBOX_ENVS
+
+
+def _commands_for_env(env_type: str) -> _RewriteCommands:
+    """Return command replacements suitable for the execution environment."""
+    if env_type.lower() == "ssh":
+        # SSH uses the same safety contract as local terminal execution.
+        return _SSH_COMMANDS
+    return _LOCAL_COMMANDS
 
 
 # ---------------------------------------------------------------------------
@@ -67,17 +127,220 @@ _WRAPPER_NAMES: frozenset[str] = frozenset({
 _WRAPPERS_TAKING_EXTRA_ARG: frozenset[str] = frozenset({'timeout', 'chroot'})
 
 
-class _RewriteVisitor(bashlex.ast.nodevisitor):
+def _base(word: str) -> str:
+    return word.split('/')[-1]
+
+
+def _skip_options(words: List[str], index: int, options_taking_arg: frozenset[str]) -> int:
+    """Skip simple command options and their value words where known."""
+    i = index
+    while i < len(words):
+        word = words[i]
+        if word == '--':
+            return i + 1
+        if not word.startswith('-') or word == '-':
+            return i
+        option = word.split('=', 1)[0]
+        i += 1
+        if option in options_taking_arg and '=' not in word and i < len(words):
+            i += 1
+    return i
+
+
+def _leading_command_index(words: List[str]) -> int:
+    """Skip common leading wrappers and return the effective command index."""
+    i = 0
+    while i < len(words):
+        word = words[i]
+        base = _base(word)
+
+        if base == 'sudo':
+            i += 1
+            i = _skip_options(words, i, _SUDO_OPTIONS_TAKING_ARG)
+            continue
+
+        if base == 'env':
+            i += 1
+            i = _skip_options(words, i, _ENV_OPTIONS_TAKING_ARG)
+            while i < len(words) and '=' in words[i] and not words[i].startswith('-'):
+                i += 1
+            continue
+
+        if base == 'nice':
+            i += 1
+            i = _skip_options(words, i, _NICE_OPTIONS_TAKING_ARG)
+            continue
+
+        if base == 'timeout':
+            i += 1
+            i = _skip_options(words, i, _TIMEOUT_OPTIONS_TAKING_ARG)
+            if i < len(words) and not words[i].startswith('-'):
+                # timeout DURATION COMMAND
+                i += 1
+            continue
+
+        if base == 'stdbuf':
+            i += 1
+            i = _skip_options(words, i, _STDBUF_OPTIONS_TAKING_ARG)
+            continue
+
+        if base == 'ionice':
+            i += 1
+            i = _skip_options(words, i, _IONICE_OPTIONS_TAKING_ARG)
+            continue
+
+        if base == 'chroot':
+            i += 1
+            i = _skip_options(words, i, _CHROOT_OPTIONS_TAKING_ARG)
+            if i < len(words):
+                # chroot NEWROOT COMMAND
+                i += 1
+            continue
+
+        if base == 'xargs':
+            i += 1
+            i = _skip_options(words, i, _XARGS_OPTIONS_TAKING_ARG)
+            continue
+
+        if base in {'nohup', 'exec'}:
+            i += 1
+            continue
+
+        if '=' in word and not word.startswith('-'):
+            i += 1
+            continue
+        break
+    return i
+
+
+def _single_quote_shell_word(word: str) -> str:
+    """Return a shell-safe single word using single-quote escaping."""
+    return "'" + word.replace("'", "'\\''") + "'"
+
+
+def _double_quote_shell_word(word: str) -> str:
+    """Return a shell-safe double-quoted word while preserving double-quote semantics."""
+    escaped = word.replace('\\', '\\\\').replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _preserve_outer_quotes(raw: str, rewritten: str) -> str:
+    """Replace a shell word while keeping the result one safely quoted word."""
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+        quote = raw[0]
+        if quote == "'":
+            return _single_quote_shell_word(rewritten)
+        return _double_quote_shell_word(rewritten)
+    return _single_quote_shell_word(rewritten)
+
+
+def _shell_c_script_index(words: List[str], start_idx: int) -> int | None:
+    """Return the script word index for sh/bash/zsh -c/-lc forms."""
+    if start_idx >= len(words) or _base(words[start_idx]) not in _SHELL_NAMES:
+        return None
+    i = start_idx + 1
+    while i < len(words):
+        word = words[i]
+        if word == '--':
+            i += 1
+            continue
+        if word.startswith('-') and 'c' in word[1:]:
+            return i + 1 if i + 1 < len(words) else None
+        i += 1
+    return None
+
+
+def _ssh_remote_command_index(words: List[str], start_idx: int) -> int | None:
+    """Return the first remote-command word in an ssh invocation."""
+    i = start_idx + 1
+    while i < len(words):
+        word = words[i]
+        if word == '--':
+            i += 1
+            break
+        if not word.startswith('-'):
+            break
+        opt = word.split('=', 1)[0]
+        if opt in _SSH_OPTIONS_TAKING_ARG and '=' not in word and len(word) == 2:
+            i += 2
+        elif opt in _SSH_OPTIONS_TAKING_ARG and '=' not in word and word in _SSH_OPTIONS_TAKING_ARG:
+            i += 2
+        else:
+            i += 1
+
+    # i is the destination host/user@host. Anything after it is remote command.
+    return i + 1 if i + 1 < len(words) else None
+
+
+def _docker_exec_command_index(words: List[str], start_idx: int) -> int | None:
+    """Return COMMAND index for docker exec [OPTIONS] CONTAINER COMMAND."""
+    if start_idx + 2 >= len(words):
+        return None
+    if _base(words[start_idx]) != 'docker' or words[start_idx + 1] != 'exec':
+        return None
+
+    i = start_idx + 2
+    while i < len(words):
+        word = words[i]
+        if word == '--':
+            i += 1
+            break
+        if not word.startswith('-'):
+            break
+        opt = word.split('=', 1)[0]
+        if opt in _DOCKER_EXEC_OPTIONS_TAKING_ARG and '=' not in word:
+            i += 2
+        else:
+            i += 1
+
+    # i is CONTAINER. Anything after it is COMMAND.
+    return i + 1 if i + 1 < len(words) else None
+
+
+class _FallbackNodeVisitorBase:
+    pass
+
+
+_NodeVisitorBase: Any = bashlex.ast.nodevisitor if _HAS_BASHLEX else _FallbackNodeVisitorBase
+
+
+class _RewriteVisitor(_NodeVisitorBase):
     """Visitor that finds rm/mv/cp commands and records position-based replacements."""
 
-    def __init__(self, original: str) -> None:
+    def __init__(
+        self,
+        original: str,
+        commands: _RewriteCommands,
+        rewrite_explicit_ssh: bool = True,
+    ) -> None:
         self.original = original
+        self.commands = commands
+        self.rewrite_explicit_ssh = rewrite_explicit_ssh
         self.replacements: List[Tuple[int, int, str]] = []
 
     def visitcommand(self, node, parts):
         words = [p.word for p in parts if hasattr(p, 'word')]
+        word_parts = [p for p in parts if hasattr(p, 'word')]
         if not words:
             return True
+
+        leading_idx = _leading_command_index(words)
+        leading_base = _base(words[leading_idx]) if leading_idx < len(words) else ''
+
+        if self.rewrite_explicit_ssh and leading_base == 'ssh':
+            if self._rewrite_explicit_ssh_command(words, word_parts, leading_idx):
+                return True
+
+        if leading_base == 'docker':
+            self._rewrite_docker_exec_command(words, word_parts, leading_idx)
+            # Docker object/subcommands such as `docker rm`, `docker rmi`, and
+            # `docker cp` are not filesystem rm/mv/cp in the current shell.  Only
+            # `docker exec ... <file-op>` is eligible for nested rewriting.
+            return True
+
+        if leading_base in _SHELL_NAMES:
+            if self._rewrite_shell_c_script(words, word_parts, leading_idx, self.commands):
+                return True
 
         # Skip VCS subcommands: git rm, hg rm, svn rm, bzr rm
         if words[0] in _VCS_TOOLS and len(words) >= 2 and words[1] == 'rm':
@@ -87,55 +350,9 @@ class _RewriteVisitor(bashlex.ast.nodevisitor):
         if words[0] in ('trash', 'gmv', 'gcp'):
             return True
 
-        # Find the actual destructive command, skipping wrappers
-        cmd_idx = 0
-        in_wrapper = False
-        skip_next = False
-
-        for i, w in enumerate(words):
-            if skip_next:
-                skip_next = False
-                cmd_idx = i + 1
-                continue
-
-            base = w.split('/')[-1]
-
-            if base in _WRAPPER_NAMES or w in _WRAPPER_NAMES:
-                in_wrapper = True
-                cmd_idx = i + 1
-            elif in_wrapper and w.startswith('-'):
-                # Single-char flag after certain wrappers may take a value arg
-                flag_only = len(w) == 2
-                w_base = words[cmd_idx - 1].split('/')[-1] if cmd_idx > 0 else ''
-                if flag_only and w_base in _WRAPPERS_TAKING_EXTRA_ARG:
-                    # Check if next token looks like a value (not a flag, not a command)
-                    if i + 1 < len(words):
-                        next_w = words[i + 1]
-                        if (not next_w.startswith('-')
-                                and '=' not in next_w
-                                and next_w.split('/')[-1] not in _DESTRUCTIVE_CMDS):
-                            skip_next = True
-                cmd_idx = i + 1
-            elif in_wrapper and not w.startswith('-') and '=' not in w:
-                # Non-flag token in wrapper mode — could be the actual command
-                if base in _DESTRUCTIVE_CMDS:
-                    cmd_idx = i
-                    break
-                else:
-                    # Unknown token — might be wrapper arg (e.g. timeout DURATION)
-                    # Consume it and continue looking
-                    cmd_idx = i + 1
-            elif base in _DESTRUCTIVE_CMDS:
-                cmd_idx = i
-                break
-            elif '=' in w:
-                # Environment variable assignment prefix: FOO=bar rm file.txt
-                # Skip over it and keep looking for the actual command
-                cmd_idx = i + 1
-                continue
-            else:
-                break
-
+        # Only the effective command after recognized wrappers/assignments is
+        # eligible.  Do not scan later arguments such as `sudo echo rm ...`.
+        cmd_idx = leading_idx
         actual_cmd = words[cmd_idx] if cmd_idx < len(words) else None
         if not actual_cmd:
             return True
@@ -144,11 +361,22 @@ class _RewriteVisitor(bashlex.ast.nodevisitor):
         if actual_base not in _DESTRUCTIVE_CMDS:
             return True
 
+        self._record_destructive_rewrite(parts, cmd_idx, actual_base, self.commands)
+
+        return True
+
+    def _record_destructive_rewrite(
+        self,
+        parts,
+        cmd_idx: int,
+        actual_base: str,
+        commands: _RewriteCommands,
+    ) -> None:
         cmd_part = parts[cmd_idx]
         cmd_start, cmd_end = cmd_part.pos
 
         if actual_base == 'rm':
-            self.replacements.append((cmd_start, cmd_end, 'trash'))
+            self.replacements.append((cmd_start, cmd_end, commands.rm))
             prev_end = cmd_end
             for p in parts[cmd_idx + 1:]:
                 if hasattr(p, 'word') and p.word == '--':
@@ -166,9 +394,8 @@ class _RewriteVisitor(bashlex.ast.nodevisitor):
                     prev_end = flag_end
                 else:
                     break
-
         elif actual_base == 'mv':
-            self.replacements.append((cmd_start, cmd_end, 'gmv'))
+            self.replacements.append((cmd_start, cmd_end, commands.mv))
             has_b = any(
                 hasattr(p, 'word') and p.word.startswith('-') and 'b' in p.word
                 for p in parts[cmd_idx + 1:]
@@ -178,7 +405,7 @@ class _RewriteVisitor(bashlex.ast.nodevisitor):
                 self.replacements.append((cmd_end, cmd_end, ' -b'))
 
         elif actual_base == 'cp':
-            self.replacements.append((cmd_start, cmd_end, 'gcp'))
+            self.replacements.append((cmd_start, cmd_end, commands.cp))
             has_b = any(
                 hasattr(p, 'word') and p.word.startswith('-') and 'b' in p.word
                 for p in parts[cmd_idx + 1:]
@@ -187,17 +414,90 @@ class _RewriteVisitor(bashlex.ast.nodevisitor):
             if not has_b:
                 self.replacements.append((cmd_end, cmd_end, ' -b'))
 
+    def _rewrite_script_word(self, part, commands: _RewriteCommands) -> bool:
+        rewritten = _rewrite_command(
+            part.word,
+            commands,
+            rewrite_explicit_ssh=False,
+        )
+        if rewritten == part.word:
+            return False
+
+        start, end = part.pos
+        raw = self.original[start:end]
+        self.replacements.append((start, end, _preserve_outer_quotes(raw, rewritten)))
+        return True
+
+    def _rewrite_shell_c_script(
+        self,
+        words: List[str],
+        parts,
+        start_idx: int,
+        commands: _RewriteCommands,
+    ) -> bool:
+        script_idx = _shell_c_script_index(words, start_idx)
+        if script_idx is None:
+            return False
+        return self._rewrite_script_word(parts[script_idx], commands)
+
+    def _rewrite_docker_exec_command(self, words: List[str], parts, start_idx: int) -> bool:
+        cmd_idx = _docker_exec_command_index(words, start_idx)
+        if cmd_idx is None:
+            return False
+
+        inner_offset = _leading_command_index(words[cmd_idx:])
+        actual_idx = cmd_idx + inner_offset
+        if actual_idx >= len(words):
+            return False
+
+        inner_base = _base(words[actual_idx])
+        commands = _SSH_COMMANDS
+
+        if inner_base in _SHELL_NAMES:
+            return self._rewrite_shell_c_script(words, parts, actual_idx, commands)
+
+        if inner_base in _DESTRUCTIVE_CMDS:
+            self._record_destructive_rewrite(parts, actual_idx, inner_base, commands)
+            return True
+        return False
+
+    def _rewrite_explicit_ssh_command(self, words: List[str], parts, start_idx: int) -> bool:
+        remote_idx = _ssh_remote_command_index(words, start_idx)
+        if remote_idx is None:
+            return False
+
+        if remote_idx == len(words) - 1 and any(ch.isspace() for ch in words[remote_idx]):
+            return self._rewrite_script_word(parts[remote_idx], _SSH_COMMANDS)
+
+        start = parts[remote_idx].pos[0]
+        end = parts[-1].pos[1]
+        remote_command = self.original[start:end]
+        rewritten = _rewrite_command(
+            remote_command,
+            _SSH_COMMANDS,
+            rewrite_explicit_ssh=False,
+        )
+        if rewritten == remote_command:
+            # This is still an explicit ssh remote command.  If the remote side
+            # needs no rewrite (for example `docker rm`), do not let the local
+            # generic scanner rewrite tokens inside the remote command.
+            return True
+        self.replacements.append((start, end, rewritten))
         return True
 
 
-def _rewrite_with_ast(command: str) -> str:
+def _rewrite_with_ast(
+    command: str,
+    commands: _RewriteCommands = _LOCAL_COMMANDS,
+    rewrite_explicit_ssh: bool = True,
+) -> str:
     """Rewrite using bashlex AST parser."""
     try:
         asts = bashlex.parse(command)
     except Exception:
         return command
 
-    visitor = _RewriteVisitor(command)
+    visitor = _RewriteVisitor(command, commands, rewrite_explicit_ssh=rewrite_explicit_ssh)
     for ast_node in asts:
         visitor.visit(ast_node)
 
@@ -218,6 +518,21 @@ def _rewrite_with_ast(command: str) -> str:
     result = result.rstrip()
 
     return result
+
+
+def _rewrite_command(
+    command: str,
+    commands: _RewriteCommands,
+    rewrite_explicit_ssh: bool = True,
+) -> str:
+    """Rewrite a command string with a caller-selected replacement policy."""
+    if _HAS_BASHLEX:
+        return _rewrite_with_ast(
+            command,
+            commands,
+            rewrite_explicit_ssh=rewrite_explicit_ssh,
+        )
+    return _rewrite_fallback(command, commands, rewrite_explicit_ssh=rewrite_explicit_ssh)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +583,96 @@ def _scan_skip_string(command: str, pos: int) -> int:
                 return pos + 1
         pos += 1
     return pos
+
+
+def _shell_words_with_spans(command: str) -> List[Tuple[str, int, int]]:
+    """Split a simple shell command into unquoted words with original spans."""
+    words: List[Tuple[str, int, int]] = []
+    i = 0
+    n = len(command)
+
+    while i < n:
+        while i < n and command[i].isspace():
+            i += 1
+        if i >= n:
+            break
+
+        start = i
+        buf: List[str] = []
+        while i < n and not command[i].isspace():
+            ch = command[i]
+            if ch in ("'", '"'):
+                quote = ch
+                i += 1
+                while i < n:
+                    if quote == "'" and command[i] == "'":
+                        i += 1
+                        break
+                    if quote == '"':
+                        if command[i] == "\\" and i + 1 < n:
+                            buf.append(command[i + 1])
+                            i += 2
+                            continue
+                        if command[i] == '"':
+                            i += 1
+                            break
+                    buf.append(command[i])
+                    i += 1
+                continue
+            if ch == "\\" and i + 1 < n:
+                buf.append(command[i + 1])
+                i += 2
+                continue
+            buf.append(ch)
+            i += 1
+
+        words.append(("".join(buf), start, i))
+
+    return words
+
+
+def _rewrite_explicit_ssh_fallback(
+    segment: str,
+    commands: _RewriteCommands,
+) -> str | None:
+    """Fallback explicit-ssh rewriting; None means segment is not ssh."""
+    word_spans = _shell_words_with_spans(segment)
+    words = [word for word, _, _ in word_spans]
+    if not words:
+        return None
+
+    leading_idx = _leading_command_index(words)
+    if leading_idx >= len(words) or _base(words[leading_idx]) != "ssh":
+        return None
+
+    remote_idx = _ssh_remote_command_index(words, leading_idx)
+    if remote_idx is None:
+        return segment
+
+    remote_start = word_spans[remote_idx][1]
+    remote_end = word_spans[-1][2]
+
+    if remote_idx == len(words) - 1 and any(ch.isspace() for ch in words[remote_idx]):
+        raw_remote = segment[remote_start:remote_end]
+        rewritten = _rewrite_command(
+            words[remote_idx],
+            commands,
+            rewrite_explicit_ssh=False,
+        )
+        if rewritten == words[remote_idx]:
+            return segment
+        replacement = _preserve_outer_quotes(raw_remote, rewritten)
+    else:
+        remote_command = segment[remote_start:remote_end]
+        replacement = _rewrite_command(
+            remote_command,
+            commands,
+            rewrite_explicit_ssh=False,
+        )
+        if replacement == remote_command:
+            return segment
+
+    return segment[:remote_start] + replacement + segment[remote_end:]
 
 
 def _find_keyword(command: str, start: int, keyword: str) -> int:
@@ -423,7 +828,11 @@ def _join_segments(segments: List[Tuple[str, str]]) -> str:
     return "".join(parts).strip()
 
 
-def _rewrite_shell_body(body: str) -> str:
+def _rewrite_shell_body(
+    body: str,
+    commands: _RewriteCommands = _LOCAL_COMMANDS,
+    rewrite_explicit_ssh: bool = True,
+) -> str:
     """Rewrite destructive commands inside a shell body."""
     parts = []
     current = []
@@ -455,7 +864,7 @@ def _rewrite_shell_body(body: str) -> str:
         if depth == 0 and ch in (";", "\n"):
             seg = "".join(current).strip()
             if seg:
-                parts.append(_rewrite_single_segment_fallback(seg))
+                parts.append(_rewrite_single_segment_fallback(seg, commands, rewrite_explicit_ssh))
             parts.append(ch + " ")
             current = []
             i += 1
@@ -465,12 +874,16 @@ def _rewrite_shell_body(body: str) -> str:
 
     seg = "".join(current).strip()
     if seg:
-        parts.append(_rewrite_single_segment_fallback(seg))
+        parts.append(_rewrite_single_segment_fallback(seg, commands, rewrite_explicit_ssh))
 
     return "".join(parts).rstrip()
 
 
-def _rewrite_segment_with_shell_keywords(segment: str) -> str:
+def _rewrite_segment_with_shell_keywords(
+    segment: str,
+    commands: _RewriteCommands = _LOCAL_COMMANDS,
+    rewrite_explicit_ssh: bool = True,
+) -> str:
     """Rewrite a segment that may contain shell structure keywords."""
     stripped = segment.strip()
 
@@ -485,7 +898,7 @@ def _rewrite_segment_with_shell_keywords(segment: str) -> str:
                 header = stripped[:do_pos + 2].rstrip()
                 body = stripped[do_pos + 2:done_pos]
                 after = stripped[done_pos + 4:].lstrip()
-                rewritten_body = _rewrite_shell_body(body)
+                rewritten_body = _rewrite_shell_body(body, commands, rewrite_explicit_ssh)
                 result = f"{header} {rewritten_body.strip()} done"
                 if after:
                     result += f" {after}"
@@ -503,10 +916,10 @@ def _rewrite_segment_with_shell_keywords(segment: str) -> str:
             if elif_pos >= 0 and (else_pos < 0 or elif_pos < else_pos):
                 then_body = body[:elif_pos]
                 rest_body = body[elif_pos:] + " fi"
-                rewritten_then = _rewrite_shell_body(then_body).strip()
+                rewritten_then = _rewrite_shell_body(then_body, commands, rewrite_explicit_ssh).strip()
                 before_then = stripped[:then_pos + 4].rstrip()
                 after_fi = stripped[fi_pos + 2:].lstrip()
-                rewritten_rest = _rewrite_segment_with_shell_keywords(rest_body.strip())
+                rewritten_rest = _rewrite_segment_with_shell_keywords(rest_body.strip(), commands, rewrite_explicit_ssh)
                 if rewritten_rest.rstrip().endswith(" fi"):
                     rewritten_rest = rewritten_rest.rstrip()[:-3].rstrip()
                 result = f"{before_then} {rewritten_then} {rewritten_rest} fi"
@@ -516,8 +929,8 @@ def _rewrite_segment_with_shell_keywords(segment: str) -> str:
             elif else_pos >= 0:
                 then_body = body[:else_pos]
                 else_body = body[else_pos + 4:]
-                rewritten_then = _rewrite_shell_body(then_body).strip()
-                rewritten_else = _rewrite_shell_body(else_body).strip()
+                rewritten_then = _rewrite_shell_body(then_body, commands, rewrite_explicit_ssh).strip()
+                rewritten_else = _rewrite_shell_body(else_body, commands, rewrite_explicit_ssh).strip()
                 before_then = stripped[:then_pos + 4].rstrip()
                 after_fi = stripped[fi_pos + 2:].lstrip()
                 result = f"{before_then} {rewritten_then} else {rewritten_else} fi"
@@ -525,7 +938,7 @@ def _rewrite_segment_with_shell_keywords(segment: str) -> str:
                     result += f" {after_fi}"
                 return result
             else:
-                rewritten_body = _rewrite_shell_body(body).strip()
+                rewritten_body = _rewrite_shell_body(body, commands, rewrite_explicit_ssh).strip()
                 before_then = stripped[:then_pos + 4].rstrip()
                 after_fi = stripped[fi_pos + 2:].lstrip()
                 result = f"{before_then} {rewritten_body} fi"
@@ -541,7 +954,7 @@ def _rewrite_segment_with_shell_keywords(segment: str) -> str:
             fi_pos = _find_keyword(stripped, else_pos + 4, "fi")
             if fi_pos >= 0:
                 body = stripped[else_pos + 4:fi_pos]
-                rewritten_body = _rewrite_shell_body(body).strip()
+                rewritten_body = _rewrite_shell_body(body, commands, rewrite_explicit_ssh).strip()
                 header = stripped[:else_pos + 4].rstrip()
                 after = stripped[fi_pos + 2:].lstrip()
                 result = f"{header} {rewritten_body} fi"
@@ -625,104 +1038,134 @@ def _add_backup_flag(args: str, cmd: str) -> str:
     return " ".join(tokens)
 
 
-def _rewrite_single_segment(segment: str) -> str:
+def _rewrite_file_op_tail_fallback(
+    tail: str,
+    commands: _RewriteCommands,
+) -> str | None:
+    """Rewrite a tail that starts at rm/mv/cp; None means no file op."""
+    m = _RM_RE.match(tail)
+    if m:
+        args = m.group(4).strip()
+        safe_args = _strip_rm_flags(args)
+        if safe_args:
+            return f"{commands.rm} {safe_args}".strip()
+        return commands.rm
+
+    m = _MV_RE.match(tail)
+    if m:
+        args = m.group(4).strip()
+        safe_args = _add_backup_flag(args, "mv")
+        return f"{commands.mv} {safe_args}".strip()
+
+    m = _CP_RE.match(tail)
+    if m:
+        args = m.group(4).strip()
+        safe_args = _add_backup_flag(args, "cp")
+        return f"{commands.cp} {safe_args}".strip()
+
+    return None
+
+
+def _rewrite_docker_exec_segment_fallback(
+    sudo_prefix: str,
+    rest: str,
+    commands: _RewriteCommands,
+) -> str:
+    """Fallback support for `docker exec ... rm/mv/cp` and shell -c forms."""
+    word_spans = _shell_words_with_spans(rest)
+    tokens = [word for word, _, _ in word_spans]
+    unchanged = f"{sudo_prefix}{rest}".strip()
+    if len(tokens) < 2 or _base(tokens[0]) != "docker" or tokens[1] != "exec":
+        return unchanged
+
+    cmd_idx = _docker_exec_command_index(tokens, 0)
+    if cmd_idx is None:
+        return unchanged
+
+    inner_offset = _leading_command_index(tokens[cmd_idx:])
+    actual_idx = cmd_idx + inner_offset
+    if actual_idx >= len(tokens):
+        return unchanged
+
+    inner_base = _base(tokens[actual_idx])
+    if inner_base in _SHELL_NAMES:
+        script_idx = _shell_c_script_index(tokens, actual_idx)
+        if script_idx is None:
+            return unchanged
+        script = tokens[script_idx]
+        rewritten = _rewrite_command(script, commands, rewrite_explicit_ssh=False)
+        if rewritten == script:
+            return unchanged
+        start, end = word_spans[script_idx][1], word_spans[script_idx][2]
+        raw = rest[start:end]
+        replacement = _preserve_outer_quotes(raw, rewritten)
+        return f"{sudo_prefix}{rest[:start]}{replacement}{rest[end:]}".strip()
+
+    if inner_base not in _DESTRUCTIVE_CMDS:
+        return unchanged
+
+    start = word_spans[actual_idx][1]
+    inner = rest[start:]
+    rewritten_inner = _rewrite_single_segment_fallback(
+        inner,
+        commands,
+        rewrite_explicit_ssh=False,
+    )
+    return f"{sudo_prefix}{rest[:start]}{rewritten_inner}".strip()
+
+
+def _rewrite_single_segment(
+    segment: str,
+    commands: _RewriteCommands = _LOCAL_COMMANDS,
+    rewrite_explicit_ssh: bool = True,
+) -> str:
     """Rewrite a single command segment (fallback regex-based).
 
     Alias for _rewrite_single_segment_fallback for backward compatibility.
     """
-    return _rewrite_single_segment_fallback(segment)
+    return _rewrite_single_segment_fallback(segment, commands, rewrite_explicit_ssh)
 
 
-def _rewrite_single_segment_fallback(segment: str) -> str:
+def _rewrite_single_segment_fallback(
+    segment: str,
+    commands: _RewriteCommands = _LOCAL_COMMANDS,
+    rewrite_explicit_ssh: bool = True,
+) -> str:
     """Rewrite a single command segment (fallback regex-based)."""
     stripped = segment.strip()
     if not stripped:
         return segment
 
-    result = _rewrite_segment_with_shell_keywords(stripped)
+    result = _rewrite_segment_with_shell_keywords(stripped, commands, rewrite_explicit_ssh)
     if result != stripped:
         return result
 
-    sudo_prefix = ""
-    rest = stripped
-    if rest.startswith("sudo "):
-        sudo_prefix = "sudo "
-        rest = rest[5:].lstrip()
+    if rewrite_explicit_ssh:
+        ssh_result = _rewrite_explicit_ssh_fallback(stripped, commands)
+        if ssh_result is not None:
+            return ssh_result
 
-    wrapper_prefix = ""
-    tokens = rest.split()
-
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok not in _WRAPPER_NAMES:
-            break
-
-        wname = tok
-        i += 1
-        wrapper_prefix += wname + " "
-
-        if wname in _WRAPPERS_TAKING_EXTRA_ARG and i < len(tokens):
-            next_tok = tokens[i]
-            if not next_tok.startswith("-") and "=" not in next_tok:
-                base = next_tok.split("/")[-1]
-                if base not in _DESTRUCTIVE_CMDS:
-                    wrapper_prefix += next_tok + " "
-                    i += 1
-
-        while i < len(tokens):
-            next_tok = tokens[i]
-            base = next_tok.split("/")[-1]
-            if base in _DESTRUCTIVE_CMDS:
-                break
-            if "=" in next_tok:
-                wrapper_prefix += next_tok + " "
-                i += 1
-            elif next_tok.startswith("-") and len(next_tok) > 1:
-                wrapper_prefix += next_tok + " "
-                i += 1
-                if (i < len(tokens) and len(next_tok) == 2
-                        and not tokens[i].startswith("-")
-                        and "=" not in tokens[i]):
-                    val_base = tokens[i].split("/")[-1]
-                    if val_base not in _DESTRUCTIVE_CMDS:
-                        wrapper_prefix += tokens[i] + " "
-                        i += 1
-            else:
-                break
-
-    if i == 0:
-        wrapper_prefix = ""
-    elif i < len(tokens):
-        rest = " ".join(tokens[i:])
-    else:
+    word_spans = _shell_words_with_spans(stripped)
+    leading_words = [word for word, _, _ in word_spans]
+    leading_idx = _leading_command_index(leading_words)
+    if leading_idx >= len(leading_words):
         return segment
 
-    if not rest:
+    leading_base = _base(leading_words[leading_idx])
+    cmd_start = word_spans[leading_idx][1]
+
+    if leading_base == "docker":
+        prefix = stripped[:cmd_start]
+        rest = stripped[cmd_start:]
+        return _rewrite_docker_exec_segment_fallback(prefix, rest, commands)
+
+    if leading_base not in _DESTRUCTIVE_CMDS:
         return segment
 
-    m = _RM_RE.match(rest)
-    if m:
-        args = m.group(4).strip()
-        safe_args = _strip_rm_flags(args)
-        if safe_args:
-            return f"{sudo_prefix}{wrapper_prefix}trash {safe_args}".strip()
-        else:
-            return f"{sudo_prefix}{wrapper_prefix}trash".strip()
-
-    m = _MV_RE.match(rest)
-    if m:
-        args = m.group(4).strip()
-        safe_args = _add_backup_flag(args, "mv")
-        return f"{sudo_prefix}{wrapper_prefix}gmv {safe_args}".strip()
-
-    m = _CP_RE.match(rest)
-    if m:
-        args = m.group(4).strip()
-        safe_args = _add_backup_flag(args, "cp")
-        return f"{sudo_prefix}{wrapper_prefix}gcp {safe_args}".strip()
-
-    return segment
+    rewritten_tail = _rewrite_file_op_tail_fallback(stripped[cmd_start:], commands)
+    if rewritten_tail is None:
+        return segment
+    return f"{stripped[:cmd_start]}{rewritten_tail}".strip()
 
 
 # ---------------------------------------------------------------------------
@@ -746,20 +1189,22 @@ def safe_command_rewrite(command: str, env_type: str = "local") -> str:
     if _is_sandbox(env_type):
         return command
 
-    if _HAS_BASHLEX:
-        return _rewrite_with_ast(command)
-    else:
-        return _rewrite_fallback(command)
+    commands = _commands_for_env(env_type)
+    return _rewrite_command(command, commands)
 
 
-def _rewrite_fallback(command: str) -> str:
+def _rewrite_fallback(
+    command: str,
+    commands: _RewriteCommands = _LOCAL_COMMANDS,
+    rewrite_explicit_ssh: bool = True,
+) -> str:
     """Fallback regex-based rewriting when bashlex is not available."""
     segments = _split_respecting_structures(command)
     if not segments:
         return command
 
     rewritten = [
-        (_rewrite_single_segment_fallback(seg), sep)
+        (_rewrite_single_segment_fallback(seg, commands, rewrite_explicit_ssh), sep)
         for seg, sep in segments
     ]
     return _join_segments(rewritten)
