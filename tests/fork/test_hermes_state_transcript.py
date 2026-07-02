@@ -35,16 +35,25 @@ def test_get_messages_as_conversation_can_order_by_insert_id(db):
 
     default_messages = db.get_messages_as_conversation("s_order_id")
     id_ordered_messages = db.get_messages_as_conversation("s_order_id", order_by="id")
+    timestamp_ordered_messages = db.get_messages_as_conversation(
+        "s_order_id", order_by="timestamp"
+    )
 
     assert [m["content"] for m in default_messages] == [
-        "late inserted but old event ts",
-        "late response",
         "first inserted",
         "first response",
+        "late inserted but old event ts",
+        "late response",
     ]
     assert [m["content"] for m in id_ordered_messages] == [
         "first inserted",
         "first response",
         "late inserted but old event ts",
         "late response",
+    ]
+    assert [m["content"] for m in timestamp_ordered_messages] == [
+        "late inserted but old event ts",
+        "late response",
+        "first inserted",
+        "first response",
     ]
