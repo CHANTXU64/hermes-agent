@@ -1767,12 +1767,14 @@ class HindsightMemoryProvider(MemoryProvider):
             content = self._stringify_retain_content(msg.get("content")).strip()
             if not role or not content:
                 continue
+            if content.startswith("[Recent Summary"):
+                continue
             if role == "user":
                 _flush_pending_turn()
                 pending_user = (content, msg.get("_timestamp", msg.get("timestamp")))
                 pending_assistant = None
                 continue
-            if role == "assistant" and content.startswith("[Recent Summary"):
+            if role == "assistant" and content.startswith("Operation interrupted:"):
                 continue
             if role != "assistant" or not pending_user:
                 continue
@@ -2489,13 +2491,66 @@ class HindsightMemoryProvider(MemoryProvider):
             "start_index": start_index,
         }
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def _append_session_turns(self, turns: List[str]) -> tuple[int, int, int]:
+        """Append transcript-derived turn JSONs that are not already buffered.
+
+        ``messages`` passed through MemoryManager is the best available
+        completed-turn transcript: it can include an earlier user message that
+        was followed by tool work and then interrupted by a later user
+        correction before the final assistant answer.  Persist the transcript
+        prefix too, while avoiding duplicates when the next sync receives the
+        same full conversation plus one new tail turn.
+        """
+        if not turns:
+            return 0, self._turn_counter, self._turn_counter
+
+        before_counter = self._turn_counter
+        start_index = 0
+        if self._session_turns:
+            existing = [self._retain_turn_canonical(turn) for turn in self._session_turns]
+            incoming = [self._retain_turn_canonical(turn) for turn in turns]
+            if len(incoming) <= len(existing) and existing[: len(incoming)] == incoming:
+                return 0, before_counter, before_counter
+            if incoming[: len(existing)] == existing:
+                start_index = len(existing)
+            else:
+                max_overlap = min(len(existing), len(incoming))
+                for size in range(max_overlap, 0, -1):
+                    if existing[-size:] == incoming[:size]:
+                        start_index = size
+                        break
+
+        new_turns = turns[start_index:]
+        for turn in new_turns:
+            self._session_turns.append(turn)
+            self._turn_counter += 1
+            self._turn_index = self._turn_counter
+            self._persist_retain_turn(turn)
+        return len(new_turns), before_counter, self._turn_counter
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: List[Dict[str, Any]] | None = None,
+    ) -> None:
         """Enqueue a retain for the current turn. Non-blocking.
 
         The actual aretain_batch runs on a single long-lived writer thread
         that drains an in-memory queue. Once shutdown() has been called,
         further sync_turn() calls are dropped — this prevents post-exit
         retains from reaching aiohttp after interpreter shutdown begins.
+
+        When MemoryManager provides the completed OpenAI-style ``messages``
+        transcript, prefer it over the scalar ``user_content``/``assistant``
+        pair.  The scalar pair only describes the final completed exchange;
+        a gateway interrupt can place an earlier user message, tool calls, and
+        a later correction into one logical completed turn.  Rebuilding the
+        retain turns from ``messages`` preserves that real first user message
+        while filtering tool output, summaries, interrupt notices, empty
+        assistant shells, and intermediate assistant drafts.
         """
         if self._shutting_down.is_set():
             logger.debug("sync_turn: skipped (shutting down)")
@@ -2503,6 +2558,26 @@ class HindsightMemoryProvider(MemoryProvider):
 
         if session_id:
             self._session_id = str(session_id).strip()
+
+        transcript_turns = self._build_turns_from_conversation_messages(messages or [])
+        if transcript_turns:
+            added, before_counter, after_counter = self._append_session_turns(transcript_turns)
+            if added == 0:
+                logger.debug("sync_turn: transcript supplied no new retained turns")
+                return
+            if not self._auto_retain:
+                logger.debug("sync_turn: buffered %d transcript turn(s) (auto_retain disabled)", added)
+                return
+            before_bucket = before_counter // self._retain_every_n_turns
+            after_bucket = after_counter // self._retain_every_n_turns
+            if after_bucket == before_bucket:
+                next_turn = (before_bucket + 1) * self._retain_every_n_turns
+                logger.debug("sync_turn: buffered transcript through turn %d (will retain at turn %d)", after_counter, next_turn)
+                return
+            logger.debug("sync_turn: retaining %d turns after transcript sync, total session content %d chars",
+                         len(self._session_turns), sum(len(t) for t in self._session_turns))
+            self.flush_retained_turns()
+            return
 
         turn = json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
         self._session_turns.append(turn)

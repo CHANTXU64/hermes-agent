@@ -6,7 +6,7 @@
 
 `/retain` 用于把当前 Hermes 会话 lineage 中，Hindsight provider 每轮已经整理好的 retain turn，手动提交到 Hindsight。
 
-关键点：手动保存不再从 Hermes 原始 SessionDB transcript 反推内容；Hindsight provider 在 `sync_turn()` 生成自动 retain payload 时，会把同一份 turn JSON 持久化到独立 SQLite 文件。
+关键点：手动保存不再从 Hermes 原始 SessionDB transcript 反推内容；Hindsight provider 在 `sync_turn()` 生成自动 retain payload 时，会把同一份 turn JSON 持久化到独立 SQLite 文件。若 MemoryManager 提供完成后的 `messages` transcript，`sync_turn(..., messages=...)` 会先从 transcript 重建干净 retain turns，以保留 gateway interrupt / 多用户消息同一完成 turn 中更早的真实用户消息。
 
 ## 本地持久化文件
 
@@ -56,6 +56,8 @@ hindsight_retain_turns
 ## 行为说明
 
 - 每个完成 turn 的 `sync_turn()` 都会先把同源 retain payload 写入 `hindsight/retain_turns.sqlite3`。
+- 当 `sync_turn()` 收到 `messages` transcript 时，优先从完整 transcript 构建 retain turns，而不是只使用最终 `user_content` / `assistant_content` 标量对。这样 gateway 中一个长任务先收到用户 A、后被用户 B 打断并最终完成时，persisted document 仍从 A 开始。
+- transcript 构建会过滤 tool output、assistant tool-call stub、`[Recent Summary ...]`、`Operation interrupted:` 通知、空 assistant 消息和同一 user segment 中的中间 assistant 草稿，只保留最后用户可见 assistant。
 - retained turn rows 带 `active` 标记；正常写入为 `active=1`。
 - `auto_retain=true` 时，自动提交逻辑仍按原机制运行。
 - `auto_retain=false` 时，只写本地 SQLite，不自动提交到 Hindsight。
@@ -171,6 +173,7 @@ bank_id = current configured bank
 - CLI `/retain` 调用 provider 的 persisted lineage retain，而不是读取原始 SessionDB transcript。
 - 即使 SessionDB 中存在 LCM/压缩生成的 `[Recent Summary ...]` 消息，`/retain` 也不会把它当作 Hindsight Document 内容源。
 - `sync_turn()` 会持久化和自动 retain 同源的 turn payload。
+- `sync_turn(..., messages=...)` 会通过完整流程测试验证：gateway interrupt / 多用户消息同一完成 turn 时，Hindsight Document `original_text` 从真实第一条用户消息开始，而不是从后来的纠偏消息开始。
 - Manual `/retain` 会按 `retain_document_id` 聚合同一压缩 logical document；即使 B/C 在 SessionDB 中表现为 siblings，也能从 C retain 到 A+B+C。
 - 旧 row 后续写入空 `parent_session_id` 时，lineage fallback 会使用早先非空 parent，而不是被空 parent 截断。
 - local `bank_id` differences in `retain_turns.sqlite3` do not exclude persisted turns; `/retain` submits all matching session lineage turns to the currently configured Hindsight bank.
