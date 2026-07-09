@@ -69,14 +69,6 @@ def clean_env(monkeypatch):
     monkeypatch.delenv("HERMES_LOCAL_STT_COMMAND", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
 
-    # The fork supports mlx_whisper as a macOS local provider, and this host may
-    # have it installed. Most historical auto-detect tests assert the cloud
-    # fallback order and should not depend on the developer machine's packages.
-    import tools.transcription_tools as transcription_tools
-
-    monkeypatch.setattr(transcription_tools, "_HAS_MLX_WHISPER", False)
-
-
 # ============================================================================
 # _get_provider — full permutation matrix
 # ============================================================================

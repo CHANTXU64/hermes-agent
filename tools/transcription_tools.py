@@ -6,8 +6,6 @@ Provides speech-to-text transcription with seven providers:
 
   - **local** (default, free) — faster-whisper running locally, no API key needed.
     Auto-downloads the model (~150 MB for ``base``) on first use.
-  - **mlx_whisper** (free, macOS/Apple Silicon) — MLX Whisper running locally.
-    Uses Hugging Face model cache shared with other tools.
   - **groq** (free tier) — Groq Whisper API, requires ``GROQ_API_KEY``.
   - **openai** (paid) — OpenAI Whisper API, requires ``VOICE_TOOLS_OPENAI_KEY``.
   - **mistral** — Mistral Voxtral Transcribe API, requires ``MISTRAL_API_KEY``.
@@ -906,11 +904,6 @@ def _get_provider(stt_config: dict) -> str:
 
     if _HAS_FASTER_WHISPER:
         return "local"
-    if _HAS_MLX_WHISPER:
-        import platform
-        if platform.system() == "Darwin":
-            logger.info("No faster-whisper found, using mlx_whisper on macOS")
-            return "mlx_whisper"
     if _has_local_command():
         return "local_command"
     # Try lazy-install before falling through to cloud providers
@@ -1345,12 +1338,6 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
     except Exception as e:
         logger.error("Unexpected error during local command transcription: %s", e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"Local transcription failed: {e}"}
-
-# ---------------------------------------------------------------------------
-# Provider: mlx_whisper (local, macOS/Apple Silicon)
-# ---------------------------------------------------------------------------
-
-
 
 # ---------------------------------------------------------------------------
 # Provider: groq (Whisper API — free tier)
@@ -1839,7 +1826,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
     Provider priority:
       1. User config (``stt.provider`` in config.yaml)
-      2. Auto-detect: local faster-whisper (free) > MLX Whisper (macOS) > local command > Groq > OpenAI > Mistral > xAI > ElevenLabs
+      2. Auto-detect: local faster-whisper (free) > local command > Groq > OpenAI > Mistral > xAI > ElevenLabs
 
     Args:
         file_path: Absolute path to the audio file to transcribe.
@@ -1959,7 +1946,6 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         "transcript": "",
         "error": (
             "No STT provider available. Install faster-whisper for free local transcription, "
-            "install mlx-whisper for Apple Silicon, "
             f"configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
             "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
             "Voxtral Transcribe, configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, "

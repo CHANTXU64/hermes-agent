@@ -139,7 +139,6 @@ class TestProviderSelectionGate:
         from tools import transcription_tools as tt
 
         with patch.object(tt, "_HAS_FASTER_WHISPER", False), \
-             patch.object(tt, "_HAS_MLX_WHISPER", False), \
              patch.object(tt, "_HAS_OPENAI", True), \
              patch.object(tt, "_HAS_MISTRAL", False), \
              patch.object(tt, "_has_local_command", return_value=False), \

@@ -62,56 +62,6 @@ Merge protection:
 
 Upstream status: fork-only.
 
-### 3. MLX Whisper local STT provider
-
-Date: 2026-04-20
-
-Commit: `ae8c0acd`
-
-Files:
-
-- `tools/transcription_tools.py`
-- `agent/transcription_registry.py`
-
-What changed:
-
-- Added `mlx_whisper` as a first-class local STT provider on macOS / Apple
-  Silicon.
-- Added model aliases such as `tiny`, `base`, `small`, `medium`, `large-v3`, and
-  `turbo`.
-- Auto-detection can choose MLX Whisper on Darwin when `faster-whisper` is not
-  available.
-
-Why it matters:
-
-- The user uses MLX Whisper locally for Chinese speech transcription.
-- Future merges must not remove the `mlx_whisper` provider path or aliases.
-
-Merge protection:
-
-- Preserve `_HAS_MLX_WHISPER`, `_normalize_mlx_model`, and
-  `_transcribe_mlx_whisper` behavior unless upstream provides an equivalent.
-- Preserve `mlx_whisper` as a native/built-in STT provider name in
-  `agent/transcription_registry.py` if upstream adds plugin dispatch around STT.
-- Confirm provider selection still supports explicit `stt.provider: mlx_whisper`.
-
-Upstream status: fork adaptation of upstream STT work.
-
-### 3.1 Reversion of MLX Whisper (2026-07-09)
-Date: 2026-07-09
-
-User explicit decision: "不要保留MLX Whisper了，反正现在我也不用了，这两个都以上游为准吧"。
-
-All MLX Whisper fork code has been removed:
-- Removed from _BUILTIN_NAMES in transcription_registry.py
-- Removed _HAS_MLX_WHISPER, MLX_MODEL_ALIASES, _normalize_mlx_model, dispatch branch, auto-detect preference, and _transcribe_mlx_whisper from transcription_tools.py
-- hermes_cli/config.py updated via upstream merge (mlx_whisper removed from provider comment)
-
-The entry is now historical. MLX Whisper will not be revived unless user explicitly requests.
-
-Upstream status: reverted per user decision (follow upstream STT providers only).
-
-
 ### 4. Safe command rewrite for terminal tool
 
 Date: 2026-04-21
@@ -275,6 +225,39 @@ Feature docs: `docs/chantxu64/hindsight-sync-cache-miss-recall/README.md`
 Upstream status: fork-only.
 
 ## Historical / reverted modifications
+
+### 3. MLX Whisper local STT provider
+
+Status: historical / reverted per user decision
+
+Date: 2026-04-20 to 2026-07-09
+
+Historical commit: `ae8c0acd`
+
+Historical files:
+
+- `tools/transcription_tools.py`
+- `agent/transcription_registry.py`
+- `tests/fork/test_mlx_whisper_stt.py`
+
+Historical behavior:
+
+- Added `mlx_whisper` as a first-class local STT provider on macOS / Apple Silicon.
+- Added model aliases such as `tiny`, `base`, `small`, `medium`, `large-v3`, and `turbo`.
+- Auto-detection could choose MLX Whisper on Darwin when `faster-whisper` was not available.
+
+Current status:
+
+- On 2026-07-09 the user explicitly decided: "不要保留MLX Whisper了，反正现在我也不用了，这两个都以上游为准吧"。
+- The fork now follows upstream STT providers for this area.
+- MLX Whisper code, tests, registry entries, auto-detect branches, and provider docs are historical only.
+
+Merge protection:
+
+- Do not revive `_HAS_MLX_WHISPER`, `MLX_MODEL_ALIASES`, `_normalize_mlx_model`, `_transcribe_mlx_whisper`, or `stt.provider: mlx_whisper` unless the user explicitly requests it again.
+- Future STT merges should preserve upstream behavior plus the active fork `custom_api` provider, not the old MLX Whisper provider.
+
+Upstream status: reverted per user decision.
 
 ### 2. MoA custom provider support
 
@@ -494,7 +477,7 @@ What changed:
 
 Why it matters:
 
-- The user's gateway can switch from local MLX Whisper to Alibaba Qwen STT through config only, while preserving MLX Whisper as a fallback/local option.
+- The user's gateway can use Alibaba Qwen STT through config only, without hardcoding a vendor-specific provider or credential name.
 - Future upstream merges must not collapse custom STT back into OpenAI-only credentials or hardcoded provider names.
 
 Merge protection:
@@ -794,7 +777,7 @@ deltas are expected in these areas:
   - `tui_gateway/server.py`
   - `tests/tui_gateway/test_undo_command.py`
   - `docs/chantxu64/hindsight-manual-retain.md`
-- MLX Whisper STT / custom STT API / custom Qwen TTS API:
+- Custom STT API / custom Qwen TTS API:
   - `tools/transcription_tools.py`
   - `tools/tts_tool.py`
   - `agent/transcription_registry.py`
