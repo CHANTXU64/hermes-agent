@@ -57,6 +57,7 @@ hindsight_retain_turns
 
 - 每个完成 turn 的 `sync_turn()` 都会先把同源 retain payload 写入 `hindsight/retain_turns.sqlite3`。
 - 当 `sync_turn()` 收到 `messages` transcript 时，优先从完整 transcript 构建 retain turns，而不是只使用最终 `user_content` / `assistant_content` 标量对。这样 gateway 中一个长任务先收到用户 A、后被用户 B 打断并最终完成时，persisted document 仍从 A 开始。
+- transcript replay 写入前会先镜像 `retain_turns.sqlite3` 中当前逻辑 document 的 `active=1` rows 到内存 buffer；provider 重启或压缩切换后再次收到完整 transcript 时，只追加新 tail turn，不重复写入已持久化历史 turns。
 - transcript 构建会过滤 tool output、assistant tool-call stub、`[Recent Summary ...]`、`Operation interrupted:` 通知、空 assistant 消息和同一 user segment 中的中间 assistant 草稿，只保留最后用户可见 assistant。
 - retained turn rows 带 `active` 标记；正常写入为 `active=1`。
 - `auto_retain=true` 时，自动提交逻辑仍按原机制运行。

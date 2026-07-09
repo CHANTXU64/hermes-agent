@@ -2504,6 +2504,21 @@ class HindsightMemoryProvider(MemoryProvider):
         if not turns:
             return 0, self._turn_counter, self._turn_counter
 
+        if self._session_id:
+            persisted_turns, _lineage, _retain_document_id = self._load_persisted_retain_turns(
+                self._session_id,
+                parent_session_id=self._parent_session_id,
+            )
+            if persisted_turns:
+                # A restarted provider has an empty in-memory buffer but the
+                # provider-owned retain store can already contain active turns
+                # for the logical document.  Mirror that active persisted view
+                # before comparing the full transcript replay, otherwise the
+                # old turns are inserted again and manual /retain repeats them.
+                self._session_turns = list(persisted_turns)
+                self._turn_counter = len(self._session_turns)
+                self._turn_index = self._turn_counter
+
         before_counter = self._turn_counter
         start_index = 0
         if self._session_turns:

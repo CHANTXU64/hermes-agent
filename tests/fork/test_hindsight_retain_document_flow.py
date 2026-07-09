@@ -231,6 +231,80 @@ def test_hindsight_document_original_text_starts_from_real_first_user_turn_after
         manager.shutdown_all()
 
 
+def test_hindsight_transcript_replay_after_provider_restart_dedupes_existing_persisted_turns(
+    tmp_path,
+    monkeypatch,
+):
+    """A restarted provider must not duplicate already-persisted active turns.
+
+    The memory manager can pass the full clean transcript on each completed
+    turn.  If the Hindsight provider is re-created after restart/compression,
+    its in-memory ``_session_turns`` buffer is empty while ``retain_turns``
+    already contains active rows for the same logical document.  Replaying the
+    full transcript must append only the new tail turn.
+    """
+    session_id = "restart-replay-dedupe-session"
+    messages_ab = [
+        {"role": "user", "content": "first request before restart", "timestamp": 1710000100.0},
+        {"role": "assistant", "content": "first answer before restart", "timestamp": 1710000101.0},
+        {"role": "user", "content": "second request before restart", "timestamp": 1710000102.0},
+        {"role": "assistant", "content": "second answer before restart", "timestamp": 1710000103.0},
+    ]
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content="second request before restart",
+        assistant_content="second answer before restart",
+        session_id=session_id,
+        messages=messages_ab,
+    )
+    provider1.shutdown()
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    messages_abc = [
+        *messages_ab,
+        {"role": "user", "content": "third request after restart", "timestamp": 1710000104.0},
+        {"role": "assistant", "content": "third answer after restart", "timestamp": 1710000105.0},
+    ]
+
+    try:
+        provider2.sync_turn(
+            user_content="third request after restart",
+            assistant_content="third answer after restart",
+            session_id=session_id,
+            messages=messages_abc,
+        )
+        info = provider2.retain_persisted_session_lineage(session_id=session_id)
+        provider2._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["turn_count"] == 3, (
+            "replayed transcript after provider restart should not duplicate "
+            "turns already present in retain_turns.sqlite3"
+        )
+        content = client2.aretain_batch.call_args.kwargs["items"][0]["content"]
+        turns = json.loads(content)
+        retained_user_messages = [turn[0]["content"] for turn in turns]
+        assert retained_user_messages == [
+            "User: first request before restart",
+            "User: second request before restart",
+            "User: third request after restart",
+        ]
+        assert content.count("User: first request before restart") == 1
+        assert content.count("User: second request before restart") == 1
+        assert content.count("User: third request after restart") == 1
+    finally:
+        provider2.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_gateway_retain_document_uses_sessionstore_sessiondb_lineage_and_clean_persisted_turns(
     tmp_path,
