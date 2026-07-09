@@ -97,6 +97,21 @@ Merge protection:
 
 Upstream status: fork adaptation of upstream STT work.
 
+### 3.1 Reversion of MLX Whisper (2026-07-09)
+Date: 2026-07-09
+
+User explicit decision: "不要保留MLX Whisper了，反正现在我也不用了，这两个都以上游为准吧"。
+
+All MLX Whisper fork code has been removed:
+- Removed from _BUILTIN_NAMES in transcription_registry.py
+- Removed _HAS_MLX_WHISPER, MLX_MODEL_ALIASES, _normalize_mlx_model, dispatch branch, auto-detect preference, and _transcribe_mlx_whisper from transcription_tools.py
+- hermes_cli/config.py updated via upstream merge (mlx_whisper removed from provider comment)
+
+The entry is now historical. MLX Whisper will not be revived unless user explicitly requests.
+
+Upstream status: reverted per user decision (follow upstream STT providers only).
+
+
 ### 4. Safe command rewrite for terminal tool
 
 Date: 2026-04-21

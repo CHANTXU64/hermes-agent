@@ -81,7 +81,6 @@ def _safe_find_spec(module_name: str) -> bool:
 
 
 _HAS_FASTER_WHISPER = _safe_find_spec("faster_whisper")
-_HAS_MLX_WHISPER = _safe_find_spec("mlx_whisper")
 _HAS_OPENAI = _safe_find_spec("openai")
 _HAS_MISTRAL = _safe_find_spec("mistralai")
 
@@ -115,18 +114,6 @@ MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
 GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-large-v3-en"}
 
-# MLX Whisper model aliases — short names → Hugging Face repo IDs
-DEFAULT_MLX_MODEL = "mlx-community/whisper-base-mlx"
-MLX_MODEL_ALIASES = {
-    "tiny":           "mlx-community/whisper-tiny-mlx",
-    "base":           "mlx-community/whisper-base-mlx",
-    "small":          "mlx-community/whisper-small-mlx",
-    "medium":         "mlx-community/whisper-medium-mlx",
-    "large":          "mlx-community/whisper-large-v3-mlx",
-    "large-v3":       "mlx-community/whisper-large-v3-mlx",
-    "turbo":          "mlx-community/whisper-large-v3-turbo",
-    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
-}
 
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
@@ -274,11 +261,6 @@ def _normalize_local_command_model(model_name: Optional[str]) -> str:
     return _normalize_local_model(model_name)
 
 
-def _normalize_mlx_model(model_name: Optional[str]) -> str:
-    """Resolve a short alias or cloud model name to a valid MLX HF repo ID."""
-    if not model_name or model_name in OPENAI_MODELS or model_name in GROQ_MODELS:
-        return DEFAULT_MLX_MODEL
-    return MLX_MODEL_ALIASES.get(model_name, model_name)
 
 
 def _try_lazy_install_stt() -> bool:
@@ -314,7 +296,6 @@ def _try_lazy_install_stt() -> bool:
 BUILTIN_STT_PROVIDERS = frozenset({
     "local",
     "local_command",
-    "mlx_whisper",
     "groq",
     "openai",
     "mistral",
@@ -838,17 +819,6 @@ def _get_provider(stt_config: dict) -> str:
     # --- Explicit provider: respect the user's choice ----------------------
 
     if explicit:
-        if provider == "mlx_whisper":
-            if _HAS_MLX_WHISPER:
-                mlx_cfg = stt_config.get("mlx_whisper", {})
-                model_name = _normalize_mlx_model(mlx_cfg.get("model", "base"))
-                logger.info("STT provider: mlx_whisper, model: %s", model_name)
-                return "mlx_whisper"
-            logger.warning(
-                "STT provider 'mlx_whisper' configured but mlx-whisper is not installed "
-                "(pip install mlx-whisper)"
-            )
-            return "none"
 
         if provider == "local":
             if _HAS_FASTER_WHISPER:
@@ -932,7 +902,7 @@ def _get_provider(stt_config: dict) -> str:
 
         return provider  # Unknown — let it fail downstream
 
-    # --- Auto-detect (no explicit provider): local > mlx_whisper (macOS) > local_command > groq > openai > mistral > xai > elevenlabs ---
+    # --- Auto-detect (no explicit provider): local > local_command > groq > openai > mistral > xai > elevenlabs ---
 
     if _HAS_FASTER_WHISPER:
         return "local"
@@ -1381,23 +1351,6 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_mlx_whisper(file_path: str, model_name: str) -> Dict[str, Any]:
-    """Transcribe using MLX Whisper (local, free, Apple Silicon)."""
-    if not _HAS_MLX_WHISPER:
-        return {"success": False, "transcript": "", "error": "mlx-whisper not installed (pip install mlx-whisper)"}
-
-    try:
-        import mlx_whisper
-        result = mlx_whisper.transcribe(file_path, path_or_hf_repo=model_name)
-        transcript = (result.get("text") or "").strip()
-        logger.info(
-            "Transcribed %s via mlx_whisper (%s, %d chars)",
-            Path(file_path).name, model_name, len(transcript),
-        )
-        return {"success": True, "transcript": transcript, "provider": "mlx_whisper"}
-    except Exception as e:
-        logger.error("MLX Whisper transcription failed: %s", e, exc_info=True)
-        return {"success": False, "transcript": "", "error": f"MLX Whisper transcription failed: {e}"}
 
 # ---------------------------------------------------------------------------
 # Provider: groq (Whisper API — free tier)
@@ -1914,11 +1867,6 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         }
 
     provider = _get_provider(stt_config)
-
-    if provider == "mlx_whisper":
-        mlx_cfg = stt_config.get("mlx_whisper", {})
-        model_name = _normalize_mlx_model(model or mlx_cfg.get("model"))
-        return _transcribe_mlx_whisper(file_path, model_name)
 
     if provider == "local":
         local_cfg = stt_config.get("local", {})
