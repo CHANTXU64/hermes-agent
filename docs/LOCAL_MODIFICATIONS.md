@@ -563,6 +563,9 @@ scripts/run_tests.sh tests/agent/test_tts_registry.py tests/fork/test_custom_qwe
   merge gap because `custom_api` existed only in the dispatcher. After reserving
   it in `agent/tts_registry.py`, the fork and changed-upstream focused suite
   reported `2070 passed`; the TTS subset in the command above was included.
+- Later in the same sync, upstream advanced another 9 commits including null
+  subsection guards in `tools/transcription_tools.py` and `tools/tts_tool.py`.
+  The final fork plus changed-upstream focused suite reported `1210 passed`.
 
 Feature docs: none — TTS provider extension documented in this index.
 
