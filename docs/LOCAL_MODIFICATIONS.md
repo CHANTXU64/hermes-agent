@@ -514,8 +514,10 @@ Date: 2026-05-28
 
 Files:
 
+- `agent/tts_registry.py`
 - `tools/tts_tool.py`
-- `tests/tools/test_tts_custom_api.py`
+- `tests/agent/test_tts_registry.py`
+- `tests/fork/test_custom_qwen_tts.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
 Summary:
@@ -525,6 +527,9 @@ Summary:
 What changed:
 
 - Added `custom_api` as a built-in TTS provider in `tools/tts_tool.py`.
+- Reserved `custom_api` in `agent/tts_registry.py` so plugin registration cannot
+  shadow the fork's native provider; this list must stay synchronized with
+  `BUILTIN_TTS_PROVIDERS`.
 - Added `tts.custom_api` resolution for `base_url`, `endpoint`, `mode`, `api_key` / `api_key_env`, `model`, `voice`, `language_type`, `response_format`, `speed`, `timeout`, and `extra_body`.
 - Default custom TTS config targets Alibaba DashScope Qwen TTS: `https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation`, `mode: dashscope_multimodal`, model `qwen3-tts-flash`, voice `Cherry`, and `api_key_env: QWEN_API_KEY`.
 - The DashScope multimodal mode posts `model` plus `input.text` / `input.voice`, then downloads the returned `output.audio.url` into the requested audio file.
@@ -540,6 +545,9 @@ Why it matters:
 Merge protection:
 
 - Preserve `custom_api` as a native/built-in TTS provider name; command providers or plugin providers must not shadow this configured implementation.
+- Keep `agent.tts_registry._BUILTIN_NAMES` synchronized with
+  `tools.tts_tool.BUILTIN_TTS_PROVIDERS`; run the registry invariant test after
+  upstream changes to TTS provider discovery.
 - Preserve `api_key_env` lookup through `get_env_value()` so keys in `~/.hermes/.env` work.
 - Preserve DashScope multimodal handling of `output.audio.url`; Qwen TTS does not use the OpenAI-compatible `/audio/speech` endpoint shape by default.
 - Preserve the generic `audio_speech` mode unless upstream provides a verified equivalent configurable HTTP TTS provider.
@@ -548,21 +556,13 @@ Merge protection:
 Verification:
 
 ```bash
-python -m pytest tests/tools/test_tts_custom_api.py -q -o 'addopts='
-python -m pytest tests/tools/test_tts_custom_api.py tests/tools/test_tts_opus_routing.py tests/tools/test_tts_max_text_length.py -q -o 'addopts='
-python - <<'PY'
-import json, os
-from tools.tts_tool import text_to_speech_tool
-out='/tmp/hermes_qwen_tts_test.mp3'
-try:
-    os.remove(out)
-except FileNotFoundError:
-    pass
-res=json.loads(text_to_speech_tool('你好，这是语音合成测试。', out))
-print(res)
-PY
-ffprobe -v error -show_entries format=format_name,duration -of json /tmp/hermes_qwen_tts_test.ogg
+scripts/run_tests.sh tests/agent/test_tts_registry.py tests/fork/test_custom_qwen_tts.py tests/tools/test_tts_plugin_dispatch.py tests/tools/test_tts_command_providers.py tests/tools/test_tts_opus_routing.py tests/tools/test_tts_max_text_length.py -q
 ```
+
+- 2026-07-10 upstream sync: upstream's newer provider registry exposed a logical
+  merge gap because `custom_api` existed only in the dispatcher. After reserving
+  it in `agent/tts_registry.py`, the fork and changed-upstream focused suite
+  reported `2070 passed`; the TTS subset in the command above was included.
 
 Feature docs: none — TTS provider extension documented in this index.
 
@@ -587,6 +587,7 @@ Files:
 - `tests/agent/test_memory_provider.py`
 - `tests/run_agent/test_run_agent.py`
 - `tests/run_agent/test_run_agent_codex_responses.py`
+- `tests/run_agent/test_codex_app_server_integration.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
 Summary:
@@ -689,6 +690,10 @@ python -m pytest tests/agent/transports/test_codex_transport.py tests/run_agent/
 
 Observed local results:
 
+- 2026-07-10 upstream sync: the Codex app-server external-memory fixture now
+  returns an explicit empty prefetch string because the fork's request-only
+  memory path calls `prefetch_all()` before dispatch. The fork and
+  changed-upstream focused suite reported `2070 passed`.
 - 2026-06-16: `202 passed` for the focused pytest command above. After gateway
   restart and a compression boundary, the new continuation session continued
   receiving cache reads instead of staying at zero cache.
@@ -786,10 +791,10 @@ deltas are expected in these areas:
   - `tools/transcription_tools.py`
   - `tools/tts_tool.py`
   - `agent/transcription_registry.py`
+  - `agent/tts_registry.py`
   - `tests/tools/test_transcription.py`
   - `tests/tools/test_transcription_dotenv_fallback.py`
-  - `tests/tools/test_tts_custom_api.py`
-  - `hermes_cli/config.py`
+  - `tests/fork/test_custom_qwen_tts.py`
 - Safe command rewrite:
   - `tools/safe_cmd_rewrite.py`
   - `tools/terminal_tool.py`
@@ -797,7 +802,6 @@ deltas are expected in these areas:
   - `pyproject.toml`
 - Disable newly bundled skills by default when configured:
   - `tools/skills_sync.py`
-  - `hermes_cli/config.py`
   - `hermes_cli/main.py`
   - `tests/tools/test_skills_sync.py`
 - Temporary Codex backend prompt-cache routing workaround:
@@ -811,6 +815,7 @@ deltas are expected in these areas:
   - `tests/agent/test_memory_provider.py`
   - `tests/run_agent/test_run_agent.py`
   - `tests/run_agent/test_run_agent_codex_responses.py`
+  - `tests/run_agent/test_codex_app_server_integration.py`
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
 
