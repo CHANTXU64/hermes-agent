@@ -59,6 +59,7 @@ hindsight_retain_turns
 - 当 `sync_turn()` 收到 `messages` transcript 时，优先从完整 transcript 构建 retain turns，而不是只使用最终 `user_content` / `assistant_content` 标量对。这样 gateway 中一个长任务先收到用户 A、后被用户 B 打断并最终完成时，persisted document 仍从 A 开始。
 - transcript replay 写入前会先镜像 `retain_turns.sqlite3` 中当前逻辑 document 的 `active=1` rows 到内存 buffer；provider 重启或压缩切换后再次收到完整 transcript 时，只追加新 tail turn，不重复写入已持久化历史 turns。
 - transcript 构建会过滤 tool output、assistant tool-call stub、`[Recent Summary ...]`、`Operation interrupted:` 通知、空 assistant 消息和同一 user segment 中的中间 assistant 草稿，只保留最后用户可见 assistant。
+- 2026-07-10 起额外过滤运行时合成注入：`[Session Arc Summary ...]`、`[Durable Summary ...]`、`[Depth-N Summary ...]`、`[Current user objective preserved from compacted history]`、`[Your active task list was preserved across context compression]`、`[Externalized payload: ...]`、`[ASYNC DELEGATION BATCH COMPLETE ...]`、`[ASYNC DELEGATION COMPLETE ...]`、`[OUT-OF-BAND USER MESSAGE ...]`。纯噪声消息整段丢弃；夹带真实用户原话时只保留残留真实文本。assistant 侧同类摘要/interrupt 也不入档。`/retain` 提交前会对历史 `turn_json` 再清洗（clean-on-retain）。标量 `sync_turn(user, assistant)` 走同一清洗器。过滤按 marker，不按业务词。
 - retained turn rows 带 `active` 标记；正常写入为 `active=1`。
 - `auto_retain=true` 时，自动提交逻辑仍按原机制运行。
 - `auto_retain=false` 时，只写本地 SQLite，不自动提交到 Hindsight。

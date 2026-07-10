@@ -908,3 +908,230 @@ def test_modern_api_auto_retain_appends_only_new_turn_after_first_flush(provider
     assert item["update_mode"] == "append"
     assert "second-user" in item["content"]
     assert "first-user" not in item["content"]
+
+
+def test_sync_turn_drops_async_delegation_and_compression_noise(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+
+    p.sync_turn(
+        "[ASYNC DELEGATION BATCH COMPLETE — deleg_deadbeef]\nA background fan-out finished.\nFIP draft saved.",
+        "ack async noise",
+    )
+    p.sync_turn(
+        "[Your active task list was preserved across context compression]\n- [>] keep researching",
+        "ack todo noise",
+    )
+    p.sync_turn(
+        "[Externalized payload: kind=raw_payload; role=user; chars=12; ref=abc]",
+        "ack externalized noise",
+    )
+    p.sync_turn(
+        (
+            "[Current user objective preserved from compacted history]\n"
+            "继续\n\n"
+            "---\n\n"
+            "[Session Arc Summary (d1, node 307)]\n"
+            "## Active Current State\n"
+            "- keep researching writing-skills\n"
+        ),
+        "继续执行",
+    )
+    p.sync_turn("正式用户消息", "正式回复")
+
+    assert len(p._session_turns) == 2
+    turns = [json.loads(t) for t in p._session_turns]
+    assert turns[0][0]["content"] == "User: 继续"
+    assert turns[0][1]["content"] == "Assistant: 继续执行"
+    assert turns[1][0]["content"] == "User: 正式用户消息"
+    assert turns[1][1]["content"] == "Assistant: 正式回复"
+
+    blob = "\n".join(p._session_turns)
+    for forbidden in (
+        "ASYNC DELEGATION",
+        "active task list was preserved",
+        "Externalized payload",
+        "Session Arc Summary",
+        "preserved from compacted history",
+        "FIP draft saved",
+    ):
+        assert forbidden not in blob
+
+
+def test_transcript_sync_strips_runtime_noise_and_keeps_real_user_text(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "[ASYNC DELEGATION BATCH COMPLETE — deleg_77e2600e]\n"
+                "Context you provided: FIP DP review\n"
+                "单号 CKD2007202607001274"
+            ),
+            "timestamp": 1710001000.0,
+        },
+        {
+            "role": "assistant",
+            "content": "async result noted",
+            "timestamp": 1710001001.0,
+        },
+        {
+            "role": "user",
+            "content": (
+                "继续\n\n"
+                "[Your active task list was preserved across context compression]\n"
+                "- [>] research-projects"
+            ),
+            "timestamp": 1710001002.0,
+        },
+        {
+            "role": "assistant",
+            "content": "已继续",
+            "timestamp": 1710001003.0,
+        },
+        {
+            "role": "user",
+            "content": (
+                "[Current user objective preserved from compacted history]\n"
+                "提交你的修改\n\n"
+                "---\n\n"
+                "[Session Arc Summary (d1, node 307)]\n"
+                "huge compression dump"
+            ),
+            "timestamp": 1710001004.0,
+        },
+        {
+            "role": "assistant",
+            "content": "已提交",
+            "timestamp": 1710001005.0,
+        },
+    ]
+
+    p.sync_turn("ignored scalar", "ignored scalar", messages=messages)
+
+    assert len(p._session_turns) == 2
+    turns = [json.loads(t) for t in p._session_turns]
+    assert turns[0][0]["content"] == "User: 继续"
+    assert turns[0][0]["timestamp"] == _local_seconds(1710001002.0)
+    assert turns[0][1]["content"] == "Assistant: 已继续"
+    assert turns[1][0]["content"] == "User: 提交你的修改"
+    assert turns[1][1]["content"] == "Assistant: 已提交"
+
+    info = p.retain_persisted_session_lineage()
+    p._retain_queue.join()
+    assert info["queued"] is True
+    assert info["turn_count"] == 2
+    content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+    assert "继续" in content
+    assert "提交你的修改" in content
+    for forbidden in (
+        "ASYNC DELEGATION",
+        "active task list was preserved",
+        "Session Arc Summary",
+        "preserved from compacted history",
+        "CKD2007202607001274",
+        "ignored scalar",
+    ):
+        assert forbidden not in content
+
+
+def test_lcm_durable_and_depth_summaries_are_dropped(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    p.sync_turn("[Durable Summary (d2, node 9)]\nlong durable dump", "should not keep")
+    p.sync_turn("[Depth-3 Summary (d3, node 12)]\ndeep dump", "should not keep")
+    p.sync_turn(
+        "真实用户\n\n[Durable Summary (d2, node 9)]\ntrailer",
+        "ok",
+    )
+    assert len(p._session_turns) == 1
+    turn = json.loads(p._session_turns[0])
+    assert turn[0]["content"] == "User: 真实用户"
+    assert "Durable Summary" not in p._session_turns[0]
+    assert "Depth-3" not in p._session_turns[0]
+
+
+def test_assistant_summary_markers_are_not_retained(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    messages = [
+        {"role": "user", "content": "真实问题", "timestamp": 1710002000.0},
+        {"role": "assistant", "content": "[Session Arc Summary (d1, node 1)]\nshould drop", "timestamp": 1710002001.0},
+        {"role": "assistant", "content": "最终可见回答", "timestamp": 1710002002.0},
+    ]
+    p.sync_turn("ignored", "ignored", messages=messages)
+    assert len(p._session_turns) == 1
+    turn = json.loads(p._session_turns[0])
+    assert turn[0]["content"] == "User: 真实问题"
+    assert turn[1]["content"] == "Assistant: 最终可见回答"
+    assert "Session Arc Summary" not in p._session_turns[0]
+
+
+def test_clean_on_retain_rewrites_historical_noise_rows(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    # Simulate pre-fix dirty rows already in sqlite.
+    with p._retain_store_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO hindsight_retain_turns
+            (bank_id, session_id, parent_session_id, retain_document_id, turn_index, turn_json, created_at, active)
+            VALUES (?, ?, '', ?, 1, ?, 1710003000.0, 1)
+            """,
+            (
+                p._bank_id,
+                p._session_id,
+                p._session_id,
+                json.dumps(
+                    [
+                        {
+                            "role": "user",
+                            "content": "User: [ASYNC DELEGATION BATCH COMPLETE — deleg_x]\nFIP noise",
+                            "timestamp": "2024-01-01T00:00:00",
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "Assistant: ack noise",
+                            "timestamp": "2024-01-01T00:00:01",
+                        },
+                    ],
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO hindsight_retain_turns
+            (bank_id, session_id, parent_session_id, retain_document_id, turn_index, turn_json, created_at, active)
+            VALUES (?, ?, '', ?, 2, ?, 1710003001.0, 1)
+            """,
+            (
+                p._bank_id,
+                p._session_id,
+                p._session_id,
+                json.dumps(
+                    [
+                        {
+                            "role": "user",
+                            "content": (
+                                "User: [Current user objective preserved from compacted history]\n"
+                                "继续\n\n---\n\n[Session Arc Summary (d1, node 1)]\ndump"
+                            ),
+                            "timestamp": "2024-01-01T00:00:02",
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "Assistant: 已继续",
+                            "timestamp": "2024-01-01T00:00:03",
+                        },
+                    ],
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+
+    info = p.retain_persisted_session_lineage()
+    p._retain_queue.join()
+    assert info["queued"] is True
+    assert info["turn_count"] == 1
+    content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+    assert "继续" in content
+    assert "已继续" in content
+    for forbidden in ("ASYNC DELEGATION", "Session Arc Summary", "preserved from compacted history", "FIP noise"):
+        assert forbidden not in content

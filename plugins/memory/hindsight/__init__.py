@@ -1724,6 +1724,136 @@ class HindsightMemoryProvider(MemoryProvider):
             return content
         return json.dumps(content, ensure_ascii=False)
 
+    # Synthetic Hermes/LCM/runtime events that must never enter retained
+    # conversation documents. Keep this marker-based, not business-topic-based.
+    # LCM depth labels: Recent (d0), Session Arc (d1), Durable (d2), Depth-N (d>=3).
+    _RETAIN_OBJECTIVE_HEADER = "[Current user objective preserved from compacted history]"
+    _RETAIN_NOISE_MARKERS = (
+        "[Recent Summary",
+        "[Session Arc Summary",
+        "[Durable Summary",
+        "[Depth-",  # e.g. [Depth-3 Summary (d3, node N)]
+        _RETAIN_OBJECTIVE_HEADER,
+        "[Your active task list was preserved across context compression]",
+        "[Externalized payload:",
+        "[ASYNC DELEGATION BATCH COMPLETE",
+        "[ASYNC DELEGATION COMPLETE",
+        "[OUT-OF-BAND USER MESSAGE",
+    )
+
+    @classmethod
+    def _starts_with_retain_noise_marker(cls, content: str) -> bool:
+        text = (content or "").lstrip()
+        return any(text.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS)
+
+    @classmethod
+    def _clean_retain_user_content(cls, content: Any) -> str:
+        """Return retainable user text after stripping synthetic runtime noise.
+
+        Compression rehydration, task-list rehydration, externalized payload
+        placeholders, and async-delegation completion injections are useful for
+        the live agent loop, but they are not conversation evidence. A pure
+        noise message becomes empty and is dropped. Mixed messages keep only
+        the real user text that remains after marker blocks are removed.
+        """
+        text = cls._stringify_retain_content(content).replace("\r\n", "\n").strip()
+        if not text:
+            return ""
+
+        if text.startswith(cls._RETAIN_OBJECTIVE_HEADER):
+            text = text[len(cls._RETAIN_OBJECTIVE_HEADER):].lstrip("\n").strip()
+            if not text:
+                return ""
+
+        # Pure synthetic messages (todo/async/externalized/LCM summary blocks).
+        # Objective header was already stripped above when present.
+        if any(
+            text.startswith(marker)
+            for marker in cls._RETAIN_NOISE_MARKERS
+            if marker != cls._RETAIN_OBJECTIVE_HEADER
+        ):
+            return ""
+
+        lines = text.split("\n")
+        cleaned_lines: List[str] = []
+        skipping_block = False
+        for line in lines:
+            stripped = line.strip()
+            if any(stripped.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS):
+                # Synthetic blocks are injected as whole segments; once a marker
+                # starts, drop the remainder of that segment/message body.
+                skipping_block = True
+                continue
+            if skipping_block:
+                continue
+            cleaned_lines.append(line)
+
+        cleaned = "\n".join(cleaned_lines).strip()
+        while cleaned.startswith("---"):
+            cleaned = cleaned[3:].lstrip("\n").strip()
+        while cleaned.endswith("---"):
+            cleaned = cleaned[:-3].rstrip("\n").strip()
+        if cleaned in {"", "---", "-"}:
+            return ""
+        return cleaned
+
+    @classmethod
+    def _is_retain_noise_assistant_content(cls, content: Any) -> bool:
+        text = cls._stringify_retain_content(content).strip()
+        if not text:
+            return True
+        if text.startswith("Operation interrupted"):
+            return True
+        return cls._starts_with_retain_noise_marker(text)
+
+    def _sanitize_persisted_turn_json(self, turn_json: str) -> str | None:
+        """Rewrite/drop a provider-owned retained turn before reuse or submit.
+
+        Historical rows written before noise cleaning may still contain synthetic
+        user injections. Manual `/retain` and in-memory mirror-on-restart both
+        load those rows, so re-clean here instead of trusting raw turn_json.
+        """
+        try:
+            payload = json.loads(turn_json)
+        except Exception:
+            return None
+        if not isinstance(payload, list):
+            return None
+
+        user_prefix = f"{self._retain_user_prefix}: "
+        assistant_prefix = f"{self._retain_assistant_prefix}: "
+        cleaned_msgs: List[Dict[str, Any]] = []
+        kept_user = False
+
+        for msg in payload:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "").strip()
+            content = self._stringify_retain_content(msg.get("content"))
+            if role == "user":
+                body = content[len(user_prefix):] if content.startswith(user_prefix) else content
+                cleaned_body = self._clean_retain_user_content(body)
+                if not cleaned_body:
+                    # Noise-only user turn: drop the whole turn payload.
+                    return None
+                kept_user = True
+                new_msg = dict(msg)
+                new_msg["content"] = f"{user_prefix}{cleaned_body}"
+                cleaned_msgs.append(new_msg)
+                continue
+            if role == "assistant":
+                body = content[len(assistant_prefix):] if content.startswith(assistant_prefix) else content
+                if self._is_retain_noise_assistant_content(body):
+                    continue
+                cleaned_msgs.append(msg)
+                continue
+            # Non user/assistant roles are not part of Hindsight turn payloads.
+            continue
+
+        if not kept_user or not cleaned_msgs:
+            return None
+        return json.dumps(cleaned_msgs, ensure_ascii=False)
+
     def _build_orphan_user_turn(self, user_content: str, *, user_timestamp: Any = None) -> List[Dict[str, str]]:
         return [
             {
@@ -1767,14 +1897,22 @@ class HindsightMemoryProvider(MemoryProvider):
             content = self._stringify_retain_content(msg.get("content")).strip()
             if not role or not content:
                 continue
-            if content.startswith("[Recent Summary"):
-                continue
             if role == "user":
+                cleaned_user = self._clean_retain_user_content(content)
+                if not cleaned_user:
+                    # Synthetic user injections are not conversation turns.
+                    # If a prior real user already has a final assistant, close
+                    # that turn first. If the prior real user is still orphaned
+                    # (gateway interrupt), keep it and wait for the next real
+                    # user/final assistant.
+                    if pending_user and pending_assistant:
+                        _flush_pending_turn()
+                    continue
                 _flush_pending_turn()
-                pending_user = (content, msg.get("_timestamp", msg.get("timestamp")))
+                pending_user = (cleaned_user, msg.get("_timestamp", msg.get("timestamp")))
                 pending_assistant = None
                 continue
-            if role == "assistant" and content.startswith("Operation interrupted:"):
+            if role == "assistant" and self._is_retain_noise_assistant_content(content):
                 continue
             if role != "assistant" or not pending_user:
                 continue
@@ -2122,7 +2260,9 @@ class HindsightMemoryProvider(MemoryProvider):
                                 lineage.append(sid)
                                 seen.add(sid)
                             if turn_json:
-                                turns.append(str(turn_json))
+                                cleaned = self._sanitize_persisted_turn_json(str(turn_json))
+                                if cleaned:
+                                    turns.append(cleaned)
                         return turns, lineage, retain_document_id
         except Exception as e:
             logger.warning("Hindsight retain document lookup failed: %s", e, exc_info=True)
@@ -2143,7 +2283,12 @@ class HindsightMemoryProvider(MemoryProvider):
                         """,
                         (sid,),
                     ).fetchall()
-                    turns.extend(str(row[0]) for row in rows if row and row[0])
+                    for row in rows:
+                        if not row or not row[0]:
+                            continue
+                        cleaned = self._sanitize_persisted_turn_json(str(row[0]))
+                        if cleaned:
+                            turns.append(cleaned)
         except Exception as e:
             logger.warning("Hindsight retain store read failed: %s", e, exc_info=True)
             return [], lineage, ""
@@ -2258,7 +2403,9 @@ class HindsightMemoryProvider(MemoryProvider):
                                 lineage.append(sid)
                                 seen.add(sid)
                             if turn_json:
-                                persisted_rows.append((sid, str(turn_json)))
+                                cleaned = self._sanitize_persisted_turn_json(str(turn_json))
+                            if cleaned:
+                                persisted_rows.append((sid, cleaned))
             except Exception as e:
                 logger.warning("Hindsight transcript retain document lookup failed: %s", e, exc_info=True)
 
@@ -2565,7 +2712,9 @@ class HindsightMemoryProvider(MemoryProvider):
         a later correction into one logical completed turn.  Rebuilding the
         retain turns from ``messages`` preserves that real first user message
         while filtering tool output, summaries, interrupt notices, empty
-        assistant shells, and intermediate assistant drafts.
+        assistant shells, intermediate assistant drafts, compression/task-list
+        rehydration markers, externalized payload placeholders, and async
+        delegation completion injections.
         """
         if self._shutting_down.is_set():
             logger.debug("sync_turn: skipped (shutting down)")
@@ -2594,7 +2743,12 @@ class HindsightMemoryProvider(MemoryProvider):
             self.flush_retained_turns()
             return
 
-        turn = json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
+        clean_user = self._clean_retain_user_content(user_content)
+        if not clean_user:
+            logger.debug("sync_turn: skipped synthetic/noise user content")
+            return
+
+        turn = json.dumps(self._build_turn_messages(clean_user, assistant_content), ensure_ascii=False)
         self._session_turns.append(turn)
         self._turn_counter += 1
         self._turn_index = self._turn_counter
