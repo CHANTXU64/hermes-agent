@@ -9,7 +9,7 @@ from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.session import SessionSource, build_session_key
+from gateway.session import AsyncSessionStore, SessionSource, build_session_key
 from tests.gateway.test_undo_rewind_session import store as store  # re-export pytest fixture
 from tests.tui_gateway.test_undo_command import (
     _call,
@@ -68,6 +68,8 @@ async def test_gateway_undo_notifies_cached_agent_memory_rewind(store):
     class _Runner(GatewaySlashCommandsMixin):
         def __init__(self):
             self.session_store = store
+            # Upstream gateway undo now goes through AsyncSessionStore.
+            self.async_session_store = AsyncSessionStore(store)
             self._agent_cache = {}
             self._agent_cache_lock = threading.Lock()
             self.evicted = []
@@ -109,6 +111,8 @@ async def test_gateway_undo_marks_hindsight_rows_without_cached_agent(store, mon
     class _Runner(GatewaySlashCommandsMixin):
         def __init__(self):
             self.session_store = store
+            # Upstream gateway undo now goes through AsyncSessionStore.
+            self.async_session_store = AsyncSessionStore(store)
             self._agent_cache = {}
             self._agent_cache_lock = threading.Lock()
             self.evicted = []
