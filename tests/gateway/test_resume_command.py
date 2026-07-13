@@ -5,6 +5,7 @@ across gateway messenger platforms.
 """
 
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -175,6 +176,116 @@ class TestHandleResumeCommand:
         runner.session_store.switch_session.assert_called_once()
         call_args = runner.session_store.switch_session.call_args
         assert call_args[0][1] == "old_session_abc"
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_cross_account_resume_rejects_target_running_on_other_bot(
+        self, tmp_path
+    ):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        primary_key = "agent:main:telegram:dm:67890"
+        db.create_session(
+            "old_session_abc",
+            "telegram",
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+            session_key=primary_key,
+        )
+        db.set_session_title("old_session_abc", "My Project")
+        db.create_session(
+            "current_session_001",
+            "telegram",
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+            session_key="agent:main:telegram:dm:67890:account:monika",
+        )
+
+        event = _make_event(text="/resume My Project")
+        event.source.account_id = "monika"
+        runner = _make_runner(
+            session_db=db,
+            current_session_id="current_session_001",
+            event=event,
+        )
+        store = cast(Any, runner.session_store)
+        store.routing_keys_for_session_id.return_value = [primary_key]
+        store.transfer_session.return_value = (
+            store.get_or_create_session.return_value,
+            [primary_key],
+        )
+        runner._running_agents[primary_key] = object()
+
+        result = await runner._handle_resume_command(event)
+
+        assert "still running" in result.lower()
+        store.switch_session.assert_not_called()
+        store.transfer_session.assert_not_called()
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_cross_account_resume_transfers_idle_route_and_clears_old_state(
+        self, tmp_path
+    ):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        primary_key = "agent:main:telegram:dm:67890"
+        monika_key = "agent:main:telegram:dm:67890:account:monika"
+        db.create_session(
+            "old_session_abc",
+            "telegram",
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+            session_key=primary_key,
+        )
+        db.set_session_title("old_session_abc", "My Project")
+        db.create_session(
+            "current_session_001",
+            "telegram",
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+            session_key=monika_key,
+        )
+
+        event = _make_event(text="/resume My Project")
+        event.source.account_id = "monika"
+        runner = _make_runner(
+            session_db=db,
+            current_session_id="current_session_001",
+            event=event,
+        )
+        store = cast(Any, runner.session_store)
+        transferred_entry = MagicMock()
+        transferred_entry.session_id = "old_session_abc"
+        transferred_entry.session_key = monika_key
+        store.routing_keys_for_session_id.return_value = [primary_key]
+        store.transfer_session.return_value = (
+            transferred_entry,
+            [primary_key],
+        )
+        typed_runner = cast(Any, runner)
+        typed_runner._session_model_overrides = {primary_key: {"model": "old"}}
+        typed_runner._pending_model_notes = {primary_key: "old-note"}
+        typed_runner._last_resolved_model = {primary_key: "old-model"}
+        typed_runner._queued_events = {primary_key: [object()]}
+
+        result = await runner._handle_resume_command(event)
+
+        assert "Resumed" in result
+        store.transfer_session.assert_called_once_with(
+            monika_key, "old_session_abc"
+        )
+        store.switch_session.assert_not_called()
+        assert primary_key not in typed_runner._session_model_overrides
+        assert primary_key not in typed_runner._pending_model_notes
+        assert primary_key not in typed_runner._last_resolved_model
+        assert primary_key not in typed_runner._queued_events
         db.close()
 
     @pytest.mark.asyncio

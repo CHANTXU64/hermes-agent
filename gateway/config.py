@@ -1472,6 +1472,85 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     if telegram_token:
         telegram_config = _enable_from_env(Platform.TELEGRAM)
         telegram_config.token = telegram_token
+
+    # Fork: multi Telegram bot tokens in one profile.
+    # TELEGRAM_BOT_TOKEN_<ACCOUNT> where ACCOUNT is [A-Za-z0-9_-]+ (normalized
+    # to lowercase). Primary TELEGRAM_BOT_TOKEN keeps adapters[Platform.TELEGRAM];
+    # extras live under platforms.telegram.extra.accounts and start as sibling
+    # adapters. Real user/chat ids are unchanged; session keys gain :account:<id>.
+    try:
+        from gateway.session import normalize_account_id
+        import re as _re
+
+        discovered_accounts: Dict[str, str] = {}
+        active_scope = current_secret_scope()
+        token_env = active_scope if active_scope is not None else os.environ
+        for env_key, env_val in token_env.items():
+            m = _re.fullmatch(r"TELEGRAM_BOT_TOKEN_([A-Za-z0-9_-]+)", env_key)
+            if not m:
+                continue
+            token_val = (env_val or "").strip()
+            if not token_val:
+                continue
+            acc_id = normalize_account_id(m.group(1))
+            if not acc_id:
+                logger.warning(
+                    "Ignoring %s: account id %r is invalid "
+                    "(use [A-Za-z0-9_-], start with alphanumeric, max 32)",
+                    env_key,
+                    m.group(1),
+                )
+                continue
+            if acc_id in discovered_accounts and discovered_accounts[acc_id] != token_val:
+                logger.warning(
+                    "Duplicate TELEGRAM_BOT_TOKEN_%s (case variants); keeping first",
+                    acc_id.upper(),
+                )
+                continue
+            discovered_accounts[acc_id] = token_val
+
+        if discovered_accounts:
+            telegram_config = config.platforms.get(Platform.TELEGRAM)
+            primary_token = (
+                (telegram_config.token or "").strip()
+                if telegram_config is not None
+                else ""
+            )
+            if not primary_token:
+                logger.warning(
+                    "Ignoring named Telegram bot tokens: TELEGRAM_BOT_TOKEN "
+                    "must be configured explicitly as the stable primary account"
+                )
+            else:
+                assert telegram_config is not None
+                accounts_map: Dict[str, Dict[str, str]] = {}
+                for acc_id, tok in sorted(discovered_accounts.items()):
+                    if tok == primary_token:
+                        logger.warning(
+                            "Skipping TELEGRAM_BOT_TOKEN_%s: token equals primary "
+                            "TELEGRAM_BOT_TOKEN",
+                            acc_id.upper(),
+                        )
+                        continue
+                    # De-dupe identical tokens across account names
+                    if any(v.get("token") == tok for v in accounts_map.values()):
+                        logger.warning(
+                            "Skipping TELEGRAM_BOT_TOKEN_%s: duplicate token already "
+                            "assigned to another account",
+                            acc_id.upper(),
+                        )
+                        continue
+                    accounts_map[acc_id] = {"token": tok}
+
+                if accounts_map:
+                    telegram_config.extra["accounts"] = accounts_map
+                    logger.info(
+                        "Telegram multi-account env: %d extra bot(s): %s",
+                        len(accounts_map),
+                        ", ".join(sorted(accounts_map)),
+                    )
+    except Exception as exc:
+        logger.warning("Telegram multi-account env discovery failed: %s", exc)
     
     # Reply threading mode for Telegram (off/first/all)
     telegram_reply_mode = getenv("TELEGRAM_REPLY_TO_MODE", "").lower()

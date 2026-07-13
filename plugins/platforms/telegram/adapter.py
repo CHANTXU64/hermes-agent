@@ -728,6 +728,25 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        # Prefer the explicit runner auth callback installed with
+        # set_authorization_check(); it is the normal gateway authorization path.
+        auth_check = getattr(self, "_authorization_check", None)
+        if callable(auth_check):
+            try:
+                return bool(
+                    auth_check(
+                        normalized_user_id,
+                        str(chat_type or "dm").strip().lower() or "dm",
+                        str(chat_id or normalized_user_id),
+                    )
+                )
+            except Exception:
+                logger.debug(
+                    "[Telegram] Explicit callback auth failed for user %s",
+                    normalized_user_id,
+                    exc_info=True,
+                )
+
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
@@ -747,6 +766,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     user_id=normalized_user_id,
                     user_name=str(user_name).strip() if user_name else None,
                     thread_id=str(thread_id) if thread_id is not None else None,
+                    account_id=(getattr(self.config, "extra", {}) or {}).get(
+                        "account_id"
+                    ),
                 )
                 return bool(auth_fn(source))
             except Exception:
@@ -824,6 +846,11 @@ class TelegramAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_id,
+            account_id=(
+                (getattr(self.config, "extra", {}) or {}).get("account_id")
+                if getattr(self, "config", None) is not None
+                else None
+            ),
         )
 
     def _telegram_auth_env_configured(self) -> bool:
@@ -882,6 +909,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             except Exception:
                 pass
+
+        # Prefer the explicitly injected runner authorization callback. Named
+        # multi-Telegram handlers are closures (no handler.__self__), while this
+        # callback carries the account_id into the runner's SessionSource.
+        auth_check = getattr(self, "_authorization_check", None)
+        if callable(auth_check) and self._telegram_auth_env_configured():
+            try:
+                return bool(auth_check(user_id, source.chat_type, source.chat_id))
+            except Exception:
+                logger.debug(
+                    "[Telegram] Explicit intake auth failed for user %s",
+                    user_id,
+                    exc_info=True,
+                )
 
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
@@ -8429,6 +8470,7 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_topic=chat_topic,
             message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False,
+            account_id=(getattr(self.config, "extra", {}) or {}).get("account_id"),
         )
         
         # Extract reply context if this message is a reply.

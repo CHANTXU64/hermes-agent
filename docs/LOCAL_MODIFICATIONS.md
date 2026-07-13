@@ -767,6 +767,94 @@ Upstream status: upstream official Codex header fix exists but is not equivalent
 for this fork's long gateway-session cache behavior; active fork workaround
 restored pending real telemetry proof of an upstream replacement.
 
+### 13. Multi Telegram bots in one profile (account_id session slots)
+
+Status: active
+
+Date: 2026-07-13
+
+Files:
+
+- `gateway/session.py`
+- `gateway/config.py`
+- `gateway/platforms/base.py`
+- `gateway/authz_mixin.py`
+- `gateway/slash_commands.py`
+- `gateway/run.py`
+- `plugins/platforms/telegram/adapter.py`
+- `tests/fork/test_multi_telegram_accounts.py`
+- `tests/gateway/test_background_process_notifications.py`
+- `tests/gateway/test_resume_command.py`
+- `docs/chantxu64/multi-telegram-accounts/README.md`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- One Hermes profile can run multiple Telegram bot tokens; each bot is an
+  independent session slot (like multi CLI), while config/skills/memory stay shared.
+
+What changed:
+
+- Env discovery: `TELEGRAM_BOT_TOKEN_<ACCOUNT>` extras under
+  `platforms.telegram.extra.accounts`; multiplex profile loads enumerate only
+  the active profile secret scope and cannot inherit another profile's tokens.
+- Primary `TELEGRAM_BOT_TOKEN` still owns `adapters[Platform.TELEGRAM]` and is
+  required when named bots are configured; named tokens are not promoted into
+  the legacy primary slot.
+- Extra bots live in `GatewayRunner._telegram_account_adapters`.
+- `SessionSource.account_id` + session key suffix `:account:<id>` isolates
+  short-term context; real `user_id`/`chat_id` stay for ownership and `/resume`.
+- Database peer recovery requires the same account suffix, preventing a fresh
+  named route from recovering the primary bot's persisted session id.
+- Telegram stamps `account_id` while building pre-dispatch auth/event sources,
+  before batching, observation persistence, or session-key computation.
+- `_adapter_for_source()` resolves a named account from
+  `_telegram_account_adapters` and fails closed if that configured account is
+  unavailable, preventing streaming/typing/media/busy traffic from falling back
+  to primary.
+- Background process/watch notifications rebuild an account-aware source and
+  send or inject through the originating named adapter.
+- Cross-bot `/resume` transfers one idle transcript to the current bot route and
+  unbinds the old route; a running target is rejected instead of dual-bound.
+- Named accounts have an independent fatal-error/reconnect queue that retains
+  their own token/config and never replaces or tears down the primary adapter.
+- `/restart` routing metadata retains `account_id`, so shutdown/comeback
+  lifecycle notices use the originating bot.
+- Personal-use boundary: named bots use ordinary DM sessions; Telegram DM Topic
+  mode remains on the primary bot, and `/update` multi-account lifecycle routing
+  is intentionally outside this change.
+
+Why it matters:
+
+- User wants multi-CLI-like Telegram doors without multi-profile brains.
+- Must not collide Telegram DM chat_id across bots for the same human.
+
+Merge protection:
+
+- Preserve when: multi-token env + account session suffix + primary adapter
+  compatibility.
+- Drop when: upstream merges an equivalent multi-bot shared-brain design and
+  tests prove primary key compatibility + cross-bot `/resume` by real user.
+- Ask user when: upstream uses a different session-key or account model.
+
+Verification:
+
+```bash
+python -m py_compile gateway/session.py gateway/config.py gateway/platforms/base.py gateway/authz_mixin.py gateway/slash_commands.py gateway/run.py plugins/platforms/telegram/adapter.py
+scripts/run_tests.sh tests/fork/test_multi_telegram_accounts.py tests/gateway/test_background_process_notifications.py tests/gateway/test_resume_command.py tests/gateway/test_restart_notification.py tests/gateway/test_runner_fatal_adapter.py tests/gateway/test_platform_reconnect.py -q
+scripts/run_tests.sh tests/fork/test_codex_prompt_cache.py tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py -q
+scripts/run_tests.sh tests/fork -q
+```
+
+CI uses `scripts/run_tests.sh` with the default `tests/` discovery root, so
+`tests/fork/test_multi_telegram_accounts.py` is collected automatically.
+2026-07-13 pre-commit baseline: focused runtime `172 passed`, cache/auth
+`28 passed`, complete fork suite `424 passed`, py_compile and diff-check passed.
+
+Feature docs: `docs/chantxu64/multi-telegram-accounts/README.md`
+
+Upstream status: fork-only (related open PRs/issues exist, not merged as equivalent).
+
 
 ## Current fork delta checklist
 
@@ -824,13 +912,25 @@ deltas are expected in these areas:
   - `tests/run_agent/test_codex_app_server_integration.py`
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
+- Multi Telegram bots (account_id session slots):
+  - `gateway/session.py`
+  - `gateway/config.py`
+  - `gateway/platforms/base.py`
+  - `gateway/authz_mixin.py`
+  - `gateway/slash_commands.py`
+  - `gateway/run.py`
+  - `plugins/platforms/telegram/adapter.py`
+  - `tests/fork/test_multi_telegram_accounts.py`
+  - `tests/gateway/test_background_process_notifications.py`
+  - `tests/gateway/test_resume_command.py`
+  - `docs/chantxu64/multi-telegram-accounts/README.md`
 
 
 ## Summary statistics
 
-Documented entries: 12 major entries.
+Documented entries: 13 major entries.
 
-Active functional areas: 9.
+Active functional areas: 10.
 
 Historical reverted / abandoned areas: 2.
 

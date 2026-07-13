@@ -9,6 +9,7 @@ Contributed by @PeterFile (PR #593), reimplemented on current main.
 
 import asyncio
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -249,6 +250,46 @@ async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_process_completion_routes_named_account_from_session_key(
+    monkeypatch, tmp_path
+):
+    import tools.process_registry as pr_module
+
+    monkeypatch.setattr(
+        pr_module,
+        "process_registry",
+        _FakeRegistry(
+            [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)]
+        ),
+    )
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path, "result")
+    primary = cast(Any, runner.adapters[Platform.TELEGRAM])
+    work = cast(
+        Any, SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
+    )
+    runner._telegram_account_adapters = {"work": work}
+
+    await runner._run_process_watcher(
+        {
+            "session_id": "proc_named_result",
+            "session_key": "agent:main:telegram:dm:123:account:work",
+            "check_interval": 0,
+            "platform": "telegram",
+            "chat_type": "dm",
+            "chat_id": "123",
+        }
+    )
+
+    work.send.assert_awaited_once()
+    primary.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 
@@ -410,6 +451,31 @@ def test_build_process_event_source_falls_back_to_session_key_chat_type(monkeypa
     assert source.thread_id == "42"
     assert source.user_id == "123"
     assert source.user_name == "Emiliyan"
+
+
+@pytest.mark.asyncio
+async def test_inject_watch_notification_routes_named_account_from_session_key(
+    monkeypatch, tmp_path
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    primary = cast(Any, runner.adapters[Platform.TELEGRAM])
+    work = cast(
+        Any, SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
+    )
+    runner._telegram_account_adapters = {"work": work}
+
+    await runner._inject_watch_notification(
+        "[SYSTEM: Background process matched]",
+        {
+            "session_id": "proc_named",
+            "session_key": "agent:main:telegram:dm:123:account:work",
+        },
+    )
+
+    work.handle_message.assert_awaited_once()
+    primary.handle_message.assert_not_awaited()
+    event = work.handle_message.await_args.args[0]
+    assert event.source.account_id == "work"
 
 
 def test_build_process_event_source_uses_cached_live_source_before_session_key_parse(

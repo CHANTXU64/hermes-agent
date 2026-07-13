@@ -182,6 +182,11 @@ class SessionSource:
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
 
+    # Named multi-account platform identity (fork: multi Telegram bots in one
+    # profile). None / empty => primary/default account. Used only for session
+    # slot isolation + inbound adapter routing; does NOT rewrite user_id/chat_id.
+    account_id: Optional[str] = None
+
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
     # rename them after the first agent turn using the generated session title.
@@ -263,6 +268,8 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.account_id:
+            d["account_id"] = self.account_id
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -288,6 +295,7 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            account_id=data.get("account_id"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
         )
@@ -848,6 +856,49 @@ def is_shared_multi_user_session(
     return not group_sessions_per_user
 
 
+def normalize_account_id(value: Optional[str]) -> Optional[str]:
+    """Normalize a multi-account id for session keys / env discovery.
+
+    Accepts ``[A-Za-z0-9_-]`` up to 32 chars; returns lowercase form or None.
+    """
+    if value is None:
+        return None
+    raw = str(value).strip().lower()
+    if not raw:
+        return None
+    import re
+
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", raw):
+        return None
+    return raw
+
+
+def append_account_session_key(session_key: str, account_id: Optional[str]) -> str:
+    """Append/replace trailing ``:account:<id>`` (primary remains bare)."""
+    acc = normalize_account_id(account_id)
+    if not acc:
+        return session_key
+    base, current = split_account_session_key(session_key)
+    if current == acc:
+        return session_key
+    return f"{base}:account:{acc}"
+
+
+def split_account_session_key(session_key: str) -> tuple:
+    """Split trailing ``:account:<id>`` from a session key.
+
+    Returns ``(base_key, account_id_or_None)``.
+    """
+    marker = ":account:"
+    if marker not in (session_key or ""):
+        return session_key, None
+    base, acc = session_key.rsplit(marker, 1)
+    acc = normalize_account_id(acc)
+    if not acc:
+        return session_key, None
+    return base, acc
+
+
 def _session_key_namespace(profile: Optional[str]) -> str:
     """Return the ``agent:<ns>`` namespace prefix for a session key.
 
@@ -911,8 +962,14 @@ def build_session_key(
 
         if dm_chat_id:
             if source.thread_id:
-                return f"{ns}:{platform}:dm:{dm_chat_id}:{source.thread_id}"
-            return f"{ns}:{platform}:dm:{dm_chat_id}"
+                return append_account_session_key(
+                    f"{ns}:{platform}:dm:{dm_chat_id}:{source.thread_id}",
+                    source.account_id,
+                )
+            return append_account_session_key(
+                f"{ns}:{platform}:dm:{dm_chat_id}",
+                source.account_id,
+            )
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
         # arrives without a chat_id (non-standard adapters / synthetic sources)
@@ -927,11 +984,20 @@ def build_session_key(
             )
         if dm_participant_id:
             if source.thread_id:
-                return f"{ns}:{platform}:dm:{dm_participant_id}:{source.thread_id}"
-            return f"{ns}:{platform}:dm:{dm_participant_id}"
+                return append_account_session_key(
+                    f"{ns}:{platform}:dm:{dm_participant_id}:{source.thread_id}",
+                    source.account_id,
+                )
+            return append_account_session_key(
+                f"{ns}:{platform}:dm:{dm_participant_id}",
+                source.account_id,
+            )
         if source.thread_id:
-            return f"{ns}:{platform}:dm:{source.thread_id}"
-        return f"{ns}:{platform}:dm"
+            return append_account_session_key(
+                f"{ns}:{platform}:dm:{source.thread_id}",
+                source.account_id,
+            )
+        return append_account_session_key(f"{ns}:{platform}:dm", source.account_id)
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -956,7 +1022,7 @@ def build_session_key(
     if isolate_user and participant_id:
         key_parts.append(str(participant_id))
 
-    return ":".join(key_parts)
+    return append_account_session_key(":".join(key_parts), source.account_id)
 
 
 class _SessionFlight:
@@ -1341,11 +1407,19 @@ class SessionStore:
         requested_session_key: str,
         recovered: Dict[str, Any],
     ) -> bool:
-        """Prevent non-multiplexed gateways from reviving another profile's row."""
+        """Prevent DB recovery from crossing account or profile route identity."""
+        recovered_key = str(recovered.get("session_key") or "")
+
+        requested_account = split_account_session_key(requested_session_key)[1]
+        recovered_account = (
+            split_account_session_key(recovered_key)[1] if recovered_key else None
+        )
+        if requested_account != recovered_account:
+            return False
+
         if getattr(self.config, "multiplex_profiles", False):
             return True
 
-        recovered_key = str(recovered.get("session_key") or "")
         if not recovered_key or recovered_key == requested_session_key:
             return True
 
@@ -1420,9 +1494,8 @@ class SessionStore:
             recovered=recovered,
         ):
             logger.warning(
-                "Gateway session DB recovery ignored %s for %s because "
-                "multiplex_profiles is disabled and the row belongs to a "
-                "different profile",
+                "Gateway session DB recovery ignored %s for %s because the "
+                "recovered routing identity is incompatible",
                 recovered.get("session_key"),
                 session_key,
             )
@@ -1468,9 +1541,8 @@ class SessionStore:
             recovered=recovered,
         ):
             logger.warning(
-                "Gateway session DB recovery ignored %s for %s because "
-                "multiplex_profiles is disabled and the row belongs to a "
-                "different profile",
+                "Gateway session DB recovery ignored %s for %s because the "
+                "recovered routing identity is incompatible",
                 recovered.get("session_key"),
                 session_key,
             )
@@ -2351,6 +2423,75 @@ class SessionStore:
 
         return new_entry
 
+    def transfer_session(
+        self,
+        session_key: str,
+        target_session_id: str,
+    ) -> tuple[Optional[SessionEntry], List[str]]:
+        """Move one persisted session to a single active routing key.
+
+        Unlike ``switch_session()``, this removes every other routing key that
+        currently points at ``target_session_id``. The caller receives those
+        detached keys so its in-memory agent/queue/model state can be cleared.
+        """
+        db_end_session_id = None
+        new_entry = None
+        detached_keys: List[str] = []
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            if session_key not in self._entries:
+                return None, detached_keys
+
+            old_entry = self._entries[session_key]
+            detached_keys = sorted(
+                key
+                for key, entry in self._entries.items()
+                if key != session_key and entry.session_id == target_session_id
+            )
+            for key in detached_keys:
+                self._entries.pop(key, None)
+
+            if old_entry.session_id == target_session_id:
+                if detached_keys:
+                    self._save()
+                return old_entry, detached_keys
+
+            db_end_session_id = old_entry.session_id
+            now = _now()
+            new_entry = SessionEntry(
+                session_key=session_key,
+                session_id=target_session_id,
+                created_at=now,
+                updated_at=now,
+                origin=old_entry.origin,
+                display_name=old_entry.display_name,
+                platform=old_entry.platform,
+                chat_type=old_entry.chat_type,
+            )
+            self._entries[session_key] = new_entry
+            self._save()
+
+        if self._db and db_end_session_id:
+            try:
+                self._db.end_session(db_end_session_id, "session_switch")
+            except Exception as e:
+                logger.debug("Session DB end_session failed: %s", e)
+
+        if self._db:
+            try:
+                self._db.reopen_session(target_session_id)
+            except Exception as e:
+                logger.debug("Session DB reopen_session failed: %s", e)
+            self._record_gateway_session_peer(
+                target_session_id,
+                session_key,
+                new_entry.origin if new_entry else None,
+                display_name=new_entry.display_name if new_entry else None,
+            )
+
+        return new_entry, detached_keys
+
     def list_sessions(self, active_minutes: Optional[int] = None) -> List[SessionEntry]:
         """List all sessions, optionally filtered by activity."""
         with self._lock:
@@ -2364,6 +2505,18 @@ class SessionStore:
         entries.sort(key=lambda e: e.updated_at, reverse=True)
 
         return entries
+
+    def routing_keys_for_session_id(self, session_id: str) -> List[str]:
+        """Return active routing keys currently bound to ``session_id``."""
+        if not session_id:
+            return []
+        with self._lock:
+            self._ensure_loaded_locked()
+            return sorted(
+                key
+                for key, entry in self._entries.items()
+                if entry.session_id == session_id
+            )
 
     def lookup_by_session_id(self, session_id: str) -> Optional[SessionEntry]:
         """Return the active session entry for a persisted session ID, if any."""

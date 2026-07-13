@@ -38,6 +38,7 @@ from gateway.session import (
     SessionSource,
     build_session_key,
     is_shared_multi_user_session,
+    split_account_session_key,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
 from utils import (
@@ -510,7 +511,7 @@ class GatewaySlashCommandsMixin:
         is_running = agent is not None and agent is not _AGENT_PENDING_SENTINEL
 
         # Count pending /queue follow-ups (slot + overflow).
-        adapter = self.adapters.get(source.platform) if source else None
+        adapter = self._adapter_for_source(source) if source else None
         queue_depth = self._queue_depth(session_key, adapter=adapter)
 
         def _clean_str(value: Any) -> str:
@@ -1246,6 +1247,8 @@ class GatewaySlashCommandsMixin:
             }
             if event.source.thread_id:
                 notify_data["thread_id"] = event.source.thread_id
+            if getattr(event.source, "account_id", None):
+                notify_data["account_id"] = event.source.account_id
             if event.message_id:
                 notify_data["message_id"] = event.message_id
             if event.source is not None:
@@ -1483,7 +1486,7 @@ class GatewaySlashCommandsMixin:
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
             # Try interactive picker if the platform supports it
-            adapter = self.adapters.get(source.platform)
+            adapter = self._adapter_for_source(source)
             has_picker = (
                 adapter is not None
                 and getattr(type(adapter), "send_model_picker", None) is not None
@@ -2209,7 +2212,7 @@ class GatewaySlashCommandsMixin:
             if state is None:
                 return t("gateway.goal.no_goal_set")
             try:
-                adapter = self.adapters.get(event.source.platform) if event.source else None
+                adapter = self._adapter_for_source(event.source) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
                 if adapter and _quick_key:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
@@ -2227,7 +2230,7 @@ class GatewaySlashCommandsMixin:
             had = mgr.has_goal()
             mgr.clear()
             try:
-                adapter = self.adapters.get(event.source.platform) if event.source else None
+                adapter = self._adapter_for_source(event.source) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
                 if adapter and _quick_key:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
@@ -2296,7 +2299,7 @@ class GatewaySlashCommandsMixin:
 
         # Queue the goal text as an immediate first turn so the agent
         # starts making progress. The post-turn hook takes over after.
-        adapter = self.adapters.get(event.source.platform) if event.source else None
+        adapter = self._adapter_for_source(event.source) if event.source else None
         _quick_key = self._session_key_for_source(event.source) if event.source else None
         if adapter and _quick_key:
             try:
@@ -2525,7 +2528,7 @@ class GatewaySlashCommandsMixin:
         platform = event.source.platform
         voice_key = self._voice_key(platform, chat_id)
 
-        adapter = self.adapters.get(platform)
+        adapter = self._adapter_for_source(event.source)
 
         if args in {"on", "enable"}:
             self._voice_mode[voice_key] = "voice_only"
@@ -2557,7 +2560,7 @@ class GatewaySlashCommandsMixin:
                 "all": t("gateway.voice.label_all"),
             }
             # Append voice channel info if connected
-            adapter = self.adapters.get(event.source.platform)
+            adapter = self._adapter_for_source(event.source)
             guild_id = self._get_guild_id(event)
             if guild_id and hasattr(adapter, "get_voice_channel_info"):
                 info = adapter.get_voice_channel_info(guild_id)
@@ -3705,13 +3708,68 @@ class GatewaySlashCommandsMixin:
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
 
+        cross_account_route_keys: list[str] = []
+        if source.platform == Platform.TELEGRAM:
+            target_route_keys = await self.async_session_store.routing_keys_for_session_id(
+                target_id
+            )
+            current_account = split_account_session_key(session_key)[1]
+            cross_account_route_keys = [
+                key
+                for key in target_route_keys
+                if key != session_key
+                and split_account_session_key(key)[1] != current_account
+            ]
+            running_agents = getattr(self, "_running_agents", {}) or {}
+            if any(key in running_agents for key in cross_account_route_keys):
+                return (
+                    "That session is still running in another Telegram bot. "
+                    "Wait for it to finish or stop it there, then resume again."
+                )
+
         # Clear any running agent for this session key
         self._release_running_agent_state(session_key)
 
-        # Switch the session entry to point at the old session
-        new_entry = await self.async_session_store.switch_session(session_key, target_id)
+        # Switch the session entry to point at the old session. Cross-account
+        # Telegram resume is a move: one persisted session may have only one
+        # active Bot route at a time.
+        detached_route_keys: list[str] = []
+        if cross_account_route_keys:
+            new_entry, detached_route_keys = (
+                await self.async_session_store.transfer_session(session_key, target_id)
+            )
+        else:
+            new_entry = await self.async_session_store.switch_session(
+                session_key, target_id
+            )
         if not new_entry:
             return t("gateway.resume.switch_failed")
+
+        for detached_key in detached_route_keys:
+            for method_name in (
+                "_release_running_agent_state",
+                "_evict_cached_agent",
+                "_clear_session_boundary_security_state",
+            ):
+                cleanup = getattr(self, method_name, None)
+                if callable(cleanup):
+                    cleanup(detached_key)
+            for attr in (
+                "_session_model_overrides",
+                "_pending_model_notes",
+                "_last_resolved_model",
+                "_queued_events",
+                "_pending_messages",
+                "_pending_native_image_paths_by_session",
+                "_busy_ack_ts",
+            ):
+                state = getattr(self, attr, None)
+                if isinstance(state, dict):
+                    state.pop(detached_key, None)
+            clear_reasoning = getattr(self, "_set_session_reasoning_override", None)
+            if callable(clear_reasoning):
+                clear_reasoning(detached_key, None)
+
         self._clear_session_boundary_security_state(session_key)
 
         # Clear session-scoped model/reasoning overrides so the resumed
@@ -4448,7 +4506,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.approve.no_pending")
 
         # Resume typing indicator — agent is about to continue processing.
-        _adapter = self.adapters.get(source.platform)
+        _adapter = self._adapter_for_source(source)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 
@@ -4502,7 +4560,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.deny.no_pending")
 
         # Resume typing indicator — agent continues (with BLOCKED result).
-        _adapter = self.adapters.get(source.platform)
+        _adapter = self._adapter_for_source(source)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 

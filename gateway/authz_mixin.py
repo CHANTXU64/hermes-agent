@@ -35,6 +35,7 @@ class GatewayAuthorizationMixin:
         self,
         platform: Optional[Platform],
         profile: Optional[str] = None,
+        account_id: Optional[str] = None,
     ):
         """Resolve the live adapter whose intake policy should gate authorization.
 
@@ -43,6 +44,11 @@ class GatewayAuthorizationMixin:
         ``self.adapters``. ``SessionSource.profile`` selects which map to consult.
         When a stamped profile has its own adapter registry entry, the default
         profile's same-platform adapter must not be consulted as a fallback.
+
+        Fork multi-Telegram: named bots live in ``_telegram_account_adapters``
+        keyed by ``account_id``. A stamped account_id must resolve to that map
+        (or None) — never fall back to the primary token (would send out the
+        wrong bot).
         """
         if not platform:
             return None
@@ -55,6 +61,24 @@ class GatewayAuthorizationMixin:
             # (e.g. its adapter failed to connect) must NOT fall back to the
             # default profile's adapter — that sends replies out the wrong bot.
             return None
+
+        # Named multi-account bots (same profile, extra TELEGRAM_BOT_TOKEN_*).
+        acc = (account_id or "").strip() or None
+        if platform == Platform.TELEGRAM and acc:
+            try:
+                from gateway.session import normalize_account_id
+
+                acc = normalize_account_id(acc)
+            except Exception:
+                acc = acc.lower() if acc else None
+            if acc:
+                extra = getattr(self, "_telegram_account_adapters", None) or {}
+                if acc in extra:
+                    return extra[acc]
+                # Fail closed: a valid stamped named account with no live adapter
+                # must not fall back to primary (would reply from the wrong bot).
+                return None
+
         adapters = getattr(self, "adapters", None) or {}
         return adapters.get(platform)
 
@@ -63,10 +87,12 @@ class GatewayAuthorizationMixin:
         if source is None:
             return None
         # ``getattr`` guards test fixtures that build a bare source via
-        # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
+        # SimpleNamespace and omit ``profile`` / ``account_id``
+        # (see AGENTS.md pitfall #17).
         return self._authorization_adapter(
             getattr(source, "platform", None),
             getattr(source, "profile", None),
+            getattr(source, "account_id", None),
         )
 
     def _adapter_authorization_is_upstream(
