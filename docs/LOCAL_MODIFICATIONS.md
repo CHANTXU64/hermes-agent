@@ -855,6 +855,51 @@ Feature docs: `docs/chantxu64/multi-telegram-accounts/README.md`
 
 Upstream status: fork-only (related open PRs/issues exist, not merged as equivalent).
 
+### 14. Live CDP browser tab safety prompts
+
+Status: active
+
+Date: 2026-07-15
+
+Files:
+
+- `tools/browser_tool.py`
+- `tests/fork/test_browser_live_cdp_safety.py`
+- `docs/chantxu64/browser-live-cdp-safety/README.md`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- Model-visible Browser tool descriptions explicitly warn that live-CDP navigation can replace a preserved tab and that a Browser screenshot may not represent a separately bound CDP/DrissionPage target.
+
+What changed:
+
+- `browser_navigate` identifies the live-CDP current-tab replacement risk, forbids treating FIP/BPM or other preserved app/login tabs as generic browser sessions, and directs unrelated work to a task-owned safe tab/session.
+- `browser_vision` identifies the separate-target screenshot risk and requires URL/target verification before drawing conclusions about another target.
+- A fork regression imports the registered `BROWSER_TOOL_SCHEMAS` and asserts these user-safety contracts, so an upstream merge cannot silently restore the old harmless-looking descriptions.
+- This is a prompt/schema guard only. It does not create a tab, assign target ownership, or add a runtime navigation block; those are separate changes.
+
+Why it matters:
+
+- The fork is configured to attach Browser tools to the user's live Chrome via CDP. A generic research task can otherwise overwrite a FIP/BPM/login tab, or use a screenshot from the wrong target as diagnostic evidence.
+
+Merge protection:
+
+- Preserve when: upstream tool descriptions do not provide an equivalent or stronger model-visible live-CDP tab and cross-target screenshot contract.
+- Drop when: upstream supplies an equivalent or stronger implementation and regression coverage, after verifying the contract remains model-visible.
+- Ask user when: upstream redesigns Browser/CDP target selection or replaces the description-based guard with runtime ownership/isolation semantics.
+
+Verification:
+
+```bash
+.venv/bin/python -m pytest tests/fork/test_browser_live_cdp_safety.py -q -o 'addopts='
+.venv/bin/python -m py_compile tools/browser_tool.py tests/fork/test_browser_live_cdp_safety.py
+```
+
+Feature docs: `docs/chantxu64/browser-live-cdp-safety/README.md`
+
+Upstream status: fork-only.
+
 
 ## Current fork delta checklist
 
@@ -924,13 +969,17 @@ deltas are expected in these areas:
   - `tests/gateway/test_background_process_notifications.py`
   - `tests/gateway/test_resume_command.py`
   - `docs/chantxu64/multi-telegram-accounts/README.md`
+- Live CDP browser tab safety prompts:
+  - `tools/browser_tool.py`
+  - `tests/fork/test_browser_live_cdp_safety.py`
+  - `docs/chantxu64/browser-live-cdp-safety/README.md`
 
 
 ## Summary statistics
 
-Documented entries: 13 major entries.
+Documented entries: 14 major entries.
 
-Active functional areas: 10.
+Active functional areas: 11.
 
 Historical reverted / abandoned areas: 2.
 
