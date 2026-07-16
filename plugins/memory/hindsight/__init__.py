@@ -1730,6 +1730,8 @@ class HindsightMemoryProvider(MemoryProvider):
     # conversation documents. Keep this marker-based, not business-topic-based.
     # LCM depth labels: Recent (d0), Session Arc (d1), Durable (d2), Depth-N (d>=3).
     _RETAIN_OBJECTIVE_HEADER = "[Current user objective preserved from compacted history]"
+    _RETAIN_MODEL_SWITCH_NOTE_PREFIX = "[Note: model was just switched from "
+    _RETAIN_MODEL_SWITCH_NOTE_SUFFIX = "Adjust your self-identification accordingly.]"
     _RETAIN_ASYNC_COMPLETION_MARKERS = (
         "[ASYNC DELEGATION BATCH COMPLETE",
         "[ASYNC DELEGATION COMPLETE",
@@ -1757,6 +1759,61 @@ class HindsightMemoryProvider(MemoryProvider):
         return any(text.startswith(marker) for marker in cls._RETAIN_ASYNC_COMPLETION_MARKERS)
 
     @classmethod
+    def _strip_model_switch_note(cls, text: str) -> str:
+        normalized = (text or "").replace("\r\n", "\n").strip()
+        if not normalized.startswith(cls._RETAIN_MODEL_SWITCH_NOTE_PREFIX):
+            return normalized
+        note_end = normalized.find(cls._RETAIN_MODEL_SWITCH_NOTE_SUFFIX)
+        if note_end < 0:
+            return normalized
+        return normalized[note_end + len(cls._RETAIN_MODEL_SWITCH_NOTE_SUFFIX):].lstrip()
+
+    @classmethod
+    def _clean_multimodal_model_switch_note(cls, text: str) -> str | None:
+        """Clean a model-switch note from serialized OpenAI content parts.
+
+        Require both a text part and a non-text part so ordinary user text that
+        happens to be a JSON array is not treated as runtime multimodal content.
+        Return ``None`` when the value is not a matching multimodal payload or no
+        model-switch note was removed.
+        """
+        if not text.startswith("["):
+            return None
+        try:
+            parts = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(parts, list):
+            return None
+        has_text = any(isinstance(part, dict) and part.get("type") == "text" for part in parts)
+        has_non_text = any(isinstance(part, dict) and part.get("type") != "text" for part in parts)
+        if not (has_text and has_non_text):
+            return None
+
+        cleaned_parts: List[Any] = []
+        note_removed = False
+        for part in parts:
+            if not note_removed and isinstance(part, dict) and part.get("type") == "text":
+                original_text = cls._stringify_retain_content(part.get("text"))
+                cleaned_text = cls._strip_model_switch_note(original_text)
+                if cleaned_text != original_text.replace("\r\n", "\n").strip():
+                    note_removed = True
+                    if not cleaned_text:
+                        continue
+                    cleaned_part = dict(part)
+                    cleaned_part["text"] = cleaned_text
+                    cleaned_parts.append(cleaned_part)
+                    continue
+                # Runtime injection always targets the first text part. If that
+                # part does not start with the exact marker, later text parts are
+                # user content and must not be scanned or rewritten.
+                return None
+            cleaned_parts.append(part)
+        if not note_removed:
+            return None
+        return json.dumps(cleaned_parts, ensure_ascii=False)
+
+    @classmethod
     def _clean_retain_user_content(cls, content: Any) -> str:
         """Return retainable user text after stripping synthetic runtime noise.
 
@@ -1767,6 +1824,14 @@ class HindsightMemoryProvider(MemoryProvider):
         the real user text that remains after marker blocks are removed.
         """
         text = cls._stringify_retain_content(content).replace("\r\n", "\n").strip()
+        if not text:
+            return ""
+
+        cleaned_multimodal = cls._clean_multimodal_model_switch_note(text)
+        if cleaned_multimodal is not None:
+            text = cleaned_multimodal
+        else:
+            text = cls._strip_model_switch_note(text)
         if not text:
             return ""
 

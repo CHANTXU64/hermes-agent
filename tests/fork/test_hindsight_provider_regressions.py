@@ -1071,6 +1071,124 @@ def test_transcript_sync_strips_runtime_payload_and_keeps_visible_results(provid
         assert forbidden not in content
 
 
+def test_transcript_sync_strips_model_switch_note_but_keeps_user_text(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "[Note: model was just switched from gpt-5.6-terra to gpt-5.6-sol "
+                "via OpenAI Codex. Adjust your self-identification accordingly.]\n\n"
+                "检查这个 Document"
+            ),
+            "timestamp": 1710001050.0,
+        },
+        {
+            "role": "assistant",
+            "content": "已检查",
+            "timestamp": 1710001051.0,
+        },
+    ]
+
+    p.sync_turn("ignored scalar", "ignored scalar", messages=messages)
+
+    assert len(p._session_turns) == 1
+    turn = json.loads(p._session_turns[0])
+    assert turn[0]["content"] == "User: 检查这个 Document"
+    assert turn[1]["content"] == "Assistant: 已检查"
+    assert "model was just switched" not in p._session_turns[0]
+
+
+def test_transcript_sync_strips_model_switch_note_from_multimodal_user_content(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+                {
+                    "type": "text",
+                    "text": (
+                        "[Note: model was just switched from gpt-5.6-terra to gpt-5.6-sol "
+                        "via OpenAI Codex. Adjust your self-identification accordingly.]\n\n"
+                        "检查这张图"
+                    ),
+                },
+            ],
+            "timestamp": 1710001050.0,
+        },
+        {
+            "role": "assistant",
+            "content": "图片已检查",
+            "timestamp": 1710001051.0,
+        },
+    ]
+
+    p.sync_turn("ignored scalar", "ignored scalar", messages=messages)
+
+    assert len(p._session_turns) == 1
+    turn = json.loads(p._session_turns[0])
+    assert "model was just switched" not in turn[0]["content"]
+    assert "检查这张图" in turn[0]["content"]
+    assert "https://example.com/image.png" in turn[0]["content"]
+    assert turn[1]["content"] == "Assistant: 图片已检查"
+
+
+def test_transcript_sync_preserves_model_switch_text_after_first_multimodal_text_part(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    quoted_note = (
+        "[Note: model was just switched from old-model to new-model via OpenAI Codex. "
+        "Adjust your self-identification accordingly.]"
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+                {"type": "text", "text": "真实第一段"},
+                {"type": "text", "text": quoted_note},
+            ],
+            "timestamp": 1710001052.0,
+        },
+        {"role": "assistant", "content": "已解释", "timestamp": 1710001053.0},
+    ]
+
+    p.sync_turn("ignored scalar", "ignored scalar", messages=messages)
+
+    turn = json.loads(p._session_turns[0])
+    assert "真实第一段" in turn[0]["content"]
+    assert quoted_note in turn[0]["content"]
+
+
+def test_historical_multimodal_cleaning_preserves_model_switch_text_after_first_text_part(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    quoted_note = (
+        "[Note: model was just switched from old-model to new-model via OpenAI Codex. "
+        "Adjust your self-identification accordingly.]"
+    )
+    serialized_parts = json.dumps(
+        [
+            {"type": "image_url", "image_url": {"url": "https://example.com/historical.png"}},
+            {"type": "text", "text": "历史真实第一段"},
+            {"type": "text", "text": quoted_note},
+        ],
+        ensure_ascii=False,
+    )
+    dirty_turn = json.dumps(
+        [
+            {"role": "user", "content": f"User: {serialized_parts}", "timestamp": "2024-01-01T00:00:00"},
+            {"role": "assistant", "content": "Assistant: 已解释", "timestamp": "2024-01-01T00:00:01"},
+        ],
+        ensure_ascii=False,
+    )
+
+    cleaned_turn = p._sanitize_persisted_turn_json(dirty_turn)
+
+    assert cleaned_turn is not None
+    assert "历史真实第一段" in cleaned_turn
+    assert quoted_note in cleaned_turn
+
+
 def test_transcript_sync_drops_async_payload_but_keeps_visible_assistant_in_order(provider_with_config):
     p = provider_with_config(auto_retain=False)
     messages = [
@@ -1246,7 +1364,7 @@ def test_assistant_summary_markers_are_not_retained(provider_with_config):
     assert "Session Arc Summary" not in p._session_turns[0]
 
 
-def test_clean_on_retain_strips_historical_async_payload_but_keeps_visible_assistant(provider_with_config):
+def test_clean_on_retain_strips_historical_runtime_payload_but_keeps_visible_content(provider_with_config):
     p = provider_with_config(auto_retain=False)
     # Simulate pre-fix dirty rows already in sqlite.
     with p._retain_store_connect() as conn:
@@ -1307,15 +1425,99 @@ def test_clean_on_retain_strips_historical_async_payload_but_keeps_visible_assis
                 ),
             ),
         )
+        conn.execute(
+            """
+            INSERT INTO hindsight_retain_turns
+            (bank_id, session_id, parent_session_id, retain_document_id, turn_index, turn_json, created_at, active)
+            VALUES (?, ?, '', ?, 3, ?, 1710003002.0, 1)
+            """,
+            (
+                p._bank_id,
+                p._session_id,
+                p._session_id,
+                json.dumps(
+                    [
+                        {
+                            "role": "user",
+                            "content": (
+                                "User: [Note: model was just switched from gpt-5.6-terra to gpt-5.6-sol "
+                                "via OpenAI Codex. Adjust your self-identification accordingly.]\n\n"
+                                "检查这个 Document"
+                            ),
+                            "timestamp": "2024-01-01T00:00:04",
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "Assistant: 已检查",
+                            "timestamp": "2024-01-01T00:00:05",
+                        },
+                    ],
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO hindsight_retain_turns
+            (bank_id, session_id, parent_session_id, retain_document_id, turn_index, turn_json, created_at, active)
+            VALUES (?, ?, '', ?, 4, ?, 1710003003.0, 1)
+            """,
+            (
+                p._bank_id,
+                p._session_id,
+                p._session_id,
+                json.dumps(
+                    [
+                        {
+                            "role": "user",
+                            "content": "User: " + json.dumps(
+                                [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": "https://example.com/historical.png"},
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "[Note: model was just switched from old-model to new-model "
+                                            "via OpenAI Codex. Adjust your self-identification accordingly.]\n\n"
+                                            "检查历史图片"
+                                        ),
+                                    },
+                                ],
+                                ensure_ascii=False,
+                            ),
+                            "timestamp": "2024-01-01T00:00:06",
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "Assistant: 历史图片已检查",
+                            "timestamp": "2024-01-01T00:00:07",
+                        },
+                    ],
+                    ensure_ascii=False,
+                ),
+            ),
+        )
 
     info = p.retain_persisted_session_lineage()
     p._retain_queue.join()
     assert info["queued"] is True
-    assert info["turn_count"] == 2
+    assert info["turn_count"] == 4
     content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
     assert "user-visible async result" in content
     assert "继续" in content
     assert "已继续" in content
+    assert "检查这个 Document" in content
+    assert "已检查" in content
+    assert "检查历史图片" in content
+    assert "https://example.com/historical.png" in content
     assert content.index("user-visible async result") < content.index("继续")
-    for forbidden in ("ASYNC DELEGATION", "Session Arc Summary", "preserved from compacted history", "FIP noise"):
+    for forbidden in (
+        "ASYNC DELEGATION",
+        "Session Arc Summary",
+        "preserved from compacted history",
+        "model was just switched",
+        "FIP noise",
+    ):
         assert forbidden not in content
