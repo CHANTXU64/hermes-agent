@@ -431,6 +431,36 @@ def test_rewind_hook_marks_persisted_turns_without_flushing_buffer(provider_with
     assert "keep user" in content
     assert "undo user" not in content
 
+
+def test_rewind_counts_user_turns_with_trailing_async_assistant_event(provider_with_config, monkeypatch):
+    from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
+    with _append_capability_lock:
+        _append_capability_cache.clear()
+    monkeypatch.setattr(
+        "plugins.memory.hindsight._fetch_hindsight_api_version",
+        lambda *a, **kw: "0.5.6",
+    )
+    p = provider_with_config(auto_retain=False)
+    p.sync_turn("keep user", "keep assistant")
+    p.sync_turn("undo user", "undo assistant")
+    p.sync_turn(
+        "[ASYNC DELEGATION COMPLETE — deleg_rewind]",
+        "visible async result after undo user",
+    )
+
+    p.on_session_rewind("test-session", turns_undone=1)
+
+    assert len(p._session_turns) == 1
+    info = p.retain_persisted_session_lineage(session_id="test-session")
+    p._retain_queue.join()
+    assert info["queued"] is True
+    assert info["turn_count"] == 1
+    content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+    assert "keep user" in content
+    assert "undo user" not in content
+    assert "visible async result" not in content
+
+
 def test_persisted_retain_ignores_stored_bank_id_and_submits_current_bank(provider_with_config, monkeypatch):
     from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
     with _append_capability_lock:
@@ -910,12 +940,12 @@ def test_modern_api_auto_retain_appends_only_new_turn_after_first_flush(provider
     assert "first-user" not in item["content"]
 
 
-def test_sync_turn_drops_async_delegation_and_compression_noise(provider_with_config):
+def test_sync_turn_drops_async_payload_but_keeps_visible_assistant(provider_with_config):
     p = provider_with_config(auto_retain=False)
 
     p.sync_turn(
         "[ASYNC DELEGATION BATCH COMPLETE — deleg_deadbeef]\nA background fan-out finished.\nFIP draft saved.",
-        "ack async noise",
+        "ack async result visible to the user",
     )
     p.sync_turn(
         "[Your active task list was preserved across context compression]\n- [>] keep researching",
@@ -938,12 +968,14 @@ def test_sync_turn_drops_async_delegation_and_compression_noise(provider_with_co
     )
     p.sync_turn("正式用户消息", "正式回复")
 
-    assert len(p._session_turns) == 2
+    assert len(p._session_turns) == 3
     turns = [json.loads(t) for t in p._session_turns]
-    assert turns[0][0]["content"] == "User: 继续"
-    assert turns[0][1]["content"] == "Assistant: 继续执行"
-    assert turns[1][0]["content"] == "User: 正式用户消息"
-    assert turns[1][1]["content"] == "Assistant: 正式回复"
+    assert [message["role"] for message in turns[0]] == ["assistant"]
+    assert turns[0][0]["content"] == "Assistant: ack async result visible to the user"
+    assert turns[1][0]["content"] == "User: 继续"
+    assert turns[1][1]["content"] == "Assistant: 继续执行"
+    assert turns[2][0]["content"] == "User: 正式用户消息"
+    assert turns[2][1]["content"] == "Assistant: 正式回复"
 
     blob = "\n".join(p._session_turns)
     for forbidden in (
@@ -953,11 +985,13 @@ def test_sync_turn_drops_async_delegation_and_compression_noise(provider_with_co
         "Session Arc Summary",
         "preserved from compacted history",
         "FIP draft saved",
+        "ack todo noise",
+        "ack externalized noise",
     ):
         assert forbidden not in blob
 
 
-def test_transcript_sync_strips_runtime_noise_and_keeps_real_user_text(provider_with_config):
+def test_transcript_sync_strips_runtime_payload_and_keeps_visible_results(provider_with_config):
     p = provider_with_config(auto_retain=False)
     messages = [
         {
@@ -1008,19 +1042,22 @@ def test_transcript_sync_strips_runtime_noise_and_keeps_real_user_text(provider_
 
     p.sync_turn("ignored scalar", "ignored scalar", messages=messages)
 
-    assert len(p._session_turns) == 2
+    assert len(p._session_turns) == 3
     turns = [json.loads(t) for t in p._session_turns]
-    assert turns[0][0]["content"] == "User: 继续"
-    assert turns[0][0]["timestamp"] == _local_seconds(1710001002.0)
-    assert turns[0][1]["content"] == "Assistant: 已继续"
-    assert turns[1][0]["content"] == "User: 提交你的修改"
-    assert turns[1][1]["content"] == "Assistant: 已提交"
+    assert [message["role"] for message in turns[0]] == ["assistant"]
+    assert turns[0][0]["content"] == "Assistant: async result noted"
+    assert turns[1][0]["content"] == "User: 继续"
+    assert turns[1][0]["timestamp"] == _local_seconds(1710001002.0)
+    assert turns[1][1]["content"] == "Assistant: 已继续"
+    assert turns[2][0]["content"] == "User: 提交你的修改"
+    assert turns[2][1]["content"] == "Assistant: 已提交"
 
     info = p.retain_persisted_session_lineage()
     p._retain_queue.join()
     assert info["queued"] is True
-    assert info["turn_count"] == 2
+    assert info["turn_count"] == 3
     content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+    assert "async result noted" in content
     assert "继续" in content
     assert "提交你的修改" in content
     for forbidden in (
@@ -1032,6 +1069,151 @@ def test_transcript_sync_strips_runtime_noise_and_keeps_real_user_text(provider_
         "ignored scalar",
     ):
         assert forbidden not in content
+
+
+def test_transcript_sync_drops_async_payload_but_keeps_visible_assistant_in_order(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    messages = [
+        {"role": "user", "content": "先把方案跑完", "timestamp": 1710001100.0},
+        {"role": "assistant", "content": "新版实测已经跑完，等待独立复核。", "timestamp": 1710001101.0},
+        {
+            "role": "user",
+            "content": (
+                "[ASYNC DELEGATION BATCH COMPLETE — deleg_visible]\n"
+                "INTERNAL ASYNC PAYLOAD THAT MUST NOT BE RETAINED"
+            ),
+            "timestamp": 1710001102.0,
+        },
+        {
+            "role": "assistant",
+            "content": "## 重新跑完了\n这是用户实际看见的正式结论。",
+            "timestamp": 1710001103.0,
+        },
+        {"role": "user", "content": "先说最终结论", "timestamp": 1710001104.0},
+        {"role": "assistant", "content": "最终结论保持原样。", "timestamp": 1710001105.0},
+    ]
+
+    p.sync_turn("ignored scalar", "ignored scalar", messages=messages)
+
+    assert len(p._session_turns) == 3
+    turns = [json.loads(turn) for turn in p._session_turns]
+    assert [message["role"] for message in turns[0]] == ["user", "assistant"]
+    assert [message["role"] for message in turns[1]] == ["assistant"]
+    assert turns[1][0]["content"] == "Assistant: ## 重新跑完了\n这是用户实际看见的正式结论。"
+    assert [message["role"] for message in turns[2]] == ["user", "assistant"]
+
+    info = p.retain_persisted_session_lineage()
+    p._retain_queue.join()
+    assert info["queued"] is True
+    content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+    assert "ASYNC DELEGATION" not in content
+    assert "INTERNAL ASYNC PAYLOAD" not in content
+    assert content.index("新版实测已经跑完") < content.index("重新跑完了") < content.index("先说最终结论")
+
+
+def test_transcript_sync_keeps_last_visible_assistant_after_async_completion(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    messages = [
+        {
+            "role": "user",
+            "content": "[ASYNC DELEGATION COMPLETE — deleg_last]",
+            "timestamp": 1710001200.0,
+        },
+        {
+            "role": "assistant",
+            "content": "intermediate assistant draft",
+            "timestamp": 1710001201.0,
+        },
+        {
+            "role": "assistant",
+            "content": "final user-visible async result",
+            "timestamp": 1710001202.0,
+        },
+    ]
+
+    p.sync_turn("ignored scalar", "ignored scalar", messages=messages)
+
+    assert len(p._session_turns) == 1
+    turn = json.loads(p._session_turns[0])
+    assert [message["role"] for message in turn] == ["assistant"]
+    assert turn[0]["content"] == "Assistant: final user-visible async result"
+    assert "intermediate assistant draft" not in p._session_turns[0]
+
+
+def test_async_completion_does_not_pair_visible_assistant_with_prior_orphan_user(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    messages = [
+        {
+            "role": "user",
+            "content": "earlier interrupted user request",
+            "timestamp": 1710001300.0,
+        },
+        {
+            "role": "user",
+            "content": "[ASYNC DELEGATION COMPLETE — deleg_orphan]",
+            "timestamp": 1710001301.0,
+        },
+        {
+            "role": "assistant",
+            "content": "visible result from the async completion",
+            "timestamp": 1710001302.0,
+        },
+        {
+            "role": "user",
+            "content": "next real user request",
+            "timestamp": 1710001303.0,
+        },
+        {
+            "role": "assistant",
+            "content": "next real assistant response",
+            "timestamp": 1710001304.0,
+        },
+    ]
+
+    p.sync_turn("ignored scalar", "ignored scalar", messages=messages)
+
+    turns = [json.loads(turn) for turn in p._session_turns]
+    assert [[message["role"] for message in turn] for turn in turns] == [
+        ["user"],
+        ["assistant"],
+        ["user", "assistant"],
+    ]
+    assert turns[0][0]["content"] == "User: earlier interrupted user request"
+    assert turns[1][0]["content"] == "Assistant: visible result from the async completion"
+    assert turns[2][0]["content"] == "User: next real user request"
+
+
+def test_partial_replay_anchor_prefers_timestamp_identity_for_repeated_text(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+
+    def assistant_event(content, timestamp):
+        return json.dumps(
+            [{"role": "assistant", "content": f"Assistant: {content}", "timestamp": timestamp}],
+            ensure_ascii=False,
+        )
+
+    existing = [
+        assistant_event("same repeated result", "2026-07-16T01:00:00"),
+        assistant_event("existing middle event", "2026-07-16T01:01:00"),
+        assistant_event("same repeated result", "2026-07-16T01:02:00"),
+        assistant_event("later exact anchor", "2026-07-16T01:03:00"),
+    ]
+    incoming = [
+        assistant_event("new event before second repeat", "2026-07-16T01:01:30"),
+        assistant_event("same repeated result", "2026-07-16T01:02:00"),
+        assistant_event("later exact anchor", "2026-07-16T01:03:00"),
+    ]
+
+    merged = p._merge_overlapping_replayed_turns(existing, incoming)
+
+    assert merged is not None
+    assert [json.loads(turn)[0]["content"] for turn in merged] == [
+        "Assistant: same repeated result",
+        "Assistant: existing middle event",
+        "Assistant: new event before second repeat",
+        "Assistant: same repeated result",
+        "Assistant: later exact anchor",
+    ]
 
 
 def test_lcm_durable_and_depth_summaries_are_dropped(provider_with_config):
@@ -1064,7 +1246,7 @@ def test_assistant_summary_markers_are_not_retained(provider_with_config):
     assert "Session Arc Summary" not in p._session_turns[0]
 
 
-def test_clean_on_retain_rewrites_historical_noise_rows(provider_with_config):
+def test_clean_on_retain_strips_historical_async_payload_but_keeps_visible_assistant(provider_with_config):
     p = provider_with_config(auto_retain=False)
     # Simulate pre-fix dirty rows already in sqlite.
     with p._retain_store_connect() as conn:
@@ -1087,7 +1269,7 @@ def test_clean_on_retain_rewrites_historical_noise_rows(provider_with_config):
                         },
                         {
                             "role": "assistant",
-                            "content": "Assistant: ack noise",
+                            "content": "Assistant: user-visible async result",
                             "timestamp": "2024-01-01T00:00:01",
                         },
                     ],
@@ -1129,9 +1311,11 @@ def test_clean_on_retain_rewrites_historical_noise_rows(provider_with_config):
     info = p.retain_persisted_session_lineage()
     p._retain_queue.join()
     assert info["queued"] is True
-    assert info["turn_count"] == 1
+    assert info["turn_count"] == 2
     content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+    assert "user-visible async result" in content
     assert "继续" in content
     assert "已继续" in content
+    assert content.index("user-visible async result") < content.index("继续")
     for forbidden in ("ASYNC DELEGATION", "Session Arc Summary", "preserved from compacted history", "FIP noise"):
         assert forbidden not in content

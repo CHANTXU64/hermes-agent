@@ -45,6 +45,16 @@ hindsight_retain_turns
 ]
 ```
 
+通常一行对应一个 `user → assistant` turn。内部 async completion 触发后如果产生用户实际看见的正式 assistant 结果，该结果会单独保存为 assistant-only event：
+
+```json
+[
+  {"role": "assistant", "content": "Assistant: ...", "timestamp": "..."}
+]
+```
+
+这避免把内部 runtime payload 写入 Document，也不虚构一条用户原话。
+
 ## 命令
 
 ```text
@@ -57,9 +67,9 @@ hindsight_retain_turns
 
 - 每个完成 turn 的 `sync_turn()` 都会先把同源 retain payload 写入 `hindsight/retain_turns.sqlite3`。
 - 当 `sync_turn()` 收到 `messages` transcript 时，优先从完整 transcript 构建 retain turns，而不是只使用最终 `user_content` / `assistant_content` 标量对。这样 gateway 中一个长任务先收到用户 A、后被用户 B 打断并最终完成时，persisted document 仍从 A 开始。
-- transcript replay 写入前会先镜像 `retain_turns.sqlite3` 中当前逻辑 document 的 `active=1` rows 到内存 buffer；provider 重启或压缩切换后再次收到完整 transcript 时，只追加新 tail turn，不重复写入已持久化历史 turns。
-- transcript 构建会过滤 tool output、assistant tool-call stub、`[Recent Summary ...]`、`Operation interrupted:` 通知、空 assistant 消息和同一 user segment 中的中间 assistant 草稿，只保留最后用户可见 assistant。
-- 2026-07-10 起额外过滤运行时合成注入：`[Session Arc Summary ...]`、`[Durable Summary ...]`、`[Depth-N Summary ...]`、`[Current user objective preserved from compacted history]`、`[Your active task list was preserved across context compression]`、`[Externalized payload: ...]`、`[ASYNC DELEGATION BATCH COMPLETE ...]`、`[ASYNC DELEGATION COMPLETE ...]`、`[OUT-OF-BAND USER MESSAGE ...]`。纯噪声消息整段丢弃；夹带真实用户原话时只保留残留真实文本。assistant 侧同类摘要/interrupt 也不入档。`/retain` 提交前会对历史 `turn_json` 再清洗（clean-on-retain）。标量 `sync_turn(user, assistant)` 走同一清洗器。过滤按 marker，不按业务词。
+- transcript replay 写入前会先镜像 `retain_turns.sqlite3` 中当前逻辑 document 的 `active=1` rows 到内存 buffer；provider 重启或压缩切换后再次收到 full transcript 或只含尾部的压缩窗口时，通过 role/content 锚点识别已持久化 turns，只把新出现的 async assistant-only events 按窗口顺序合并进完整历史。合并会软停用旧 rows、保留已匹配 root/child rows 的 session 归属，并写入一份顺序正确的新 active sequence；下一次自动 retain（包括未到阈值就发生 session switch 的旧 buffer flush）强制使用 `replace`，避免把窗口以 `append` 再重复一次。带时间戳的 event identity 用于区分合法重复文本；时间重叠但没有精确锚点的窗口不会自动追加。旧 rows 的 `retain_document_id` 为空时，通过已解析 lineage 软停用。
+- transcript 构建会过滤 tool output、assistant tool-call stub、`[Recent Summary ...]`、`Operation interrupted:` 通知、空 assistant 消息和同一 user segment 中的中间 assistant 草稿。真实 user segment 只保留最后用户可见 assistant；async completion 后的最后一个 eligible 用户可见正式 assistant 结果按原顺序保留为 assistant-only event。async marker 前若存在 orphan real user，会先单独保存该 user，避免把 async result 错配给它。
+- 2026-07-10 起额外过滤运行时合成注入：`[Session Arc Summary ...]`、`[Durable Summary ...]`、`[Depth-N Summary ...]`、`[Current user objective preserved from compacted history]`、`[Your active task list was preserved across context compression]`、`[Externalized payload: ...]`、`[ASYNC DELEGATION BATCH COMPLETE ...]`、`[ASYNC DELEGATION COMPLETE ...]`、`[OUT-OF-BAND USER MESSAGE ...]`。2026-07-16 起 async completion 只丢内部 payload，保留其后的用户可见 assistant 结果；其它纯噪声消息整段丢弃，夹带真实用户原话时只保留残留真实文本。assistant 侧同类摘要/interrupt 也不入档。`/retain` 提交前会对历史 `turn_json` 再清洗（clean-on-retain），并用相同规则保留历史 async visible assistant。标量 `sync_turn(user, assistant)` 走同一规则。过滤按 marker，不按业务词。
 - retained turn rows 带 `active` 标记；正常写入为 `active=1`。
 - `auto_retain=true` 时，自动提交逻辑仍按原机制运行。
 - `auto_retain=false` 时，只写本地 SQLite，不自动提交到 Hindsight。
@@ -88,7 +98,7 @@ hindsight_retain_turns
 
 Hindsight 收到 rewind 后：
 
-- 在 `hindsight_retain_turns` 中把当前 session 最后 N 个 `active=1` rows 标为 `active=0`，并写入 `rewound_at`。
+- 在 `hindsight_retain_turns` 中按真实 user turn 计数回退，把对应后缀 rows 标为 `active=0` 并写入 `rewound_at`；若后缀含 assistant-only async result，也随所属回退后缀一起排除。
 - `/retain` 读取 persisted turns 时只读取 `active=1` rows。
 - 不硬删除 rows，保留本地审计能力。
 - 截断当前 provider 的内存 retain buffer，并重置 queued/flushed/pending/generation 状态。
@@ -176,10 +186,11 @@ bank_id = current configured bank
 - 即使 SessionDB 中存在 LCM/压缩生成的 `[Recent Summary ...]` 消息，`/retain` 也不会把它当作 Hindsight Document 内容源。
 - `sync_turn()` 会持久化和自动 retain 同源的 turn payload。
 - `sync_turn(..., messages=...)` 会通过完整流程测试验证：gateway interrupt / 多用户消息同一完成 turn 时，Hindsight Document `original_text` 从真实第一条用户消息开始，而不是从后来的纠偏消息开始。
+- async completion 回归会验证内部 payload 不进入 persisted/manual retain，最后一个用户可见 final assistant 以 assistant-only event 保留，prior orphan user 不会被误配，并且后续真实 user/assistant 顺序不变；clean-on-retain 对历史 dirty async turn 使用相同规则。Restart/partial replay 回归还验证 pre-fix 中间缺口会合并进完整 persisted history，软替换本地 active rows，自动 retain 使用 `replace`，不会产生 `old + replay window` 重复乱序。
 - Manual `/retain` 会按 `retain_document_id` 聚合同一压缩 logical document；即使 B/C 在 SessionDB 中表现为 siblings，也能从 C retain 到 A+B+C。
 - 旧 row 后续写入空 `parent_session_id` 时，lineage fallback 会使用早先非空 parent，而不是被空 parent 截断。
 - local `bank_id` differences in `retain_turns.sqlite3` do not exclude persisted turns; `/retain` submits all matching session lineage turns to the currently configured Hindsight bank.
-- `/undo N` marks the current session's last N active persisted retain rows inactive; manual `/retain` skips inactive rows while still preserving compression siblings that share the same `retain_document_id`.
+- `/undo N` counts the current session's last N real user turns, marks their persisted suffix inactive (including trailing assistant-only async results), and manual `/retain` skips inactive rows while still preserving compression siblings that share the same `retain_document_id`.
 - Hindsight rewind handling does not run flush-on-switch, so `/undo` does not enqueue stale buffered turns as a side effect.
 - Manual `/retain` submits a clean item containing `content` and configured `context`, with no extra metadata/tags.
 - 没有 persisted turns 时不提交。

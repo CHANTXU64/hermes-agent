@@ -305,6 +305,563 @@ def test_hindsight_transcript_replay_after_provider_restart_dedupes_existing_per
         provider2.shutdown()
 
 
+@pytest.mark.parametrize("legacy_empty_document_id", [False, True])
+def test_hindsight_transcript_replay_reconciles_pre_fix_async_gap_without_duplicates(
+    tmp_path,
+    monkeypatch,
+    legacy_empty_document_id,
+):
+    """A fixed transcript may insert an async assistant event between old rows.
+
+    Pre-fix persisted turns omitted that event. A restarted provider must
+    reconcile the active persisted view to the fixed transcript instead of
+    appending the whole transcript after the old rows.
+    """
+    session_id = "restart-replay-async-gap-session"
+    first_pair = [
+        {"role": "user", "content": "first request before async gap", "timestamp": 1710000200.0},
+        {"role": "assistant", "content": "first answer before async gap", "timestamp": 1710000201.0},
+    ]
+    second_pair = [
+        {"role": "user", "content": "second request after async gap", "timestamp": 1710000204.0},
+        {"role": "assistant", "content": "second answer after async gap", "timestamp": 1710000205.0},
+    ]
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content="second request after async gap",
+        assistant_content="second answer after async gap",
+        session_id=session_id,
+        messages=[*first_pair, *second_pair],
+    )
+    provider1.shutdown()
+    if legacy_empty_document_id:
+        with provider1._retain_store_connect() as conn:
+            conn.execute(
+                "UPDATE hindsight_retain_turns SET retain_document_id = '' WHERE session_id = ?",
+                (session_id,),
+            )
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    fixed_transcript = [
+        *first_pair,
+        {
+            "role": "user",
+            "content": "[ASYNC DELEGATION COMPLETE — deleg_historical_gap]",
+            "timestamp": 1710000202.0,
+        },
+        {
+            "role": "assistant",
+            "content": "visible assistant restored in historical gap",
+            "timestamp": 1710000203.0,
+        },
+        *second_pair,
+        {"role": "user", "content": "third request after restart", "timestamp": 1710000206.0},
+        {"role": "assistant", "content": "third answer after restart", "timestamp": 1710000207.0},
+    ]
+
+    try:
+        provider2.sync_turn(
+            user_content="third request after restart",
+            assistant_content="third answer after restart",
+            session_id=session_id,
+            messages=fixed_transcript,
+        )
+        info = provider2.retain_persisted_session_lineage(session_id=session_id)
+        provider2._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["turn_count"] == 4
+        with provider2._retain_store_connect() as conn:
+            active_count = conn.execute(
+                "SELECT COUNT(*) FROM hindsight_retain_turns WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()[0]
+        assert active_count == 4
+        content = client2.aretain_batch.call_args.kwargs["items"][0]["content"]
+        turns = json.loads(content)
+        assert [[message["role"] for message in turn] for turn in turns] == [
+            ["user", "assistant"],
+            ["assistant"],
+            ["user", "assistant"],
+            ["user", "assistant"],
+        ]
+        assert content.count("User: first request before async gap") == 1
+        assert content.count("Assistant: visible assistant restored in historical gap") == 1
+        assert content.count("User: second request after async gap") == 1
+        assert content.count("User: third request after restart") == 1
+        assert "ASYNC DELEGATION" not in content
+    finally:
+        provider2.shutdown()
+
+
+def test_hindsight_partial_replay_merges_missing_async_events_into_persisted_history(
+    tmp_path,
+    monkeypatch,
+):
+    """A compressed active transcript can be only a tail window of persisted history."""
+    session_id = "partial-replay-async-gaps"
+    old_pairs = []
+    for index, label in enumerate(("A", "B", "C", "D")):
+        old_pairs.extend(
+            [
+                {
+                    "role": "user",
+                    "content": f"request {label}",
+                    "timestamp": 1710000500.0 + (index * 10),
+                },
+                {
+                    "role": "assistant",
+                    "content": f"answer {label}",
+                    "timestamp": 1710000501.0 + (index * 10),
+                },
+            ]
+        )
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content="request D",
+        assistant_content="answer D",
+        session_id=session_id,
+        messages=old_pairs,
+    )
+    provider1.shutdown()
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    partial_replay = [
+        {
+            "role": "user",
+            "content": "[ASYNC DELEGATION COMPLETE — deleg_partial_x]",
+            "timestamp": 1710000505.0,
+        },
+        {
+            "role": "assistant",
+            "content": "visible async result X",
+            "timestamp": 1710000506.0,
+        },
+        *old_pairs[2:6],
+        {
+            "role": "user",
+            "content": "[ASYNC DELEGATION COMPLETE — deleg_partial_y]",
+            "timestamp": 1710000525.0,
+        },
+        {
+            "role": "assistant",
+            "content": "visible async result Y",
+            "timestamp": 1710000526.0,
+        },
+        *old_pairs[6:8],
+    ]
+
+    try:
+        provider2.sync_turn(
+            user_content="request D",
+            assistant_content="answer D",
+            session_id=session_id,
+            messages=partial_replay,
+        )
+        info = provider2.retain_persisted_session_lineage(session_id=session_id)
+        provider2._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["turn_count"] == 6
+        content = client2.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert content.count("User: request A") == 1
+        assert content.count("Assistant: visible async result X") == 1
+        assert content.count("User: request B") == 1
+        assert content.count("User: request C") == 1
+        assert content.count("Assistant: visible async result Y") == 1
+        assert content.count("User: request D") == 1
+        assert content.index("User: request A") < content.index("Assistant: visible async result X")
+        assert content.index("Assistant: visible async result X") < content.index("User: request B")
+        assert content.index("User: request C") < content.index("Assistant: visible async result Y")
+        assert content.index("Assistant: visible async result Y") < content.index("User: request D")
+        assert "ASYNC DELEGATION" not in content
+    finally:
+        provider2.shutdown()
+
+
+def test_hindsight_disjoint_new_tail_after_restart_still_appends(
+    tmp_path,
+    monkeypatch,
+):
+    session_id = "restart-disjoint-new-tail"
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content="old request",
+        assistant_content="old answer",
+        session_id=session_id,
+        messages=[
+            {"role": "user", "content": "old request", "timestamp": 1710000600.0},
+            {"role": "assistant", "content": "old answer", "timestamp": 1710000601.0},
+        ],
+    )
+    provider1.shutdown()
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    try:
+        provider2.sync_turn(
+            user_content="new request",
+            assistant_content="new answer",
+            session_id=session_id,
+            messages=[
+                {"role": "user", "content": "new request", "timestamp": 1710000700.0},
+                {"role": "assistant", "content": "new answer", "timestamp": 1710000701.0},
+            ],
+        )
+        info = provider2.retain_persisted_session_lineage(session_id=session_id)
+        provider2._retain_queue.join()
+
+        assert info["turn_count"] == 2
+        assert provider2._retain_force_replace is False
+        content = client2.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert content.count("User: old request") == 1
+        assert content.count("User: new request") == 1
+    finally:
+        provider2.shutdown()
+
+
+@pytest.mark.parametrize("with_new_tail", [False, True])
+def test_hindsight_later_repeated_sequence_after_restart_is_not_swallowed(
+    tmp_path,
+    monkeypatch,
+    with_new_tail,
+):
+    session_id = "restart-later-repeated-sequence"
+    repeated_messages_1 = [
+        {"role": "user", "content": "repeat request A", "timestamp": 1710000800.0},
+        {"role": "assistant", "content": "repeat answer A", "timestamp": 1710000801.0},
+        {"role": "user", "content": "repeat request B", "timestamp": 1710000810.0},
+        {"role": "assistant", "content": "repeat answer B", "timestamp": 1710000811.0},
+    ]
+    repeated_messages_2 = [
+        {"role": "user", "content": "repeat request A", "timestamp": 1710000900.0},
+        {"role": "assistant", "content": "repeat answer A", "timestamp": 1710000901.0},
+        {"role": "user", "content": "repeat request B", "timestamp": 1710000910.0},
+        {"role": "assistant", "content": "repeat answer B", "timestamp": 1710000911.0},
+    ]
+    if with_new_tail:
+        repeated_messages_2.extend(
+            [
+                {"role": "user", "content": "new request C", "timestamp": 1710000920.0},
+                {"role": "assistant", "content": "new answer C", "timestamp": 1710000921.0},
+            ]
+        )
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content="repeat request B",
+        assistant_content="repeat answer B",
+        session_id=session_id,
+        messages=repeated_messages_1,
+    )
+    provider1.shutdown()
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    try:
+        provider2.sync_turn(
+            user_content="repeat request B",
+            assistant_content="repeat answer B",
+            session_id=session_id,
+            messages=repeated_messages_2,
+        )
+        info = provider2.retain_persisted_session_lineage(session_id=session_id)
+        provider2._retain_queue.join()
+
+        assert info["turn_count"] == (5 if with_new_tail else 4)
+        assert provider2._retain_force_replace is False
+        content = client2.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert content.count("User: repeat request A") == 2
+        assert content.count("User: repeat request B") == 2
+        assert content.count("User: new request C") == (1 if with_new_tail else 0)
+    finally:
+        provider2.shutdown()
+
+
+def test_hindsight_auto_retain_replaces_remote_document_after_pre_fix_gap_reconciliation(
+    tmp_path,
+    monkeypatch,
+):
+    session_id = "restart-replay-async-gap-auto-retain"
+    first_pair = [
+        {"role": "user", "content": "first request before remote repair", "timestamp": 1710000300.0},
+        {"role": "assistant", "content": "first answer before remote repair", "timestamp": 1710000301.0},
+    ]
+    second_pair = [
+        {"role": "user", "content": "second request after remote repair", "timestamp": 1710000304.0},
+        {"role": "assistant", "content": "second answer after remote repair", "timestamp": 1710000305.0},
+    ]
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content="second request after remote repair",
+        assistant_content="second answer after remote repair",
+        session_id=session_id,
+        messages=[*first_pair, *second_pair],
+    )
+    provider1.shutdown()
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        auto_retain=True,
+        retain_every_n_turns=1,
+    )
+    fixed_transcript = [
+        *first_pair,
+        {
+            "role": "user",
+            "content": "[ASYNC DELEGATION COMPLETE — deleg_remote_repair]",
+            "timestamp": 1710000302.0,
+        },
+        {
+            "role": "assistant",
+            "content": "visible assistant restored before remote replace",
+            "timestamp": 1710000303.0,
+        },
+        *second_pair,
+    ]
+
+    try:
+        provider2.sync_turn(
+            user_content="second request after remote repair",
+            assistant_content="second answer after remote repair",
+            session_id=session_id,
+            messages=fixed_transcript,
+        )
+        provider2._retain_queue.join()
+
+        assert client2.aretain_batch.call_count == 1
+        assert provider2._retain_force_replace is False
+        call = client2.aretain_batch.call_args
+        item = call.kwargs["items"][0]
+        assert item["update_mode"] == "replace"
+        turns = json.loads(item["content"])
+        assert [[message["role"] for message in turn] for turn in turns] == [
+            ["user", "assistant"],
+            ["assistant"],
+            ["user", "assistant"],
+        ]
+        assert item["content"].count("User: first request before remote repair") == 1
+        assert item["content"].count("Assistant: visible assistant restored before remote replace") == 1
+        assert item["content"].count("User: second request after remote repair") == 1
+    finally:
+        provider2.shutdown()
+
+
+def test_hindsight_session_switch_replaces_remote_after_buffered_gap_reconciliation(
+    tmp_path,
+    monkeypatch,
+):
+    session_id = "restart-replay-gap-before-switch"
+    first_pair = [
+        {"role": "user", "content": "first request before switch repair", "timestamp": 1710000350.0},
+        {"role": "assistant", "content": "first answer before switch repair", "timestamp": 1710000351.0},
+    ]
+    second_pair = [
+        {"role": "user", "content": "second request after switch repair", "timestamp": 1710000354.0},
+        {"role": "assistant", "content": "second answer after switch repair", "timestamp": 1710000355.0},
+    ]
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content="second request after switch repair",
+        assistant_content="second answer after switch repair",
+        session_id=session_id,
+        messages=[*first_pair, *second_pair],
+    )
+    provider1.shutdown()
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        auto_retain=True,
+        retain_every_n_turns=10,
+    )
+    fixed_transcript = [
+        *first_pair,
+        {
+            "role": "user",
+            "content": "[ASYNC DELEGATION COMPLETE — deleg_switch_repair]",
+            "timestamp": 1710000352.0,
+        },
+        {
+            "role": "assistant",
+            "content": "visible assistant restored before session switch",
+            "timestamp": 1710000353.0,
+        },
+        *second_pair,
+    ]
+
+    try:
+        provider2.sync_turn(
+            user_content="second request after switch repair",
+            assistant_content="second answer after switch repair",
+            session_id=session_id,
+            messages=fixed_transcript,
+        )
+        assert provider2._retain_force_replace is True
+        client2.aretain_batch.assert_not_called()
+
+        provider2.on_session_switch("session-after-gap-repair")
+        provider2._retain_queue.join()
+
+        assert client2.aretain_batch.call_count == 1
+        item = client2.aretain_batch.call_args.kwargs["items"][0]
+        assert item["update_mode"] == "replace"
+        assert item["content"].count("User: first request before switch repair") == 1
+        assert item["content"].count("Assistant: visible assistant restored before session switch") == 1
+        assert item["content"].count("User: second request after switch repair") == 1
+    finally:
+        provider2.shutdown()
+
+
+def test_hindsight_replay_reconciliation_preserves_lineage_session_ownership(
+    tmp_path,
+    monkeypatch,
+):
+    root_session = "async-gap-lineage-root"
+    child_session = "async-gap-lineage-child"
+    root_pair = [
+        {
+            "role": "user",
+            "content": "root request before lineage gap",
+            "timestamp": 1710000400.0,
+            "_session_id": root_session,
+        },
+        {
+            "role": "assistant",
+            "content": "root answer before lineage gap",
+            "timestamp": 1710000401.0,
+            "_session_id": root_session,
+        },
+    ]
+    child_pair = [
+        {
+            "role": "user",
+            "content": "child request after lineage gap",
+            "timestamp": 1710000404.0,
+            "_session_id": child_session,
+        },
+        {
+            "role": "assistant",
+            "content": "child answer after lineage gap",
+            "timestamp": 1710000405.0,
+            "_session_id": child_session,
+        },
+    ]
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=root_session,
+    )
+    provider1.sync_turn(
+        user_content="root request before lineage gap",
+        assistant_content="root answer before lineage gap",
+        session_id=root_session,
+        messages=root_pair,
+    )
+    provider1.on_session_switch(child_session, parent_session_id=root_session)
+    provider1.sync_turn(
+        user_content="child request after lineage gap",
+        assistant_content="child answer after lineage gap",
+        session_id=child_session,
+        messages=child_pair,
+    )
+    provider1.shutdown()
+
+    provider2, _client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=child_session,
+        parent_session_id=root_session,
+    )
+    fixed_lineage_transcript = [
+        *root_pair,
+        {
+            "role": "user",
+            "content": "[ASYNC DELEGATION COMPLETE — deleg_lineage_gap]",
+            "timestamp": 1710000402.0,
+            "_session_id": child_session,
+        },
+        {
+            "role": "assistant",
+            "content": "visible child async result in lineage gap",
+            "timestamp": 1710000403.0,
+            "_session_id": child_session,
+        },
+        *child_pair,
+    ]
+
+    try:
+        provider2.sync_turn(
+            user_content="child request after lineage gap",
+            assistant_content="child answer after lineage gap",
+            session_id=child_session,
+            messages=fixed_lineage_transcript,
+        )
+
+        with provider2._retain_store_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, turn_json
+                FROM hindsight_retain_turns
+                WHERE retain_document_id = ? AND active = 1
+                ORDER BY id ASC
+                """,
+                (root_session,),
+            ).fetchall()
+        assert [row[0] for row in rows] == [root_session, child_session, child_session]
+        assert "root request before lineage gap" in rows[0][1]
+        assert "visible child async result in lineage gap" in rows[1][1]
+        assert "child request after lineage gap" in rows[2][1]
+    finally:
+        provider2.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_gateway_retain_document_uses_sessionstore_sessiondb_lineage_and_clean_persisted_turns(
     tmp_path,

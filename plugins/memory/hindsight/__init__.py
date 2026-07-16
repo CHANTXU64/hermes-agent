@@ -746,6 +746,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._last_flushed_turn_count = 0
         self._last_queued_flush_count = 0
         self._retain_flush_pending = False
+        self._retain_force_replace = False
         self._retain_generation = 0
         self._retain_flush_lock = threading.Lock()
 
@@ -1336,6 +1337,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._last_flushed_turn_count = 0
             self._last_queued_flush_count = 0
             self._retain_flush_pending = False
+            self._retain_force_replace = False
         self._mode = self._config.get("mode", "cloud")
         # Read timeout from config or env var, fall back to default
         self._timeout = _parse_int_setting(
@@ -1728,6 +1730,10 @@ class HindsightMemoryProvider(MemoryProvider):
     # conversation documents. Keep this marker-based, not business-topic-based.
     # LCM depth labels: Recent (d0), Session Arc (d1), Durable (d2), Depth-N (d>=3).
     _RETAIN_OBJECTIVE_HEADER = "[Current user objective preserved from compacted history]"
+    _RETAIN_ASYNC_COMPLETION_MARKERS = (
+        "[ASYNC DELEGATION BATCH COMPLETE",
+        "[ASYNC DELEGATION COMPLETE",
+    )
     _RETAIN_NOISE_MARKERS = (
         "[Recent Summary",
         "[Session Arc Summary",
@@ -1736,8 +1742,7 @@ class HindsightMemoryProvider(MemoryProvider):
         _RETAIN_OBJECTIVE_HEADER,
         "[Your active task list was preserved across context compression]",
         "[Externalized payload:",
-        "[ASYNC DELEGATION BATCH COMPLETE",
-        "[ASYNC DELEGATION COMPLETE",
+        *_RETAIN_ASYNC_COMPLETION_MARKERS,
         "[OUT-OF-BAND USER MESSAGE",
     )
 
@@ -1745,6 +1750,11 @@ class HindsightMemoryProvider(MemoryProvider):
     def _starts_with_retain_noise_marker(cls, content: str) -> bool:
         text = (content or "").lstrip()
         return any(text.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS)
+
+    @classmethod
+    def _is_async_completion_user_content(cls, content: Any) -> bool:
+        text = cls._stringify_retain_content(content).lstrip()
+        return any(text.startswith(marker) for marker in cls._RETAIN_ASYNC_COMPLETION_MARKERS)
 
     @classmethod
     def _clean_retain_user_content(cls, content: Any) -> str:
@@ -1824,6 +1834,7 @@ class HindsightMemoryProvider(MemoryProvider):
         assistant_prefix = f"{self._retain_assistant_prefix}: "
         cleaned_msgs: List[Dict[str, Any]] = []
         kept_user = False
+        kept_assistant = False
 
         for msg in payload:
             if not isinstance(msg, dict):
@@ -1834,7 +1845,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 body = content[len(user_prefix):] if content.startswith(user_prefix) else content
                 cleaned_body = self._clean_retain_user_content(body)
                 if not cleaned_body:
-                    # Noise-only user turn: drop the whole turn payload.
+                    if self._is_async_completion_user_content(body):
+                        # Drop the internal trigger payload but keep scanning:
+                        # its final assistant response was visible to the user.
+                        continue
+                    # Other noise-only user turns are dropped as a unit.
                     return None
                 kept_user = True
                 new_msg = dict(msg)
@@ -1845,12 +1860,13 @@ class HindsightMemoryProvider(MemoryProvider):
                 body = content[len(assistant_prefix):] if content.startswith(assistant_prefix) else content
                 if self._is_retain_noise_assistant_content(body):
                     continue
+                kept_assistant = True
                 cleaned_msgs.append(msg)
                 continue
             # Non user/assistant roles are not part of Hindsight turn payloads.
             continue
 
-        if not kept_user or not cleaned_msgs:
+        if not cleaned_msgs or not (kept_user or kept_assistant):
             return None
         return json.dumps(cleaned_msgs, ensure_ascii=False)
 
@@ -1863,10 +1879,26 @@ class HindsightMemoryProvider(MemoryProvider):
             }
         ]
 
+    def _build_orphan_assistant_turn(
+        self,
+        assistant_content: str,
+        *,
+        assistant_timestamp: Any = None,
+    ) -> List[Dict[str, str]]:
+        return [
+            {
+                "role": "assistant",
+                "content": f"{self._retain_assistant_prefix}: {assistant_content}",
+                "timestamp": self._retain_message_timestamp(assistant_timestamp),
+            }
+        ]
+
     def _build_turn_group_from_conversation_messages(self, messages: List[Dict[str, Any]]) -> List[str]:
         turns: List[str] = []
         pending_user: tuple[str, Any] | None = None
         pending_assistant: tuple[str, Any] | None = None
+        pending_async_completion = False
+        pending_async_assistant: tuple[str, Any] | None = None
 
         def _flush_pending_turn() -> None:
             nonlocal pending_user, pending_assistant
@@ -1892,6 +1924,21 @@ class HindsightMemoryProvider(MemoryProvider):
             pending_user = None
             pending_assistant = None
 
+        def _flush_pending_async_assistant() -> None:
+            nonlocal pending_async_completion, pending_async_assistant
+            if not pending_async_assistant:
+                return
+            assistant_content, assistant_timestamp = pending_async_assistant
+            turns.append(json.dumps(
+                self._build_orphan_assistant_turn(
+                    assistant_content,
+                    assistant_timestamp=assistant_timestamp,
+                ),
+                ensure_ascii=False,
+            ))
+            pending_async_completion = False
+            pending_async_assistant = None
+
         for msg in messages or []:
             role = str(msg.get("role") or "").strip()
             content = self._stringify_retain_content(msg.get("content")).strip()
@@ -1901,22 +1948,36 @@ class HindsightMemoryProvider(MemoryProvider):
                 cleaned_user = self._clean_retain_user_content(content)
                 if not cleaned_user:
                     # Synthetic user injections are not conversation turns.
-                    # If a prior real user already has a final assistant, close
-                    # that turn first. If the prior real user is still orphaned
-                    # (gateway interrupt), keep it and wait for the next real
-                    # user/final assistant.
-                    if pending_user and pending_assistant:
+                    # A completed real turn closes normally. An async marker
+                    # also closes a prior orphan user before collecting its own
+                    # visible assistant, so the async result cannot be falsely
+                    # paired with that earlier user.
+                    is_async_completion = self._is_async_completion_user_content(content)
+                    if pending_user and (pending_assistant or is_async_completion):
                         _flush_pending_turn()
+                    _flush_pending_async_assistant()
+                    pending_async_completion = is_async_completion
                     continue
+                _flush_pending_async_assistant()
                 _flush_pending_turn()
+                pending_async_completion = False
                 pending_user = (cleaned_user, msg.get("_timestamp", msg.get("timestamp")))
                 pending_assistant = None
                 continue
             if role == "assistant" and self._is_retain_noise_assistant_content(content):
                 continue
-            if role != "assistant" or not pending_user:
+            if role != "assistant":
                 continue
             if msg.get("tool_calls") or msg.get("finish_reason") == "tool_calls":
+                continue
+            if not pending_user:
+                if pending_async_completion:
+                    # Mirror normal user segments: retain the last eligible
+                    # assistant, not an intermediate progress/draft message.
+                    pending_async_assistant = (
+                        content,
+                        msg.get("_timestamp", msg.get("timestamp")),
+                    )
                 continue
             # A single user turn can have intermediate assistant scratch or
             # progress messages before the final user-visible response is
@@ -1925,6 +1986,7 @@ class HindsightMemoryProvider(MemoryProvider):
             pending_assistant = (content, msg.get("_timestamp", msg.get("timestamp")))
 
         _flush_pending_turn()
+        _flush_pending_async_assistant()
         return turns
 
     @staticmethod
@@ -1942,6 +2004,116 @@ class HindsightMemoryProvider(MemoryProvider):
                 continue
             canonical.append((str(msg.get("role") or ""), str(msg.get("content") or "")))
         return tuple(canonical)
+
+    @staticmethod
+    def _retain_turn_replay_identity(turn_json: str) -> tuple:
+        try:
+            payload = json.loads(turn_json)
+        except Exception:
+            return tuple()
+        if not isinstance(payload, list):
+            return tuple()
+        identity = []
+        for msg in payload:
+            if not isinstance(msg, dict):
+                continue
+            identity.append(
+                (
+                    str(msg.get("role") or ""),
+                    str(msg.get("content") or ""),
+                    str(msg.get("timestamp") or ""),
+                )
+            )
+        return tuple(identity)
+
+    @classmethod
+    def _retain_turn_replay_timestamp(cls, turn_json: str) -> str:
+        identity = cls._retain_turn_replay_identity(turn_json)
+        return str(identity[0][2]) if identity else ""
+
+    @classmethod
+    def _merge_overlapping_replayed_turns(
+        cls,
+        existing_turns: List[str],
+        incoming_turns: List[str],
+    ) -> List[str] | None:
+        """Merge an anchored partial transcript window into persisted history."""
+        existing_ids = [cls._retain_turn_replay_identity(turn) for turn in existing_turns]
+        incoming_ids = [cls._retain_turn_replay_identity(turn) for turn in incoming_turns]
+        existing_canonical = [cls._retain_turn_canonical(turn) for turn in existing_turns]
+        incoming_canonical = [cls._retain_turn_canonical(turn) for turn in incoming_turns]
+        matched_pairs: list[tuple[int, int]] = []
+        existing_cursor = 0
+        for incoming_index, incoming_value in enumerate(incoming_canonical):
+            if not incoming_value:
+                continue
+            candidates = [
+                existing_index
+                for existing_index in range(existing_cursor, len(existing_canonical))
+                if incoming_value == existing_canonical[existing_index]
+            ]
+            if not candidates:
+                continue
+            exact_identity = next(
+                (
+                    existing_index
+                    for existing_index in candidates
+                    if incoming_ids[incoming_index] == existing_ids[existing_index]
+                ),
+                None,
+            )
+            existing_index = exact_identity if exact_identity is not None else candidates[0]
+            matched_pairs.append((incoming_index, existing_index))
+            existing_cursor = existing_index + 1
+        if not matched_pairs:
+            return None
+
+        merged: list[str] = []
+        seen_ids = set(existing_ids)
+        incoming_cursor = 0
+        existing_cursor = 0
+        for incoming_index, existing_index in matched_pairs:
+            merged.extend(existing_turns[existing_cursor:existing_index])
+            for candidate_index in range(incoming_cursor, incoming_index):
+                if incoming_ids[candidate_index] not in seen_ids:
+                    merged.append(incoming_turns[candidate_index])
+                    seen_ids.add(incoming_ids[candidate_index])
+            merged.append(existing_turns[existing_index])
+            incoming_cursor = incoming_index + 1
+            existing_cursor = existing_index + 1
+
+        existing_tail = existing_turns[existing_cursor:]
+        incoming_tail: list[str] = []
+        for index in range(incoming_cursor, len(incoming_turns)):
+            if incoming_ids[index] in seen_ids:
+                continue
+            incoming_tail.append(incoming_turns[index])
+            seen_ids.add(incoming_ids[index])
+        if not existing_tail:
+            merged.extend(incoming_tail)
+            return merged
+        if not incoming_tail:
+            merged.extend(existing_tail)
+            return merged
+
+        # Both sides have an unmatched tail. Preserve each side's order and use
+        # timestamps only to interleave the tails; anchored middle blocks above
+        # intentionally follow transcript order because rehydrated timestamps
+        # can differ from the provider-owned persisted timestamps.
+        existing_tail_cursor = 0
+        incoming_tail_cursor = 0
+        while existing_tail_cursor < len(existing_tail) and incoming_tail_cursor < len(incoming_tail):
+            existing_timestamp = cls._retain_turn_replay_timestamp(existing_tail[existing_tail_cursor])
+            incoming_timestamp = cls._retain_turn_replay_timestamp(incoming_tail[incoming_tail_cursor])
+            if incoming_timestamp and existing_timestamp and incoming_timestamp < existing_timestamp:
+                merged.append(incoming_tail[incoming_tail_cursor])
+                incoming_tail_cursor += 1
+            else:
+                merged.append(existing_tail[existing_tail_cursor])
+                existing_tail_cursor += 1
+        merged.extend(existing_tail[existing_tail_cursor:])
+        merged.extend(incoming_tail[incoming_tail_cursor:])
+        return merged
 
     def _dedupe_replayed_turn_groups(self, turn_groups: List[List[str]]) -> List[str]:
         """Remove only exact parent/child boundary replay overlap.
@@ -2123,6 +2295,163 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("Hindsight retain store write failed: %s", e, exc_info=True)
 
+    def _replace_active_persisted_turns(
+        self,
+        turns: List[str],
+        *,
+        lineage_session_ids: List[str],
+        retain_document_id: str,
+    ) -> bool:
+        """Soft-replace a reconciled replay while preserving lineage ownership."""
+        sid = str(self._session_id or "").strip()
+        if not sid or not turns:
+            return False
+        lineage = [str(value).strip() for value in lineage_session_ids if str(value).strip()]
+        if not lineage:
+            lineage = [sid]
+        document_id = str(retain_document_id or self._retain_document_id or sid).strip() or sid
+        now = time.time()
+        try:
+            with self._retain_store_connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT bank_id, session_id, parent_session_id, turn_json
+                    FROM hindsight_retain_turns
+                    WHERE retain_document_id = ? AND active = 1
+                    ORDER BY id ASC
+                    """,
+                    (document_id,),
+                ).fetchall()
+                matched_by_document = bool(rows)
+                if not rows:
+                    placeholders = ",".join("?" for _ in lineage)
+                    rows = conn.execute(
+                        f"""
+                        SELECT bank_id, session_id, parent_session_id, turn_json
+                        FROM hindsight_retain_turns
+                        WHERE active = 1 AND session_id IN ({placeholders})
+                        ORDER BY id ASC
+                        """,
+                        tuple(lineage),
+                    ).fetchall()
+                if not rows:
+                    return False
+
+                old_entries: list[tuple[tuple, tuple[str, str, str]]] = []
+                for bank_id, row_session_id, row_parent_session_id, turn_json in rows:
+                    cleaned = self._sanitize_persisted_turn_json(str(turn_json or ""))
+                    if not cleaned:
+                        continue
+                    old_entries.append(
+                        (
+                            self._retain_turn_replay_identity(cleaned),
+                            (
+                                str(bank_id or self._bank_id),
+                                str(row_session_id or sid),
+                                str(row_parent_session_id or ""),
+                            ),
+                        )
+                    )
+                if not old_entries:
+                    return False
+
+                incoming = [(turn_json, self._retain_turn_replay_identity(turn_json)) for turn_json in turns]
+                owners: dict[int, tuple[str, str, str]] = {}
+                old_index = 0
+                for incoming_index, (_turn_json, identity) in enumerate(incoming):
+                    if identity == old_entries[old_index][0]:
+                        owners[incoming_index] = old_entries[old_index][1]
+                        old_index += 1
+                        if old_index == len(old_entries):
+                            break
+                if old_index != len(old_entries):
+                    return False
+
+                # Missing events belong to the next matched session segment;
+                # trailing additions belong to the active session.
+                next_owner: tuple[str, str, str] | None = None
+                active_owner = (self._bank_id, sid, self._parent_session_id)
+                for incoming_index in range(len(incoming) - 1, -1, -1):
+                    if incoming_index in owners:
+                        next_owner = owners[incoming_index]
+                    else:
+                        owners[incoming_index] = next_owner or active_owner
+
+                if matched_by_document:
+                    conn.execute(
+                        """
+                        UPDATE hindsight_retain_turns
+                        SET active = 0, rewound_at = ?
+                        WHERE retain_document_id = ? AND active = 1
+                        """,
+                        (now, document_id),
+                    )
+                else:
+                    placeholders = ",".join("?" for _ in lineage)
+                    conn.execute(
+                        f"""
+                        UPDATE hindsight_retain_turns
+                        SET active = 0, rewound_at = ?
+                        WHERE active = 1 AND session_id IN ({placeholders})
+                        """,
+                        (now, *lineage),
+                    )
+                per_session_index: dict[str, int] = {}
+                for incoming_index, (turn_json, _canonical) in enumerate(incoming):
+                    owner_bank, owner_session, owner_parent = owners[incoming_index]
+                    per_session_index[owner_session] = per_session_index.get(owner_session, 0) + 1
+                    conn.execute(
+                        """
+                        INSERT INTO hindsight_retain_turns
+                        (bank_id, session_id, parent_session_id, retain_document_id,
+                         turn_index, turn_json, created_at, active)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                        """,
+                        (
+                            owner_bank,
+                            owner_session,
+                            owner_parent,
+                            document_id,
+                            per_session_index[owner_session],
+                            turn_json,
+                            now + ((incoming_index + 1) * 0.000001),
+                        ),
+                    )
+            return True
+        except Exception as e:
+            logger.warning("Hindsight retain store replay reconciliation failed: %s", e, exc_info=True)
+            return False
+
+    def _retain_turn_contains_real_user(self, turn_json: str) -> bool:
+        try:
+            payload = json.loads(turn_json)
+        except Exception:
+            return False
+        if not isinstance(payload, list):
+            return False
+        user_prefix = f"{self._retain_user_prefix}: "
+        for msg in payload:
+            if not isinstance(msg, dict) or str(msg.get("role") or "").strip() != "user":
+                continue
+            content = self._stringify_retain_content(msg.get("content"))
+            body = content[len(user_prefix):] if content.startswith(user_prefix) else content
+            if self._clean_retain_user_content(body):
+                return True
+        return False
+
+    def _retain_rewind_suffix_size(self, turns: List[str], user_turns: int) -> int:
+        if not turns:
+            return 0
+        remaining = max(1, int(user_turns))
+        for suffix_size, turn_json in enumerate(reversed(turns), 1):
+            if self._retain_turn_contains_real_user(turn_json):
+                remaining -= 1
+                if remaining == 0:
+                    return suffix_size
+        # Match the old best-effort behavior when the caller asks to rewind
+        # more user turns than this local buffer currently contains.
+        return len(turns)
+
     def mark_persisted_turns_rewound(self, session_id: str, turns_undone: int = 1) -> int:
         """Soft-exclude the last N active persisted turns for a session.
 
@@ -2143,16 +2472,19 @@ class HindsightMemoryProvider(MemoryProvider):
             with self._retain_store_connect() as conn:
                 rows = conn.execute(
                     """
-                    SELECT id
+                    SELECT id, turn_json
                     FROM hindsight_retain_turns
                     WHERE session_id = ?
                       AND active = 1
-                    ORDER BY id DESC
-                    LIMIT ?
+                    ORDER BY id ASC
                     """,
-                    (sid, limit),
+                    (sid,),
                 ).fetchall()
-                ids = [int(row[0]) for row in rows]
+                suffix_size = self._retain_rewind_suffix_size(
+                    [str(row[1]) for row in rows],
+                    limit,
+                )
+                ids = [int(row[0]) for row in rows[-suffix_size:]] if suffix_size else []
                 if not ids:
                     return 0
                 placeholders = ",".join("?" for _ in ids)
@@ -2178,7 +2510,8 @@ class HindsightMemoryProvider(MemoryProvider):
         if count < 1:
             count = 1
         if sid == self._session_id:
-            keep = max(0, len(self._session_turns) - count)
+            remove_count = self._retain_rewind_suffix_size(self._session_turns, count)
+            keep = max(0, len(self._session_turns) - remove_count)
             self._session_turns = self._session_turns[:keep]
             with self._retain_flush_lock:
                 self._retain_generation += 1
@@ -2549,6 +2882,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 }
 
             document_id, update_mode = self._resolve_retain_target(self._document_id)
+            force_replace = self._retain_force_replace
+            if force_replace and update_mode == "append":
+                update_mode = "replace"
             if update_mode == "append" and self._retain_flush_pending:
                 return {
                     "queued": False,
@@ -2614,6 +2950,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 with self._retain_flush_lock:
                     if self._retain_generation == retain_generation:
                         self._last_flushed_turn_count = max(self._last_flushed_turn_count, flush_up_to)
+                        if force_replace:
+                            self._retain_force_replace = False
                 logger.debug("Hindsight retain succeeded")
             except Exception:
                 with self._retain_flush_lock:
@@ -2651,8 +2989,10 @@ class HindsightMemoryProvider(MemoryProvider):
         if not turns:
             return 0, self._turn_counter, self._turn_counter
 
+        persisted_lineage: List[str] = []
+        persisted_document_id = ""
         if self._session_id:
-            persisted_turns, _lineage, _retain_document_id = self._load_persisted_retain_turns(
+            persisted_turns, persisted_lineage, persisted_document_id = self._load_persisted_retain_turns(
                 self._session_id,
                 parent_session_id=self._parent_session_id,
             )
@@ -2671,11 +3011,83 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._session_turns:
             existing = [self._retain_turn_canonical(turn) for turn in self._session_turns]
             incoming = [self._retain_turn_canonical(turn) for turn in turns]
+            existing_ids = [self._retain_turn_replay_identity(turn) for turn in self._session_turns]
+            incoming_ids = [self._retain_turn_replay_identity(turn) for turn in turns]
+            existing_times = [
+                timestamp
+                for identity in existing_ids
+                for _role, _content, timestamp in identity
+                if timestamp
+            ]
+            incoming_times = [
+                timestamp
+                for identity in incoming_ids
+                for _role, _content, timestamp in identity
+                if timestamp
+            ]
+            incoming_follows_existing = bool(
+                existing_times
+                and incoming_times
+                and min(incoming_times) > max(existing_times)
+            )
             if len(incoming) <= len(existing) and existing[: len(incoming)] == incoming:
-                return 0, before_counter, before_counter
-            if incoming[: len(existing)] == existing:
-                start_index = len(existing)
+                if existing_ids[: len(incoming_ids)] == incoming_ids:
+                    return 0, before_counter, before_counter
+                if not incoming_follows_existing:
+                    return 0, before_counter, before_counter
+                # The same user-visible sequence can legitimately recur later.
+                # Distinct identities whose complete timestamp range follows the
+                # persisted history are new turns, not replay duplication.
+                start_index = 0
+            elif incoming[: len(existing)] == existing:
+                if incoming_ids[: len(existing_ids)] == existing_ids:
+                    start_index = len(existing)
+                elif incoming_follows_existing:
+                    # The replay-shaped prefix is itself a later legitimate
+                    # repetition; retain it together with any additional tail.
+                    start_index = 0
+                else:
+                    # Rehydration can shift some timestamps while preserving the
+                    # same role/content prefix. Only append the genuinely new tail.
+                    start_index = len(existing)
             else:
+                merged_turns = self._merge_overlapping_replayed_turns(self._session_turns, turns)
+                if merged_turns is not None:
+                    if len(merged_turns) == len(self._session_turns):
+                        return 0, before_counter, before_counter
+                    # A compressed/restarted transcript can be only a tail
+                    # window of the persisted document. Merge timestamped
+                    # missing events into the full active history, then replace;
+                    # appending the window would duplicate all of its anchors.
+                    if not self._replace_active_persisted_turns(
+                        merged_turns,
+                        lineage_session_ids=persisted_lineage,
+                        retain_document_id=persisted_document_id,
+                    ):
+                        return 0, before_counter, before_counter
+                    self._session_turns = list(merged_turns)
+                    self._turn_counter = len(merged_turns)
+                    self._turn_index = self._turn_counter
+                    with self._retain_flush_lock:
+                        self._retain_generation += 1
+                        self._last_flushed_turn_count = 0
+                        self._last_queued_flush_count = 0
+                        self._retain_flush_pending = False
+                        self._retain_force_replace = True
+                    return len(merged_turns) - len(existing), before_counter, self._turn_counter
+
+                existing_timestamps = [
+                    self._retain_turn_replay_timestamp(turn) for turn in self._session_turns
+                ]
+                incoming_timestamps = [self._retain_turn_replay_timestamp(turn) for turn in turns]
+                known_existing = [value for value in existing_timestamps if value]
+                known_incoming = [value for value in incoming_timestamps if value]
+                if known_existing and known_incoming and min(known_incoming) <= max(known_existing):
+                    # The replay overlaps persisted time but has no exact anchor.
+                    # Preserve the authoritative persisted view rather than
+                    # appending a likely duplicate/divergent transcript window.
+                    return 0, before_counter, before_counter
+
                 max_overlap = min(len(existing), len(incoming))
                 for size in range(max_overlap, 0, -1):
                     if existing[-size:] == incoming[:size]:
@@ -2744,11 +3156,21 @@ class HindsightMemoryProvider(MemoryProvider):
             return
 
         clean_user = self._clean_retain_user_content(user_content)
-        if not clean_user:
+        if clean_user:
+            turn_messages = self._build_turn_messages(clean_user, assistant_content)
+        elif (
+            self._is_async_completion_user_content(user_content)
+            and not self._is_retain_noise_assistant_content(assistant_content)
+        ):
+            # Scalar callers lack the completed transcript but still describe a
+            # user-visible response to an internal async-completion trigger.
+            # Persist the response without inventing a user utterance.
+            turn_messages = self._build_orphan_assistant_turn(assistant_content)
+        else:
             logger.debug("sync_turn: skipped synthetic/noise user content")
             return
 
-        turn = json.dumps(self._build_turn_messages(clean_user, assistant_content), ensure_ascii=False)
+        turn = json.dumps(turn_messages, ensure_ascii=False)
         self._session_turns.append(turn)
         self._turn_counter += 1
         self._turn_index = self._turn_counter
@@ -2918,6 +3340,8 @@ class HindsightMemoryProvider(MemoryProvider):
             old_parent_session_id = self._parent_session_id
             old_turn_index = self._turn_index
             old_document_id, old_update_mode = self._resolve_retain_target(self._document_id)
+            if self._retain_force_replace and old_update_mode == "append":
+                old_update_mode = "replace"
             if old_update_mode == "append":
                 old_turns = list(self._session_turns[old_start_index:old_total_turns])
             else:
@@ -3000,6 +3424,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._last_flushed_turn_count = 0
             self._last_queued_flush_count = 0
             self._retain_flush_pending = False
+            self._retain_force_replace = False
         self._turn_counter = 0
         self._turn_index = 0
         logger.debug(
