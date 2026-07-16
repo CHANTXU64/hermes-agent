@@ -342,6 +342,7 @@ class TestLightpandaFallbackWarning:
                  "session_name": "test", "_first_nav": False, "features": {"local": True, "proxies": True}
              }), \
              patch("tools.browser_tool._run_browser_command", side_effect=[
+                 {"success": True, "data": {}},  # first-conversation tab new
                  result,
                  {"success": True, "data": {"snapshot": "- heading \"Fallback OK\" [ref=e1]", "refs": {"e1": {}}}},
              ]):
@@ -369,6 +370,7 @@ class TestLightpandaFallbackWarning:
                  "session_name": "test", "_first_nav": False, "features": {"local": True, "proxies": True}
              }), \
              patch("tools.browser_tool._run_browser_command", side_effect=[
+                 {"success": True, "data": {}},  # first-conversation tab new
                  {"success": True, "data": {"title": "Fallback OK", "url": "https://example.com/"}},
                  snapshot_result,
              ]):

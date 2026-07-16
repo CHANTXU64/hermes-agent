@@ -283,26 +283,19 @@ KANBAN_GUIDANCE = (
 )
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
-    "# Tool-use enforcement\n"
-    "You MUST use your tools to take action — do not describe what you would do "
-    "or plan to do without actually doing it. When you say you will perform an "
-    "action (e.g. 'I will run the tests', 'Let me check the file', 'I will create "
-    "the project'), you MUST immediately make the corresponding tool call in the same "
-    "response. Never end your turn with a promise of future action — execute it now.\n"
-    "Keep working until the task is actually complete. Do not stop with a summary of "
-    "what you plan to do next time. If you have tools available that can accomplish "
-    "the task, use them instead of telling the user what you would do.\n"
-    "Every response should either (a) contain tool calls that make progress, or "
-    "(b) deliver a final result to the user. Responses that only describe intentions "
-    "without acting are not acceptable."
+    "# Tool-call follow-through\n"
+    "When you state that you will perform an action requiring a tool, make the "
+    "corresponding tool call in the same response. Do not end a turn with a "
+    "promise of future tool use. Each response should either make concrete "
+    "progress on the current request or deliver its result or blocker."
 )
 
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
 
-# Universal "finish the job" guidance — applied to ALL models, not gated
-# by model family.  Addresses two cross-model failure modes:
+# Universal execution contract — applied to ALL models, not gated by model
+# family.  Addresses four cross-model failure modes:
 #   1. Stopping after a stub: writing a tiny file or running one command
 #      and then ending the turn with a description of the plan instead
 #      of the finished artifact.  (Observed on Opus during a real
@@ -313,23 +306,34 @@ TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm",
 #      (fake addresses, fake JSON, fake numbers) instead of reporting
 #      the blocker.  (Observed on DeepSeek v4-flash on the same task:
 #      pushed through PEP-668 wall, then returned fabricated listings.)
+#   3. Asking the user for safely retrievable facts while skipping available
+#      tools, or proceeding through material ambiguity about scope,
+#      authorization, acceptance criteria, or user-visible effects.
+#   4. Continuing beyond sufficient completion evidence for optional polish,
+#      theoretical completeness, or unrequested optimization.
 #
-# Short on purpose.  This block is shipped to every user, every session,
-# in the cached system prompt — token cost is paid once at install and
-# then amortised across all sessions via prefix caching.  Keep it tight.
+# Shipped to every user, every session, in the cached system prompt — token
+# cost is paid once at install and then amortised across all sessions via
+# prefix caching. Keep it tight and outcome-oriented.
 TASK_COMPLETION_GUIDANCE = (
-    "# Finishing the job\n"
-    "When the user asks you to build, run, or verify something, the deliverable is "
-    "a working artifact backed by real tool output — not a description of one. "
-    "Do not stop after writing a stub, a plan, or a single command. Keep working "
-    "until you have actually exercised the code or produced the requested result, "
-    "then report what real execution returned.\n"
-    "If a tool, install, or network call fails and blocks the real path, say so "
-    "directly and try an alternative (different package manager, different "
-    "approach, ask the user). NEVER substitute plausible-looking fabricated "
-    "output (made-up data, invented file contents, synthesised API responses) "
-    "for results you couldn't actually produce. Reporting a blocker honestly "
-    "is always better than inventing a result."
+    "# Execution contract\n"
+    "Work within the user's stated goal, scope, and authorization. For safely "
+    "retrievable facts or an obvious low-risk default, use available tools "
+    "instead of asking the user for information you can verify. Ask before "
+    "proceeding when ambiguity would materially change the goal, scope, "
+    "authorization, acceptance criteria, user-visible result, irreversible "
+    "effects, or a substantive trade-off — even if the same tool would be used.\n"
+    "When the user asks you to build, run, or verify something, produce the "
+    "requested result or working artifact and back it with the evidence needed "
+    "to verify it. A stub, plan, or isolated command is not completion unless "
+    "that is the requested deliverable. Complete required prerequisites; if a "
+    "tool returns empty, partial, or failed results, try a reasonable in-scope "
+    "alternative when one remains.\n"
+    "Stop when the core request and required verification are satisfied. Do not "
+    "extend the task for optional polish, theoretical completeness, or "
+    "unrequested optimization. If no authorized path remains, report the "
+    "blocker and the minimum missing input. Never fabricate results, files, "
+    "data, or tool output."
 )
 
 # Universal parallel-tool-call guidance — applied to ALL models.
@@ -460,8 +464,6 @@ GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
     # instruction twice.
     "- **Non-interactive commands:** Use flags like -y, --yes, --non-interactive "
     "to prevent CLI tools from hanging on prompts.\n"
-    "- **Keep going:** Work autonomously until the task is fully resolved. "
-    "Don't stop with a plan — execute it.\n"
 )
 
 

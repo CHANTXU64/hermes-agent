@@ -131,6 +131,14 @@ CLARIFY_SCHEMA = {
         "or types their own answer via a 5th 'Other' option.\n"
         "2. **Open-ended** — omit choices entirely. The user types a free-form "
         "response.\n\n"
+        "SELF-CONTAINED PROMPT: the clarify UI may render this as a standalone "
+        "card without any other assistant prose from the tool-call turn. Put all "
+        "context the user needs to decide in `question`. For an action or approval "
+        "decision, briefly explain the current situation, proposed action and "
+        "scope, material impact or trade-off, and your recommendation when you "
+        "have one. Do not use references such as 'above', 'earlier', 'the "
+        "recommended scope', or 'as discussed' as substitutes for that context; "
+        "the user must be able to answer from the card alone.\n\n"
         "CRITICAL: when you are offering options, put each option ONLY in the "
         "`choices` array — NEVER enumerate the options inside the `question` "
         "text. The UI renders `choices` as selectable rows; options written "
@@ -152,9 +160,13 @@ CLARIFY_SCHEMA = {
             "question": {
                 "type": "string",
                 "description": (
-                    "The question itself, and ONLY the question (e.g. 'Which "
-                    "deployment target?'). Do NOT embed the answer options here "
-                    "— pass them as separate elements in `choices`."
+                    "The complete, self-contained prompt shown to the user. Include "
+                    "all context needed to answer without relying on earlier "
+                    "assistant prose. For an action or approval decision, briefly "
+                    "state the current situation, proposed action and scope, "
+                    "material impact or trade-off, and your recommendation when one "
+                    "exists, then ask the question. Do not embed the answer options "
+                    "here — pass them as separate elements in `choices`."
                 ),
             },
             "choices": {

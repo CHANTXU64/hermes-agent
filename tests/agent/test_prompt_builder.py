@@ -24,6 +24,7 @@ from agent.prompt_builder import (
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
     drain_truncation_warnings,
+    TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -1544,12 +1545,21 @@ class TestToolUseEnforcementGuidance:
     def test_guidance_mentions_tool_calls(self):
         assert "tool call" in TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
 
-    def test_guidance_forbids_description_only(self):
-        assert "describe" in TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
-        assert "promise" in TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
+    def test_guidance_requires_same_response_follow_through(self):
+        text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
+        assert "same response" in text
+        assert "promise" in text
 
-    def test_guidance_requires_action(self):
-        assert "MUST" in TOOL_USE_ENFORCEMENT_GUIDANCE
+    def test_guidance_requires_progress_or_delivery(self):
+        text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
+        assert "progress" in text
+        assert "result" in text
+        assert "blocker" in text
+
+    def test_guidance_does_not_duplicate_completion_policy(self):
+        text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
+        assert "keep working until the task" not in text
+        assert "actually complete" not in text
 
     def test_enforcement_models_includes_gpt(self):
         assert "gpt" in TOOL_USE_ENFORCEMENT_MODELS
@@ -1568,6 +1578,40 @@ class TestToolUseEnforcementGuidance:
 
     def test_enforcement_models_is_tuple(self):
         assert isinstance(TOOL_USE_ENFORCEMENT_MODELS, tuple)
+
+
+class TestTaskCompletionGuidance:
+    """Behavior contract for the universal execution guidance."""
+
+    def test_bounds_work_by_goal_scope_and_authorization(self):
+        text = TASK_COMPLETION_GUIDANCE.lower()
+        assert "goal" in text
+        assert "scope" in text
+        assert "authorization" in text
+
+    def test_material_ambiguity_requires_clarification_even_with_same_tool(self):
+        text = TASK_COMPLETION_GUIDANCE.lower()
+        assert "ask before proceeding" in text
+        assert "acceptance criteria" in text
+        assert "user-visible" in text
+        assert "even if the same tool" in text
+
+    def test_preserves_real_delivery_and_anti_fabrication(self):
+        text = TASK_COMPLETION_GUIDANCE.lower()
+        assert "working artifact" in text
+        assert "stub" in text
+        assert "requested deliverable" in text
+        assert "never fabricate" in text
+
+    def test_stops_after_required_verification(self):
+        text = TASK_COMPLETION_GUIDANCE.lower()
+        assert "stop when the core request" in text
+        assert "required verification" in text
+        assert "optional polish" in text
+        assert "unrequested optimization" in text
+
+    def test_stays_bounded_for_the_cached_prompt(self):
+        assert len(TASK_COMPLETION_GUIDANCE) < 1500
 
 
 class TestOpenAIModelExecutionGuidance:
@@ -1646,6 +1690,9 @@ class TestParallelToolCallGuidance:
         # steer. The Google-only block must NOT carry its own copy, otherwise
         # Gemini/Gemma would receive the instruction twice in one prompt.
         assert "parallel tool call" not in GOOGLE_MODEL_OPERATIONAL_GUIDANCE.lower()
+
+    def test_google_guidance_does_not_duplicate_unbounded_persistence(self):
+        assert "keep going" not in GOOGLE_MODEL_OPERATIONAL_GUIDANCE.lower()
 
 
 # =========================================================================

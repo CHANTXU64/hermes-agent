@@ -245,6 +245,31 @@ class TestClarifySchema:
         """Question parameter should be required."""
         assert "question" in CLARIFY_SCHEMA["parameters"]["required"]
 
+    def test_schema_requires_a_self_contained_standalone_prompt(self):
+        """The rendered card must not depend on hidden or earlier assistant prose."""
+        schema_text = CLARIFY_SCHEMA["description"].lower()
+        question_text = (
+            CLARIFY_SCHEMA["parameters"]["properties"]["question"]["description"]
+            .lower()
+        )
+
+        assert "self-contained" in schema_text
+        assert "standalone" in schema_text
+        assert "without relying on earlier assistant prose" in question_text
+
+    def test_action_decision_prompt_carries_the_material_context(self):
+        """A decision card should explain what the user is being asked to approve."""
+        question_text = (
+            CLARIFY_SCHEMA["parameters"]["properties"]["question"]["description"]
+            .lower()
+        )
+
+        assert "current situation" in question_text
+        assert "proposed action" in question_text
+        assert "material impact" in question_text
+        assert "recommendation" in question_text
+        assert "do not embed the answer options" in question_text
+
     def test_schema_choices_optional(self):
         """Choices parameter should be optional."""
         assert "choices" not in CLARIFY_SCHEMA["parameters"]["required"]

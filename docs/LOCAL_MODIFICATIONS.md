@@ -857,51 +857,6 @@ Feature docs: `docs/chantxu64/multi-telegram-accounts/README.md`
 
 Upstream status: fork-only (related open PRs/issues exist, not merged as equivalent).
 
-### 14. Live CDP browser tab safety prompts
-
-Status: active
-
-Date: 2026-07-15
-
-Files:
-
-- `tools/browser_tool.py`
-- `tests/fork/test_browser_live_cdp_safety.py`
-- `docs/chantxu64/browser-live-cdp-safety/README.md`
-- `docs/LOCAL_MODIFICATIONS.md`
-
-Summary:
-
-- Model-visible Browser tool descriptions explicitly warn that live-CDP navigation can replace a preserved tab and that a Browser screenshot may not represent a separately bound CDP/DrissionPage target.
-
-What changed:
-
-- `browser_navigate` identifies the live-CDP current-tab replacement risk, forbids treating FIP/BPM or other preserved app/login tabs as generic browser sessions, and directs unrelated work to a task-owned safe tab/session.
-- `browser_vision` identifies the separate-target screenshot risk and requires URL/target verification before drawing conclusions about another target.
-- A fork regression imports the registered `BROWSER_TOOL_SCHEMAS` and asserts these user-safety contracts, so an upstream merge cannot silently restore the old harmless-looking descriptions.
-- This is a prompt/schema guard only. It does not create a tab, assign target ownership, or add a runtime navigation block; those are separate changes.
-
-Why it matters:
-
-- The fork is configured to attach Browser tools to the user's live Chrome via CDP. A generic research task can otherwise overwrite a FIP/BPM/login tab, or use a screenshot from the wrong target as diagnostic evidence.
-
-Merge protection:
-
-- Preserve when: upstream tool descriptions do not provide an equivalent or stronger model-visible live-CDP tab and cross-target screenshot contract.
-- Drop when: upstream supplies an equivalent or stronger implementation and regression coverage, after verifying the contract remains model-visible.
-- Ask user when: upstream redesigns Browser/CDP target selection or replaces the description-based guard with runtime ownership/isolation semantics.
-
-Verification:
-
-```bash
-.venv/bin/python -m pytest tests/fork/test_browser_live_cdp_safety.py -q -o 'addopts='
-.venv/bin/python -m py_compile tools/browser_tool.py tests/fork/test_browser_live_cdp_safety.py
-```
-
-Feature docs: `docs/chantxu64/browser-live-cdp-safety/README.md`
-
-Upstream status: fork-only.
-
 ### 15. Telegram tool-progress literal-text rendering
 
 Status: active
@@ -969,6 +924,184 @@ git diff --check
 
 Feature docs: none — localized gateway/Telegram display behavior with merge
 guidance and verification captured in this index entry.
+
+Upstream status: fork-only.
+
+### 16. Prompt execution-contract deduplication
+
+Status: active
+
+Date: 2026-07-16
+
+Files:
+
+- `agent/prompt_builder.py`
+- `agent/system_prompt.py`
+- `tests/agent/test_prompt_builder.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- The universal task-completion block is now a bounded execution contract, and
+  the model-family tool-use block only enforces same-response follow-through.
+
+What changed:
+
+- The universal contract keeps real delivery, prerequisites, reasonable
+  in-scope recovery, and anti-fabrication while adding explicit goal, scope,
+  authorization, material-ambiguity, and sufficient-evidence stop boundaries.
+- `TOOL_USE_ENFORCEMENT_GUIDANCE` no longer repeats unbounded completion or
+  persistence pressure; it only prevents promise-only turns when a tool action
+  is stated.
+- Gemini/Gemma guidance no longer adds a second `Keep going` instruction.
+- `OPENAI_MODEL_EXECUTION_GUIDANCE`, Memory/Skill guidance, tool descriptions,
+  and their write-gate implementation are intentionally unchanged by this
+  source modification.
+
+Why it matters:
+
+- Repeated persistence language can overweight continued action after the
+  user's requested result is already supported by sufficient evidence.
+- Clarification must also cover material changes to authorization, scope,
+  acceptance criteria, and user-visible effects, even when the same tool would
+  be used.
+
+Merge protection:
+
+- Preserve when: upstream still distributes completion, stop, and
+  same-response tool-follow-through policy across overlapping prompt blocks.
+- Drop when: upstream supplies an equivalent or stronger bounded execution
+  contract without weakening real delivery, grounding, or anti-fabrication.
+- Ask user when: upstream redesigns the GPT/Codex execution overlay or moves
+  authorization and stop policy into a different runtime-enforced layer.
+
+Verification:
+
+```bash
+.venv/bin/python -m pytest tests/agent/test_prompt_builder.py -q -o 'addopts='
+.venv/bin/python -m pytest tests/run_agent/test_run_agent.py::TestToolUseEnforcementConfig tests/run_agent/test_run_agent.py::TestTaskCompletionGuidance -q -o 'addopts='
+.venv/bin/python -m py_compile agent/prompt_builder.py agent/system_prompt.py tests/agent/test_prompt_builder.py
+git diff --check
+```
+
+Feature docs: none — prompt behavior and merge guidance are captured by the
+behavior-contract tests and this index entry.
+
+Upstream status: fork-only.
+
+### 17. Self-contained Clarify decision cards
+
+Status: active
+
+Date: 2026-07-16
+
+Files:
+
+- `tools/clarify_tool.py`
+- `tests/tools/test_clarify_tool.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- Clarify tool calls must carry enough context in the rendered question for the
+  user to make the decision without unseen or earlier assistant prose.
+
+What changed:
+
+- The tool schema now explains that messaging UIs may render Clarify as a
+  standalone card.
+- Action and approval questions must briefly state the current situation,
+  proposed action and scope, material impact or trade-off, and a recommendation
+  when one exists.
+- References such as `above`, `earlier`, or `the recommended scope` cannot stand
+  in for the omitted context.
+- Selectable answers remain separate `choices`; the tool parameters, callback,
+  Gateway flow, and platform adapters are unchanged.
+
+Why it matters:
+
+- A real Clarify call asked whether to apply “the recommended scope” while its
+  assistant message contained no visible prose. The user could not know what
+  was being approved and had to ask for the recommendation separately.
+
+Merge protection:
+
+- Preserve when: upstream Clarify guidance still permits context-dependent
+  questions that messaging surfaces can render alone.
+- Drop when: upstream supplies an equivalent or stronger self-contained
+  decision-card contract while keeping choices independently selectable.
+- Ask user when: upstream replaces the single question string with structured
+  context, impact, recommendation, or approval fields.
+
+Verification:
+
+```bash
+.venv/bin/python -m pytest tests/tools/test_clarify_tool.py -q -o 'addopts='
+.venv/bin/python -m py_compile tools/clarify_tool.py tests/tools/test_clarify_tool.py
+git diff --check
+```
+
+Feature docs: none — this is model-visible tool guidance with behavior-contract
+coverage and no platform API change.
+
+Upstream status: fork-only.
+
+### 18. First browser navigation opens a fresh tab
+
+Status: active
+
+Date: 2026-07-16
+
+Files:
+
+- `tools/browser_tool.py`
+- `tests/fork/test_browser_first_conversation_tab.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- The first `browser_navigate` call in each conversation opens and activates a
+  new tab before loading the requested URL; later calls keep their existing
+  navigation behavior.
+
+What changed:
+
+- A conversation marker keyed by the stable task/session ID survives the normal
+  per-turn Browser resource cleanup.
+- Calls for the same task/session ID are serialized through the complete
+  `browser_navigate` result, so the first `tab new`/`open` and later navigations
+  cannot interleave; different conversations retain independent locks.
+- On the first call only, `browser_navigate` runs `tab new` before its existing
+  `open <url>` command. `agent-browser` activates the new tab as part of that
+  command.
+- The tool description states this actual first-call behavior. The earlier
+  live-CDP warning text and the unrelated `browser_vision` prompt override were
+  removed.
+- This does not bind later backend reconnects to the created tab. Subsequent
+  target selection remains unchanged, matching the intentionally minimal scope.
+
+Why it matters:
+
+- The first navigation in a new conversation must not replace a useful page
+  that was already open in the connected browser.
+
+Merge protection:
+
+- Preserve the one-time marker separately from backend session `_first_nav`,
+  because Browser resources are cleaned after every agent turn.
+- Preserve the command order `tab new` then `open <url>` on the first call and
+  plain `open <url>` on later calls in the same conversation.
+
+Verification:
+
+```bash
+.venv/bin/python -m pytest tests/fork/test_browser_first_conversation_tab.py -q -o 'addopts='
+.venv/bin/python -m py_compile tools/browser_tool.py tests/fork/test_browser_first_conversation_tab.py
+git diff --check
+```
+
+Feature docs: none — the behavior is confined to one tool and covered by a
+focused runtime test plus this merge note.
 
 Upstream status: fork-only.
 
@@ -1041,10 +1174,10 @@ deltas are expected in these areas:
   - `tests/gateway/test_background_process_notifications.py`
   - `tests/gateway/test_resume_command.py`
   - `docs/chantxu64/multi-telegram-accounts/README.md`
-- Live CDP browser tab safety prompts:
+- First browser navigation opens a fresh tab:
   - `tools/browser_tool.py`
-  - `tests/fork/test_browser_live_cdp_safety.py`
-  - `docs/chantxu64/browser-live-cdp-safety/README.md`
+  - `tests/fork/test_browser_first_conversation_tab.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
 - Telegram tool-progress literal-text rendering:
   - `gateway/run.py`
   - `plugins/platforms/telegram/adapter.py`
@@ -1052,13 +1185,22 @@ deltas are expected in these areas:
   - `tests/gateway/test_run_progress_topics.py`
   - `tests/gateway/test_telegram_rich_messages.py`
   - `docs/LOCAL_MODIFICATIONS.md`
+- Prompt execution-contract deduplication:
+  - `agent/prompt_builder.py`
+  - `agent/system_prompt.py`
+  - `tests/agent/test_prompt_builder.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
+- Self-contained Clarify decision cards:
+  - `tools/clarify_tool.py`
+  - `tests/tools/test_clarify_tool.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
 
 
 ## Summary statistics
 
-Documented entries: 15 major entries.
+Documented entries: 17 major entries.
 
-Active functional areas: 12.
+Active functional areas: 14.
 
 Historical reverted / abandoned areas: 2.
 
