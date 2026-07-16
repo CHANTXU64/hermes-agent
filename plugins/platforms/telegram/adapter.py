@@ -3922,6 +3922,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        # Gateway status surfaces can carry literal user/model tool arguments
+        # (regexes, shell fragments, URLs). They must not be parsed as Telegram
+        # Markdown or rich-message syntax.
+        plain_text = bool((metadata or {}).get("plain_text"))
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -3929,7 +3934,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if not plain_text and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -3946,12 +3951,18 @@ class TelegramAdapter(BasePlatformAdapter):
                                 pass  # Typing failures are non-fatal
                     return rich_result
 
-            # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+            # Format and split message if needed. Plain-text status surfaces
+            # deliberately bypass MarkdownV2 conversion so their control
+            # characters arrive literally.
+            formatted = content if plain_text else self.format_message(content)
+            chunks = (
+                self._truncate_plain_text(formatted)
+                if plain_text
+                else self.truncate_message(
+                    formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                )
             )
-            if len(chunks) > 1:
+            if len(chunks) > 1 and not plain_text:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
                 # chunk and fall back to plain text.
@@ -4033,7 +4044,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             msg = await self._bot.send_message(
                                 chat_id=normalize_telegram_chat_id(chat_id),
                                 text=chunk,
-                                parse_mode=ParseMode.MARKDOWN_V2,
+                                parse_mode=None if plain_text else ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
@@ -4287,6 +4298,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        plain_text = bool((metadata or {}).get("plain_text"))
+
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet
         # lists, task lists, <details>, block math) and rich is available,
@@ -4297,7 +4310,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # table that exceeds the MarkdownV2 limit must not be split into legacy
         # chunks.  Falls back to the legacy edit path (overflow split included)
         # on capability/permanent rejection.
-        if finalize and self._rich_eligible(content):
+        if finalize and not plain_text and self._rich_eligible(content):
             rich_result = await self._try_edit_rich(
                 chat_id, message_id, content, metadata=metadata,
             )
@@ -4349,13 +4362,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
 
-            formatted = self.format_message(content)
+            formatted = content if plain_text else self.format_message(content)
             try:
                 await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=formatted,
-                    parse_mode=ParseMode.MARKDOWN_V2,
+                    parse_mode=None if plain_text else ParseMode.MARKDOWN_V2,
                 )
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
@@ -4368,7 +4381,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name,
                     safe_format_error,
                 )
-                _plain = _strip_mdv2(content) if content else content
+                _plain = content if plain_text else (_strip_mdv2(content) if content else content)
                 await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
@@ -4510,8 +4523,13 @@ class TelegramAdapter(BasePlatformAdapter):
         Falls back to ``SendResult(success=False)`` only if even the first-
         chunk edit fails — that's a real adapter problem, not an overflow.
         """
-        chunks = self.truncate_message(
-            content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+        plain_text = bool((metadata or {}).get("plain_text"))
+        chunks = (
+            self._truncate_plain_text(content)
+            if plain_text
+            else self.truncate_message(
+                content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+            )
         )
         if len(chunks) <= 1:
             # Defensive: shouldn't happen given the caller's pre-flight, but
@@ -4522,17 +4540,21 @@ class TelegramAdapter(BasePlatformAdapter):
         first_chunk = chunks[0]
         try:
             if finalize:
-                # Use format_message + parse_mode for the final chunk;
-                # mirror edit_message's main happy-path.
-                formatted = _separate_chunk_indicator_from_fence(
-                    self.format_message(first_chunk)
+                # Mirror edit_message's main path. Literal tool-status text
+                # must not regain Markdown semantics merely because it overflowed.
+                formatted = (
+                    first_chunk
+                    if plain_text
+                    else _separate_chunk_indicator_from_fence(
+                        self.format_message(first_chunk)
+                    )
                 )
                 try:
                     await self._bot.edit_message_text(
                         chat_id=normalize_telegram_chat_id(chat_id),
                         message_id=int(message_id),
                         text=formatted,
-                        parse_mode=ParseMode.MARKDOWN_V2,
+                        parse_mode=None if plain_text else ParseMode.MARKDOWN_V2,
                     )
                 except Exception as fmt_err:
                     if "not modified" not in str(fmt_err).lower():
@@ -4544,7 +4566,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         await self._bot.edit_message_text(
                             chat_id=normalize_telegram_chat_id(chat_id),
                             message_id=int(message_id),
-                            text=_strip_mdv2(first_chunk),
+                            text=(first_chunk if plain_text else _strip_mdv2(first_chunk)),
                         )
             else:
                 await self._bot.edit_message_text(
@@ -4584,18 +4606,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 metadata,
                 reply_to_message_id=reply_to_id,
             )
-            for use_markdown in (True, False) if finalize else (False,):
+            attempt_modes = (False,) if plain_text else ((True, False) if finalize else (False,))
+            for use_markdown in attempt_modes:
                 try:
                     if use_markdown:
                         text = _separate_chunk_indicator_from_fence(
                             self.format_message(chunk)
                         )
                     else:
-                        # Plain attempt: on finalize the MarkdownV2 attempt
-                        # failed, so degrade to clean stripped text, never
-                        # the raw chunk (raw ** / ``` markers would render
-                        # literally); streaming previews stay raw.
-                        text = _strip_mdv2(chunk) if finalize else chunk
+                        # Literal status text must preserve its control
+                        # characters. Ordinary final-message fallback keeps
+                        # its existing clean-text degradation.
+                        text = (
+                            chunk
+                            if plain_text
+                            else (_strip_mdv2(chunk) if finalize else chunk)
+                        )
                     sent_msg = await self._bot.send_message(
                         chat_id=normalize_telegram_chat_id(chat_id),
                         text=text,
@@ -4621,7 +4647,11 @@ class TelegramAdapter(BasePlatformAdapter):
                         try:
                             sent_msg = await self._bot.send_message(
                                 chat_id=normalize_telegram_chat_id(chat_id),
-                                text=_strip_mdv2(chunk) if finalize else chunk,
+                                text=(
+                                    chunk
+                                    if plain_text
+                                    else (_strip_mdv2(chunk) if finalize else chunk)
+                                ),
                                 **retry_thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -6856,6 +6886,54 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
+
+    def _truncate_plain_text(self, content: str) -> List[str]:
+        """Split literal text without treating Markdown delimiters as structure.
+
+        ``BasePlatformAdapter.truncate_message`` intentionally balances fenced
+        code blocks across chunks. That would mutate a literal tool argument
+        containing backticks, so plain-text status messages use this whitespace-
+        aware splitter instead.
+        """
+        max_length = self.MAX_MESSAGE_LENGTH
+        if utf16_len(content) <= max_length:
+            return [content]
+
+        reserve = min(10, max(1, max_length - 1))
+        while True:
+            usable = max(1, max_length - reserve)
+            chunks: List[str] = []
+            remaining = content
+            while utf16_len(remaining) > usable:
+                used = 0
+                split_at = 0
+                last_whitespace = 0
+                for index, char in enumerate(remaining):
+                    char_len = utf16_len(char)
+                    if used + char_len > usable:
+                        break
+                    used += char_len
+                    split_at = index + 1
+                    if char.isspace():
+                        last_whitespace = split_at
+                if split_at == 0:
+                    # A single code point larger than the remaining UTF-16
+                    # budget is exceptionally rare for Telegram's 4096 cap;
+                    # preserve it rather than dropping data or looping forever.
+                    split_at = 1
+                split_at = last_whitespace or split_at
+                chunks.append(remaining[:split_at])
+                remaining = remaining[split_at:]
+            chunks.append(remaining)
+
+            total = len(chunks)
+            marker_width = utf16_len(f" ({total}/{total})")
+            if marker_width <= reserve:
+                return [
+                    f"{chunk} ({index}/{total})"
+                    for index, chunk in enumerate(chunks, start=1)
+                ]
+            reserve = marker_width
 
     def format_message(self, content: str) -> str:
         """

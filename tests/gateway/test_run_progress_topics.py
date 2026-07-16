@@ -308,9 +308,9 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     assert adapter.sent == [
         {
             "chat_id": "-1001",
-            "content": '💻 Running pwd',
+            "content": '💻 terminal: pwd',
             "reply_to": None,
-            "metadata": {"thread_id": "17585"},
+            "metadata": {"thread_id": "17585", "plain_text": True},
         }
     ]
     assert adapter.edits
@@ -352,7 +352,10 @@ async def test_run_agent_progress_edits_keep_originating_topic_metadata(monkeypa
 
     assert result["final_response"] == "done"
     assert adapter.edits
-    assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.edits)
+    assert all(
+        call["metadata"] == {"thread_id": "17585", "plain_text": True}
+        for call in adapter.edits
+    )
 
 
 @pytest.mark.asyncio
@@ -393,7 +396,7 @@ async def test_run_agent_progress_does_not_use_event_message_id_for_telegram_dm(
 
     assert result["final_response"] == "done"
     assert adapter.sent
-    assert adapter.sent[0]["metadata"] is None
+    assert adapter.sent[0]["metadata"] == {"plain_text": True}
     assert all(call["metadata"] is None for call in adapter.typing)
 
 
@@ -500,7 +503,8 @@ def _extract_progress_preview(content: str) -> str | None:
     """Extract the argument-preview portion from a tool-progress message.
 
     Handles both render styles:
-    - Legacy / custom tools:  ``🔧 tool_name: "<preview>"`` (quoted)
+    - Legacy / custom tools: ``🔧 tool_name: "<preview>"`` (quoted)
+    - Telegram terminal: ``💻 terminal: <preview>`` (literal tool label)
     - Friendly built-in verb: ``💻 Running <preview>`` (verb prefix, no quotes)
     """
     import re
@@ -509,7 +513,11 @@ def _extract_progress_preview(content: str) -> str | None:
     match = re.search(r'"(.+)"', content)
     if match:
         return match.group(1)
-    # Friendly form: "<emoji> <verb> <preview>". The terminal verb is "Running".
+    terminal_marker = " terminal: "
+    idx = content.find(terminal_marker)
+    if idx != -1:
+        return content[idx + len(terminal_marker):].strip()
+    # Friendly form: "<emoji> <verb> <preview>".
     marker = " Running "
     idx = content.find(marker)
     if idx != -1:
@@ -733,6 +741,23 @@ class VerboseAgent:
         }
 
 
+class MarkdownPreviewAgent:
+    """Emits a tool preview containing Telegram Markdown control characters."""
+
+    PREVIEW = "```|code block|code_block ||hidden||"
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback(
+            "tool.started", "search_files", self.PREVIEW, {"pattern": self.PREVIEW}
+        )
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
 async def _run_with_agent(
     monkeypatch,
     tmp_path,
@@ -793,6 +818,25 @@ async def _run_with_agent(
         session_key=session_key,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_telegram_tool_progress_marks_dynamic_previews_plain_text(monkeypatch, tmp_path):
+    """Telegram progress sends tool arguments as literal text, not Markdown."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        MarkdownPreviewAgent,
+        session_id="sess-progress-plain-text",
+        config_data={"display": {"tool_progress": "all"}},
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert adapter.sent[0]["metadata"] == {
+        "thread_id": "17585",
+        "plain_text": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -1425,12 +1469,63 @@ class TerminalCommandAgent:
 
 
 @pytest.mark.asyncio
-async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path):
-    """Terminal progress on a markdown-capable (supports_code_blocks) gateway
-    renders a bare fenced code block — no language tag (Slack mrkdwn would print
-    'bash' as a literal first code line).  In non-verbose ("all"/"new") mode the
-    command is collapsed to a single line capped at tool_preview_length so a long
-    or multi-line command doesn't render as a huge block (#42634)."""
+async def test_terminal_progress_renders_fenced_code_block_off_telegram(monkeypatch, tmp_path):
+    """Terminal progress on a non-Telegram markdown gateway renders a bare
+    fenced code block — no language tag (Slack mrkdwn would print 'bash' as a
+    literal first code line). In non-verbose ("all"/"new") mode the command is
+    collapsed to a single line capped at tool_preview_length so a long or
+    multi-line command doesn't render as a huge block (#42634)."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TerminalCommandAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji
+
+    adapter = CodeBlockProgressAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-terminal-code-block-discord",
+        session_key="agent:main:discord:dm:12345",
+    )
+
+    assert result["final_response"] == "done"
+    all_content = " ".join(call["content"] for call in adapter.sent)
+    all_content += " ".join(call["content"] for call in adapter.edits)
+    # Bare fenced block, no language tag (no '```bash').
+    assert "```" in all_content
+    assert "```bash" not in all_content
+    # Non-verbose collapses to the first line + truncation marker — the later
+    # command lines must NOT appear (this was the "huge block" regression).
+    assert "set -euo pipefail" in all_content
+    assert "npm install -g hyperframes@latest" not in all_content
+    assert "node --version" not in all_content
+    # No truncated quoted preview for the terminal command.
+    assert 'terminal: "' not in all_content
+
+
+@pytest.mark.asyncio
+async def test_telegram_terminal_progress_uses_single_plain_text_line(monkeypatch, tmp_path):
+    """Telegram terminal progress stays in the same compact text form as other tools."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -1460,23 +1555,20 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
         context_prompt="",
         history=[],
         source=source,
-        session_id="sess-terminal-code-block",
+        session_id="sess-terminal-plain-text-telegram",
         session_key="agent:main:telegram:dm:12345",
     )
 
     assert result["final_response"] == "done"
-    all_content = " ".join(call["content"] for call in adapter.sent)
-    all_content += " ".join(call["content"] for call in adapter.edits)
-    # Bare fenced block, no language tag (no '```bash').
-    assert "```" in all_content
-    assert "```bash" not in all_content
-    # Non-verbose collapses to the first line + truncation marker — the later
-    # command lines must NOT appear (this was the "huge block" regression).
-    assert "set -euo pipefail" in all_content
-    assert "npm install -g hyperframes@latest" not in all_content
-    assert "node --version" not in all_content
-    # No truncated quoted preview for the terminal command.
-    assert 'terminal: "' not in all_content
+    progress = next(
+        call["content"]
+        for call in [*adapter.sent, *adapter.edits]
+        if "set -euo pipefail" in call["content"]
+    )
+    assert progress.startswith("💻 terminal: set -euo pipefail")
+    assert "```" not in progress
+    assert "\n" not in progress
+    assert "npm install -g hyperframes@latest" not in progress
 
 
 @pytest.mark.asyncio
@@ -1495,14 +1587,14 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    adapter = CodeBlockProgressAdapter(platform=Platform.DISCORD)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     source = SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=Platform.DISCORD,
         chat_id="12345",
         chat_type="dm",
         thread_id=None,
@@ -1513,8 +1605,8 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
         context_prompt="",
         history=[],
         source=source,
-        session_id="sess-terminal-code-block-verbose",
-        session_key="agent:main:telegram:dm:12345",
+        session_id="sess-terminal-code-block-verbose-discord",
+        session_key="agent:main:discord:dm:12345",
     )
 
     assert result["final_response"] == "done"
@@ -1528,10 +1620,8 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_terminal_progress_no_bash_block_in_verbose_mode(monkeypatch, tmp_path):
-    """#41215 also rendered the bash block in verbose mode. The revert removed it
-    from both branches, so verbose progress must not emit a fenced ```bash block
-    either (verbose still shows args by opt-in, just not as a code block)."""
+async def test_telegram_terminal_progress_verbose_uses_no_code_block(monkeypatch, tmp_path):
+    """Telegram keeps terminal progress out of a Markdown code block in verbose mode."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "verbose")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -1568,7 +1658,7 @@ async def test_terminal_progress_no_bash_block_in_verbose_mode(monkeypatch, tmp_
     assert result["final_response"] == "done"
     all_content = " ".join(call["content"] for call in adapter.sent)
     all_content += " ".join(call["content"] for call in adapter.edits)
-    assert "```bash" not in all_content
+    assert "```" not in all_content
 
 class MultiTerminalCommandAgent:
     """Emits several consecutive terminal tool.started events, then a
@@ -1605,14 +1695,14 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    adapter = CodeBlockProgressAdapter(platform=Platform.DISCORD)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     source = SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=Platform.DISCORD,
         chat_id="12345",
         chat_type="dm",
         thread_id=None,
@@ -1623,8 +1713,8 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
         context_prompt="",
         history=[],
         source=source,
-        session_id="sess-terminal-consecutive",
-        session_key="agent:main:telegram:dm:12345",
+        session_id="sess-terminal-consecutive-discord",
+        session_key="agent:main:discord:dm:12345",
     )
 
     assert result["final_response"] == "done"

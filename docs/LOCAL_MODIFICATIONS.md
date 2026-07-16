@@ -900,6 +900,76 @@ Feature docs: `docs/chantxu64/browser-live-cdp-safety/README.md`
 
 Upstream status: fork-only.
 
+### 15. Telegram tool-progress literal-text rendering
+
+Status: active
+
+Date: 2026-07-16
+
+Files:
+
+- `gateway/run.py`
+- `plugins/platforms/telegram/adapter.py`
+- `tests/fork/test_telegram_tool_progress_literal_text.py`
+- `tests/gateway/test_run_progress_topics.py`
+- `tests/gateway/test_telegram_rich_messages.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- Every Telegram tool-progress bubble treats dynamic tool arguments as literal
+  text. Terminal also retains the fork's compact one-line status style instead
+  of a fenced Markdown command block.
+
+What changed:
+
+- `GatewayRunner` marks only Telegram tool-progress sends and edits as
+  `plain_text`, retaining topic/reply metadata and leaving typing indicators,
+  approvals, final replies, and other platforms unchanged.
+- The Telegram adapter bypasses both rich-message delivery and MarkdownV2
+  conversion for that marker, including finalized accumulated bubbles and
+  overflow continuations. Regexes, code fragments, URLs, backticks, pipes, and
+  spoiler-like tokens therefore display literally.
+- A fork-protection test keeps the Telegram-only metadata contract and literal
+  send/edit behavior visible during future upstream merges.
+- Telegram terminal command previews normalize whitespace while retaining the
+  `terminal` tool label, so multi-line shell commands remain one persistent
+  status line (for example, `💻 terminal: set -euo pipefail ...`).
+- Other Markdown-capable platforms retain their existing fenced terminal
+  progress rendering, including full-command verbose mode and consecutive-call
+  header collapsing.
+
+Why it matters:
+
+- Tool previews contain machine-generated arguments. A regex beginning with
+  triple backticks can open a code block, and paired pipes can create Telegram
+  spoiler/blur styling; accumulating several progress lines can make such
+  delimiters interact across a single edited bubble.
+
+Merge protection:
+
+- Preserve when: Telegram tool-progress still routes dynamic arguments through
+  a Markdown or rich-message parser without an equivalent literal-text guard.
+- Drop when: upstream supplies equivalent all-tool Telegram literal delivery
+  with coverage for normal sends, edits, and overflow continuation.
+- Ask user when: upstream introduces a platform-wide message-kind or
+  per-tool-display system with different progress metadata semantics.
+
+Verification:
+
+```bash
+.venv/bin/python -m pytest tests/fork/test_telegram_tool_progress_literal_text.py -q -o 'addopts='
+.venv/bin/python -m pytest tests/gateway/test_run_progress_topics.py -q -o 'addopts='
+.venv/bin/python -m pytest tests/gateway/test_telegram_rich_messages.py -q -o 'addopts='
+.venv/bin/python -m py_compile gateway/run.py plugins/platforms/telegram/adapter.py tests/fork/test_telegram_tool_progress_literal_text.py tests/gateway/test_run_progress_topics.py tests/gateway/test_telegram_rich_messages.py
+git diff --check
+```
+
+Feature docs: none — localized gateway/Telegram display behavior with merge
+guidance and verification captured in this index entry.
+
+Upstream status: fork-only.
+
 
 ## Current fork delta checklist
 
@@ -973,13 +1043,20 @@ deltas are expected in these areas:
   - `tools/browser_tool.py`
   - `tests/fork/test_browser_live_cdp_safety.py`
   - `docs/chantxu64/browser-live-cdp-safety/README.md`
+- Telegram tool-progress literal-text rendering:
+  - `gateway/run.py`
+  - `plugins/platforms/telegram/adapter.py`
+  - `tests/fork/test_telegram_tool_progress_literal_text.py`
+  - `tests/gateway/test_run_progress_topics.py`
+  - `tests/gateway/test_telegram_rich_messages.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
 
 
 ## Summary statistics
 
-Documented entries: 14 major entries.
+Documented entries: 15 major entries.
 
-Active functional areas: 11.
+Active functional areas: 12.
 
 Historical reverted / abandoned areas: 2.
 

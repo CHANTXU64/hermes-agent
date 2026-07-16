@@ -229,6 +229,19 @@ def _non_conversational_metadata(
     return merged
 
 
+def _tool_progress_delivery_metadata(
+    metadata: Optional[Dict[str, Any]] = None,
+    *,
+    platform: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Mark only Telegram's dynamic tool-progress text for literal delivery."""
+    if _gateway_platform_value(platform) != "telegram":
+        return metadata
+    merged = dict(metadata or {})
+    merged["plain_text"] = True
+    return merged
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -18286,11 +18299,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Markdown-capable platforms render a terminal command as a fenced
             # code block instead of the compact `terminal: "cmd…"` preview.
+            # Telegram intentionally keeps terminal progress as one compact
+            # plain-text line, matching its other tool-status messages and
+            # avoiding a persistent visual code panel for each shell command.
+            # Other markdown-capable adapters retain fenced command blocks.
             # Gated on the adapter's ``supports_code_blocks`` capability so
-            # plain-text platforms keep the short line.  No language tag is
-            # emitted — Slack mrkdwn renders the tag as a literal first code
-            # line ("bash"), and a bare fence renders correctly everywhere
-            # that supports blocks.
+            # plain-text platforms keep the short line.
             #
             # Verbose mode shows the FULL command.  Non-verbose ("all"/"new")
             # modes still wrap in a fence but truncate to a single line capped
@@ -18304,7 +18318,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 _progress_adapter = None
             if (
-                getattr(_progress_adapter, "supports_code_blocks", False)
+                source.platform != Platform.TELEGRAM
+                and getattr(_progress_adapter, "supports_code_blocks", False)
                 and tool_name == "terminal"
                 and isinstance(args, dict)
                 and isinstance(args.get("command"), str)
@@ -18364,6 +18379,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 msg = _code_block_short
                 last_was_terminal_block[0] = True
             elif preview:
+                if source.platform == Platform.TELEGRAM and tool_name == "terminal":
+                    command = args.get("command") if isinstance(args, dict) else None
+                    if isinstance(command, str) and command.strip():
+                        preview = " ".join(command.split())
                 from agent.display import (
                     get_tool_preview_max_len,
                     get_tool_verb,
@@ -18374,19 +18393,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cap = _pl if _pl > 0 else 40
                 if len(preview) > _cap:
                     preview = preview[:_cap - 3] + "..."
-                # Friendly labels: render a human-phrased line for built-in
-                # tools ("🔍 Searching the web for ...") by prefixing the verb
-                # onto the preview the callback already computed (so the
-                # command/url/query is preserved).  Custom/plugin/MCP tools
-                # have no verb and fall back to the raw "tool_name: ..." form.
-                _verb = get_tool_verb(tool_name)
-                if _verb:
-                    if verb_drops_preview(tool_name):
-                        msg = f"{emoji} {_verb}"
-                    else:
-                        msg = f"{emoji} {_verb}{tool_verb_connector(tool_name)}{preview}"
+                # Telegram preserves the terminal tool identity in its compact
+                # literal line. The generic friendly verb would turn it into
+                # "Running", which loses the source tool name.
+                if source.platform == Platform.TELEGRAM and tool_name == "terminal":
+                    msg = f"{emoji} {tool_name}: {preview}"
                 else:
-                    msg = f"{emoji} {tool_name}: \"{preview}\""
+                    # Friendly labels: render a human-phrased line for built-in
+                    # tools ("🔍 Searching the web for ...") by prefixing the verb
+                    # onto the preview the callback already computed (so the
+                    # command/url/query is preserved).  Custom/plugin/MCP tools
+                    # have no verb and fall back to the raw "tool_name: ..." form.
+                    _verb = get_tool_verb(tool_name)
+                    if _verb:
+                        if verb_drops_preview(tool_name):
+                            msg = f"{emoji} {_verb}"
+                        else:
+                            msg = f"{emoji} {_verb}{tool_verb_connector(tool_name)}{preview}"
+                    else:
+                        msg = f"{emoji} {tool_name}: \"{preview}\""
                 last_was_terminal_block[0] = False
             else:
                 msg = f"{emoji} {tool_name}..."
@@ -18425,6 +18450,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
+        _progress_message_metadata = _tool_progress_delivery_metadata(
+            _progress_metadata, platform=source.platform
+        )
         _progress_reply_to = (
             event_message_id
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
@@ -18530,7 +18558,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Detect whether the adapter's edit_message accepts metadata so
             # overflow edits preserve Telegram topic/thread routing (#27487).
             _edit_accepts_metadata = False
-            if _progress_metadata:
+            if _progress_message_metadata:
                 try:
                     _edit_params = inspect.signature(adapter.edit_message).parameters
                     _edit_accepts_metadata = (
@@ -18552,7 +18580,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False):
                     kwargs["finalize"] = True
                 if _edit_accepts_metadata:
-                    kwargs["metadata"] = _progress_metadata
+                    kwargs["metadata"] = _progress_message_metadata
                 return await adapter.edit_message(**kwargs)
 
             def _progress_text(lines: list) -> str:
@@ -18586,7 +18614,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id=source.chat_id,
                     content=text,
                     reply_to=_progress_reply_to,
-                    metadata=_progress_metadata,
+                    metadata=_progress_message_metadata,
                 )
                 _track_progress_result(result)
                 return result
@@ -18733,7 +18761,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 chat_id=source.chat_id,
                                 content=msg,
                                 reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                                metadata=_progress_message_metadata,
                             )
                             if (
                                 _cleanup_progress
@@ -18749,7 +18777,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 chat_id=source.chat_id,
                                 content=full_text,
                                 reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                                metadata=_progress_message_metadata,
                             )
                         else:
                             # Editing unsupported: send just this line
@@ -18757,7 +18785,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 chat_id=source.chat_id,
                                 content=msg,
                                 reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                                metadata=_progress_message_metadata,
                             )
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
