@@ -4179,6 +4179,7 @@ class TestCodexAdapterReasoningTranslation:
                 response=SimpleNamespace(
                     status="completed",
                     id="resp_test",
+                    model="provider-terminal-model",
                     usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
                 ),
             ),
@@ -4198,6 +4199,17 @@ class TestCodexAdapterReasoningTranslation:
         real_client.responses.create = _create
         adapter = _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
         return adapter, captured_kwargs
+
+    def test_provider_reported_terminal_model_is_exposed_separately(self):
+        adapter, _ = self._build_adapter()
+
+        response = adapter.create(
+            model="requested-model",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        assert response.model == "requested-model"
+        assert response.provider_reported_model == "provider-terminal-model"
 
     def test_reasoning_effort_medium_translated_to_top_level(self):
         adapter, captured = self._build_adapter()

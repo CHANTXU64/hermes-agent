@@ -2418,7 +2418,18 @@ def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:
     deterministic ordering in pickers and tests.
     """
     manager = _ensure_plugins_discovered()
-    return [manager._aux_tasks[k] for k in sorted(manager._aux_tasks)]
+    tasks = dict(manager._aux_tasks)
+    try:
+        from plugins.memory import get_memory_provider_auxiliary_tasks
+
+        for entry in get_memory_provider_auxiliary_tasks():
+            key = str(entry.get("key") or "")
+            if key and key not in tasks:
+                tasks[key] = entry
+    except Exception:
+        # Memory-plugin discovery failure must not hide general plugin tasks.
+        pass
+    return [tasks[k] for k in sorted(tasks)]
 
 
 def get_plugin_toolsets() -> List[tuple]:

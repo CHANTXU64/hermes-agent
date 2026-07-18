@@ -91,7 +91,14 @@ class MemoryProvider(ABC):
         """
         return ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+        previous_assistant_message: str = "",
+    ) -> str:
         """Recall relevant context for the upcoming turn.
 
         Called before each API call. Return formatted text to inject as
@@ -102,15 +109,33 @@ class MemoryProvider(ABC):
         session_id is provided for providers serving concurrent sessions
         (gateway group chats, cached agents). Providers that don't need
         per-session scoping can ignore it.
+
+        turn_id identifies the exact conversation turn. MemoryManager only
+        passes it to providers whose prefetch signature opts in.
+
+        previous_assistant_message is the most recent completed assistant
+        response before the current user turn. MemoryManager only passes this
+        keyword to providers whose prefetch signature opts in, preserving
+        compatibility with existing providers.
         """
         return ""
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+    ) -> None:
         """Queue a background recall for the NEXT turn.
 
         Called after each turn completes. The result will be consumed
         by prefetch() on the next turn. Default is no-op — providers
         that do background prefetching should override this.
+
+        turn_id matches the prefetch call for the completed turn. Providers
+        can use it to preserve per-turn queue decisions without relying on
+        query text.
         """
 
     def sync_turn(

@@ -1227,6 +1227,7 @@ class _CodexCompletionsAdapter:
         return SimpleNamespace(
             choices=[choice],
             model=model,
+            provider_reported_model=getattr(final, "provider_reported_model", None),
             usage=usage,
         )
 

@@ -697,6 +697,27 @@ def test_consume_codex_stream_keeps_final_answer_phase_deltas(monkeypatch):
     assert response.output_text == "visible answer"
 
 
+def test_consume_codex_stream_exposes_provider_reported_terminal_model():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    response = _consume_codex_event_stream(
+        _FakeCreateStream([
+            SimpleNamespace(type="response.output_text.delta", delta="ok"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(
+                    status="completed",
+                    model="gpt-5.6-luna",
+                ),
+            ),
+        ]),
+        model="requested-model",
+    )
+
+    assert response.model == "requested-model"
+    assert response.provider_reported_model == "gpt-5.6-luna"
+
+
 def test_run_codex_stream_surfaces_failed_status_in_final_response(monkeypatch):
     """A ``response.failed`` terminal event is reflected on the returned object."""
     agent = _build_agent(monkeypatch)

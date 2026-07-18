@@ -224,6 +224,101 @@ Feature docs: `docs/chantxu64/hindsight-sync-cache-miss-recall/README.md`
 
 Upstream status: fork-only.
 
+### 9. Hindsight P5 recall preprocessor
+
+Date: 2026-07-17
+
+Files:
+
+- `agent/memory_provider.py`
+- `agent/memory_manager.py`
+- `agent/turn_context.py`
+- `agent/codex_runtime.py`
+- `agent/auxiliary_client.py`
+- `hermes_cli/plugins.py`
+- `plugins/memory/__init__.py`
+- `plugins/memory/hindsight/recall_preprocessor.py`
+- `plugins/memory/hindsight/__init__.py`
+- `tests/fork/test_hindsight_recall_preprocessor.py`
+- `tests/fork/test_hindsight_provider_regressions.py`
+- `tests/fork/test_codex_memory_context_isolation.py`
+- `tests/hermes_cli/test_plugin_auxiliary_tasks.py`
+- `tests/run_agent/test_run_agent_codex_responses.py`
+- `tests/agent/test_auxiliary_client.py`
+- `docs/chantxu64/hindsight-p5-recall-preprocessor/README.md`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+What changed:
+
+- Hindsight background prefetch now keeps the actual recall query and ordered
+  result texts as a structured snapshot alongside the historical formatted
+  cache string.
+- The current user message, latest completed non-tool assistant response, and
+  previous real recall are evaluated by the frozen P5 prompt through the
+  standard `auxiliary.hindsight_recall_preprocessor` task. Its configurable
+  provider/model/timeout defaults remain `openai-codex / gpt-5.6-luna / 30s`,
+  with no generic model/provider fallback.
+- Dynamic `main`/`auto` routes are rejected. Bare `custom` is rejected unless
+  this task has its own `base_url`, preventing fallback through global custom or
+  unrelated API-key providers. Non-Codex provider-reported `response.model`
+  values must match the configured model. Reserved canonical equivalents under
+  `custom:*` (empty, `auto`, `main`, or `custom` suffixes) follow the same route
+  rejection rules.
+- The active memory-plugin loader now exposes auxiliary tasks declared by a
+  memory provider to Hermes' standard model picker and dashboard registry; the
+  bridge is generic and does not special-case Hindsight in the CLI.
+- Strict output parsing accepts only `drop_old_refs` plus a one-line string or
+  null `new_query`. A non-null query preserves un-dropped old results and
+  appends one new read-only recall. A null query clears current/next recall
+  state and suppresses the same turn's legacy background prefetch.
+- `MemoryManager` forwards the previous assistant message only to providers
+  whose `prefetch` signature opts in, preserving legacy provider compatibility.
+- Turn setup also checks the duck-typed manager's `prefetch_all` signature before
+  passing the new keyword, preserving older manager substitutes and their memory
+  context instead of silently dropping it on `TypeError`.
+- The Codex stream consumer captures the terminal response's provider-reported
+  model separately from the requested-model compatibility field; P5 validates
+  the former before parsing output.
+- Preprocessor or generated-recall failures conservatively restore the full old
+  cache. Generation and session-switch guards clear and protect both cached
+  representations; delayed queue work from an old session is rejected before
+  recall and cannot repopulate a new session.
+
+Why it matters:
+
+- Short continuations such as “继续” and “修吧” can inherit a specific target
+  from the previous assistant analysis without sending those phrases or the
+  full assistant response directly to Hindsight.
+- The user accepts occasional duplicate recall and conservative side-topic
+  retention, but does not accept a hard coverage gate that suppresses memory
+  needed for the next answer.
+
+Merge protection:
+
+- Preserve P5 prompt SHA-256
+  `7dfade51638396003e6332f7dbb8da45698d03d715d1d54b2f51658d2edbfa09`
+  unless the user explicitly approves and evaluates a successor.
+- Preserve the explicit configurable/no-fallback auxiliary task, its evaluated
+  Luna/30-second defaults, Codex provider-reported terminal-model validation,
+  non-Codex `response.model` validation, and strict schema validation. Continue
+  rejecting `auto`, `main`, bare `custom`, and their reserved `custom:*`
+  canonical equivalents. Do not treat the Codex adapter's requested-model
+  `.model` compatibility field as independent backend-model evidence.
+- Keep query/result snapshots under the same generation and session lifecycle
+  as `_prefetch_result`; do not preserve one cache representation without the
+  other. Preserve session checks on queued prefetch before worker launch and
+  before recall.
+- Preserve fail-open restoration of old recall and the tools/auto_recall/
+  shutdown guards.
+- Do not reintroduce rejected P6 behavior that forces `new_query=null` merely
+  because old results appear to cover the target.
+- Run the focused command documented in the feature README after conflicts
+  touching memory prefetch, turn context, Hindsight, or auxiliary routing.
+
+Feature docs: `docs/chantxu64/hindsight-p5-recall-preprocessor/README.md`
+
+Upstream status: fork-only.
+
 ## Historical / reverted modifications
 
 ### 3. MLX Whisper local STT provider

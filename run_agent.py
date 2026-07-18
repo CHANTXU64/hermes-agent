@@ -35,6 +35,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import inspect
 import json
 import logging
 logger = logging.getLogger(__name__)
@@ -3491,10 +3492,21 @@ class AIAgent:
                 response_text,
                 **sync_kwargs,
             )
-            self._memory_manager.queue_prefetch_all(
-                user_text,
-                session_id=self.session_id or "",
-            )
+            queue_prefetch = self._memory_manager.queue_prefetch_all
+            queue_kwargs = {"session_id": self.session_id or ""}
+            try:
+                queue_parameters = inspect.signature(queue_prefetch).parameters.values()
+            except (TypeError, ValueError):
+                queue_parameters = ()
+            if any(
+                parameter.name == "turn_id"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in queue_parameters
+            ):
+                queue_kwargs["turn_id"] = (
+                    getattr(self, "_current_turn_id", "") or ""
+                )
+            queue_prefetch(user_text, **queue_kwargs)
         except Exception:
             pass
 

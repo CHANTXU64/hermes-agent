@@ -43,6 +43,7 @@ import sys
 import threading
 import time
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -50,6 +51,7 @@ from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
+from .recall_preprocessor import run_recall_preprocessor
 
 logger = logging.getLogger(__name__)
 
@@ -664,6 +666,12 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class _RecallSnapshot:
+    query: str
+    results: tuple[str, ...]
+
+
 class HindsightMemoryProvider(MemoryProvider):
     """Hindsight long-term memory with knowledge graph and multi-strategy retrieval."""
 
@@ -705,10 +713,12 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout = _DEFAULT_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
+        self._prefetch_snapshot: _RecallSnapshot | None = None
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         self._prefetch_thread_generation = 0
         self._prefetch_generation = 0
+        self._skip_queue_prefetch_turn_ids: set[str] = set()
         # Single-writer model for retain. sync_turn() enqueues; the writer
         # thread drains sequentially. Avoids spawning ad-hoc threads that
         # can race the interpreter shutdown and emit "cannot schedule new
@@ -1564,10 +1574,19 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
-    def _recall_for_query(self, query: str, *, timeout: float | None = None) -> str:
+    @staticmethod
+    def _recall_snapshot_text(snapshot: _RecallSnapshot) -> str:
+        return "\n".join(f"- {text}" for text in snapshot.results if text)
+
+    def _recall_snapshot_for_query(
+        self,
+        query: str,
+        *,
+        timeout: float | None = None,
+    ) -> _RecallSnapshot:
         query = str(query or "").strip()
         if not query:
-            return ""
+            return _RecallSnapshot(query="", results=())
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
         if self._prefetch_method == "reflect":
@@ -1576,7 +1595,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget),
                 timeout=timeout,
             )
-            return resp.text or ""
+            text = str(resp.text or "").strip()
+            return _RecallSnapshot(query=query, results=(text,) if text else ())
 
         recall_kwargs: dict = {
             "bank_id": self._bank_id,
@@ -1599,9 +1619,34 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         num_results = len(resp.results) if resp.results else 0
         logger.debug("Prefetch: recall returned %d results", num_results)
-        return "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+        results = tuple(
+            str(result.text)
+            for result in (resp.results or [])
+            if getattr(result, "text", None)
+        )
+        return _RecallSnapshot(query=query, results=results)
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def _recall_for_query(self, query: str, *, timeout: float | None = None) -> str:
+        """Compatibility wrapper returning the historical formatted text shape."""
+        return self._recall_snapshot_text(
+            self._recall_snapshot_for_query(query, timeout=timeout)
+        )
+
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+        previous_assistant_message: str = "",
+    ) -> str:
+        if self._memory_mode == "tools" or not self._auto_recall:
+            logger.debug("Prefetch: skipped (automatic recall inactive)")
+            return ""
+        if self._shutting_down.is_set():
+            logger.debug("Prefetch: skipped (shutting down)")
+            return ""
+
         thread = self._prefetch_thread
         thread_generation = self._prefetch_thread_generation
         if thread and thread.is_alive() and thread_generation == self._prefetch_generation:
@@ -1612,7 +1657,84 @@ class HindsightMemoryProvider(MemoryProvider):
                 return ""
         with self._prefetch_lock:
             result = self._prefetch_result
+            snapshot = self._prefetch_snapshot
             self._prefetch_result = ""
+            self._prefetch_snapshot = None
+
+        preprocessor_snapshot = snapshot
+        if (
+            preprocessor_snapshot is None
+            and not result
+            and str(previous_assistant_message or "").strip()
+        ):
+            preprocessor_snapshot = _RecallSnapshot(query="", results=())
+
+        if preprocessor_snapshot is not None:
+            original_results = tuple(preprocessor_snapshot.results)
+            fall_back_to_current_query = False
+            try:
+                decision = run_recall_preprocessor(
+                    current_user_message=str(query or ""),
+                    previous_assistant_message=str(previous_assistant_message or ""),
+                    previous_recall_query=preprocessor_snapshot.query,
+                    previous_recall_results=original_results,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Hindsight recall preprocessor failed; using full cached recall: %s",
+                    exc,
+                )
+                if original_results:
+                    selected_results = original_results
+                else:
+                    selected_results = ()
+                    fall_back_to_current_query = True
+            else:
+                if decision.new_query is None:
+                    skipped_turn_id = str(turn_id or "").strip()
+                    if skipped_turn_id:
+                        with self._prefetch_lock:
+                            self._skip_queue_prefetch_turn_ids.add(skipped_turn_id)
+                    logger.debug(
+                        "Prefetch: preprocessor skipped recall; clearing recall context"
+                    )
+                    return ""
+                dropped = set(decision.drop_old_refs)
+                selected_results = tuple(
+                    text
+                    for ref, text in enumerate(original_results, 1)
+                    if ref not in dropped
+                )
+                try:
+                    new_snapshot = self._recall_snapshot_for_query(
+                        decision.new_query,
+                        timeout=self._recall_sync_timeout_seconds,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Hindsight recall for preprocessor query failed; "
+                        "restoring full cached recall: %s",
+                        exc,
+                    )
+                    if original_results:
+                        selected_results = original_results
+                    else:
+                        selected_results = ()
+                        fall_back_to_current_query = True
+                else:
+                    selected_results += tuple(new_snapshot.results)
+
+            if not fall_back_to_current_query:
+                result = self._recall_snapshot_text(
+                    _RecallSnapshot(
+                        query=preprocessor_snapshot.query,
+                        results=selected_results,
+                    )
+                )
+                if not result:
+                    logger.debug("Prefetch: preprocessor selected no recall context")
+                    return ""
+
         if not result:
             if (
                 self._memory_mode == "tools"
@@ -1624,7 +1746,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Prefetch: no results available")
                 return ""
             try:
-                result = self._recall_for_query(query, timeout=self._recall_sync_timeout_seconds)
+                sync_snapshot = self._recall_snapshot_for_query(
+                    query,
+                    timeout=self._recall_sync_timeout_seconds,
+                )
+                result = self._recall_snapshot_text(sync_snapshot)
             except Exception as e:
                 logger.debug("Hindsight sync prefetch failed: %s", e, exc_info=True)
                 return ""
@@ -1634,7 +1760,13 @@ class HindsightMemoryProvider(MemoryProvider):
         logger.debug("Prefetch: returning %d chars of context", len(result))
         return self._format_prefetch_context(result)
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+    ) -> None:
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
             return
@@ -1647,23 +1779,72 @@ class HindsightMemoryProvider(MemoryProvider):
         query = str(query or "").strip()
         if not query:
             return
+        queued_session_id = str(session_id or "").strip()
+        completed_turn_id = str(turn_id or "").strip()
         with self._prefetch_lock:
+            current_session_id = str(self._session_id or "").strip()
+            if (
+                queued_session_id
+                and current_session_id
+                and queued_session_id != current_session_id
+            ):
+                logger.debug(
+                    "Prefetch: skipped stale queued session %s (current=%s)",
+                    queued_session_id,
+                    current_session_id,
+                )
+                return
+            if (
+                completed_turn_id
+                and completed_turn_id in self._skip_queue_prefetch_turn_ids
+            ):
+                self._skip_queue_prefetch_turn_ids.discard(completed_turn_id)
+                self._prefetch_generation += 1
+                self._prefetch_result = ""
+                self._prefetch_snapshot = None
+                logger.debug(
+                    "Prefetch: skipped post-turn recall for cleared turn %s",
+                    completed_turn_id,
+                )
+                return
             self._prefetch_generation += 1
             generation = self._prefetch_generation
             # A new queued query supersedes any previously cached recall.
             # If this generation returns no text, the next prefetch() should
             # sync-recall the current query instead of consuming stale context.
             self._prefetch_result = ""
+            self._prefetch_snapshot = None
 
         def _run():
             try:
-                text = self._recall_for_query(query)
-                if text:
-                    with self._prefetch_lock:
-                        if generation == self._prefetch_generation:
-                            self._prefetch_result = text
-                        else:
-                            logger.debug("Prefetch: discarded stale generation %s", generation)
+                with self._prefetch_lock:
+                    current_session_id = str(self._session_id or "").strip()
+                    if generation != self._prefetch_generation:
+                        logger.debug(
+                            "Prefetch: skipped stale generation %s before recall",
+                            generation,
+                        )
+                        return
+                    if (
+                        queued_session_id
+                        and current_session_id
+                        and queued_session_id != current_session_id
+                    ):
+                        logger.debug(
+                            "Prefetch: skipped stale queued session %s before recall "
+                            "(current=%s)",
+                            queued_session_id,
+                            current_session_id,
+                        )
+                        return
+                snapshot = self._recall_snapshot_for_query(query)
+                text = self._recall_snapshot_text(snapshot)
+                with self._prefetch_lock:
+                    if generation == self._prefetch_generation:
+                        self._prefetch_snapshot = snapshot
+                        self._prefetch_result = text
+                    else:
+                        logger.debug("Prefetch: discarded stale generation %s", generation)
             except Exception as e:
                 logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
 
@@ -3468,6 +3649,15 @@ class HindsightMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             self._prefetch_generation += 1
             self._prefetch_result = ""
+            self._prefetch_snapshot = None
+            self._session_id = new_id
+            skipped_turn_ids = getattr(
+                self,
+                "_skip_queue_prefetch_turn_ids",
+                None,
+            )
+            if skipped_turn_ids is not None:
+                skipped_turn_ids.clear()
 
         # 3. Now rotate to the new session.
         parent_id = str(parent_session_id or "").strip()
@@ -3480,7 +3670,6 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._retain_document_id = parent_id
         else:
             self._retain_document_id = new_id
-        self._session_id = new_id
         start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self._document_id = f"{self._session_id}-{start_ts}"
         self._session_turns = []
@@ -3561,3 +3750,13 @@ class HindsightMemoryProvider(MemoryProvider):
 def register(ctx) -> None:
     """Register Hindsight as a memory provider plugin."""
     ctx.register_memory_provider(HindsightMemoryProvider())
+    ctx.register_auxiliary_task(
+        "hindsight_recall_preprocessor",
+        display_name="Hindsight recall preprocessor",
+        description="Filter prior Hindsight recall and generate the next retrieval query",
+        defaults={
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "timeout": 30,
+        },
+    )

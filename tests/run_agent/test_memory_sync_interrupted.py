@@ -35,6 +35,7 @@ def _bare_agent():
     # providers that cache per-session state can update it mid-process
     # (see #6672).
     agent.session_id = "test_session_001"
+    agent._current_turn_id = "turn-1"
     return agent
 
 
@@ -89,7 +90,31 @@ class TestSyncExternalMemoryForTurn:
         agent._memory_manager.queue_prefetch_all.assert_called_once_with(
             "What's the weather in Paris?",
             session_id="test_session_001",
+            turn_id="turn-1",
         )
+
+    def test_completed_turn_keeps_legacy_queue_prefetch_signature(self):
+        class _LegacyMemoryManager:
+            def __init__(self):
+                self.queued = []
+
+            def sync_all(self, *args, **kwargs):
+                return None
+
+            def queue_prefetch_all(self, query, *, session_id=""):
+                self.queued.append((query, session_id))
+
+        agent = _bare_agent()
+        manager = _LegacyMemoryManager()
+        agent._memory_manager = manager
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="Continue",
+            final_response="Done",
+            interrupted=False,
+        )
+
+        assert manager.queued == [("Continue", "test_session_001")]
 
     def test_completed_turn_syncs_messages_when_present(self):
         agent = _bare_agent()
@@ -161,6 +186,7 @@ class TestSyncExternalMemoryForTurn:
         agent._memory_manager.queue_prefetch_all.assert_called_once_with(
             skill_message,
             session_id="test_session_001",
+            turn_id="turn-1",
         )
 
     # --- Edge cases (pre-existing behaviour preserved) ------------------
@@ -265,6 +291,7 @@ class TestSyncExternalMemoryForTurn:
         agent._memory_manager.queue_prefetch_all.assert_called_once_with(
             "[1 image] what is in this screenshot?",
             session_id="test_session_001",
+            turn_id="turn-1",
         )
 
     def test_multimodal_response_is_flattened(self):

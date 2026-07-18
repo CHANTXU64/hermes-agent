@@ -497,7 +497,38 @@ class MemoryManager:
         """
         return extract_user_instruction_from_skill_message(text)
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
+    @staticmethod
+    def _provider_prefetch_accepts_previous_assistant(provider: MemoryProvider) -> bool:
+        """Return whether prefetch accepts previous_assistant_message."""
+        try:
+            signature = inspect.signature(provider.prefetch)
+        except (TypeError, ValueError):
+            return True
+        params = list(signature.parameters.values())
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+            return True
+        return "previous_assistant_message" in signature.parameters
+
+    @staticmethod
+    def _provider_prefetch_accepts_turn_id(provider: MemoryProvider) -> bool:
+        """Return whether prefetch accepts turn_id."""
+        try:
+            signature = inspect.signature(provider.prefetch)
+        except (TypeError, ValueError):
+            return True
+        params = list(signature.parameters.values())
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+            return True
+        return "turn_id" in signature.parameters
+
+    def prefetch_all(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+        previous_assistant_message: str = "",
+    ) -> str:
         """Collect prefetch context from all providers.
 
         Returns merged context text labeled by provider. Empty providers
@@ -509,7 +540,14 @@ class MemoryManager:
         parts = []
         for provider in self._providers:
             try:
-                result = provider.prefetch(clean_query, session_id=session_id)
+                prefetch_kwargs = {"session_id": session_id}
+                if self._provider_prefetch_accepts_previous_assistant(provider):
+                    prefetch_kwargs["previous_assistant_message"] = (
+                        previous_assistant_message
+                    )
+                if self._provider_prefetch_accepts_turn_id(provider):
+                    prefetch_kwargs["turn_id"] = turn_id
+                result = provider.prefetch(clean_query, **prefetch_kwargs)
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -519,7 +557,25 @@ class MemoryManager:
                 )
         return "\n\n".join(parts)
 
-    def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
+    @staticmethod
+    def _provider_queue_prefetch_accepts_turn_id(provider: MemoryProvider) -> bool:
+        """Return whether queue_prefetch accepts turn_id."""
+        try:
+            signature = inspect.signature(provider.queue_prefetch)
+        except (TypeError, ValueError):
+            return True
+        params = list(signature.parameters.values())
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+            return True
+        return "turn_id" in signature.parameters
+
+    def queue_prefetch_all(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+    ) -> None:
         """Queue background prefetch on all providers for the next turn.
 
         Provider work is dispatched to a background worker so a slow or
@@ -537,7 +593,14 @@ class MemoryManager:
         def _run() -> None:
             for provider in providers:
                 try:
-                    provider.queue_prefetch(clean_query, session_id=session_id)
+                    if self._provider_queue_prefetch_accepts_turn_id(provider):
+                        provider.queue_prefetch(
+                            clean_query,
+                            session_id=session_id,
+                            turn_id=turn_id,
+                        )
+                    else:
+                        provider.queue_prefetch(clean_query, session_id=session_id)
                 except Exception as e:
                     logger.debug(
                         "Memory provider '%s' queue_prefetch failed (non-fatal): %s",

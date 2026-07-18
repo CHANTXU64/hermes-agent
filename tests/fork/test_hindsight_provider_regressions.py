@@ -851,14 +851,14 @@ def test_late_prefetch_generation_cannot_overwrite_newer_result(provider):
     old_started = threading.Event()
     release_old = threading.Event()
 
-    def _fake_recall(query, *, timeout=None):
+    def _fake_recall_snapshot(query, *, timeout=None):
         if query == "old query":
             old_started.set()
             release_old.wait(timeout=5.0)
-            return "- old recall"
-        return "- new recall"
+            return SimpleNamespace(query=query, results=("old recall",))
+        return SimpleNamespace(query=query, results=("new recall",))
 
-    provider._recall_for_query = _fake_recall
+    provider._recall_snapshot_for_query = _fake_recall_snapshot
     provider.queue_prefetch("old query")
     assert old_started.wait(timeout=5.0)
     old_thread = provider._prefetch_thread
@@ -870,15 +870,22 @@ def test_late_prefetch_generation_cannot_overwrite_newer_result(provider):
     old_thread.join(timeout=5.0)
 
     assert provider._prefetch_result == "- new recall"
+    assert provider._prefetch_snapshot.query == "new query"
+    assert provider._prefetch_snapshot.results == ("new recall",)
 
 def test_queue_prefetch_clears_cached_result_when_new_generation_returns_empty(provider):
     provider._prefetch_result = "- old cached recall"
-    provider._recall_for_query = lambda query, *, timeout=None: ""
+    provider._recall_snapshot_for_query = lambda query, *, timeout=None: SimpleNamespace(
+        query=query,
+        results=(),
+    )
 
     provider.queue_prefetch("new query")
     provider._prefetch_thread.join(timeout=5.0)
 
     assert provider._prefetch_result == ""
+    assert provider._prefetch_snapshot.query == "new query"
+    assert provider._prefetch_snapshot.results == ()
 
 def test_sync_turn_buffers_when_auto_retain_off(provider_with_config):
     p = provider_with_config(auto_retain=False)

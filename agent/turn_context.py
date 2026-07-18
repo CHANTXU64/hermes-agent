@@ -21,6 +21,7 @@ request shape without mutating durable conversation history.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import uuid
@@ -35,6 +36,71 @@ from agent.model_metadata import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _latest_completed_assistant_message(
+    messages: List[Dict[str, Any]],
+    *,
+    current_turn_user_idx: int,
+) -> str:
+    """Return the latest non-tool assistant text before the current user turn."""
+    upper_bound = min(max(current_turn_user_idx, 0), len(messages))
+    for message in reversed(messages[:upper_bound]):
+        if message.get("role") != "assistant":
+            continue
+        if message.get("tool_calls") or message.get("finish_reason") == "tool_calls":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") not in {"text", "input_text", "output_text"}:
+                    continue
+                part_text = part.get("text")
+                if isinstance(part_text, str) and part_text.strip():
+                    text_parts.append(part_text.strip())
+            text = "\n".join(text_parts)
+        else:
+            text = ""
+        if text:
+            return text
+    return ""
+
+
+def _memory_manager_accepts_previous_assistant(memory_manager: Any) -> bool:
+    """Whether a duck-typed manager accepts the optional P5 turn-context input."""
+    prefetch_all = getattr(memory_manager, "prefetch_all", None)
+    if not callable(prefetch_all):
+        return False
+    try:
+        parameters = inspect.signature(prefetch_all).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "previous_assistant_message"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _memory_manager_accepts_turn_id(memory_manager: Any) -> bool:
+    """Whether a duck-typed manager accepts the optional turn identifier."""
+    prefetch_all = getattr(memory_manager, "prefetch_all", None)
+    if not callable(prefetch_all):
+        return False
+    try:
+        parameters = inspect.signature(prefetch_all).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "turn_id"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 def _compression_made_progress(
@@ -313,6 +379,10 @@ def build_turn_context(
     # stamped by an earlier close flush.
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
+    previous_assistant_message = _latest_completed_assistant_message(
+        messages,
+        current_turn_user_idx=current_turn_user_idx,
+    )
     agent._persist_user_message_idx = current_turn_user_idx
 
     # Track user turns for memory flush and periodic nudge logic.
@@ -604,7 +674,17 @@ def build_turn_context(
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            prefetch_kwargs = {}
+            if _memory_manager_accepts_previous_assistant(agent._memory_manager):
+                prefetch_kwargs["previous_assistant_message"] = (
+                    previous_assistant_message
+                )
+            if _memory_manager_accepts_turn_id(agent._memory_manager):
+                prefetch_kwargs["turn_id"] = turn_id
+            ext_prefetch_cache = agent._memory_manager.prefetch_all(
+                _query,
+                **prefetch_kwargs,
+            ) or ""
         except Exception:
             pass
 

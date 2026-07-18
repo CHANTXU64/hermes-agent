@@ -198,6 +198,100 @@ def test_get_plugin_auxiliary_tasks_empty_when_none_registered(patched_manager):
     assert get_plugin_auxiliary_tasks() == []
 
 
+def test_get_plugin_auxiliary_tasks_includes_active_memory_provider(
+    monkeypatch,
+    patched_manager,
+):
+    monkeypatch.setattr(
+        "plugins.memory._get_active_memory_provider",
+        lambda: "hindsight",
+    )
+
+    tasks = get_plugin_auxiliary_tasks()
+    task = next(
+        entry
+        for entry in tasks
+        if entry["key"] == "hindsight_recall_preprocessor"
+    )
+
+    assert task["plugin"] == "memory:hindsight"
+    assert task["defaults"] == {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+        "base_url": "",
+        "api_key": "",
+        "timeout": 30,
+        "extra_body": {},
+    }
+
+
+def test_active_memory_provider_auxiliary_registration_is_cached(monkeypatch):
+    from plugins import memory as memory_plugins
+
+    monkeypatch.setattr(
+        memory_plugins,
+        "_MEMORY_AUXILIARY_TASKS",
+        {},
+    )
+    monkeypatch.setattr(
+        memory_plugins,
+        "_get_active_memory_provider",
+        lambda: "example_memory",
+    )
+    load_calls = []
+
+    def _load_memory_provider(name):
+        load_calls.append(name)
+        memory_plugins._MEMORY_AUXILIARY_TASKS[name] = [
+            {
+                "key": "example_task",
+                "display_name": "Example task",
+                "description": "example",
+                "defaults": {"provider": "auto"},
+                "plugin": "memory:example_memory",
+            }
+        ]
+        return object()
+
+    monkeypatch.setattr(
+        memory_plugins,
+        "load_memory_provider",
+        _load_memory_provider,
+    )
+
+    first = memory_plugins.get_memory_provider_auxiliary_tasks()
+    second = memory_plugins.get_memory_provider_auxiliary_tasks()
+
+    assert first == second
+    assert load_calls == ["example_memory"]
+
+
+def test_active_memory_provider_without_auxiliary_tasks_is_cached(monkeypatch):
+    from plugins import memory as memory_plugins
+
+    monkeypatch.setattr(memory_plugins, "_MEMORY_AUXILIARY_TASKS", {})
+    monkeypatch.setattr(
+        memory_plugins,
+        "_get_active_memory_provider",
+        lambda: "plain_memory",
+    )
+    load_calls = []
+
+    def _load_memory_provider(name):
+        load_calls.append(name)
+        return object()
+
+    monkeypatch.setattr(
+        memory_plugins,
+        "load_memory_provider",
+        _load_memory_provider,
+    )
+
+    assert memory_plugins.get_memory_provider_auxiliary_tasks() == []
+    assert memory_plugins.get_memory_provider_auxiliary_tasks() == []
+    assert load_calls == ["plain_memory"]
+
+
 # ── _all_aux_tasks merges built-in + plugin ──────────────────────────────────
 
 

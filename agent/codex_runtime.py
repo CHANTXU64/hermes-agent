@@ -644,10 +644,12 @@ def _consume_codex_event_stream(
     * ``id``: ``response.id`` when present.
     * ``incomplete_details``: passed through for ``response.incomplete`` frames.
     * ``error``: passed through for ``response.failed`` frames.
-    * ``model``: from kwargs (the wire model name is not authoritative).
+    * ``model``: from kwargs, preserving the existing requested-model contract.
+    * ``provider_reported_model``: the terminal response's model field, when present.
 
     Critically, we never read ``response.output`` from the terminal event for
-    content reconstruction — only ``usage``, ``status``, ``id``.  That field
+    content reconstruction — only metadata such as ``usage``, ``status``,
+    ``id``, and provider-reported ``model``.  That field
     being ``null`` / ``[]`` / missing is fine.
 
     Callbacks:
@@ -669,6 +671,7 @@ def _consume_codex_event_stream(
     terminal_status: str = "completed"
     terminal_usage: Any = None
     terminal_response_id: str = None
+    terminal_response_model: str | None = None
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
     saw_terminal = False
@@ -774,6 +777,11 @@ def _consume_codex_event_stream(
                 if rid is None and isinstance(resp_obj, dict):
                     rid = resp_obj.get("id")
                 terminal_response_id = rid
+                reported_model = getattr(resp_obj, "model", None)
+                if reported_model is None and isinstance(resp_obj, dict):
+                    reported_model = resp_obj.get("model")
+                if isinstance(reported_model, str) and reported_model.strip():
+                    terminal_response_model = reported_model.strip()
                 rstatus = getattr(resp_obj, "status", None)
                 if rstatus is None and isinstance(resp_obj, dict):
                     rstatus = resp_obj.get("status")
@@ -832,6 +840,7 @@ def _consume_codex_event_stream(
         status=terminal_status,
         id=terminal_response_id,
         model=model,
+        provider_reported_model=terminal_response_model,
         incomplete_details=terminal_incomplete_details,
         error=terminal_error,
     )
