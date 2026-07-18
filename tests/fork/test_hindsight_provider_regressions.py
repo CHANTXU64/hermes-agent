@@ -1371,6 +1371,54 @@ def test_assistant_summary_markers_are_not_retained(provider_with_config):
     assert "Session Arc Summary" not in p._session_turns[0]
 
 
+def test_transcript_sync_keeps_visible_assistant_after_lcm_summary_only_window(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    messages = [
+        {
+            "role": "user",
+            "content": "[Recent Summary (d0, node 564)]\ncompressed source conversation",
+            "timestamp": 1710002100.0,
+        },
+        {
+            "role": "assistant",
+            "content": "最终可见的评估结论",
+            "timestamp": 1710002101.0,
+        },
+    ]
+
+    p.sync_turn(messages[0]["content"], messages[1]["content"], messages=messages)
+
+    assert len(p._session_turns) == 1
+    turn = json.loads(p._session_turns[0])
+    assert [message["role"] for message in turn] == ["assistant"]
+    assert turn[0]["content"] == "Assistant: 最终可见的评估结论"
+    assert "Recent Summary" not in p._session_turns[0]
+
+
+def test_transcript_sync_preserves_real_user_recent_summary_lookalike(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    messages = [
+        {
+            "role": "user",
+            "content": "[Recent Summary request]\n这是用户真实输入",
+            "timestamp": 1710002200.0,
+        },
+        {
+            "role": "assistant",
+            "content": "正常回答",
+            "timestamp": 1710002201.0,
+        },
+    ]
+
+    p.sync_turn(messages[0]["content"], messages[1]["content"], messages=messages)
+
+    assert len(p._session_turns) == 1
+    turn = json.loads(p._session_turns[0])
+    assert [message["role"] for message in turn] == ["user", "assistant"]
+    assert turn[0]["content"] == "User: [Recent Summary request]\n这是用户真实输入"
+    assert turn[1]["content"] == "Assistant: 正常回答"
+
+
 def test_clean_on_retain_strips_historical_runtime_payload_but_keeps_visible_content(provider_with_config):
     p = provider_with_config(auto_retain=False)
     # Simulate pre-fix dirty rows already in sqlite.

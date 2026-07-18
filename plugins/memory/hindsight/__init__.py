@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sqlite3
 import sys
 import threading
@@ -1913,15 +1914,18 @@ class HindsightMemoryProvider(MemoryProvider):
     _RETAIN_OBJECTIVE_HEADER = "[Current user objective preserved from compacted history]"
     _RETAIN_MODEL_SWITCH_NOTE_PREFIX = "[Note: model was just switched from "
     _RETAIN_MODEL_SWITCH_NOTE_SUFFIX = "Adjust your self-identification accordingly.]"
+    _RETAIN_LCM_SUMMARY_HEADER_RE = re.compile(
+        r"(?:\[(?:Recent|Session Arc|Durable) Summary \(d\d+(?:,\s*node\s+\d+)?\)\]"
+        r"|\[Depth-\d+ Summary \(d\d+(?:,\s*node\s+\d+)?\)\])"
+    )
+    _RETAIN_RECENT_SUMMARY_HEADER_RE = re.compile(
+        r"\[Recent Summary \(d0(?:,\s*node\s+\d+)?\)\]"
+    )
     _RETAIN_ASYNC_COMPLETION_MARKERS = (
         "[ASYNC DELEGATION BATCH COMPLETE",
         "[ASYNC DELEGATION COMPLETE",
     )
     _RETAIN_NOISE_MARKERS = (
-        "[Recent Summary",
-        "[Session Arc Summary",
-        "[Durable Summary",
-        "[Depth-",  # e.g. [Depth-3 Summary (d3, node N)]
         _RETAIN_OBJECTIVE_HEADER,
         "[Your active task list was preserved across context compression]",
         "[Externalized payload:",
@@ -1930,14 +1934,44 @@ class HindsightMemoryProvider(MemoryProvider):
     )
 
     @classmethod
+    def _is_lcm_summary_header_line(cls, content: str) -> bool:
+        return bool(cls._RETAIN_LCM_SUMMARY_HEADER_RE.fullmatch((content or "").strip()))
+
+    @classmethod
+    def _starts_with_lcm_summary_block(cls, content: str) -> bool:
+        first_line = (content or "").lstrip().split("\n", 1)[0]
+        return cls._is_lcm_summary_header_line(first_line)
+
+    @classmethod
+    def _starts_with_recent_summary_block(cls, content: str) -> bool:
+        first_line = (content or "").lstrip().split("\n", 1)[0].strip()
+        return bool(cls._RETAIN_RECENT_SUMMARY_HEADER_RE.fullmatch(first_line))
+
+    @classmethod
     def _starts_with_retain_noise_marker(cls, content: str) -> bool:
         text = (content or "").lstrip()
-        return any(text.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS)
+        return cls._starts_with_lcm_summary_block(text) or any(
+            text.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS
+        )
 
     @classmethod
     def _is_async_completion_user_content(cls, content: Any) -> bool:
         text = cls._stringify_retain_content(content).lstrip()
         return any(text.startswith(marker) for marker in cls._RETAIN_ASYNC_COMPLETION_MARKERS)
+
+    @classmethod
+    def _is_orphan_assistant_trigger_user_content(cls, content: Any) -> bool:
+        """Return whether a synthetic user row may close with visible output.
+
+        Async completion rows and recent-summary rehydration are internal
+        runtime inputs, but the assistant response immediately following either
+        row is user-visible conversation evidence. Other summary/noise-only rows
+        remain dropped as a unit.
+        """
+        text = cls._stringify_retain_content(content).lstrip()
+        return cls._starts_with_recent_summary_block(text) or any(
+            text.startswith(marker) for marker in cls._RETAIN_ASYNC_COMPLETION_MARKERS
+        )
 
     @classmethod
     def _strip_model_switch_note(cls, text: str) -> str:
@@ -2023,11 +2057,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Pure synthetic messages (todo/async/externalized/LCM summary blocks).
         # Objective header was already stripped above when present.
-        if any(
-            text.startswith(marker)
-            for marker in cls._RETAIN_NOISE_MARKERS
-            if marker != cls._RETAIN_OBJECTIVE_HEADER
-        ):
+        if cls._starts_with_retain_noise_marker(text):
             return ""
 
         lines = text.split("\n")
@@ -2035,7 +2065,9 @@ class HindsightMemoryProvider(MemoryProvider):
         skipping_block = False
         for line in lines:
             stripped = line.strip()
-            if any(stripped.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS):
+            if cls._is_lcm_summary_header_line(stripped) or any(
+                stripped.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS
+            ):
                 # Synthetic blocks are injected as whole segments; once a marker
                 # starts, drop the remainder of that segment/message body.
                 skipping_block = True
@@ -2091,7 +2123,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 body = content[len(user_prefix):] if content.startswith(user_prefix) else content
                 cleaned_body = self._clean_retain_user_content(body)
                 if not cleaned_body:
-                    if self._is_async_completion_user_content(body):
+                    if self._is_orphan_assistant_trigger_user_content(body):
                         # Drop the internal trigger payload but keep scanning:
                         # its final assistant response was visible to the user.
                         continue
@@ -2198,11 +2230,11 @@ class HindsightMemoryProvider(MemoryProvider):
                     # also closes a prior orphan user before collecting its own
                     # visible assistant, so the async result cannot be falsely
                     # paired with that earlier user.
-                    is_async_completion = self._is_async_completion_user_content(content)
-                    if pending_user and (pending_assistant or is_async_completion):
+                    preserves_visible_assistant = self._is_orphan_assistant_trigger_user_content(content)
+                    if pending_user and (pending_assistant or preserves_visible_assistant):
                         _flush_pending_turn()
                     _flush_pending_async_assistant()
-                    pending_async_completion = is_async_completion
+                    pending_async_completion = preserves_visible_assistant
                     continue
                 _flush_pending_async_assistant()
                 _flush_pending_turn()
@@ -3405,7 +3437,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if clean_user:
             turn_messages = self._build_turn_messages(clean_user, assistant_content)
         elif (
-            self._is_async_completion_user_content(user_content)
+            self._is_orphan_assistant_trigger_user_content(user_content)
             and not self._is_retain_noise_assistant_content(assistant_content)
         ):
             # Scalar callers lack the completed transcript but still describe a
