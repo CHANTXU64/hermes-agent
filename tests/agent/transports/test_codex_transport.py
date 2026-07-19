@@ -303,6 +303,125 @@ class TestCodexBuildKwargs:
         )
         assert "max_output_tokens" not in kw
 
+    def test_codex_backend_sets_cache_routing_headers(self, transport):
+        """Codex backend sends session_id / x-client-request-id as HTTP
+        headers (via extra_headers) for cache-scope routing."""
+        messages = [{"role": "user", "content": "Hi"}]
+
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            session_id="conv-codex-1",
+            is_codex_backend=True,
+        )
+
+        headers = kw.get("extra_headers", {})
+        assert headers.get("session_id") == "conv-codex-1"
+        assert headers.get("x-client-request-id") == "conv-codex-1"
+
+    def test_codex_backend_hashes_overlength_cache_routing_headers(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        long_session_id = "paperclip:company:" + "a" * 80
+
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            session_id=long_session_id,
+            is_codex_backend=True,
+        )
+
+        headers = kw["extra_headers"]
+        cache_scope = headers["session_id"]
+        assert cache_scope == headers["x-client-request-id"]
+        assert cache_scope.startswith("pck_")
+        assert len(cache_scope) <= 64
+        assert cache_scope != long_session_id
+        assert kw["prompt_cache_key"].startswith("pck_")
+        assert len(kw["prompt_cache_key"]) <= 64
+
+    @pytest.mark.parametrize("length", [64, 65])
+    def test_codex_cache_scope_boundary(self, transport, length):
+        session_id = "s" * length
+        scope = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            session_id=session_id,
+            is_codex_backend=True,
+            request_overrides={"extra_headers": {"x-test": "1"}},
+        )["extra_headers"]
+
+        assert scope["x-test"] == "1"
+        assert len(scope["session_id"]) <= 64
+        assert scope["x-client-request-id"] == scope["session_id"]
+        if length == 64:
+            assert scope["session_id"] == session_id
+        else:
+            assert scope["session_id"].startswith("pck_")
+            assert scope["session_id"] != session_id
+
+    def test_codex_backend_overlength_cache_scope_is_stable_and_collision_resistant(self, transport):
+        common = "paperclip:company:" + "a" * 80
+
+        def cache_scope(session_id):
+            return transport.build_kwargs(
+                model="gpt-5.4",
+                messages=[{"role": "user", "content": "Hi"}],
+                tools=[],
+                session_id=session_id,
+                is_codex_backend=True,
+            )["extra_headers"]["session_id"]
+
+        assert cache_scope(common + "1") == cache_scope(common + "1")
+        assert cache_scope(common + "1") != cache_scope(common + "2")
+
+    def test_long_override_keys_are_bounded_at_build_and_preflight(self, transport):
+        long_key = "paperclip:" + "x" * 130
+        kwargs = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            request_overrides={"prompt_cache_key": long_key},
+        )
+        assert len(kwargs["prompt_cache_key"]) <= 64
+
+        middleware_payload = dict(kwargs)
+        middleware_payload["prompt_cache_key"] = long_key
+        preflight = transport.preflight_kwargs(middleware_payload)
+        assert preflight["prompt_cache_key"].startswith("pck_")
+        assert len(preflight["prompt_cache_key"]) <= 64
+
+    def test_xai_long_override_key_is_bounded_at_build_and_preflight(self, transport):
+        long_key = "paperclip:" + "x" * 130
+        kwargs = transport.build_kwargs(
+            model="grok-4.3",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_xai_responses=True,
+            request_overrides={"extra_body": {"prompt_cache_key": long_key}},
+        )
+        assert len(kwargs["extra_body"]["prompt_cache_key"]) <= 64
+
+        middleware_payload = dict(kwargs)
+        middleware_payload["extra_body"] = {"prompt_cache_key": long_key}
+        preflight = transport.preflight_kwargs(middleware_payload)
+        assert preflight["extra_body"]["prompt_cache_key"].startswith("pck_")
+        assert len(preflight["extra_body"]["prompt_cache_key"]) <= 64
+
+    def test_codex_backend_no_headers_without_session_id(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+        )
+
+        assert "extra_headers" not in kw
+
     def test_codex_backend_preserves_caller_extra_headers(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
 
@@ -315,15 +434,10 @@ class TestCodexBuildKwargs:
             request_overrides={"extra_headers": {"x-test": "1"}},
         )
 
-        pck = kw["prompt_cache_key"]
-        assert pck.startswith("pck_")
-        assert kw["extra_headers"] == {
-            "x-test": "1",
-            "session_id": "conv-codex-1",
-            "thread-id": pck,
-            "x-client-request-id": pck,
-        }
-        assert "session-id" not in kw["extra_headers"]
+        headers = kw.get("extra_headers", {})
+        assert headers.get("x-test") == "1"
+        assert headers.get("session_id") == "conv-codex-1"
+        assert headers.get("x-client-request-id") == "conv-codex-1"
 
     def test_non_codex_responses_preserves_caller_extra_headers(self, transport):
         messages = [{"role": "user", "content": "Hi"}]

@@ -1,10 +1,13 @@
 """Tests for the memory provider interface, manager, and builtin provider."""
 
 import json
+import threading
+import time
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import agent.memory_manager as memory_manager
 from agent.memory_provider import MemoryProvider
 from agent.memory_manager import MemoryManager, inject_memory_provider_tools
 
@@ -92,6 +95,21 @@ class MessagesMemoryProvider(FakeMemoryProvider):
         self.synced_turns.append((user_content, assistant_content, session_id, messages))
 
 
+class BlockingPrefetchProvider(FakeMemoryProvider):
+    """External provider whose prefetch call blocks until released."""
+
+    def __init__(self, name="external"):
+        super().__init__(name=name)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def prefetch(self, query, *, session_id=""):
+        self.prefetch_queries.append(query)
+        self.started.set()
+        self.release.wait(timeout=5.0)
+        return self._prefetch_result
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider ABC tests
 # ---------------------------------------------------------------------------
@@ -112,6 +130,7 @@ class TestMemoryProviderABC:
     def test_default_optional_hooks_are_noop(self):
         """Optional hooks have default no-op implementations."""
         p = FakeMemoryProvider()
+        assert p.prefetch_timeout_seconds() is None
         # These should not raise
         p.on_turn_start(1, "hello")
         p.on_session_end([])
@@ -398,6 +417,149 @@ class TestMemoryManager:
 
         result = mgr.prefetch_all("query")
         assert "external memory" in result
+
+    def test_external_prefetch_timeout_skips_stuck_provider(self):
+        mgr = MemoryManager(external_prefetch_timeout=0.01)
+        builtin = FakeMemoryProvider("builtin")
+        builtin._prefetch_result = "builtin memory"
+        external = BlockingPrefetchProvider("hy-memory")
+        external._prefetch_result = "late external memory"
+        mgr.add_provider(builtin)
+        mgr.add_provider(external)
+
+        started = time.monotonic()
+        result = mgr.prefetch_all("query")
+        elapsed = time.monotonic() - started
+
+        assert result == "builtin memory"
+        assert elapsed < 0.5
+        assert external.started.wait(timeout=1.0)
+        assert external.prefetch_queries == ["query"]
+
+        started = time.monotonic()
+        result = mgr.prefetch_all("query 2")
+        elapsed = time.monotonic() - started
+
+        assert result == "builtin memory"
+        assert elapsed < 0.2
+        assert external.prefetch_queries == ["query"]
+
+        external.release.set()
+
+        deadline = time.monotonic() + 1.0
+        while (
+            external.name in mgr._external_prefetch_threads
+            and mgr._external_prefetch_threads[external.name].is_alive()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+
+        result = mgr.prefetch_all("query 3")
+
+        assert result == "builtin memory\n\nlate external memory"
+        assert external.prefetch_queries == ["query", "query 3"]
+        assert external.name not in mgr._external_prefetch_threads
+
+    def test_external_prefetch_uses_provider_declared_timeout(self, monkeypatch):
+        monkeypatch.setattr(memory_manager, "_EXTERNAL_PREFETCH_TIMEOUT_S", 0.01)
+
+        class BudgetedProvider(FakeMemoryProvider):
+            def prefetch_timeout_seconds(self):
+                return 0.2
+
+            def prefetch(self, query, *, session_id=""):
+                self.prefetch_queries.append(query)
+                time.sleep(0.03)
+                return "provider memory"
+
+        mgr = MemoryManager()
+        provider = BudgetedProvider("external")
+        mgr.add_provider(provider)
+
+        assert mgr.prefetch_all("query") == "provider memory"
+        assert provider.prefetch_queries == ["query"]
+
+    def test_external_prefetch_without_declared_timeout_uses_default(self, monkeypatch):
+        monkeypatch.setattr(memory_manager, "_EXTERNAL_PREFETCH_TIMEOUT_S", 0.01)
+        mgr = MemoryManager()
+        provider = BlockingPrefetchProvider("external")
+        mgr.add_provider(provider)
+
+        try:
+            assert mgr.prefetch_all("query") == ""
+        finally:
+            provider.release.set()
+
+    def test_explicit_external_timeout_overrides_provider_declared_timeout(self):
+        class BudgetedBlockingProvider(BlockingPrefetchProvider):
+            def prefetch_timeout_seconds(self):
+                return 0.2
+
+        mgr = MemoryManager(external_prefetch_timeout=0.01)
+        provider = BudgetedBlockingProvider("external")
+        provider._prefetch_result = "late provider memory"
+        mgr.add_provider(provider)
+
+        try:
+            assert mgr.prefetch_all("query") == ""
+            assert provider.started.wait(timeout=0.2)
+        finally:
+            provider.release.set()
+
+    @pytest.mark.parametrize(
+        "declared_timeout",
+        [0.0, -1.0, float("nan"), float("inf"), "invalid"],
+    )
+    def test_invalid_provider_prefetch_timeout_uses_default(
+        self,
+        monkeypatch,
+        declared_timeout,
+    ):
+        monkeypatch.setattr(memory_manager, "_EXTERNAL_PREFETCH_TIMEOUT_S", 0.01)
+
+        class InvalidBudgetProvider(BlockingPrefetchProvider):
+            def prefetch_timeout_seconds(self):
+                return declared_timeout
+
+        mgr = MemoryManager()
+        provider = InvalidBudgetProvider("external")
+        mgr.add_provider(provider)
+
+        try:
+            assert mgr.prefetch_all("query") == ""
+        finally:
+            provider.release.set()
+
+    def test_provider_prefetch_timeout_error_uses_default(self, monkeypatch):
+        monkeypatch.setattr(memory_manager, "_EXTERNAL_PREFETCH_TIMEOUT_S", 0.01)
+
+        class BrokenBudgetProvider(BlockingPrefetchProvider):
+            def prefetch_timeout_seconds(self):
+                raise RuntimeError("broken timeout resolver")
+
+        mgr = MemoryManager()
+        provider = BrokenBudgetProvider("external")
+        mgr.add_provider(provider)
+
+        try:
+            assert mgr.prefetch_all("query") == ""
+        finally:
+            provider.release.set()
+
+    def test_provider_prefetch_timeout_overflow_uses_default(self, monkeypatch):
+        monkeypatch.setattr(memory_manager, "_EXTERNAL_PREFETCH_TIMEOUT_S", 0.2)
+
+        class OverflowBudgetProvider(FakeMemoryProvider):
+            def prefetch_timeout_seconds(self):
+                return 10**10000
+
+        mgr = MemoryManager()
+        provider = OverflowBudgetProvider("external")
+        provider._prefetch_result = "provider memory"
+        mgr.add_provider(provider)
+
+        assert mgr.prefetch_all("query") == "provider memory"
+        assert provider.prefetch_queries == ["query"]
 
     def test_system_prompt_failure_doesnt_block(self):
         mgr = MemoryManager()

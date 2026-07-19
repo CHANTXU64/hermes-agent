@@ -226,7 +226,7 @@ Upstream status: fork-only.
 
 ### 9. Hindsight P5 recall preprocessor
 
-Date: 2026-07-17
+Date: 2026-07-17; external-prefetch timeout compatibility fix 2026-07-19
 
 Files:
 
@@ -240,8 +240,8 @@ Files:
 - `plugins/memory/hindsight/recall_preprocessor.py`
 - `plugins/memory/hindsight/__init__.py`
 - `tests/fork/test_hindsight_recall_preprocessor.py`
+- `tests/agent/test_memory_provider.py`
 - `tests/fork/test_hindsight_provider_regressions.py`
-- `tests/fork/test_codex_memory_context_isolation.py`
 - `tests/hermes_cli/test_plugin_auxiliary_tasks.py`
 - `tests/run_agent/test_run_agent_codex_responses.py`
 - `tests/agent/test_auxiliary_client.py`
@@ -283,6 +283,15 @@ What changed:
   cache. Generation and session-switch guards clear and protect both cached
   representations; delayed queue work from an old session is rejected before
   recall and cannot repopulate a new session.
+- External memory providers may declare a complete synchronous prefetch budget.
+  Providers without a declaration retain upstream's generic 8-second fail-open
+  guard. Hindsight declares the sum of its bounded stages: the 3-second legacy
+  background-prefetch handoff, the configured P5 auxiliary timeout, up to two
+  sequential `recall_sync_timeout_seconds` windows, and a 1-second outer-guard
+  scheduling margin. The second recall covers the branch where a P5-generated
+  query fails with no old results and the provider retries the current query.
+  With the current 30/10-second settings the outer guard is 54 seconds, so it no
+  longer truncates either recall stage at 8 seconds.
 
 Why it matters:
 
@@ -310,6 +319,9 @@ Merge protection:
   before recall.
 - Preserve fail-open restoration of old recall and the tools/auto_recall/
   shutdown guards.
+- Preserve provider-specific prefetch budgeting. Do not replace the generic
+  external-provider 8-second guard with a Hindsight-specific global constant,
+  and do not let that generic guard silently override P5/recall stage timeouts.
 - Do not reintroduce rejected P6 behavior that forces `new_query=null` merely
   because old results appear to cover the target.
 - Run the focused command documented in the feature README after conflicts
@@ -502,7 +514,7 @@ What changed:
 - Hindsight rewind handling truncates the in-memory retain buffer and invalidates flush state without running the normal session-switch flush, so `/undo` does not itself push stale buffered turns to Hindsight.
 - Only `/retain` is user-facing; no long command aliases are registered.
 - Slack native slash generation keeps Telegram-visible canonical commands ahead of low-priority aliases so the extra fork-only `/retain` command keeps a native Slack slot under Slack's 50-command cap.
-- Slack routes low-frequency or high-cost commands such as `/billing`, `/blueprint`, `/credits`, `/moa`, `/debug`, `/disk-cleanup` / `/disk_cleanup`, and `/lcm` through `/hermes <command>` on this fork when native slots are exhausted; this preserves native `/retain` while keeping those commands reachable on Slack.
+- Slack routes low-frequency or high-cost commands such as `/topup`, `/blueprint`, `/moa`, `/debug`, `/disk-cleanup` / `/disk_cleanup`, and `/lcm` through `/hermes <command>` on this fork when native slots are exhausted; this preserves native `/retain` while keeping those commands reachable on Slack.
 - `hindsight_retain_session` is not registered in model-visible tool schemas; CLI/Gateway call the provider directly via `memory_manager.get_provider("hindsight")`, so manual retain works even when `memory_mode="context"` hides Hindsight tools from the model.
 
 Why it matters:
@@ -673,13 +685,23 @@ Feature docs: none — TTS provider extension documented in this index.
 Upstream status: fork-only.
 
 
-### 12. Temporary Codex backend prompt-cache routing workaround
+### 12. Codex backend prompt-cache routing workaround
 
-Status: active, temporary
+Status: historical / superseded by upstream per user decision
 
-Date: 2026-06-16
+Date: 2026-06-16 to 2026-07-19
 
-Files:
+Current status:
+
+- On 2026-07-19 the user explicitly chose the official upstream cache
+  implementation as canonical for this entire area.
+- The fork-specific stable logical cache key, custom Codex routing headers,
+  request-only developer-message memory isolation, related regression tests, and
+  weak memory-context wording are removed.
+- Upstream `api_content` composition, persistence, invalidation, and replay are the
+  source of truth. Unrelated Hindsight P5 recall preprocessing remains active.
+
+Historical files:
 
 - `agent/chat_completion_helpers.py`
 - `agent/transports/codex.py`
@@ -694,9 +716,9 @@ Files:
 - `tests/run_agent/test_codex_app_server_integration.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
-Summary:
+Historical summary:
 
-- Adds a short-term fork workaround for Codex prompt-cache regressions where
+- Added a short-term fork workaround for Codex prompt-cache regressions where
   consecutive tool calls, compression continuations, or dynamic memory-context
   injection can otherwise lose cache affinity.
 
@@ -747,11 +769,10 @@ Why it matters:
 - Keeping recalled memory out of `instructions` and the current user message
   preserves the stable prompt prefix and avoids treating old memory as fresh user
   discourse.
-- The user wants persistent memory to remain available as historical reference,
-  not promoted into a stronger instruction such as `authoritative` or `should
-  inform all responses`.
+- Historical note: the user originally wanted persistent memory treated as
+  reference rather than a stronger instruction.
 
-Merge protection:
+Retired merge rules (do not apply):
 
 - This is intentionally a temporary fork patch, not a long-term fork feature.
 - Do **not** discard the fork `session_id` / `thread-id` / stable
@@ -785,7 +806,14 @@ Merge protection:
   that telemetry, stop and ask the user instead of assuming the upstream fix is
   equivalent.
 
-Verification:
+Current merge protection:
+
+- Do not revive the stable logical cache key, custom Codex routing headers,
+  request-only developer-memory slots, weak note wording, or retired tests without
+  a new explicit user decision.
+- Preserve upstream `api_content` cache behavior as canonical.
+
+Historical verification:
 
 ```bash
 git diff --check
@@ -861,9 +889,8 @@ Observed local results:
   `venv/bin/python -m py_compile agent/conversation_loop.py agent/turn_context.py tests/fork/test_codex_memory_context_isolation.py`
   and `git diff --check` passed.
 
-Upstream status: upstream official Codex header fix exists but is not equivalent
-for this fork's long gateway-session cache behavior; active fork workaround
-restored pending real telemetry proof of an upstream replacement.
+Upstream status: superseded by the official `api_content` cache implementation
+per the user's 2026-07-19 decision.
 
 ### 13. Multi Telegram bots in one profile (account_id session slots)
 
@@ -940,7 +967,7 @@ Verification:
 ```bash
 python -m py_compile gateway/session.py gateway/config.py gateway/platforms/base.py gateway/authz_mixin.py gateway/slash_commands.py gateway/run.py plugins/platforms/telegram/adapter.py
 scripts/run_tests.sh tests/fork/test_multi_telegram_accounts.py tests/gateway/test_background_process_notifications.py tests/gateway/test_resume_command.py tests/gateway/test_restart_notification.py tests/gateway/test_runner_fatal_adapter.py tests/gateway/test_platform_reconnect.py -q
-scripts/run_tests.sh tests/fork/test_codex_prompt_cache.py tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py -q
+scripts/run_tests.sh tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py -q
 scripts/run_tests.sh tests/fork -q
 ```
 

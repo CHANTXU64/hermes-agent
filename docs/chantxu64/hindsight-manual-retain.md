@@ -195,7 +195,7 @@ bank_id = current configured bank
 - Manual `/retain` submits a clean item containing `content` and configured `context`, with no extra metadata/tags.
 - 没有 persisted turns 时不提交。
 - `get_tool_schemas()` 不暴露 `hindsight_retain_session`。
-- Slack native slash slots under the 50-command cap preserve canonical `/debug` despite fork-only `/retain`; low-frequency `/blueprint`, `/credits`, `/disk_cleanup`, and `/lcm` remain reachable through `/hermes <command>` on Slack.
+- Slack native slash slots under the 50-command cap preserve canonical `/debug` despite fork-only `/retain`; low-frequency `/blueprint`, `/topup`, `/disk_cleanup`, and `/lcm` remain reachable through `/hermes <command>` on Slack.
 - legacy buffer flush 的 append/pending/失败回滚/generation guard 回归测试仍保留，避免自动 retain 路径退化。
 
 验证命令：

@@ -13,6 +13,20 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
 
+def _bounded_prompt_cache_key(value: Any) -> Optional[str]:
+    """Return a provider-safe cache key without changing session identity."""
+    if value is None:
+        return None
+    key = str(value).strip()
+    if not key:
+        return None
+    if len(key) <= 64:
+        return key
+    # Match _content_cache_key's compact, collision-resistant routing-key shape.
+    digest = hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"pck_{digest}"
+
+
 def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]]) -> Optional[str]:
     """Content-address the prompt cache key from the static request prefix.
 
@@ -107,11 +121,10 @@ class ResponsesApiTransport(ProviderTransport):
         params:
             instructions: str — system prompt (extracted from messages[0] if not given)
             reasoning_config: dict | None — {effort, enabled}
-            session_id: str | None — physical transcript/session id; drives the
-                xAI x-grok-conv-id header and the Codex physical-session header
-            prompt_cache_key: str | None — stable logical cache scope for gateway
-                or compression lineage; when absent or only equal to session_id,
-                the transport content-addresses the static prefix instead
+            session_id: str | None — transcript/session id; drives the xAI
+                x-grok-conv-id header and the Codex cache-scope headers, and is
+                the fallback prompt_cache_key when there is no static prefix to
+                content-address
             max_tokens: int | None — max_output_tokens
             timeout: float | None — per-request timeout forwarded to the SDK
             request_overrides: dict | None — extra kwargs merged in
@@ -258,30 +271,18 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["tool_choice"] = "auto"
             kwargs["parallel_tool_calls"] = True
 
-        session_id = str(params.get("session_id") or "").strip()
-        raw_prompt_cache_key = str(params.get("prompt_cache_key") or "").strip()
-        # Upstream cache fix: when there is no fork-stable logical scope, route
-        # by the static prefix (instructions + tool schemas) instead of the
-        # physical session id. This keeps recurring cron fires warm even when
-        # their session_id contains a timestamp. Fork cache fix: a caller may
-        # still supply a stable logical scope (gateway key / compression root)
-        # via prompt_cache_key; that wins when it differs from session_id.
-        stable_prompt_cache_key = (
-            raw_prompt_cache_key
-            if raw_prompt_cache_key and raw_prompt_cache_key != session_id
-            else ""
-        )
-        content_cache_key = _content_cache_key(instructions, response_tools)
-        prompt_cache_key = (
-            stable_prompt_cache_key
-            or content_cache_key
-            or raw_prompt_cache_key
-            or session_id
-        )
+        session_id = params.get("session_id")
+        # prompt_cache_key is content-addressed from the static prefix
+        # (instructions + tools), NOT session_id — recurring cron jobs carry a
+        # per-fire timestamp in session_id (cron_<id>_<ts>) that made every run
+        # cache-cold. session_id is left untouched for transcript isolation and
+        # the cache-scope routing headers below. Falls back to session_id when
+        # there is no static content to hash.
+        cache_key = _content_cache_key(instructions, response_tools) or session_id
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
-        if not is_github_responses and not is_xai_responses and prompt_cache_key:
-            kwargs["prompt_cache_key"] = prompt_cache_key
+        if not is_github_responses and not is_xai_responses and cache_key:
+            kwargs["prompt_cache_key"] = cache_key
 
         if reasoning_enabled and is_xai_responses:
             from agent.model_metadata import grok_supports_reasoning_effort
@@ -316,9 +317,13 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
-            prompt_cache_key = str(
-                kwargs.get("prompt_cache_key") or prompt_cache_key or session_id or ""
-            ).strip()
+
+        if "prompt_cache_key" in kwargs:
+            bounded_cache_key = _bounded_prompt_cache_key(kwargs["prompt_cache_key"])
+            if bounded_cache_key:
+                kwargs["prompt_cache_key"] = bounded_cache_key
+            else:
+                kwargs.pop("prompt_cache_key", None)
 
         # xAI Responses API rejects ``service_tier`` (HTTP 400 "Argument not
         # supported: service_tier") — hit when ``/fast`` priority-processing
@@ -346,30 +351,28 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs.pop("timeout", None)
 
         if is_codex_backend:
-            # chatgpt.com/backend-api/codex needs stable HTTP header affinity
-            # for prompt-cache routing. Keep the fork's stable logical
-            # prompt_cache_key/thread routing, but use upstream's official
-            # ``session_id`` header spelling for the physical Hermes session.
-            existing_extra_headers = kwargs.get("extra_headers")
-            merged_extra_headers: Dict[str, str] = {}
-            if isinstance(existing_extra_headers, dict):
-                merged_extra_headers.update(
-                    {
-                        str(key): str(value)
-                        for key, value in existing_extra_headers.items()
-                        if key and value is not None
-                    }
-                )
-            if session_id:
-                merged_extra_headers["session_id"] = session_id
-                merged_extra_headers.pop("session-id", None)
-            if prompt_cache_key:
-                merged_extra_headers["thread-id"] = prompt_cache_key
-                merged_extra_headers["x-client-request-id"] = prompt_cache_key
-            if merged_extra_headers:
+            # The Codex backend rejects body-level ``extra_headers`` with
+            # HTTP 400, but the OpenAI SDK's ``extra_headers`` kwarg maps
+            # to actual HTTP request headers (not body fields).  We need
+            # these headers for cache-scope routing so prompt cache hits
+            # remain high.  Send session_id / x-client-request-id as HTTP
+            # headers while keeping ``prompt_cache_key`` in the body for
+            # standard OpenAI routing as a belt-and-braces fallback.
+            cache_scope_id = _bounded_prompt_cache_key(session_id)
+            if cache_scope_id:
+                existing_extra_headers = kwargs.get("extra_headers")
+                merged_extra_headers: Dict[str, str] = {}
+                if isinstance(existing_extra_headers, dict):
+                    merged_extra_headers.update(
+                        {
+                            str(key): str(value)
+                            for key, value in existing_extra_headers.items()
+                            if key and value is not None
+                        }
+                    )
+                merged_extra_headers["session_id"] = cache_scope_id
+                merged_extra_headers["x-client-request-id"] = cache_scope_id
                 kwargs["extra_headers"] = merged_extra_headers
-            else:
-                kwargs.pop("extra_headers", None)
 
         max_tokens = params.get("max_tokens")
         if max_tokens is not None and not is_codex_backend:
@@ -397,8 +400,16 @@ class ResponsesApiTransport(ProviderTransport):
             merged_extra_body: Dict[str, Any] = {}
             if isinstance(existing_extra_body, dict):
                 merged_extra_body.update(existing_extra_body)
-            merged_extra_body.setdefault("prompt_cache_key", prompt_cache_key)
+            merged_extra_body.setdefault("prompt_cache_key", cache_key)
             kwargs["extra_body"] = merged_extra_body
+
+        extra_body = kwargs.get("extra_body")
+        if isinstance(extra_body, dict) and "prompt_cache_key" in extra_body:
+            bounded_cache_key = _bounded_prompt_cache_key(extra_body["prompt_cache_key"])
+            if bounded_cache_key:
+                extra_body["prompt_cache_key"] = bounded_cache_key
+            else:
+                extra_body.pop("prompt_cache_key", None)
 
         return kwargs
 
@@ -488,11 +499,26 @@ class ResponsesApiTransport(ProviderTransport):
         Normalizes input items, strips unsupported fields, validates structure.
         """
         from agent.codex_responses_adapter import _preflight_codex_api_kwargs
-        return _preflight_codex_api_kwargs(
+
+        normalized = _preflight_codex_api_kwargs(
             api_kwargs,
             allow_stream=allow_stream,
             is_github_responses=is_github_responses,
         )
+        if "prompt_cache_key" in normalized:
+            bounded = _bounded_prompt_cache_key(normalized["prompt_cache_key"])
+            if bounded:
+                normalized["prompt_cache_key"] = bounded
+            else:
+                normalized.pop("prompt_cache_key", None)
+        extra_body = normalized.get("extra_body")
+        if isinstance(extra_body, dict) and "prompt_cache_key" in extra_body:
+            bounded = _bounded_prompt_cache_key(extra_body["prompt_cache_key"])
+            if bounded:
+                extra_body["prompt_cache_key"] = bounded
+            else:
+                extra_body.pop("prompt_cache_key", None)
+        return normalized
 
     def map_finish_reason(self, raw_reason: str) -> str:
         """Map Codex response.status to OpenAI finish_reason.

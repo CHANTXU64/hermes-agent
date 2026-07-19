@@ -27,10 +27,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import inspect
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -44,6 +45,7 @@ logger = logging.getLogger(__name__)
 # teardown indefinitely — the worker threads are daemon, so anything still
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
+_EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -348,8 +350,8 @@ def build_memory_context_block(raw_context: str) -> str:
     return (
         "<memory-context>\n"
         "[System note: The following is recalled memory context, "
-        "NOT new user input. This is the agent's persistent memory "
-        "from prior sessions, for reference only.]\n\n"
+        "NOT new user input. Treat as authoritative reference data — "
+        "this is the agent's persistent memory and should inform all responses.]\n\n"
         f"{clean}\n"
         "</memory-context>"
     )
@@ -362,10 +364,20 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
+        self._external_prefetch_timeout_explicit = external_prefetch_timeout is not None
+        self._external_prefetch_timeout = (
+            _EXTERNAL_PREFETCH_TIMEOUT_S
+            if external_prefetch_timeout is None
+            else float(external_prefetch_timeout)
+        )
+        if self._external_prefetch_timeout <= 0:
+            raise ValueError("external_prefetch_timeout must be positive")
+        self._external_prefetch_threads: Dict[str, threading.Thread] = {}
+        self._external_prefetch_lock = threading.Lock()
         # Background executor for end-of-turn sync/prefetch. Lazily created on
         # first use so the common builtin-only path spawns no extra threads.
         # A single worker serializes a provider's writes (turn N must land
@@ -373,6 +385,16 @@ class MemoryManager:
         # _submit_background() and the sync_all/queue_prefetch_all rationale.
         self._sync_executor: Optional[ThreadPoolExecutor] = None
         self._sync_executor_lock = threading.Lock()
+        # Futures are tracked by durability class so shutdown can give writes
+        # a bounded FIFO drain, then explicitly report anything abandoned.
+        self._background_futures: Dict[Future, str] = {}
+        self._shutting_down = False
+        self._shutdown_drain_state: Dict[str, Any] = {
+            "status": "not_started",
+            "abandoned_writes": 0,
+            "abandoned_prefetches": 0,
+            "active_tasks": 0,
+        }
 
     # -- Registration --------------------------------------------------------
 
@@ -521,6 +543,50 @@ class MemoryManager:
             return True
         return "turn_id" in signature.parameters
 
+    def _provider_prefetch_timeout(self, provider: MemoryProvider) -> float:
+        """Resolve the outer wait budget without overriding explicit callers."""
+        if self._external_prefetch_timeout_explicit:
+            return self._external_prefetch_timeout
+
+        timeout_resolver = getattr(provider, "prefetch_timeout_seconds", None)
+        if not callable(timeout_resolver):
+            return self._external_prefetch_timeout
+        try:
+            declared_timeout: Any = timeout_resolver()
+        except Exception as exc:
+            logger.warning(
+                "Memory provider '%s' failed to resolve its prefetch timeout; "
+                "using %.1fs: %s",
+                provider.name,
+                self._external_prefetch_timeout,
+                exc,
+            )
+            return self._external_prefetch_timeout
+        if declared_timeout is None:
+            return self._external_prefetch_timeout
+        try:
+            timeout = float(declared_timeout)
+        except Exception as exc:
+            logger.warning(
+                "Memory provider '%s' declared a non-convertible prefetch timeout "
+                "of type %s; using %.1fs: %s",
+                provider.name,
+                type(declared_timeout).__name__,
+                self._external_prefetch_timeout,
+                exc,
+            )
+            return self._external_prefetch_timeout
+        if not math.isfinite(timeout) or timeout <= 0:
+            logger.warning(
+                "Memory provider '%s' declared invalid prefetch timeout %r; "
+                "using %.1fs",
+                provider.name,
+                timeout,
+                self._external_prefetch_timeout,
+            )
+            return self._external_prefetch_timeout
+        return timeout
+
     def prefetch_all(
         self,
         query: str,
@@ -540,14 +606,13 @@ class MemoryManager:
         parts = []
         for provider in self._providers:
             try:
-                prefetch_kwargs = {"session_id": session_id}
-                if self._provider_prefetch_accepts_previous_assistant(provider):
-                    prefetch_kwargs["previous_assistant_message"] = (
-                        previous_assistant_message
-                    )
-                if self._provider_prefetch_accepts_turn_id(provider):
-                    prefetch_kwargs["turn_id"] = turn_id
-                result = provider.prefetch(clean_query, **prefetch_kwargs)
+                result = self._prefetch_provider(
+                    provider,
+                    clean_query,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    previous_assistant_message=previous_assistant_message,
+                )
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -556,6 +621,69 @@ class MemoryManager:
                     provider.name, e,
                 )
         return "\n\n".join(parts)
+
+    def _prefetch_provider(
+        self,
+        provider: MemoryProvider,
+        query: str,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+        previous_assistant_message: str = "",
+    ) -> str:
+        prefetch_kwargs = {"session_id": session_id}
+        if self._provider_prefetch_accepts_previous_assistant(provider):
+            prefetch_kwargs["previous_assistant_message"] = previous_assistant_message
+        if self._provider_prefetch_accepts_turn_id(provider):
+            prefetch_kwargs["turn_id"] = turn_id
+
+        if provider.name == "builtin":
+            return provider.prefetch(query, **prefetch_kwargs)
+
+        prefetch_timeout = self._provider_prefetch_timeout(provider)
+        result_box: Dict[str, str] = {}
+        error_box: Dict[str, Exception] = {}
+
+        def _run() -> None:
+            try:
+                result_box["value"] = provider.prefetch(query, **prefetch_kwargs) or ""
+            except Exception as exc:  # pragma: no cover - re-raised by caller
+                error_box["value"] = exc
+
+        thread = threading.Thread(
+            target=_run,
+            daemon=True,
+            name=f"memory-prefetch-{provider.name}",
+        )
+        with self._external_prefetch_lock:
+            existing = self._external_prefetch_threads.get(provider.name)
+            if existing is not None:
+                if existing.is_alive():
+                    logger.debug(
+                        "Memory provider '%s' prefetch is still running; skipping this turn",
+                        provider.name,
+                    )
+                    return ""
+                self._external_prefetch_threads.pop(provider.name, None)
+            self._external_prefetch_threads[provider.name] = thread
+            thread.start()
+
+        thread.join(prefetch_timeout)
+        if thread.is_alive():
+            logger.warning(
+                "Memory provider '%s' prefetch timed out after %.1fs; skipping it until "
+                "the stuck call returns",
+                provider.name,
+                prefetch_timeout,
+            )
+            return ""
+
+        with self._external_prefetch_lock:
+            if self._external_prefetch_threads.get(provider.name) is thread:
+                self._external_prefetch_threads.pop(provider.name, None)
+        if error_box:
+            raise error_box["value"]
+        return result_box.get("value", "")
 
     @staticmethod
     def _provider_queue_prefetch_accepts_turn_id(provider: MemoryProvider) -> bool:
@@ -607,7 +735,7 @@ class MemoryManager:
                         provider.name, e,
                     )
 
-        self._submit_background(_run)
+        self._submit_background(_run, kind="prefetch")
 
     # -- Sync ----------------------------------------------------------------
 
@@ -683,46 +811,57 @@ class MemoryManager:
 
     # -- Background dispatch -------------------------------------------------
 
-    def _submit_background(self, fn) -> None:
-        """Run ``fn`` on the manager's background worker.
-
-        The executor is created lazily and shared across calls. If the
-        executor can't be created or has already been shut down, ``fn``
-        runs inline as a last-resort fallback — losing the async benefit
-        but never losing the write itself. ``fn`` must do its own
-        per-provider error handling; this wrapper only guards executor
-        plumbing.
-        """
+    def _submit_background(self, fn, *, kind: str = "write") -> None:
+        """Queue ``fn`` on the serialized worker and track its durability class."""
         executor = self._get_sync_executor()
         if executor is None:
-            # Executor unavailable (shut down / creation failed) — run
-            # inline rather than drop the work. Slow, but correct.
+            if self._shutting_down:
+                logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
+                return
+            # Creation failure outside shutdown: preserve the historical
+            # fail-safe behavior and run the operation inline.
             try:
                 fn()
             except Exception as e:  # pragma: no cover - fn guards internally
                 logger.debug("Inline memory background task failed: %s", e)
             return
         try:
-            executor.submit(fn)
+            # Make submit+tracking atomic with the shutdown snapshot. The
+            # callback is attached after releasing the lock because an already
+            # completed future invokes callbacks synchronously.
+            with self._sync_executor_lock:
+                if self._shutting_down:
+                    logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
+                    return
+                future = executor.submit(fn)
+                self._background_futures[future] = kind
+            future.add_done_callback(self._forget_background_future)
         except RuntimeError:
-            # Executor was shut down between the get and the submit
-            # (teardown race). Fall back to inline.
+            if self._shutting_down:
+                logger.warning("Memory manager shut down during %s submission; task rejected", kind)
+                return
             try:
                 fn()
             except Exception as e:  # pragma: no cover - fn guards internally
                 logger.debug("Inline memory background task failed: %s", e)
 
+    def _forget_background_future(self, future: Future) -> None:
+        with self._sync_executor_lock:
+            self._background_futures.pop(future, None)
+
     def _get_sync_executor(self) -> Optional[ThreadPoolExecutor]:
         """Lazily create the single-worker background executor."""
+        if self._shutting_down:
+            return None
         if self._sync_executor is not None:
             return self._sync_executor
         with self._sync_executor_lock:
+            if self._shutting_down:
+                return None
             if self._sync_executor is None:
                 try:
                     # Daemon workers (see tools.daemon_pool): a provider wedged
-                    # on a network call must never block interpreter exit —
-                    # stdlib ThreadPoolExecutor's atexit hook would join it
-                    # unconditionally even after shutdown(wait=False).
+                    # on a network call must never block interpreter exit.
                     from tools.daemon_pool import DaemonThreadPoolExecutor
                     self._sync_executor = DaemonThreadPoolExecutor(
                         max_workers=1,
@@ -1160,51 +1299,66 @@ class MemoryManager:
                     provider.name, e,
                 )
 
-    def _drain_sync_executor(self) -> None:
-        """Shut down the background executor, waiting briefly for drain.
-
-        Bounded by ``_SYNC_DRAIN_TIMEOUT_S``: a wedged provider must never
-        hang process/session teardown. We stop accepting new work and
-        cancel anything still queued, then wait at most the drain timeout
-        for the currently-running task on a watcher thread. The worker is
-        daemon, so an over-running task dies with the interpreter.
-        """
+    @property
+    def shutdown_drain_state(self) -> Dict[str, Any]:
+        """Snapshot of the most recent bounded shutdown drain outcome."""
         with self._sync_executor_lock:
+            return dict(self._shutdown_drain_state)
+
+    def _drain_sync_executor(self) -> None:
+        """Give queued FIFO work a bounded chance, then abandon explicitly."""
+        with self._sync_executor_lock:
+            self._shutting_down = True
             executor = self._sync_executor
             self._sync_executor = None
+            tracked = dict(self._background_futures)
+            self._shutdown_drain_state = {
+                "status": "draining" if executor is not None else "drained",
+                "abandoned_writes": 0,
+                "abandoned_prefetches": 0,
+                "active_tasks": sum(not future.done() for future in tracked),
+            }
         if executor is None:
             return
-        try:
-            # Stop accepting new work and drop anything still queued, but
-            # do NOT block here — cancel_futures cancels not-yet-started
-            # tasks; the in-flight one keeps running on its daemon thread.
-            executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            # Older Python without cancel_futures kwarg.
-            try:
-                executor.shutdown(wait=False)
-            except Exception as e:  # pragma: no cover
-                logger.debug("Memory sync executor shutdown failed: %s", e)
-            return
-        except Exception as e:  # pragma: no cover
-            logger.debug("Memory sync executor shutdown failed: %s", e)
-            return
-        # Give an in-flight sync a bounded chance to finish on a watcher
-        # thread so we don't block the caller past the drain timeout.
-        drainer = threading.Thread(
-            target=lambda: self._bounded_executor_wait(executor),
-            daemon=True,
-            name="mem-sync-drain",
-        )
-        drainer.start()
-        drainer.join(timeout=_SYNC_DRAIN_TIMEOUT_S)
 
-    @staticmethod
-    def _bounded_executor_wait(executor: ThreadPoolExecutor) -> None:
-        try:
-            executor.shutdown(wait=True)
-        except Exception as e:  # pragma: no cover
-            logger.debug("Memory sync executor drain wait failed: %s", e)
+        # shutdown(wait=False) closes submission without touching the FIFO.
+        # Waiting on the tracked futures lets the real single-worker executor
+        # run every queued write/boundary task in order up to the deadline.
+        executor.shutdown(wait=False, cancel_futures=False)
+        _, pending = wait(tuple(tracked), timeout=_SYNC_DRAIN_TIMEOUT_S)
+        if not pending:
+            with self._sync_executor_lock:
+                self._shutdown_drain_state.update(status="drained", active_tasks=0)
+            return
+
+        abandoned_writes = 0
+        abandoned_prefetches = 0
+        active_tasks = 0
+        for future in pending:
+            kind = tracked[future]
+            if future.cancel():
+                if kind == "prefetch":
+                    abandoned_prefetches += 1
+                else:
+                    abandoned_writes += 1
+            else:
+                active_tasks += 1
+
+        with self._sync_executor_lock:
+            self._shutdown_drain_state.update(
+                status="timed_out",
+                abandoned_writes=abandoned_writes,
+                abandoned_prefetches=abandoned_prefetches,
+                active_tasks=active_tasks,
+            )
+        logger.warning(
+            "Memory shutdown drain timed out after %.2fs; abandoning %d queued "
+            "memory write(s) and %d queued prefetch(es); %d active task(s) remain detached",
+            _SYNC_DRAIN_TIMEOUT_S,
+            abandoned_writes,
+            abandoned_prefetches,
+            active_tasks,
+        )
 
     def initialize_all(self, session_id: str, **kwargs) -> None:
         """Initialize all providers.

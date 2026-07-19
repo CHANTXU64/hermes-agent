@@ -68,6 +68,22 @@ class RecallPreprocessDecision:
     new_query: str | None
 
 
+def get_recall_preprocessor_timeout_seconds() -> float:
+    """Return the configured P5 timeout used by execution and budgeting."""
+    from agent import auxiliary_client as aux
+
+    timeout_seconds = aux._get_task_timeout(
+        _AUXILIARY_TASK,
+        _DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise RuntimeError(
+            "recall-preprocessor timeout must be a positive finite number: "
+            f"{timeout_seconds!r}"
+        )
+    return timeout_seconds
+
+
 def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -189,15 +205,7 @@ def run_recall_preprocessor(
             f"provider={configured_provider!r} model={configured_model!r}"
         )
 
-    timeout_seconds = aux._get_task_timeout(
-        _AUXILIARY_TASK,
-        _DEFAULT_TIMEOUT_SECONDS,
-    )
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-        raise RuntimeError(
-            "recall-preprocessor timeout must be a positive finite number: "
-            f"{timeout_seconds!r}"
-        )
+    timeout_seconds = get_recall_preprocessor_timeout_seconds()
 
     client_kwargs = {}
     if resolved_base_url:

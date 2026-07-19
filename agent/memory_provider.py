@@ -91,6 +91,16 @@ class MemoryProvider(ABC):
         """
         return ""
 
+    def prefetch_timeout_seconds(self) -> Optional[float]:
+        """Return this provider's complete synchronous prefetch budget.
+
+        ``None`` keeps MemoryManager's generic external-provider timeout.
+        Providers that perform multiple bounded stages may override this with
+        their worst-case wall-clock budget so the generic fail-open guard does
+        not cut those configured stages short.
+        """
+        return None
+
     def prefetch(
         self,
         query: str,

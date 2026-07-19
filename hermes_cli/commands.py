@@ -231,9 +231,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True),
     CommandDef("usage", "Show token usage and rate limits; `reset` redeems a banked Codex limit reset", "Info",
                args_hint="[reset [--force]]"),
-    CommandDef("credits", "Show Nous credit balance and top up", "Info"),
-    CommandDef("billing", "Manage Nous terminal billing — buy credits, auto-reload, limits", "Info",
-               cli_only=True),
+    CommandDef("subscription", "View your Nous plan and change it in the browser", "Info",
+               cli_only=True, aliases=("upgrade",)),
+    CommandDef("topup", "Show your Nous balance and manage billing on the portal", "Info"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
@@ -1156,25 +1156,17 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 # caps apps at 50 slash commands and the registry is at that ceiling; rather
 # than let the clamp silently drop whichever command sorts last (and break
 # Telegram parity), we explicitly route a few low-frequency commands through
-# ``/hermes <command>`` on Slack only. Other surfaces use their normal
-# registry/plugin routing; CLI-only entries below are future guards. Keep this
-# list TIGHT and intentional — the telegram-parity test reads it so an entry
-# here is a deliberate "Slack-via-/hermes" decision, not a silent clamp.
-#   - credits: gateway-visible billing/top-up surface; reached via /hermes
-#     credits on Slack.
-#   - billing: terminal billing is currently CLI-only, but stays explicit here so
-#     any future gateway re-enable uses /hermes billing instead of a native slot.
-#   - moa: high-cost one-shot MoA mode; available through /hermes moa so it does
-#     not displace existing native Slack slash commands at the 50-command cap.
-#   - debug: log/report upload surface; follows upstream as /hermes debug on Slack.
-#   - blueprint: low-frequency automation setup; routed via /hermes blueprint on
-#     this fork so the fork-only /retain command keeps a native Slack slot.
-#   - disk-cleanup/disk_cleanup and lcm: plugin-provided maintenance commands
-#     remain available through /hermes <command> when Slack native slots are
-#     exhausted.
+# ``/hermes <command>`` on Slack only. They remain native on every other
+# surface (CLI, TUI, Telegram, Discord). Keep this list TIGHT and intentional —
+# the telegram-parity test reads it so an entry here is a deliberate
+# "Slack-via-/hermes" decision, not a silent clamp.
+#   - topup: the upstream billing/balance surface; reached via /hermes topup.
+#   - moa: high-cost slash mode; reached via /hermes moa.
+#   - debug: log/report upload surface; reached via /hermes debug.
+#   - blueprint, disk-cleanup/disk_cleanup, and lcm: low-frequency surfaces
+#     kept behind /hermes so the fork-only /retain command retains a native slot.
 _SLACK_VIA_HERMES_ONLY = frozenset({
-    "credits",
-    "billing",
+    "topup",
     "moa",
     "debug",
     "blueprint",

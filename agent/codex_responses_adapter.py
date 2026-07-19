@@ -83,7 +83,7 @@ def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> Lis
     Output: ``[{"type":"input_text"|"output_text"|"input_image", ...}]`` (Responses format)
 
     The ``role`` parameter controls the text content type:
-    - ``"user"`` / ``"developer"`` (default) → ``"input_text"``
+    - ``"user"`` (default) → ``"input_text"``
     - ``"assistant"`` → ``"output_text"``
 
     The Responses API rejects ``input_text`` inside assistant messages and
@@ -372,7 +372,7 @@ def _chat_messages_to_responses_input(
         if role == "system":
             continue
 
-        if role in {"user", "assistant", "developer"}:
+        if role in {"user", "assistant"}:
             content = msg.get("content", "")
             if isinstance(content, list):
                 content_parts = _chat_content_to_responses_parts(content, role=role)
@@ -552,7 +552,7 @@ def _chat_messages_to_responses_input(
                         })
                 continue
 
-            # Non-assistant (user/developer) role: emit multimodal parts when present,
+            # Non-assistant (user) role: emit multimodal parts when present,
             # otherwise fall back to the text payload.
             if content_parts:
                 items.append({"role": role, "content": content_parts})
@@ -760,7 +760,7 @@ def _preflight_codex_input_items(
             continue
 
         role = item.get("role")
-        if role in {"user", "assistant", "developer"}:
+        if role in {"user", "assistant"}:
             content = item.get("content", "")
             if content is None:
                 content = ""
@@ -769,7 +769,7 @@ def _preflight_codex_input_items(
                 # is already in Responses format (``input_text`` / ``output_text``
                 # / ``input_image``).  Validate each part and pass through.
                 # Use the correct text type for the role — ``output_text`` for
-                # assistant messages, ``input_text`` for user/developer messages.
+                # assistant messages, ``input_text`` for user messages.
                 text_type = "output_text" if role == "assistant" else "input_text"
                 validated: List[Dict[str, Any]] = []
                 for part_idx, part in enumerate(content):

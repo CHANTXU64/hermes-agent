@@ -62,6 +62,9 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
+_PREFETCH_BACKGROUND_JOIN_TIMEOUT_SECONDS = 3.0
+_PREFETCH_MAX_SEQUENTIAL_SYNC_RECALLS = 2
+_PREFETCH_OUTER_TIMEOUT_GRACE_SECONDS = 1.0
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -786,6 +789,22 @@ class HindsightMemoryProvider(MemoryProvider):
     @property
     def name(self) -> str:
         return "hindsight"
+
+    def prefetch_timeout_seconds(self) -> float:
+        """Budget the complete bounded prefetch pipeline for MemoryManager."""
+        from .recall_preprocessor import get_recall_preprocessor_timeout_seconds
+
+        sync_recall_attempts = (
+            _PREFETCH_MAX_SEQUENTIAL_SYNC_RECALLS
+            if self._recall_sync_on_cache_miss
+            else 1
+        )
+        return (
+            _PREFETCH_BACKGROUND_JOIN_TIMEOUT_SECONDS
+            + get_recall_preprocessor_timeout_seconds()
+            + (sync_recall_attempts * self._recall_sync_timeout_seconds)
+            + _PREFETCH_OUTER_TIMEOUT_GRACE_SECONDS
+        )
 
     def is_available(self) -> bool:
         try:
@@ -1652,7 +1671,7 @@ class HindsightMemoryProvider(MemoryProvider):
         thread_generation = self._prefetch_thread_generation
         if thread and thread.is_alive() and thread_generation == self._prefetch_generation:
             logger.debug("Prefetch: waiting for background thread to complete")
-            thread.join(timeout=3.0)
+            thread.join(timeout=_PREFETCH_BACKGROUND_JOIN_TIMEOUT_SECONDS)
             if thread.is_alive():
                 logger.debug("Prefetch: background thread still running; skipping sync fallback")
                 return ""

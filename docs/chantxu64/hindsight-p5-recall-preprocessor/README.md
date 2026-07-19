@@ -67,6 +67,27 @@ The auxiliary `timeout` controls only the P5 LLM decision. The subsequent
 read-only Hindsight recall has its own
 `recall_sync_timeout_seconds` setting in Hindsight's config.
 
+`MemoryManager` retains upstream's 8-second fail-open guard for ordinary
+external memory providers. Hindsight declares a provider-specific outer budget
+for its complete bounded pipeline:
+
+```text
+3-second background-prefetch handoff
++ configured auxiliary.hindsight_recall_preprocessor.timeout
++ up to 2 × configured recall_sync_timeout_seconds
++ 1-second outer-guard scheduling margin
+```
+
+With 30-second P5 and 10-second recall settings this outer budget is 54 seconds.
+Two recall windows are required for the bounded branch where a P5-generated
+query fails with no old results and Hindsight then retries the current query.
+Each recall still has its own 10-second deadline; the larger outer budget only
+prevents the generic guard from cutting either attempt off first. The 1-second
+margin covers thread startup, stage transitions, and timeout scheduling jitter.
+An explicit `MemoryManager(external_prefetch_timeout=...)` test/application
+override still takes precedence, and providers without a valid declaration keep
+the generic 8-second behavior.
+
 - Default provider: `openai-codex`
 - Default model: `gpt-5.6-luna`
 - Generic provider/main-model fallback: disabled
@@ -115,8 +136,9 @@ The preprocessor is skipped when Hindsight is in tools-only mode, `auto_recall` 
 
 ## Files
 
-- `agent/memory_provider.py` — optional previous-assistant prefetch contract.
-- `agent/memory_manager.py` — signature-aware forwarding that keeps legacy providers compatible.
+- `agent/memory_provider.py` — optional previous-assistant and complete-prefetch-budget contracts.
+- `agent/memory_manager.py` — signature-aware forwarding plus provider-specific
+  outer budgets while preserving the generic 8-second fail-open default.
 - `agent/turn_context.py` — extracts the latest completed non-tool assistant text.
 - `agent/codex_runtime.py` — captures the provider-reported terminal response model separately from the requested model.
 - `agent/auxiliary_client.py` — propagates that terminal model through the Codex chat-compatible adapter.
@@ -130,7 +152,7 @@ The preprocessor is skipped when Hindsight is in tools-only mode, `auto_recall` 
   session-queue tests.
 - `tests/hermes_cli/test_plugin_auxiliary_tasks.py` — active memory-plugin auxiliary task discovery and defaults.
 - `tests/fork/test_hindsight_provider_regressions.py` — structured generation-race regressions.
-- `tests/fork/test_codex_memory_context_isolation.py` — legacy duck-typed manager and request-context invariants.
+- `tests/agent/test_turn_context.py` — duck-typed manager compatibility and request-context invariants.
 - `tests/run_agent/test_run_agent_codex_responses.py` and `tests/agent/test_auxiliary_client.py` — terminal model provenance.
 
 ## Merge Guidance
@@ -149,6 +171,8 @@ Drop only when upstream provides equivalent behavior and the user confirms the r
 - structured query/result snapshot guarded by generation and session lifecycle;
 - fail-open restoration of old memory;
 - no direct forwarding of full assistant text to Hindsight;
+- provider-specific total prefetch budgeting that lets configured P5 and recall
+  deadlines finish without changing the 8-second default for other providers;
 - no P6-style hard coverage gate.
 
 When `MemoryProvider.prefetch`, turn-context assembly, Hindsight prefetch, or auxiliary-client routing conflicts during an upstream merge, compare actual behavior and run the focused tests rather than preserving individual lines mechanically.
@@ -158,7 +182,7 @@ When `MemoryProvider.prefetch`, turn-context assembly, Hindsight prefetch, or au
 Focused regression command:
 
 ```bash
-python -m pytest tests/fork/test_hindsight_recall_preprocessor.py tests/plugins/memory/test_hindsight_provider.py tests/fork/test_hindsight_provider_regressions.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_provider.py tests/agent/test_turn_context.py tests/run_agent/test_run_agent.py::TestMemoryProviderTurnStart tests/fork/test_codex_memory_context_isolation.py tests/run_agent/test_run_agent_codex_responses.py tests/agent/test_auxiliary_client.py::TestCodexAdapterReasoningTranslation tests/hermes_cli/test_plugin_auxiliary_tasks.py -q -o 'addopts='
+python -m pytest tests/fork/test_hindsight_recall_preprocessor.py tests/plugins/memory/test_hindsight_provider.py tests/fork/test_hindsight_provider_regressions.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_provider.py tests/agent/test_turn_context.py tests/run_agent/test_run_agent.py::TestMemoryProviderTurnStart tests/run_agent/test_run_agent_codex_responses.py tests/agent/test_auxiliary_client.py::TestCodexAdapterReasoningTranslation tests/hermes_cli/test_plugin_auxiliary_tasks.py -q -o 'addopts='
 ```
 
 Implementation verification on 2026-07-17:
@@ -184,6 +208,21 @@ git diff --check: passed
 P5 prompt SHA-256: 7dfade51638396003e6332f7dbb8da45698d03d715d1d54b2f51658d2edbfa09
 standard task discovery: hindsight_recall_preprocessor present
 effective defaults: openai-codex / gpt-5.6-luna / 30 seconds
+```
+
+External-prefetch timeout compatibility verification on 2026-07-19:
+
+```text
+TDD initial red gate: 2 expected failures (generic manager ignored provider budget; Hindsight had no budget contract)
+TDD initial green gate: 2 passed
+independent-review red gate: 3 expected failures (second recall omitted; end-to-end outer truncation; overflow conversion skipped provider)
+independent-review green gate: 3 passed
+adjacent MemoryManager/P5/Hindsight provider suites: 255 passed
+focused memory/P5/Codex integration suite: 482 passed
+complete fork suite: 478 passed, 8 third-party deprecation warnings
+Ruff: All checks passed
+py_compile: passed
+unstaged git diff --check: passed
 ```
 
 Real read-only smoke used the production provider path against Bank `Hermes`:

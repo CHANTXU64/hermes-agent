@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -157,6 +158,7 @@ def test_turn_prefetch_keeps_previous_assistant_across_preflight_compression(tmp
     ))
 
     with (
+        patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None),
         patch("agent.turn_context._should_run_preflight_estimate", return_value=True),
         patch(
             "agent.turn_context.estimate_request_tokens_rough",
@@ -322,6 +324,73 @@ def test_recall_preprocessor_uses_configured_auxiliary_route_and_timeout(
     assert build_kwargs["timeout"] == 12.5
     assert build_kwargs["extra_body"] == {"reasoning": {"enabled": False}}
     assert decision.new_query is None
+
+
+def test_hindsight_declares_full_prefetch_budget_from_stage_timeouts(
+    provider_with_config,
+    monkeypatch,
+):
+    from agent import auxiliary_client as aux
+
+    hindsight = provider_with_config(recall_sync_timeout_seconds=10)
+    monkeypatch.setattr(aux, "_get_task_timeout", lambda task, default: 30.0)
+
+    assert hindsight.prefetch_timeout_seconds() == 54.0
+
+
+def test_hindsight_budget_covers_rewrite_recall_and_current_query_fallback(
+    provider_with_config,
+    monkeypatch,
+):
+    from agent import auxiliary_client as aux
+
+    hindsight_module = importlib.import_module("plugins.memory.hindsight")
+    preprocessor = importlib.import_module(
+        "plugins.memory.hindsight.recall_preprocessor"
+    )
+    hindsight = provider_with_config(recall_sync_timeout_seconds=0.02)
+    monkeypatch.setattr(aux, "_get_task_timeout", lambda task, default: 0.02)
+    monkeypatch.setattr(
+        hindsight_module,
+        "_PREFETCH_BACKGROUND_JOIN_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        hindsight_module,
+        "_PREFETCH_OUTER_TIMEOUT_GRACE_SECONDS",
+        2.0,
+        raising=False,
+    )
+
+    def _preprocess(**kwargs):
+        time.sleep(0.02)
+        return preprocessor.RecallPreprocessDecision((), "rewritten query")
+
+    recall_queries = []
+
+    def _recall(query, *, timeout=None):
+        recall_queries.append(query)
+        time.sleep(0.02)
+        if len(recall_queries) == 1:
+            raise TimeoutError("rewritten recall timed out")
+        return hindsight_module._RecallSnapshot(
+            query=query,
+            results=("fallback memory",),
+        )
+
+    monkeypatch.setattr(hindsight_module, "run_recall_preprocessor", _preprocess)
+    monkeypatch.setattr(hindsight, "_recall_snapshot_for_query", _recall)
+
+    manager = MemoryManager()
+    manager.add_provider(hindsight)
+
+    result = manager.prefetch_all(
+        "current query",
+        previous_assistant_message="previous answer",
+    )
+
+    assert "fallback memory" in result
+    assert recall_queries == ["rewritten query", "current query"]
 
 
 def test_recall_preprocessor_uses_default_luna_direct_path_without_generic_fallback(

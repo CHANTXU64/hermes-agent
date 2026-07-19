@@ -24,7 +24,7 @@ def test_retain_keeps_native_slack_slot_while_low_frequency_commands_use_hermes(
     assert "retain" in native_slashes
     assert "retain" not in _SLACK_VIA_HERMES_ONLY
 
-    for command in {"moa", "debug", "blueprint", "credits", "disk-cleanup", "disk_cleanup", "lcm"}:
+    for command in {"moa", "debug", "blueprint", "topup", "disk-cleanup", "disk_cleanup", "lcm"}:
         assert command in _SLACK_VIA_HERMES_ONLY
         if command in slack_subcommands:
             assert command not in native_slashes
