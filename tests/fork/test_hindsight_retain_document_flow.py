@@ -305,6 +305,308 @@ def test_hindsight_transcript_replay_after_provider_restart_dedupes_existing_per
         provider2.shutdown()
 
 
+def test_hindsight_transcript_replay_keeps_persisted_answer_and_later_assistant_event(
+    tmp_path,
+    monkeypatch,
+):
+    """A later assistant-only event must not rewrite the persisted answer anchor."""
+    session_id = "restart-replay-later-assistant-event"
+    first_pair = [
+        {"role": "user", "content": "first request before restart", "timestamp": 1710000151.0},
+        {"role": "assistant", "content": "first answer before restart", "timestamp": 1710000151.0},
+    ]
+    replayed_first_pair = [
+        {"role": "user", "content": "first request before restart", "timestamp": 1710000150.0},
+        {"role": "assistant", "content": "first answer before restart", "timestamp": 1710000151.0},
+    ]
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content="first request before restart",
+        assistant_content="first answer before restart",
+        session_id=session_id,
+        messages=first_pair,
+    )
+    provider1.shutdown()
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    replay_with_later_event = [
+        *replayed_first_pair,
+        {
+            "role": "assistant",
+            "content": "later assistant-only status after restart",
+            "timestamp": 1710000152.0,
+        },
+        {"role": "user", "content": "second request after restart", "timestamp": 1710000153.0},
+        {"role": "assistant", "content": "second answer after restart", "timestamp": 1710000154.0},
+    ]
+
+    try:
+        provider2.sync_turn(
+            user_content="second request after restart",
+            assistant_content="second answer after restart",
+            session_id=session_id,
+            messages=replay_with_later_event,
+        )
+        info = provider2.retain_persisted_session_lineage(session_id=session_id)
+        provider2._retain_queue.join()
+
+        assert info["queued"] is True
+        assert info["turn_count"] == 3
+        assert provider2._retain_force_replace is True
+        content = client2.aretain_batch.call_args.kwargs["items"][0]["content"]
+        turns = json.loads(content)
+        assert [[message["role"] for message in turn] for turn in turns] == [
+            ["user", "assistant"],
+            ["assistant"],
+            ["user", "assistant"],
+        ]
+        assert turns[0][1]["content"] == "Assistant: first answer before restart"
+        assert turns[1][0]["content"] == "Assistant: later assistant-only status after restart"
+        assert turns[2][0]["content"] == "User: second request after restart"
+    finally:
+        provider2.shutdown()
+
+
+def test_hindsight_transcript_replay_matches_stable_answer_across_user_representation_change(
+    tmp_path,
+    monkeypatch,
+):
+    """A stable assistant identity anchors the turn when replay rewrites user media content."""
+    session_id = "restart-replay-user-representation-change"
+    original_turn = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What do you see in this image?"},
+                {"type": "image", "path": "/tmp/example.png"},
+            ],
+            "timestamp": 1710000160.0,
+        },
+        {"role": "assistant", "content": "image answer", "timestamp": 1710000161.0},
+    ]
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content="What do you see in this image?",
+        assistant_content="image answer",
+        session_id=session_id,
+        messages=original_turn,
+    )
+    provider1.shutdown()
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    replay = [
+        {
+            "role": "user",
+            "content": "What do you see in this image?\n\n[Image attached at /tmp/example.png]",
+            "timestamp": 1710000159.0,
+        },
+        {"role": "assistant", "content": "image answer", "timestamp": 1710000161.0},
+        {"role": "user", "content": "next request", "timestamp": 1710000162.0},
+        {"role": "assistant", "content": "next answer", "timestamp": 1710000163.0},
+    ]
+
+    try:
+        provider2.sync_turn(
+            user_content="next request",
+            assistant_content="next answer",
+            session_id=session_id,
+            messages=replay,
+        )
+        info = provider2.retain_persisted_session_lineage(session_id=session_id)
+        provider2._retain_queue.join()
+
+        assert info["turn_count"] == 2
+        content = client2.aretain_batch.call_args.kwargs["items"][0]["content"]
+        retained_turns = json.loads(content)
+        assert len(retained_turns) == 2
+        first_retained = retained_turns[0]
+        assert first_retained[1]["content"] == "Assistant: image answer"
+        assert "[Image attached at /tmp/example.png]" not in first_retained[0]["content"]
+    finally:
+        provider2.shutdown()
+
+
+def test_hindsight_transcript_replay_persists_same_length_orphan_completion(tmp_path, monkeypatch):
+    """Completing a persisted orphan user must replace the same-length local row."""
+    session_id = "restart-replay-orphan-completion"
+    orphan = [
+        {"role": "user", "content": "orphan request", "timestamp": 1710000170.0},
+    ]
+    completed = [
+        *orphan,
+        {"role": "assistant", "content": "completed answer", "timestamp": 1710000171.0},
+    ]
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content="orphan request",
+        assistant_content="",
+        session_id=session_id,
+        messages=orphan,
+    )
+    provider1.shutdown()
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    try:
+        provider2.sync_turn(
+            user_content="orphan request",
+            assistant_content="completed answer",
+            session_id=session_id,
+            messages=completed,
+        )
+        assert provider2._retain_force_replace is True
+        info = provider2.retain_persisted_session_lineage(session_id=session_id)
+        provider2._retain_queue.join()
+
+        assert info["turn_count"] == 1
+        content = client2.aretain_batch.call_args.kwargs["items"][0]["content"]
+        retained_turns = json.loads(content)
+        assert [message["role"] for message in retained_turns[0]] == ["user", "assistant"]
+        assert retained_turns[0][1]["content"] == "Assistant: completed answer"
+    finally:
+        provider2.shutdown()
+
+
+def test_hindsight_same_length_orphan_completion_triggers_auto_replace(tmp_path, monkeypatch):
+    session_id = "restart-replay-orphan-auto-replace"
+    orphan = [{"role": "user", "content": "orphan request", "timestamp": 1710000175.0}]
+    completed = [
+        *orphan,
+        {"role": "assistant", "content": "completed answer", "timestamp": 1710000176.0},
+    ]
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn("orphan request", "", session_id=session_id, messages=orphan)
+    provider1.shutdown()
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+        auto_retain=True,
+        retain_every_n_turns=10,
+    )
+    try:
+        provider2.sync_turn(
+            "orphan request",
+            "completed answer",
+            session_id=session_id,
+            messages=completed,
+        )
+        provider2._retain_queue.join()
+
+        assert client2.aretain_batch.call_count == 1
+        call = client2.aretain_batch.call_args.kwargs
+        assert call["items"][0]["update_mode"] == "replace"
+        retained_turns = json.loads(call["items"][0]["content"])
+        assert retained_turns[0][1]["content"] == "Assistant: completed answer"
+    finally:
+        provider2.shutdown()
+
+
+def test_hindsight_transcript_replay_keeps_new_tail_when_media_and_assistant_grouping_both_change(
+    tmp_path,
+    monkeypatch,
+):
+    """A divergent replay prefix must not discard timestamp-new events or tail turns."""
+    session_id = "restart-replay-media-and-assistant-change"
+    original_turn = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Inspect this image"},
+                {"type": "image", "path": "/tmp/original.png"},
+            ],
+            "timestamp": 1710000180.0,
+        },
+        {"role": "assistant", "content": "original image answer", "timestamp": 1710000181.0},
+    ]
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content="Inspect this image",
+        assistant_content="original image answer",
+        session_id=session_id,
+        messages=original_turn,
+    )
+    provider1.shutdown()
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    replay = [
+        {
+            "role": "user",
+            "content": "Inspect this image\n\n[Image attached at /tmp/original.png]",
+            "timestamp": 1710000179.0,
+        },
+        {"role": "assistant", "content": "original image answer", "timestamp": 1710000181.0},
+        {"role": "assistant", "content": "later lifecycle status", "timestamp": 1710000182.0},
+        {"role": "user", "content": "new request after restart", "timestamp": 1710000183.0},
+        {"role": "assistant", "content": "new answer after restart", "timestamp": 1710000184.0},
+    ]
+
+    try:
+        provider2.sync_turn(
+            user_content="new request after restart",
+            assistant_content="new answer after restart",
+            session_id=session_id,
+            messages=replay,
+        )
+        info = provider2.retain_persisted_session_lineage(session_id=session_id)
+        provider2._retain_queue.join()
+
+        assert info["turn_count"] == 3
+        content = client2.aretain_batch.call_args.kwargs["items"][0]["content"]
+        retained_turns = json.loads(content)
+        assert [[message["role"] for message in turn] for turn in retained_turns] == [
+            ["user", "assistant"],
+            ["assistant"],
+            ["user", "assistant"],
+        ]
+        assert retained_turns[0][1]["content"] == "Assistant: original image answer"
+        assert retained_turns[1][0]["content"] == "Assistant: later lifecycle status"
+        assert retained_turns[2][0]["content"] == "User: new request after restart"
+    finally:
+        provider2.shutdown()
+
+
 @pytest.mark.parametrize("legacy_empty_document_id", [False, True])
 def test_hindsight_transcript_replay_reconciles_pre_fix_async_gap_without_duplicates(
     tmp_path,

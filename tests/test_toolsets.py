@@ -55,6 +55,10 @@ class TestResolveToolset:
         tools = resolve_toolset("web")
         assert set(tools) == {"web_search", "web_extract"}
 
+    def test_none_toolset_is_valid_and_resolves_no_tools(self):
+        assert validate_toolset("none") is True
+        assert resolve_toolset("none") == []
+
     def test_composite_toolset(self):
         tools = resolve_toolset("debugging")
         assert "terminal" in tools

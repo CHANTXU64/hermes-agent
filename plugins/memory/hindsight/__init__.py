@@ -2329,6 +2329,38 @@ class HindsightMemoryProvider(MemoryProvider):
         return str(identity[0][2]) if identity else ""
 
     @classmethod
+    def _retain_turns_strictly_after(
+        cls,
+        incoming_turns: List[str],
+        *,
+        cutoff: str,
+        seen_message_ids: set[tuple],
+    ) -> List[str]:
+        """Keep only replay messages provably newer than persisted history."""
+        retained: list[str] = []
+        seen = set(seen_message_ids)
+        for turn_json in incoming_turns:
+            try:
+                payload = json.loads(turn_json)
+            except Exception:
+                continue
+            if not isinstance(payload, list):
+                continue
+            later_messages: list[dict] = []
+            for message, identity in zip(payload, cls._retain_turn_replay_identity(turn_json)):
+                if (
+                    isinstance(message, dict)
+                    and identity[2]
+                    and identity[2] > cutoff
+                    and identity not in seen
+                ):
+                    later_messages.append(message)
+                    seen.add(identity)
+            if later_messages:
+                retained.append(json.dumps(later_messages, ensure_ascii=False))
+        return retained
+
+    @classmethod
     def _merge_overlapping_replayed_turns(
         cls,
         existing_turns: List[str],
@@ -2339,7 +2371,7 @@ class HindsightMemoryProvider(MemoryProvider):
         incoming_ids = [cls._retain_turn_replay_identity(turn) for turn in incoming_turns]
         existing_canonical = [cls._retain_turn_canonical(turn) for turn in existing_turns]
         incoming_canonical = [cls._retain_turn_canonical(turn) for turn in incoming_turns]
-        matched_pairs: list[tuple[int, int]] = []
+        matched_pairs: list[tuple[int, int, str]] = []
         existing_cursor = 0
         for incoming_index, incoming_value in enumerate(incoming_canonical):
             if not incoming_value:
@@ -2349,6 +2381,46 @@ class HindsightMemoryProvider(MemoryProvider):
                 for existing_index in range(existing_cursor, len(existing_canonical))
                 if incoming_value == existing_canonical[existing_index]
             ]
+            match_kind = "exact"
+            if not candidates:
+                incoming_identity = incoming_ids[incoming_index]
+                candidates = [
+                    existing_index
+                    for existing_index in range(existing_cursor, len(existing_ids))
+                    if incoming_identity
+                    and existing_ids[existing_index]
+                    and incoming_identity[0][0] == "user"
+                    and incoming_identity[0] == existing_ids[existing_index][0]
+                ]
+                if candidates:
+                    match_kind = "shared_user"
+            if not candidates and incoming_ids[incoming_index]:
+                incoming_message_ids = set(incoming_ids[incoming_index])
+                candidates = [
+                    existing_index
+                    for existing_index in range(existing_cursor, len(existing_ids))
+                    if incoming_message_ids.intersection(existing_ids[existing_index])
+                ]
+                if candidates:
+                    match_kind = "shared_message"
+            if not candidates and incoming_ids[incoming_index]:
+                incoming_identity = incoming_ids[incoming_index]
+                incoming_user = incoming_identity[0][:2]
+                if incoming_user[0] == "user":
+                    user_candidates = [
+                        existing_index
+                        for existing_index in range(existing_cursor, len(existing_ids))
+                        if existing_ids[existing_index]
+                        and existing_ids[existing_index][0][:2] == incoming_user
+                    ]
+                    incoming_user_count = sum(
+                        1
+                        for candidate_identity in incoming_ids[incoming_index:]
+                        if candidate_identity and candidate_identity[0][:2] == incoming_user
+                    )
+                    if len(user_candidates) == 1 and incoming_user_count == 1:
+                        candidates = user_candidates
+                        match_kind = "shared_user"
             if not candidates:
                 continue
             exact_identity = next(
@@ -2360,22 +2432,56 @@ class HindsightMemoryProvider(MemoryProvider):
                 None,
             )
             existing_index = exact_identity if exact_identity is not None else candidates[0]
-            matched_pairs.append((incoming_index, existing_index))
+            matched_pairs.append((incoming_index, existing_index, match_kind))
             existing_cursor = existing_index + 1
         if not matched_pairs:
             return None
 
         merged: list[str] = []
         seen_ids = set(existing_ids)
+        seen_message_ids = {
+            message_identity
+            for turn_identity in existing_ids
+            for message_identity in turn_identity
+        }
         incoming_cursor = 0
         existing_cursor = 0
-        for incoming_index, existing_index in matched_pairs:
+        for incoming_index, existing_index, match_kind in matched_pairs:
             merged.extend(existing_turns[existing_cursor:existing_index])
             for candidate_index in range(incoming_cursor, incoming_index):
                 if incoming_ids[candidate_index] not in seen_ids:
                     merged.append(incoming_turns[candidate_index])
                     seen_ids.add(incoming_ids[candidate_index])
-            merged.append(existing_turns[existing_index])
+                    seen_message_ids.update(incoming_ids[candidate_index])
+            if match_kind == "shared_user" and len(existing_ids[existing_index]) == 1:
+                # The persisted row was an orphan user and the replay now closes
+                # that unambiguous user event with an assistant response.
+                merged.append(incoming_turns[incoming_index])
+                seen_ids.add(incoming_ids[incoming_index])
+                seen_message_ids.update(incoming_ids[incoming_index])
+            else:
+                merged.append(existing_turns[existing_index])
+                if match_kind == "shared_user":
+                    # A completed persisted answer is authoritative. A later
+                    # assistant message before the next user is a separate visible
+                    # event, even though transcript grouping folds it into the same
+                    # user turn during replay.  Preserve both without matching any
+                    # incident-specific recovery text.
+                    try:
+                        incoming_payload = json.loads(incoming_turns[incoming_index])
+                    except Exception:
+                        incoming_payload = []
+                    for message, message_identity in zip(
+                        incoming_payload[1:] if isinstance(incoming_payload, list) else [],
+                        incoming_ids[incoming_index][1:],
+                    ):
+                        if message_identity in seen_message_ids:
+                            continue
+                        singleton = json.dumps([message], ensure_ascii=False)
+                        singleton_id = cls._retain_turn_replay_identity(singleton)
+                        merged.append(singleton)
+                        seen_ids.add(singleton_id)
+                        seen_message_ids.add(message_identity)
             incoming_cursor = incoming_index + 1
             existing_cursor = existing_index + 1
 
@@ -2656,7 +2762,14 @@ class HindsightMemoryProvider(MemoryProvider):
                 owners: dict[int, tuple[str, str, str]] = {}
                 old_index = 0
                 for incoming_index, (_turn_json, identity) in enumerate(incoming):
-                    if identity == old_entries[old_index][0]:
+                    old_identity = old_entries[old_index][0]
+                    closes_orphan_user = bool(
+                        len(old_identity) == 1
+                        and old_identity[0][0] == "user"
+                        and identity
+                        and identity[0] == old_identity[0]
+                    )
+                    if identity == old_identity or closes_orphan_user:
                         owners[incoming_index] = old_entries[old_index][1]
                         old_index += 1
                         if old_index == len(old_entries):
@@ -3350,7 +3463,7 @@ class HindsightMemoryProvider(MemoryProvider):
             else:
                 merged_turns = self._merge_overlapping_replayed_turns(self._session_turns, turns)
                 if merged_turns is not None:
-                    if len(merged_turns) == len(self._session_turns):
+                    if merged_turns == self._session_turns:
                         return 0, before_counter, before_counter
                     # A compressed/restarted transcript can be only a tail
                     # window of the persisted document. Merge timestamped
@@ -3371,19 +3484,39 @@ class HindsightMemoryProvider(MemoryProvider):
                         self._last_queued_flush_count = 0
                         self._retain_flush_pending = False
                         self._retain_force_replace = True
-                    return len(merged_turns) - len(existing), before_counter, self._turn_counter
+                    return max(1, len(merged_turns) - len(existing)), before_counter, self._turn_counter
 
                 existing_timestamps = [
                     self._retain_turn_replay_timestamp(turn) for turn in self._session_turns
                 ]
                 incoming_timestamps = [self._retain_turn_replay_timestamp(turn) for turn in turns]
                 known_existing = [value for value in existing_timestamps if value]
+                known_existing_events = [
+                    timestamp
+                    for turn_identity in existing_ids
+                    for _role, _content, timestamp in turn_identity
+                    if timestamp
+                ]
                 known_incoming = [value for value in incoming_timestamps if value]
-                if known_existing and known_incoming and min(known_incoming) <= max(known_existing):
-                    # The replay overlaps persisted time but has no exact anchor.
-                    # Preserve the authoritative persisted view rather than
-                    # appending a likely duplicate/divergent transcript window.
-                    return 0, before_counter, before_counter
+                if known_existing and known_incoming and min(known_incoming) <= max(known_existing_events):
+                    # A divergent replay prefix may still contain events whose
+                    # timestamps are strictly newer than every persisted event.
+                    # Preserve only that provably-new suffix; never append the
+                    # overlapping representation itself without a safe anchor.
+                    seen_message_ids = {
+                        message_identity
+                        for turn_identity in existing_ids
+                        for message_identity in turn_identity
+                    }
+                    strictly_new_turns = self._retain_turns_strictly_after(
+                        turns,
+                        cutoff=max(known_existing_events),
+                        seen_message_ids=seen_message_ids,
+                    )
+                    if not strictly_new_turns:
+                        return 0, before_counter, before_counter
+                    turns = strictly_new_turns
+                    incoming = [self._retain_turn_canonical(turn) for turn in turns]
 
                 max_overlap = min(len(existing), len(incoming))
                 for size in range(max_overlap, 0, -1):
@@ -3440,6 +3573,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 return
             if not self._auto_retain:
                 logger.debug("sync_turn: buffered %d transcript turn(s) (auto_retain disabled)", added)
+                return
+            if after_counter == before_counter:
+                logger.debug("sync_turn: retaining same-length replay correction")
+                self.flush_retained_turns()
                 return
             before_bucket = before_counter // self._retain_every_n_turns
             after_bucket = after_counter // self._retain_every_n_turns

@@ -189,6 +189,12 @@ TOOLSETS = {
     },
     
 
+    "none": {
+        "description": "No tools — model-only sessions with no tool access",
+        "tools": [],
+        "includes": []
+    },
+
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
         "tools": ["read_file", "write_file", "patch", "search_files"],
