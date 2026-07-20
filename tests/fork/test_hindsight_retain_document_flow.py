@@ -38,6 +38,11 @@ _NETWORK_ENV_KEYS = (
     "HINDSIGHT_RETAIN_USER_PREFIX",
     "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
 )
+_TOOL_BUDGET_NOTICE = (
+    "You've reached the maximum number of tool-calling iterations allowed. "
+    "Please provide a final response summarizing what you've found and accomplished so far, "
+    "without calling any more tools."
+)
 
 
 def _local_seconds(value):
@@ -119,6 +124,90 @@ def _initialized_hindsight_provider(
     client = _fake_hindsight_client()
     provider._client = client
     return provider, client
+
+
+def test_hindsight_filters_tool_budget_notice_without_losing_visible_assistant_output():
+    provider = HindsightMemoryProvider()
+    messages = [
+        {"role": "user", "content": "fix the retain issue", "timestamp": 1710000000.0},
+        {"role": "user", "content": _TOOL_BUDGET_NOTICE, "timestamp": 1710000001.0},
+        {"role": "assistant", "content": "final answer for the fix request", "timestamp": 1710000002.0},
+        {"role": "user", "content": "verify the completed fix", "timestamp": 1710000003.0},
+        {"role": "assistant", "content": "verification completed", "timestamp": 1710000004.0},
+        {"role": "user", "content": _TOOL_BUDGET_NOTICE, "timestamp": 1710000005.0},
+        {"role": "assistant", "content": "visible post-limit status", "timestamp": 1710000006.0},
+    ]
+
+    turns = [json.loads(turn) for turn in provider._build_turns_from_conversation_messages(messages)]
+
+    assert [[message["role"] for message in turn] for turn in turns] == [
+        ["user", "assistant"],
+        ["user", "assistant"],
+        ["assistant"],
+    ]
+    assert turns[0][0]["content"] == "User: fix the retain issue"
+    assert turns[0][1]["content"] == "Assistant: final answer for the fix request"
+    assert turns[2][0]["content"] == "Assistant: visible post-limit status"
+    assert "maximum number of tool-calling iterations" not in json.dumps(turns)
+
+
+def test_hindsight_clean_on_retain_filters_persisted_tool_budget_notice():
+    provider = HindsightMemoryProvider()
+    dirty_turn = json.dumps(
+        [
+            {"role": "user", "content": f"User: {_TOOL_BUDGET_NOTICE}", "timestamp": "2026-07-20T05:00:00"},
+            {"role": "assistant", "content": "Assistant: visible final response", "timestamp": "2026-07-20T05:00:01"},
+        ]
+    )
+
+    cleaned_turn = provider._sanitize_persisted_turn_json(dirty_turn)
+
+    assert cleaned_turn is not None
+    cleaned_messages = json.loads(cleaned_turn)
+    assert [message["role"] for message in cleaned_messages] == ["assistant"]
+    assert cleaned_messages[0]["content"] == "Assistant: visible final response"
+    assert "maximum number of tool-calling iterations" not in cleaned_turn
+
+
+def test_hindsight_keeps_user_authored_extension_of_tool_budget_notice():
+    provider = HindsightMemoryProvider()
+    quoted_request = f"{_TOOL_BUDGET_NOTICE} Explain why this literal sentence appears."
+
+    turns = provider._build_turns_from_conversation_messages(
+        [
+            {"role": "user", "content": quoted_request, "timestamp": 1710000010.0},
+            {"role": "assistant", "content": "It is a quoted runtime notice.", "timestamp": 1710000011.0},
+        ]
+    )
+
+    assert len(turns) == 1
+    messages = json.loads(turns[0])
+    assert messages[0]["content"] == f"User: {quoted_request}"
+    assert messages[1]["content"] == "Assistant: It is a quoted runtime notice."
+
+
+def test_hindsight_strips_leading_tool_budget_notice_but_keeps_residual_real_user_text():
+    provider = HindsightMemoryProvider()
+    mixed_runtime_user = (
+        f"{_TOOL_BUDGET_NOTICE}\n\n"
+        "继续\n\n"
+        "[Your active task list was preserved across context compression]\n"
+        "- [>] review. inspect the diff"
+    )
+
+    turns = provider._build_turns_from_conversation_messages(
+        [
+            {"role": "user", "content": mixed_runtime_user, "timestamp": 1710000020.0},
+            {"role": "assistant", "content": "继续处理完成。", "timestamp": 1710000021.0},
+        ]
+    )
+
+    assert len(turns) == 1
+    messages = json.loads(turns[0])
+    assert messages[0]["content"] == "User: 继续"
+    assert messages[1]["content"] == "Assistant: 继续处理完成。"
+    assert "maximum number of tool-calling iterations" not in turns[0]
+    assert "active task list" not in turns[0]
 
 
 def test_hindsight_document_original_text_starts_from_real_first_user_turn_after_gateway_interrupt_multi_user_turn_flow_via_agent_sync(

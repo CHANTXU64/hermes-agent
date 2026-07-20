@@ -1933,6 +1933,11 @@ class HindsightMemoryProvider(MemoryProvider):
     _RETAIN_OBJECTIVE_HEADER = "[Current user objective preserved from compacted history]"
     _RETAIN_MODEL_SWITCH_NOTE_PREFIX = "[Note: model was just switched from "
     _RETAIN_MODEL_SWITCH_NOTE_SUFFIX = "Adjust your self-identification accordingly.]"
+    _RETAIN_TOOL_BUDGET_EXHAUSTED_NOTICE = (
+        "You've reached the maximum number of tool-calling iterations allowed. "
+        "Please provide a final response summarizing what you've found and accomplished so far, "
+        "without calling any more tools."
+    )
     _RETAIN_LCM_SUMMARY_HEADER_RE = re.compile(
         r"(?:\[(?:Recent|Session Arc|Durable) Summary \(d\d+(?:,\s*node\s+\d+)?\)\]"
         r"|\[Depth-\d+ Summary \(d\d+(?:,\s*node\s+\d+)?\)\])"
@@ -1967,10 +1972,17 @@ class HindsightMemoryProvider(MemoryProvider):
         return bool(cls._RETAIN_RECENT_SUMMARY_HEADER_RE.fullmatch(first_line))
 
     @classmethod
+    def _is_tool_budget_exhausted_notice(cls, content: Any) -> bool:
+        text = cls._stringify_retain_content(content).replace("\r\n", "\n").strip()
+        return text == cls._RETAIN_TOOL_BUDGET_EXHAUSTED_NOTICE
+
+    @classmethod
     def _starts_with_retain_noise_marker(cls, content: str) -> bool:
         text = (content or "").lstrip()
-        return cls._starts_with_lcm_summary_block(text) or any(
-            text.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS
+        return (
+            cls._is_tool_budget_exhausted_notice(text)
+            or cls._starts_with_lcm_summary_block(text)
+            or any(text.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS)
         )
 
     @classmethod
@@ -1988,8 +2000,10 @@ class HindsightMemoryProvider(MemoryProvider):
         remain dropped as a unit.
         """
         text = cls._stringify_retain_content(content).lstrip()
-        return cls._starts_with_recent_summary_block(text) or any(
-            text.startswith(marker) for marker in cls._RETAIN_ASYNC_COMPLETION_MARKERS
+        return (
+            cls._is_tool_budget_exhausted_notice(text)
+            or cls._starts_with_recent_summary_block(text)
+            or any(text.startswith(marker) for marker in cls._RETAIN_ASYNC_COMPLETION_MARKERS)
         )
 
     @classmethod
@@ -2084,6 +2098,11 @@ class HindsightMemoryProvider(MemoryProvider):
         skipping_block = False
         for line in lines:
             stripped = line.strip()
+            if cls._is_tool_budget_exhausted_notice(stripped):
+                # This runtime notice is a single injected line. Unlike the
+                # block markers below, later lines may contain a real user
+                # continuation and must remain eligible for retention.
+                continue
             if cls._is_lcm_summary_header_line(stripped) or any(
                 stripped.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS
             ):
@@ -2245,11 +2264,17 @@ class HindsightMemoryProvider(MemoryProvider):
                 cleaned_user = self._clean_retain_user_content(content)
                 if not cleaned_user:
                     # Synthetic user injections are not conversation turns.
-                    # A completed real turn closes normally. An async marker
-                    # also closes a prior orphan user before collecting its own
-                    # visible assistant, so the async result cannot be falsely
-                    # paired with that earlier user.
+                    # A tool-budget notice arrives while the real request may
+                    # still be pending; keep that user open so the following
+                    # visible final answer closes the correct turn. Other
+                    # assistant-producing runtime triggers form an independent
+                    # assistant-only event instead of borrowing an earlier user.
+                    tool_budget_notice = self._is_tool_budget_exhausted_notice(content)
                     preserves_visible_assistant = self._is_orphan_assistant_trigger_user_content(content)
+                    if tool_budget_notice and pending_user and not pending_assistant:
+                        _flush_pending_async_assistant()
+                        pending_async_completion = False
+                        continue
                     if pending_user and (pending_assistant or preserves_visible_assistant):
                         _flush_pending_turn()
                     _flush_pending_async_assistant()
@@ -3555,8 +3580,8 @@ class HindsightMemoryProvider(MemoryProvider):
         retain turns from ``messages`` preserves that real first user message
         while filtering tool output, summaries, interrupt notices, empty
         assistant shells, intermediate assistant drafts, compression/task-list
-        rehydration markers, externalized payload placeholders, and async
-        delegation completion injections.
+        rehydration markers, externalized payload placeholders, tool-budget
+        exhaustion notices, and async delegation completion injections.
         """
         if self._shutting_down.is_set():
             logger.debug("sync_turn: skipped (shutting down)")
