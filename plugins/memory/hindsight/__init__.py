@@ -1977,11 +1977,37 @@ class HindsightMemoryProvider(MemoryProvider):
         return text == cls._RETAIN_TOOL_BUDGET_EXHAUSTED_NOTICE
 
     @classmethod
+    def _strip_leading_retain_runtime_injections(cls, content: str) -> str:
+        """Strip recognized leading runtime injections without scanning user prose."""
+        text = (content or "").replace("\r\n", "\n").strip()
+        saw_runtime_marker = False
+        while True:
+            without_model_switch = cls._strip_model_switch_note(text)
+            if without_model_switch != text:
+                text = without_model_switch
+                saw_runtime_marker = True
+                continue
+
+            prefix = f"{cls._RETAIN_TOOL_BUDGET_EXHAUSTED_NOTICE}\n"
+            if not text.startswith(prefix):
+                break
+            remainder = text[len(prefix):].lstrip("\n")
+            has_runtime_marker = saw_runtime_marker or any(
+                cls._is_lcm_summary_header_line(line.strip())
+                or any(line.strip().startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS)
+                or cls._strip_model_switch_note(line.strip()) != line.strip()
+                for line in remainder.split("\n")
+            )
+            if not has_runtime_marker:
+                break
+            text = remainder
+        return text
+
+    @classmethod
     def _starts_with_retain_noise_marker(cls, content: str) -> bool:
         text = (content or "").lstrip()
         return (
-            cls._is_tool_budget_exhausted_notice(text)
-            or cls._starts_with_lcm_summary_block(text)
+            cls._starts_with_lcm_summary_block(text)
             or any(text.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS)
         )
 
@@ -2079,7 +2105,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if cleaned_multimodal is not None:
             text = cleaned_multimodal
         else:
-            text = cls._strip_model_switch_note(text)
+            text = cls._strip_leading_retain_runtime_injections(text)
         if not text:
             return ""
 
@@ -2087,6 +2113,10 @@ class HindsightMemoryProvider(MemoryProvider):
             text = text[len(cls._RETAIN_OBJECTIVE_HEADER):].lstrip("\n").strip()
             if not text:
                 return ""
+            text = cls._strip_leading_retain_runtime_injections(text)
+
+        if cls._is_tool_budget_exhausted_notice(text):
+            return ""
 
         # Pure synthetic messages (todo/async/externalized/LCM summary blocks).
         # Objective header was already stripped above when present.
@@ -2098,11 +2128,6 @@ class HindsightMemoryProvider(MemoryProvider):
         skipping_block = False
         for line in lines:
             stripped = line.strip()
-            if cls._is_tool_budget_exhausted_notice(stripped):
-                # This runtime notice is a single injected line. Unlike the
-                # block markers below, later lines may contain a real user
-                # continuation and must remain eligible for retention.
-                continue
             if cls._is_lcm_summary_header_line(stripped) or any(
                 stripped.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS
             ):

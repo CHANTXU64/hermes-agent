@@ -1897,6 +1897,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
+def _store_max_iteration_visible_response(messages: list, final_response: str) -> None:
+    """Close the durable turn with the exact response delivered to the user."""
+    tail = messages[-1] if messages and isinstance(messages[-1], dict) else None
+    if (
+        tail is not None
+        and tail.get("role") == "assistant"
+        and not tail.get("tool_calls")
+        and tail.get("finish_reason") != "tool_calls"
+    ):
+        # A plain Assistant tail is an intermediate draft from this exhausted
+        # turn. Replace it rather than creating Assistant→Assistant history.
+        tail["content"] = final_response
+        tail.pop("_db_persisted", None)
+        return
+    messages.append({"role": "assistant", "content": final_response})
+
+
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
@@ -1906,14 +1923,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         "Please provide a final response summarizing what you've found and accomplished so far, "
         "without calling any more tools."
     )
-    messages.append({"role": "user", "content": summary_request})
+    summary_messages = [*messages, {"role": "user", "content": summary_request}]
 
     try:
         # Build API messages, stripping internal-only fields
         # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
         _needs_sanitize = agent._should_sanitize_tool_calls()
         api_messages = []
-        for msg in messages:
+        for msg in summary_messages:
             api_msg = msg.copy()
             agent._copy_reasoning_content_for_api(msg, api_msg)
             for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
@@ -2091,9 +2108,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         if final_response:
             if "<think>" in final_response:
                 final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
-            if final_response:
-                messages.append({"role": "assistant", "content": final_response})
-            else:
+            if not final_response:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
         else:
             # Retry summary generation
@@ -2134,9 +2149,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             if final_response:
                 if "<think>" in final_response:
                     final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
-                if final_response:
-                    messages.append({"role": "assistant", "content": final_response})
-                else:
+                if not final_response:
                     final_response = "I reached the iteration limit and couldn't generate a summary."
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
@@ -2145,6 +2158,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         logger.warning(f"Failed to get summary response: {e}")
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
 
+    _store_max_iteration_visible_response(messages, final_response)
     return final_response
 
 

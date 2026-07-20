@@ -3870,6 +3870,75 @@ class TestHandleMaxIterations:
         assert len(result) > 0
         assert "summary" in result.lower()
 
+    def test_summary_request_is_api_only_and_not_added_to_durable_messages(self, agent):
+        notice = (
+            "You've reached the maximum number of tool-calling iterations allowed. "
+            "Please provide a final response summarizing what you've found and accomplished so far, "
+            "without calling any more tools."
+        )
+        resp = _mock_response(content="Visible final summary.")
+        agent.client.chat.completions.create.return_value = resp
+        agent._cached_system_prompt = "You are helpful."
+        messages = [{"role": "user", "content": "finish the task"}]
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        assert result == "Visible final summary."
+        assert messages == [
+            {"role": "user", "content": "finish the task"},
+            {"role": "assistant", "content": "Visible final summary."},
+        ]
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert sent_messages[-1] == {"role": "user", "content": notice}
+
+    def test_summary_replaces_assistant_tail_with_visible_success(self, agent):
+        agent.client.chat.completions.create.return_value = _mock_response(content="Visible final summary.")
+        messages = [
+            {"role": "user", "content": "finish the task"},
+            {"role": "assistant", "content": "Intermediate draft.", "_db_persisted": True},
+        ]
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        assert result == "Visible final summary."
+        assert messages == [
+            {"role": "user", "content": "finish the task"},
+            {"role": "assistant", "content": "Visible final summary."},
+        ]
+
+    def test_empty_summary_retry_replaces_assistant_tail_with_visible_fallback(self, agent):
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content=""),
+            _mock_response(content=""),
+        ]
+        messages = [
+            {"role": "user", "content": "finish the task"},
+            {"role": "assistant", "content": "Intermediate draft.", "_db_persisted": True},
+        ]
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        assert result == "I reached the iteration limit and couldn't generate a summary."
+        assert messages == [
+            {"role": "user", "content": "finish the task"},
+            {"role": "assistant", "content": result},
+        ]
+
+    def test_summary_api_failure_replaces_assistant_tail_with_visible_error(self, agent):
+        agent.client.chat.completions.create.side_effect = Exception("API down")
+        messages = [
+            {"role": "user", "content": "finish the task"},
+            {"role": "assistant", "content": "Intermediate draft.", "_db_persisted": True},
+        ]
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        assert "API down" in result
+        assert messages == [
+            {"role": "user", "content": "finish the task"},
+            {"role": "assistant", "content": result},
+        ]
+
     def test_api_failure_returns_error(self, agent):
         agent.client.chat.completions.create.side_effect = Exception("API down")
         agent._cached_system_prompt = "You are helpful."

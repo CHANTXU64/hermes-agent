@@ -43,6 +43,10 @@ _TOOL_BUDGET_NOTICE = (
     "Please provide a final response summarizing what you've found and accomplished so far, "
     "without calling any more tools."
 )
+_MODEL_SWITCH_NOTICE = (
+    "[Note: model was just switched from gpt-5.6-terra to gpt-5.6-sol via OpenAI Codex. "
+    "Adjust your self-identification accordingly.]"
+)
 
 
 def _local_seconds(value):
@@ -186,7 +190,43 @@ def test_hindsight_keeps_user_authored_extension_of_tool_budget_notice():
     assert messages[1]["content"] == "Assistant: It is a quoted runtime notice."
 
 
-def test_hindsight_strips_leading_tool_budget_notice_but_keeps_residual_real_user_text():
+def test_hindsight_keeps_multiline_user_quotation_of_tool_budget_notice():
+    provider = HindsightMemoryProvider()
+    quoted_request = f"{_TOOL_BUDGET_NOTICE}\n\nExplain why this literal sentence appears."
+
+    turns = provider._build_turns_from_conversation_messages(
+        [
+            {"role": "user", "content": quoted_request, "timestamp": 1710000015.0},
+            {"role": "assistant", "content": "It is a quoted runtime notice.", "timestamp": 1710000016.0},
+        ]
+    )
+
+    assert len(turns) == 1
+    messages = json.loads(turns[0])
+    assert messages[0]["content"] == f"User: {quoted_request}"
+    assert messages[1]["content"] == "Assistant: It is a quoted runtime notice."
+
+
+def test_hindsight_keeps_assistant_answer_equal_to_tool_budget_notice():
+    provider = HindsightMemoryProvider()
+
+    turns = provider._build_turns_from_conversation_messages(
+        [
+            {"role": "user", "content": "Repeat the tool-budget notice exactly.", "timestamp": 1710000017.0},
+            {"role": "assistant", "content": _TOOL_BUDGET_NOTICE, "timestamp": 1710000018.0},
+        ]
+    )
+
+    assert len(turns) == 1
+    messages = json.loads(turns[0])
+    assert len(messages) == 2
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"] == "User: Repeat the tool-budget notice exactly."
+    assert messages[1]["role"] == "assistant"
+    assert messages[1]["content"] == f"Assistant: {_TOOL_BUDGET_NOTICE}"
+
+
+def test_hindsight_strips_tool_budget_notice_from_runtime_bundle_but_keeps_real_user_text():
     provider = HindsightMemoryProvider()
     mixed_runtime_user = (
         f"{_TOOL_BUDGET_NOTICE}\n\n"
@@ -208,6 +248,48 @@ def test_hindsight_strips_leading_tool_budget_notice_but_keeps_residual_real_use
     assert messages[1]["content"] == "Assistant: 继续处理完成。"
     assert "maximum number of tool-calling iterations" not in turns[0]
     assert "active task list" not in turns[0]
+
+
+@pytest.mark.parametrize(
+    "leading_runtime",
+    [
+        f"{_TOOL_BUDGET_NOTICE}\n\n{_MODEL_SWITCH_NOTICE}",
+        f"{_MODEL_SWITCH_NOTICE}\n\n{_TOOL_BUDGET_NOTICE}",
+    ],
+)
+def test_hindsight_strips_budget_and_model_switch_runtime_bundle_in_either_order(leading_runtime):
+    provider = HindsightMemoryProvider()
+    mixed_runtime_user = f"{leading_runtime}\n\n继续"
+
+    turns = provider._build_turns_from_conversation_messages(
+        [
+            {"role": "user", "content": mixed_runtime_user, "timestamp": 1710000022.0},
+            {"role": "assistant", "content": "继续处理完成。", "timestamp": 1710000023.0},
+        ]
+    )
+
+    assert len(turns) == 1
+    messages = json.loads(turns[0])
+    assert messages[0]["content"] == "User: 继续"
+    assert messages[1]["content"] == "Assistant: 继续处理完成。"
+
+
+def test_hindsight_clean_on_retain_strips_budget_then_model_switch_runtime_bundle():
+    provider = HindsightMemoryProvider()
+    mixed_runtime_user = f"{_TOOL_BUDGET_NOTICE}\n\n{_MODEL_SWITCH_NOTICE}\n\n继续"
+    dirty_turn = json.dumps(
+        [
+            {"role": "user", "content": f"User: {mixed_runtime_user}", "timestamp": "2026-07-20T05:00:00"},
+            {"role": "assistant", "content": "Assistant: 继续处理完成。", "timestamp": "2026-07-20T05:00:01"},
+        ]
+    )
+
+    cleaned_turn = provider._sanitize_persisted_turn_json(dirty_turn)
+
+    assert cleaned_turn is not None
+    messages = json.loads(cleaned_turn)
+    assert messages[0]["content"] == "User: 继续"
+    assert messages[1]["content"] == "Assistant: 继续处理完成。"
 
 
 def test_hindsight_document_original_text_starts_from_real_first_user_turn_after_gateway_interrupt_multi_user_turn_flow_via_agent_sync(
