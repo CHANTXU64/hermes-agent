@@ -191,8 +191,14 @@ def test_p5_prompt_is_frozen_and_parser_enforces_strict_contract():
         "plugins.memory.hindsight.recall_preprocessor"
     )
 
+    assert "按其在当前 Session 之前是否可能存在" in preprocessor.P5_PROMPT
+    assert "不按字段类型或示例清单决定" in preprocessor.P5_PROMPT
+    assert "本轮刚创建的 commit hash" in preprocessor.P5_PROMPT
+    assert "刚生成文件的完整文件名或路径" in preprocessor.P5_PROMPT
+    assert "new_query=null 只表示不发起新的 recall" in preprocessor.P5_PROMPT
+    assert "未被 drop_old_refs 删除的旧 results 仍会注入本轮" in preprocessor.P5_PROMPT
     assert hashlib.sha256(preprocessor.P5_PROMPT.encode("utf-8")).hexdigest() == (
-        "7dfade51638396003e6332f7dbb8da45698d03d715d1d54b2f51658d2edbfa09"
+        "b9b182478b41ab593398bb1649b8a318ab7f59464cd4abe5681a7add6481106f"
     )
 
     decision = preprocessor.parse_recall_preprocessor_output(
@@ -1181,10 +1187,11 @@ def test_hindsight_empty_generated_recall_is_carried_as_real_snapshot(
     assert preprocessor_calls[1]["previous_recall_query"] == "empty target"
     assert preprocessor_calls[1]["previous_recall_results"] == ()
     assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot is None
+    assert provider._prefetch_snapshot.query == "empty target"
+    assert provider._prefetch_snapshot.results == ()
 
 
-def test_hindsight_prefetch_null_query_clears_old_results_without_new_recall(
+def test_hindsight_prefetch_null_query_reuses_selected_old_results_without_new_recall(
     provider,
     monkeypatch,
 ):
@@ -1210,12 +1217,46 @@ def test_hindsight_prefetch_null_query_clears_old_results_without_new_recall(
         previous_assistant_message="没有提出新的具体检索目标。",
     )
 
+    assert "keep" in result
+    assert "drop" not in result
+    assert provider._prefetch_result == "- keep"
+    assert provider._prefetch_snapshot.query == "old query"
+    assert provider._prefetch_snapshot.results == ("keep",)
+
+
+def test_hindsight_prefetch_null_query_all_dropped_clears_old_recall(
+    provider,
+    monkeypatch,
+):
+    provider._prefetch_result = "- first old\n- second old"
+    provider._prefetch_snapshot = SimpleNamespace(
+        query="old query",
+        results=("first old", "second old"),
+    )
+    monkeypatch.setattr(
+        "plugins.memory.hindsight.run_recall_preprocessor",
+        lambda **kwargs: SimpleNamespace(drop_old_refs=(1, 2), new_query=None),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_recall_snapshot_for_query",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("no recall may run when new_query is null")
+        ),
+    )
+
+    result = provider.prefetch(
+        "这个话题结束。",
+        previous_assistant_message="上一轮任务已经完成。",
+    )
+
     assert result == ""
     assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot is None
+    assert provider._prefetch_snapshot.query == ""
+    assert provider._prefetch_snapshot.results == ()
 
 
-def test_hindsight_null_query_suppresses_post_turn_queue_for_same_turn(
+def test_hindsight_null_query_reuses_old_results_and_post_turn_queue_is_noop(
     provider,
     monkeypatch,
 ):
@@ -1248,10 +1289,11 @@ def test_hindsight_null_query_suppresses_post_turn_queue_for_same_turn(
         turn_id="turn-3",
     )
 
-    assert result == ""
+    assert "old memory" in result
     assert recall_calls == []
-    assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot is None
+    assert provider._prefetch_result == "- old memory"
+    assert provider._prefetch_snapshot.query == "old query"
+    assert provider._prefetch_snapshot.results == ("old memory",)
 
 
 def test_hindsight_null_query_delayed_old_session_queue_cannot_repopulate_after_switch(
@@ -1289,14 +1331,14 @@ def test_hindsight_null_query_delayed_old_session_queue_cannot_repopulate_after_
         turn_id="turn-3",
     )
 
-    assert result == ""
+    assert "old memory" in result
     assert recall_calls == []
     assert provider._session_id == "new-session"
     assert provider._prefetch_result == ""
     assert provider._prefetch_snapshot is None
 
 
-def test_hindsight_recall_after_skipped_turn_uses_only_new_results(
+def test_hindsight_recall_after_null_query_merges_reused_old_and_new_results(
     provider,
     monkeypatch,
 ):
@@ -1347,12 +1389,14 @@ def test_hindsight_recall_after_skipped_turn_uses_only_new_results(
         previous_assistant_message="第三轮回答包含了新的具体内容。",
     )
 
-    assert third_context == ""
-    assert preprocessor_calls[1]["previous_recall_query"] == ""
-    assert preprocessor_calls[1]["previous_recall_results"] == ()
+    assert "second-turn memory" in third_context
+    assert preprocessor_calls[1]["previous_recall_query"] == "second-turn query"
+    assert preprocessor_calls[1]["previous_recall_results"] == (
+        "second-turn memory",
+    )
     assert recall_calls == [("fourth-turn query", 5.0)]
     assert "fourth-turn memory" in fourth_context
-    assert "second-turn memory" not in fourth_context
+    assert "second-turn memory" in fourth_context
 
 
 def test_hindsight_prefetch_preprocessor_failure_preserves_full_old_cache(

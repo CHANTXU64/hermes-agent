@@ -1753,36 +1753,40 @@ class HindsightMemoryProvider(MemoryProvider):
                     selected_results = ()
                     fall_back_to_current_query = True
             else:
-                if decision.new_query is None:
-                    logger.debug(
-                        "Prefetch: preprocessor skipped recall; clearing recall context"
-                    )
-                    return ""
                 dropped = set(decision.drop_old_refs)
                 selected_results = tuple(
                     text
                     for ref, text in enumerate(original_results, 1)
                     if ref not in dropped
                 )
-                try:
-                    new_snapshot = self._recall_snapshot_for_query(
-                        decision.new_query,
-                        timeout=self._recall_sync_timeout_seconds,
+                if decision.new_query is None:
+                    if original_results and not selected_results:
+                        selected_query = ""
+                    logger.debug(
+                        "Prefetch: preprocessor skipped new recall; reusing %d "
+                        "selected old results",
+                        len(selected_results),
                     )
-                except Exception as exc:
-                    logger.warning(
-                        "Hindsight recall for preprocessor query failed; "
-                        "restoring full cached recall: %s",
-                        exc,
-                    )
-                    if original_results:
-                        selected_results = original_results
-                    else:
-                        selected_results = ()
-                        fall_back_to_current_query = True
                 else:
-                    selected_query = new_snapshot.query
-                    selected_results += tuple(new_snapshot.results)
+                    try:
+                        new_snapshot = self._recall_snapshot_for_query(
+                            decision.new_query,
+                            timeout=self._recall_sync_timeout_seconds,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Hindsight recall for preprocessor query failed; "
+                            "restoring full cached recall: %s",
+                            exc,
+                        )
+                        if original_results:
+                            selected_results = original_results
+                        else:
+                            selected_results = ()
+                            fall_back_to_current_query = True
+                    else:
+                        selected_query = new_snapshot.query
+                        selected_results += tuple(new_snapshot.results)
 
             if not fall_back_to_current_query:
                 selected_snapshot = _RecallSnapshot(

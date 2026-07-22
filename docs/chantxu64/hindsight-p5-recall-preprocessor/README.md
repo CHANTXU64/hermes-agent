@@ -28,8 +28,9 @@ The provider then:
   `drop_old_refs`, performs one bounded read-only recall, and appends the new
   results; the exact query and merged results actually used by the current turn
   become the next turn's previous-recall snapshot;
-- when `new_query` is null, injects no Hindsight context for the current turn,
-  and clears the previous structured/text recall snapshot;
+- when `new_query` is null, performs no new Hindsight recall but still injects
+  and carries every old result not listed in `drop_old_refs`; dropping every old
+  ref together with a null query clears the recall chain;
 - the generic post-turn `queue_prefetch()` hook is always a no-op for Hindsight,
   so the completed turn's raw user text never starts another recall;
 - when no carried snapshot exists but a previous assistant response is
@@ -104,7 +105,15 @@ so its late result cannot become the next turn's carried snapshot.
   `max_tokens` or `max_output_tokens` on the wire because this endpoint rejects
   those fields. It is therefore not a provider-enforced output cap.
 - Requested temperature: `0`; the Codex adapter does not currently send this field on the wire, so the call is not described as deterministically temperature-zero.
-- P5 prompt SHA-256: `7dfade51638396003e6332f7dbb8da45698d03d715d1d54b2f51658d2edbfa09`
+- P5 prompt SHA-256: `b9b182478b41ab593398bb1649b8a318ab7f59464cd4abe5681a7add6481106f`
+
+The prompt decides whether to retain a detail from whether it could have existed
+before the current session and whether it improves retrieval of useful history,
+not from a field-type whitelist. For example, it omits a commit hash created by
+the immediately preceding action or the complete path/name of a just-generated
+file, then queries history related to the underlying target instead. The same
+kind of detail may remain when the context establishes that it refers to an
+older historical object.
 
 The parser rejects malformed JSON, missing or extra keys, duplicate keys,
 bool/non-integer/duplicate/out-of-range refs, empty or multi-line queries, and
@@ -139,8 +148,9 @@ The feature is deliberately fail-open toward memory availability:
 - P5 route unavailable, timeout, model mismatch, exception, or invalid JSON/schema: return the complete old recall cache.
 - P5 requests a new query but that Hindsight recall raises: restore the complete old recall cache.
 - No old cache and P5 fails: use the existing bounded current-query synchronous recall.
-- A valid `new_query=null`: inject no recall context and clear both cached
-  recall representations. The post-turn hook is already a no-op.
+- A valid `new_query=null`: make no new recall, inject/carry the selected old
+  results, and apply `drop_old_refs`. If every old result is dropped, carry an
+  empty snapshot so the old query/results no longer affect later decisions.
 - A valid new recall that succeeds with zero results is a real empty result, not an exception.
 
 Conservative retention of a side-topic result remains an accepted limitation.
@@ -213,7 +223,7 @@ compileall: passed
 git diff --check: passed
 ```
 
-Latest configurable-route verification:
+Earlier configurable-route verification (previous prompt baseline):
 
 ```text
 fork-specific preprocessor gate: 30 passed
@@ -237,6 +247,26 @@ Ruff: All checks passed
 py_compile: passed
 git diff --check: passed
 ```
+
+Current-session identifier filtering and null-reuse verification on 2026-07-22:
+
+```text
+TDD red gate: 7 expected failures
+focused null/prompt green gate: 7 passed
+focused Hindsight/Agent/Codex/plugin integration suite: 496 passed
+Ruff: All checks passed
+py_compile: passed
+git diff --check: passed
+P5 prompt SHA-256: b9b182478b41ab593398bb1649b8a318ab7f59464cd4abe5681a7add6481106f
+```
+
+Two paired-context Luna smoke repetitions omitted a just-created commit hash
+and a complete just-generated settlement filename/path. In the matched historical
+cases, both repetitions retained the exact old commit hash, and preserved the
+older archived-file identity without being required to copy its literal path.
+This verifies context-sensitive retrieval rather than a field-type blacklist.
+Covered old recall produced `new_query=null`; provider tests confirmed that
+un-dropped old results were still injected and carried.
 
 External-prefetch timeout compatibility verification on 2026-07-19:
 

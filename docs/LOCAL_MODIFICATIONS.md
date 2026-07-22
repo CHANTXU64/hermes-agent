@@ -274,7 +274,15 @@ What changed:
 - Strict output parsing accepts only `drop_old_refs` plus a one-line string or
   null `new_query`. A non-null query preserves un-dropped old results, appends
   one new read-only recall, and carries that actual merged snapshot to the next
-  P5 decision. A null query clears current/next recall state.
+  P5 decision. A null query skips only the new recall: un-dropped old results
+  remain injected and carried. Dropping every old ref with a null query clears
+  the chain.
+- Query generation keeps or omits details according to whether they could have
+  existed before the current session and whether they improve retrieval of
+  useful history, not according to a field-type whitelist. A fresh commit hash
+  or the complete path/name of a just-generated file is omitted and generalized
+  to the related historical target; an explicitly historical identifier is not
+  removed merely because it has the same field type.
 - `MemoryManager` forwards the previous assistant message only to providers
   whose `prefetch` signature opts in, preserving legacy provider compatibility.
 - Turn setup also checks the duck-typed manager's `prefetch_all` signature before
@@ -313,7 +321,7 @@ Why it matters:
 Merge protection:
 
 - Preserve P5 prompt SHA-256
-  `7dfade51638396003e6332f7dbb8da45698d03d715d1d54b2f51658d2edbfa09`
+  `b9b182478b41ab593398bb1649b8a318ab7f59464cd4abe5681a7add6481106f`
   unless the user explicitly approves and evaluates a successor.
 - Preserve the explicit configurable/no-fallback auxiliary task, its evaluated
   Luna/30-second defaults, Codex provider-reported terminal-model validation,
