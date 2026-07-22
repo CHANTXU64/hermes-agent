@@ -312,10 +312,8 @@ def strip_stale_dangerous_confirmations(
                 )
                 redacted = dict(msg)
                 redacted["content"] = _EXPIRED_CONFIRMATION_SENTINEL
-                # Drop the api_content sidecar: it carries the exact bytes
-                # previously sent — i.e. the dangerous confirmation this
-                # redaction exists to expire. Replaying it verbatim would
-                # undo the redaction on the wire.
+                # Drop legacy api_content metadata together with the expired
+                # confirmation so no stale copy survives the redaction.
                 drop_stale_api_content(redacted)
                 cleaned.append(redacted)
                 continue

@@ -86,6 +86,34 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_request_only_recall_is_not_written_to_persistent_codex_thread(self, monkeypatch):
+        sent_inputs = []
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            sent_inputs.append(user_input)
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-request-only-1",
+                thread_id="thread-request-only-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        agent = _make_codex_agent()
+        memory_manager = MagicMock()
+        memory_manager.build_system_prompt.return_value = ""
+        memory_manager.prefetch_all.return_value = "VOLATILE-RECALL"
+        setattr(agent, "_memory_manager", memory_manager)
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello")
+
+        memory_manager.prefetch_all.assert_called_once()
+        assert sent_inputs == ["hello"]
+        user_messages = [m for m in result["messages"] if m.get("role") == "user"]
+        assert user_messages[-1]["content"] == "hello"
+        assert "api_content" not in user_messages[-1]
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(

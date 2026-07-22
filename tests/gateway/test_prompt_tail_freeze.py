@@ -9,8 +9,8 @@ a full AIAgent rebuild per message.
 
 The fix pins the rendered session-context bytes per session keyed by a hash
 of the exact renderer inputs (``_ephemeral_change_key``) and relocates
-must-deliver per-turn facts onto the current user message (the api_content
-sidecar), so a key hit reuses the pinned bytes verbatim.
+must-deliver per-turn facts onto the current request's user-message copy, so a
+key hit reuses the pinned system bytes without persisting one-shot facts.
 
 The maintained invariant — every rendered input appears in the change key —
 is guarded by the parity test below.

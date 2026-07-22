@@ -1933,13 +1933,6 @@ class AIAgent:
                     continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
-                # api_content sidecar: the exact bytes sent to the API when
-                # they differ from the clean content (stamped by the turn
-                # prologue for prefetch/plugin injections). Written verbatim
-                # so replay can reproduce the sent prefix byte-for-byte.
-                _row_api_content = msg.get("api_content")
-                if not isinstance(_row_api_content, str):
-                    _row_api_content = None
                 _row_timestamp = msg.get("timestamp")
                 # Apply the persist override to THIS row's written values only
                 # (never to the live dict). A multimodal override is a complete
@@ -1967,43 +1960,10 @@ class AIAgent:
                         and (not isinstance(content, list) or isinstance(_ov_content, list))
                         and not msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
                     ):
-                        # The live content is what the API call sends; the
-                        # override is the cleaned transcript value. If they
-                        # differ and no injection already stamped the sidecar,
-                        # keep the sent bytes in api_content so replay matches
-                        # the wire (#48677 divergence, closed for the cache
-                        # prefix too).
-                        if (
-                            _row_api_content is None
-                            and isinstance(content, str)
-                            and content != _ov_content
-                        ):
-                            _row_api_content = content
                         content = _ov_content
                     if _ov_timestamp is not None:
                         _row_timestamp = _ov_timestamp
-                # Store the sidecar only when it actually differs.
-                if _row_api_content == content:
-                    _row_api_content = None
-                # Load-time sanitize divergence: get_messages_as_conversation
-                # replays user/assistant rows through
-                # ``sanitize_context(content).strip()``, so content that
-                # sanitize would rewrite (echoed/pasted <memory-context>
-                # fences or system notes) replays different bytes after a
-                # session reload even though THIS turn sent it verbatim.
-                # Capture the sent bytes in the sidecar so a reloaded session
-                # replays what was actually on the wire. Compared in wire form
-                # (both sides .strip()-ed — the api_messages build strips
-                # every outgoing content string) so plain surrounding
-                # whitespace doesn't grow redundant sidecars.
-                if (
-                    _row_api_content is None
-                    and role in ("user", "assistant")
-                    and isinstance(content, str)
-                    and content
-                    and sanitize_context(content).strip() != content.strip()
-                ):
-                    _row_api_content = content
+
                 # Persist multimodal tool results as their text summary only —
                 # base64 images would bloat the session DB and aren't useful
                 # for cross-session replay.
@@ -2040,7 +2000,6 @@ class AIAgent:
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
                     timestamp=_row_timestamp,
-                    api_content=_row_api_content,
                 )
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
@@ -6325,10 +6284,22 @@ class AIAgent:
         from agent.tool_executor import execute_tool_calls_sequential
         return execute_tool_calls_sequential(self, assistant_message, messages, effective_task_id, api_call_count)
 
-    def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
+    def _handle_max_iterations(
+        self,
+        messages: list,
+        api_call_count: int,
+        turn_context=None,
+    ) -> str:
         """Forwarder — see ``agent.chat_completion_helpers.handle_max_iterations``."""
         from agent.chat_completion_helpers import handle_max_iterations
-        return handle_max_iterations(self, messages, api_call_count)
+        return handle_max_iterations(
+            self,
+            messages,
+            api_call_count,
+            current_turn_user_idx=getattr(turn_context, "current_turn_user_idx", None),
+            ext_prefetch_cache=getattr(turn_context, "ext_prefetch_cache", ""),
+            plugin_user_context=getattr(turn_context, "plugin_user_context", ""),
+        )
 
     def _conversation_root_id(self) -> Optional[str]:
         """Resolve the stable conversation id for Portal usage attribution.

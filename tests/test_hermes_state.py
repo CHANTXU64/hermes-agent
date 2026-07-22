@@ -6342,12 +6342,12 @@ class TestLoneSurrogatePersistence:
         db.append_message("s1", "tool", "ok", tool_name="web\ud835search")
         assert len(db.get_messages("s1")) == 1
 
-    def test_replace_messages_survives_lone_surrogate_api_content(self, db):
+    def test_replace_messages_drops_legacy_api_content(self, db):
         db.create_session("s1", source="cli")
         db.replace_messages(
             "s1", [{"role": "user", "content": "u1", "api_content": self.DIRTY}]
         )
-        assert db.get_messages("s1")[0]["api_content"] == "scraped \ufffd price"
+        assert db.get_messages("s1")[0]["api_content"] is None
 
     def test_set_latest_user_api_content_survives_lone_surrogate(self, db):
         db.create_session("s1", source="cli")

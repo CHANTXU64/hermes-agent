@@ -694,212 +694,156 @@ Feature docs: none — TTS provider extension documented in this index.
 Upstream status: fork-only.
 
 
-### 12. Codex backend prompt-cache routing workaround
+### 12. Request-only recall isolation and Codex prompt-cache routing
 
-Status: historical / superseded by upstream per user decision
+Status: active fork maintenance
 
-Date: 2026-06-16 to 2026-07-19
+Date: 2026-06-16, restored 2026-07-22 after upstream sync
 
-Current status:
+Decision and behavior:
 
-- On 2026-07-19 the user explicitly chose the official upstream cache
-  implementation as canonical for this entire area.
-- The fork-specific stable logical cache key, custom Codex routing headers,
-  request-only developer-message memory isolation, related regression tests, and
-  weak memory-context wording are removed.
-- Upstream `api_content` composition, persistence, invalidation, and replay are the
-  source of truth. Unrelated Hindsight P5 recall preprocessing remains active.
+- Hindsight recall, `pre_llm_call` user-message context, plugin context, and
+  gateway turn notes are volatile additions for the current provider request.
+  Durable user history keeps the clean user-authored content only.
+- A later turn replays historical `content`; it never substitutes an older
+  `messages.api_content` value. This intentionally accepts a prompt-cache
+  boundary miss when volatile recall changes rather than replaying stale recall
+  as if it were new user input.
+- OpenAI/Codex Responses places the current turn's recall in a request-only
+  `developer` item immediately after the clean current user item. That position
+  is rebuilt for every same-turn tool call, but the developer item is not
+  replayed on the next user turn. Other runtimes receive recall on a copy of the
+  current user content. Plugin and Gateway one-turn context remain on that
+  current-user request copy for all runtimes.
+- MoA reference fan-out and its aggregator receive a provider-neutral request
+  copy containing the current turn's recall plus plugin/Gateway context. The
+  acting model still receives its normal provider-specific shape; neither MoA
+  auxiliary path mutates durable history.
+- The max-iteration forced-summary request receives the same current
+  `TurnContext` as the preceding tool loop. Chat-completions keeps the context on
+  the current-user request copy; OpenAI/Codex Responses keeps recall in the
+  request-only developer item after that user. The synthetic summary request and
+  all volatile context remain absent from durable history.
+- String and multimodal composition never mutates the durable message object or
+  its content list.
+- New normal CLI, Gateway, branch, compression, and session-flush paths do not
+  write or forward `api_content`. The nullable SQLite column and low-level
+  reader/writer compatibility remain so existing databases require no unsafe
+  schema migration; legacy values are stripped before model requests.
+- In-place compression does not backfill a sidecar. Max-iteration summaries and
+  Gateway replay also ignore legacy values.
+- `codex_app_server` remains separate: request-only recall is prefetched for the
+  normal memory lifecycle but is not injected into its persistent Codex thread,
+  because the protocol has no safe per-request volatile input slot.
 
-Historical files:
+Codex Responses cache routing:
 
-- `agent/chat_completion_helpers.py`
-- `agent/transports/codex.py`
-- `agent/conversation_loop.py`
+- The physical Hermes `session_id` remains distinct from the logical cache
+  scope.
+- Logical scope priority is the stable Gateway `_gateway_session_key`, then the
+  root returned by compression-only lineage. Branch and delegate parent links
+  do not merge cache scope. If lineage lookup is unavailable or fails, routing
+  falls back to the physical session id.
+- Known ordinary non-compression sessions retain upstream's bounded,
+  content-addressed `prompt_cache_key` derived from static instructions and tool
+  schema, including the 64-character hardening.
+- Codex backend HTTP routing is:
+  - `session_id` = physical Hermes session id
+  - `thread-id` = logical/bounded `prompt_cache_key`
+  - `x-client-request-id` = logical/bounded `prompt_cache_key`
+- Do not restore the obsolete `session-id` spelling.
+
+Primary files:
+
 - `agent/turn_context.py`
+- `agent/conversation_loop.py`
 - `agent/codex_responses_adapter.py`
-- `agent/memory_manager.py`
+- `agent/chat_completion_helpers.py`
+- `agent/turn_finalizer.py`
+- `agent/transports/codex.py`
+- `run_agent.py`
+- `gateway/run.py`
+- `gateway/session.py`
+- `gateway/slash_commands.py`
+- `hermes_cli/cli_commands_mixin.py`
+- `hermes_state.py` (schema compatibility only)
+- `tests/agent/test_api_content_sidecar.py`
+- `tests/agent/test_gateway_turn_sidecar.py`
 - `tests/agent/transports/test_codex_transport.py`
-- `tests/agent/test_memory_provider.py`
-- `tests/run_agent/test_run_agent.py`
+- `tests/gateway/test_replay_entry_fields.py`
 - `tests/run_agent/test_run_agent_codex_responses.py`
 - `tests/run_agent/test_codex_app_server_integration.py`
-- `docs/LOCAL_MODIFICATIONS.md`
+- `tests/fork/test_codex_request_only_memory_context.py`
 
-Historical summary:
+Merge protection:
 
-- Added a short-term fork workaround for Codex prompt-cache regressions where
-  consecutive tool calls, compression continuations, or dynamic memory-context
-  injection can otherwise lose cache affinity.
+- Upstream commit `7b3dcee92` introduced exact-wire `api_content` persistence
+  and replay. Preserve the fork's request-only isolation when syncing code that
+  touches that mechanism; an upstream nullable column is harmless, historical
+  sidecar substitution is not.
+- Preserve current-turn must-deliver gateway notes while keeping them out of
+  durable history, including multimodal turns.
+- Preserve the current-turn Codex `user → developer-recall` position across tool
+  calls and max-iteration summaries. Do not restore the historical cross-turn
+  replay of prior developer memory slots; that cache-affinity workaround
+  violates the current lifecycle contract.
+- Preserve current-turn recall/plugin/Gateway context in MoA reference and
+  aggregator requests; building MoA advice from the clean durable transcript
+  alone silently drops the current recall.
+- Preserve Hindsight P5/synchronous recall, `/retain`, `/undo`, multi-Telegram
+  account routing, and upstream Gateway lifecycle improvements.
+- Do not merge delegate or branch cache scope merely because
+  `parent_session_id` is present.
+- Do not remove upstream content-addressed key hardening while restoring the
+  fork's logical/physical routing split.
 
-What changed:
+Historical implementation references:
 
-- Codex Responses requests can pass a stable `prompt_cache_key` separate from
-  the physical Hermes `session_id`.
-- Gateway sessions prefer the stable `_gateway_session_key` as the Codex cache
-  thread, so compression-created continuation sessions do not reset the cache
-  scope just because Hermes rotated the physical session row.
-- Non-gateway sessions may fall back to compression lineage so compression
-  children can share the same cache scope as their root session.
-- Codex backend HTTP cache-routing headers keep the fork's stable logical
-  prompt-cache routing while aligning the physical-session header spelling with
-  upstream:
-  - `session_id` = physical Hermes session id
-  - `thread-id` = stable `prompt_cache_key`
-  - `x-client-request-id` = stable `prompt_cache_key`
-- During the 2026-06-18 upstream sync, upstream's official `session_id` /
-  `x-client-request-id` header variant was tested and temporarily adopted, but
-  Langfuse later showed it did **not** fully preserve cache affinity in long
-  gateway sessions. Same-turn follow-up calls could still drop to zero cache
-  reads, so the fork restored its own `thread-id`/stable-cache-key routing.
-- OpenAI/Codex Responses auto-recall now injects prefetched `<memory-context>`
-  as `role="developer"` input items immediately after the relevant user
-  messages instead of appending it to the current user text. Prior request-only
-  developer memory slots are replayed at the same user-turn positions on later
-  turns so the Codex prompt-cache prefix stays append-like across tool loops and
-  the following user turn. Non-OpenAI Responses runtimes keep the legacy
-  ephemeral user suffix; `codex_app_server` also keeps the suffix because that
-  protocol does not expose a per-turn Responses developer input slot.
-- Codex Responses chat-to-input conversion and preflight validation accept
-  `role="developer"` input items and preserve them as `input_text` content.
-- The memory-context system note wording was weakened from
-  `authoritative reference data` / `should inform all responses` to: `This is
-  the agent's persistent memory from prior sessions, for reference only.`
-  Sanitization still strips both the old and new notes.
+- `ce52975c27` introduced the fork's Codex developer-item support for
+  request-only memory context.
+- `ca60311b33` is a useful current-turn placement reference, but its replay of
+  prior developer-memory slots is intentionally not restored.
+- `a19af2e5a2`, `9a3a8e18d0`, `4d39a603d1`, and `bafa2360dc9` document the
+  stable cache scope, physical/logical header split, and corrected `session_id`
+  spelling that this restoration adapts to current upstream code.
 
-Why it matters:
+Verification after the 2026-07-22 restoration:
 
-- The user observed a sharp prompt-cache drop in Hermes on 2026-06-15 to
-  2026-06-16, visible in Langfuse and local session usage.
-- The failure lined up with the upstream change that stripped Codex backend
-  `extra_headers`, plus Hermes using compression-rotated physical session ids as
-  cache keys.
-- This workaround keeps Gateway tool-call chains and compression continuations on
-  a stable Codex cache thread.
-- Keeping recalled memory out of `instructions` and the current user message
-  preserves the stable prompt prefix and avoids treating old memory as fresh user
-  discourse.
-- Historical note: the user originally wanted persistent memory treated as
-  reference rather than a stronger instruction.
+- Initial RED before production edits: `14 failed, 1 passed`, covering sidecar
+  stamping, replay, multimodal mutation, summary replay, and Codex header
+  separation.
+- Final semantic review found two gaps not covered by that first rebaseline:
+  current-turn Codex developer placement (`3 failed`) and obsolete
+  `session-id` removal (`1 failed`). Both were observed RED before their
+  production fixes.
+- Focused request-isolation, Codex transport/runtime, app-server, Gateway replay,
+  prompt-tail, state compatibility, syntax, and whitespace validation:
+  `335 passed`; `git diff --check` and `py_compile` also passed.
+- Adjacent compression, replay cleanup, chat-completions, branch/resume/undo,
+  compression-lineage, and multi-Telegram regression suite: `389 passed`
+  (`7` third-party deprecation warnings).
+- Independent pre-commit review then found two request shapes missing current
+  context: MoA auxiliary calls and the max-iteration forced summary. Focused RED
+  reproduced all three provider shapes (`3 failed`): MoA, chat-completions
+  summary, and Codex summary. After repair, an end-to-end
+  `run_conversation → turn_finalizer → summary` regression also passed. The MoA
+  regression executes the real `aggregate_moa_context()` consumer path and
+  separately captures the rendered reference request and aggregator synthesis
+  request; it does not mock the function under test.
+- Post-repair request-only/Codex/MoA/turn-finalizer suite: `239 passed`.
+  Existing `TestHandleMaxIterations`: `18 passed`. A final main-agent gate review
+  then reproduced a stale-index defect after message repair moved the current
+  user: the forced summary attached context to its synthetic summary request
+  instead (`1 failed`). Synchronizing the loop's latest re-anchored index into
+  the ephemeral `TurnContext` made the end-to-end regression pass. The final
+  expanded focused suite, additionally covering Codex transport, Gateway replay,
+  prompt-tail, and state compatibility, reported `408 passed`. The adjacent
+  regression suite remained `389 passed` with the same `7` third-party
+  deprecation warnings; `git diff --check` and `py_compile` passed.
 
-Retired merge rules (do not apply):
+Upstream status: intentional fork divergence from persistent `api_content`
+replay; compatible upstream schema and content-addressed key hardening retained.
 
-- This is intentionally a temporary fork patch, not a long-term fork feature.
-- Do **not** discard the fork `session_id` / `thread-id` / stable
-  `x-client-request-id` routing merely because upstream has a nominal Codex
-  cache-routing fix. The 2026-06-18 upstream `session_id` /
-  `x-client-request-id` variant was tested in real Langfuse traces and did not
-  fully fix long gateway sessions: same-turn follow-up calls still sometimes
-  dropped to `cache_read_input_tokens=0`.
-- Preserve the fork's stable `prompt_cache_key` body field and matching
-  `thread-id` / `x-client-request-id` headers for gateway and compression
-  lineage.
-- Preserve after-user `role="developer"` memory-context injection and replay of
-  prior request-only developer slots for OpenAI/Codex Responses runtimes. Do not
-  move recalled memory back into `instructions`, the current user message text,
-  or the request tail unless live cache evidence and behavior tests show the
-  replacement is equivalent.
-- Preserve the fallback path that appends recalled memory to the current user
-  turn only for runtimes that cannot accept Responses developer input.
-- Preserve the exact weak memory-context note wording unless the user explicitly
-  approves stronger wording: `This is the agent's persistent memory from prior
-  sessions, for reference only.`
-- Preserve tests that prove developer input items survive Codex Responses
-  conversion/preflight, that memory does not enter `instructions` or the current
-  user suffix on OpenAI/Codex Responses, and that same-turn plus next-turn tool
-  chains do not rewrite prior developer-memory prefix slots.
-- Drop this workaround only after an upstream replacement has been checked
-  carefully against real long-running gateway telemetry and focused tests. At a
-  minimum, verify both cross-turn and same-turn tool-call chains keep high cache
-  reads after memory-context injection, retries, and compression boundaries.
-- If future upstream code conflicts with this area but has not been proven with
-  that telemetry, stop and ask the user instead of assuming the upstream fix is
-  equivalent.
-
-Current merge protection:
-
-- Do not revive the stable logical cache key, custom Codex routing headers,
-  request-only developer-memory slots, weak note wording, or retired tests without
-  a new explicit user decision.
-- Preserve upstream `api_content` cache behavior as canonical.
-
-Historical verification:
-
-```bash
-git diff --check
-python -m pytest tests/agent/transports/test_codex_transport.py tests/run_agent/test_run_agent_codex_responses.py tests/gateway/test_agent_cache.py -q
-```
-
-Observed local results:
-
-- 2026-07-10 upstream sync: the Codex app-server external-memory fixture now
-  returns an explicit empty prefetch string because the fork's request-only
-  memory path calls `prefetch_all()` before dispatch. The fork and
-  changed-upstream focused suite reported `2070 passed`.
-- 2026-06-16: `202 passed` for the focused pytest command above. After gateway
-  restart and a compression boundary, the new continuation session continued
-  receiving cache reads instead of staying at zero cache.
-- 2026-06-18 upstream sync: upstream official Codex HTTP header names were
-  temporarily adopted while retaining stable `prompt_cache_key`; targeted
-  Codex/Hindsight/session tests reported `630 passed`, but later Langfuse
-  traces showed the official header variant was insufficient in live long
-  gateway sessions.
-- 2026-06-18 post-sync telemetry: trace
-  `59cc7e9d98edd3ff9fe35f8e4980ec88` / session
-  `20260618_104142_40390af6` had a same-turn follow-up call drop from
-  `input=146,239, cache_read_input_tokens=24,576` to
-  `input=176,230, cache_read_input_tokens=0`; trace
-  `1829d0bdab5e3cd305d395abea4a594f` showed the older fork routing was mostly
-  stable for same-turn follow-ups before the switch, while the official variant
-  later produced another same-turn cliff (`cache_read_input_tokens=0`). This
-  evidence restored the fork header workaround.
-- 2026-06-24 physical-session header spelling alignment: switched the physical
-  Hermes session header from `session-id` to upstream spelling `session_id`
-  while retaining the stable `thread-id` / `x-client-request-id` values from
-  `prompt_cache_key`. `python -m py_compile agent/transports/codex.py tests/agent/transports/test_codex_transport.py tests/run_agent/test_run_agent_codex_responses.py` → passed; `python -m pytest tests/agent/transports/test_codex_transport.py tests/run_agent/test_run_agent_codex_responses.py -q -o 'addopts='` → 139 passed, 1 unrelated `audioop` deprecation warning; `git diff --check` → passed.
-- 2026-06-26 OpenAI/Codex Responses developer memory injection: targeted
-  request-shape tests for developer recall, chat-completions fallback,
-  Responses developer conversion, developer preflight acceptance, and optional
-  function-call-id stripping reported `5 passed`; memory-context wrapper tests
-  reported `6 passed`; combined scrubber/developer focused regression reported
-  `28 passed, 1 unrelated audioop deprecation warning`; `python -m py_compile
-  agent/memory_manager.py tests/agent/test_memory_provider.py` and `git diff
-  --check` passed.
-- 2026-06-29 same-turn Codex tool-loop placement fix: moved that ephemeral
-  developer memory item from the request tail to immediately after the current
-  user item, so follow-up tool-loop requests keep the memory block before newly
-  appended assistant/tool items instead of moving the previous tail. RED test:
-  `tests/fork/test_codex_memory_context_isolation.py::test_auto_memory_recall_codex_developer_stays_after_user_across_tool_loop`
-  failed with `developer_index == 3` instead of `1` before the fix.
-- 2026-06-29 next-turn Codex memory replay fix for Langfuse trace
-  `aa645114645bf98925dcb9debfaa92a2`: added a regression that reproduces the
-  prior request's developer-memory slot being rewritten by a replayed
-  `reasoning` item on the following user turn. RED test
-  `tests/fork/test_codex_memory_context_isolation.py::test_auto_memory_recall_codex_replays_prior_turn_developer_for_cache_affinity`
-  failed before the fix with the second-turn item at that slot equal to
-  `{"type": "reasoning", ...}` instead of the prior `role="developer"` memory
-  item. After the fix: `python -m pytest tests/fork/test_codex_memory_context_isolation.py tests/fork/test_codex_prompt_cache.py tests/run_agent/test_run_agent_codex_responses.py -q -o 'addopts='`
-  → 93 passed; `python -m pytest tests/fork -q -o 'addopts='` → 300 passed;
-  `python -m py_compile agent/conversation_loop.py agent/turn_context.py tests/fork/test_codex_memory_context_isolation.py` and `git diff --check` passed.
-- 2026-06-29 repaired-user preflight dump fix for the same trace: live dumps
-  after 16:05 still showed tail `role="developer"` because
-  `repair_message_sequence_with_cursor()` can remove/merge messages before the
-  current user while `current_turn_user_idx` kept its pre-repair value. The
-  memory marker then missed the current user and the defensive fallback appended
-  the developer memory item at the request tail after reasoning/tool history.
-  The fork now re-anchors the current-user cursor after repair and the Codex
-  fallback inserts memory after the last user instead of at the tail. RED test
-  `tests/fork/test_codex_memory_context_isolation.py::test_auto_memory_recall_codex_preflight_dump_keeps_developer_after_repaired_user`
-  captures the final `HERMES_DUMP_REQUESTS` preflight body and failed before the
-  fix with the developer item at the tail. Verification: `HERMES_DUMP_REQUESTS=0
-  HERMES_HOME=/tmp/hermes-verify-memory-context venv/bin/python -m pytest
-  tests/fork/test_codex_memory_context_isolation.py tests/run_agent/test_run_agent_codex_responses.py -q -o 'addopts='`
-  → 88 passed; `HERMES_DUMP_REQUESTS=0 HERMES_HOME=/tmp/hermes-verify-fork
-  venv/bin/python -m pytest tests/fork -q -o 'addopts='` → 301 passed;
-  `venv/bin/python -m py_compile agent/conversation_loop.py agent/turn_context.py tests/fork/test_codex_memory_context_isolation.py`
-  and `git diff --check` passed.
-
-Upstream status: superseded by the official `api_content` cache implementation
-per the user's 2026-07-19 decision.
 
 ### 13. Multi Telegram bots in one profile (account_id session slots)
 
@@ -1280,18 +1224,24 @@ deltas are expected in these areas:
   - `tools/skills_sync.py`
   - `hermes_cli/main.py`
   - `tests/tools/test_skills_sync.py`
-- Temporary Codex backend prompt-cache routing workaround:
+- Request-only recall isolation and Codex prompt-cache routing:
   - `agent/chat_completion_helpers.py`
   - `agent/transports/codex.py`
   - `agent/conversation_loop.py`
-  - `agent/turn_context.py`
   - `agent/codex_responses_adapter.py`
-  - `agent/memory_manager.py`
+  - `agent/turn_context.py`
+  - `run_agent.py`
+  - `gateway/run.py`
+  - `gateway/session.py`
+  - `gateway/slash_commands.py`
+  - `hermes_cli/cli_commands_mixin.py`
+  - `tests/agent/test_api_content_sidecar.py`
+  - `tests/agent/test_gateway_turn_sidecar.py`
   - `tests/agent/transports/test_codex_transport.py`
-  - `tests/agent/test_memory_provider.py`
-  - `tests/run_agent/test_run_agent.py`
+  - `tests/gateway/test_replay_entry_fields.py`
   - `tests/run_agent/test_run_agent_codex_responses.py`
   - `tests/run_agent/test_codex_app_server_integration.py`
+  - `tests/fork/test_codex_request_only_memory_context.py`
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
 - Multi Telegram bots (account_id session slots):

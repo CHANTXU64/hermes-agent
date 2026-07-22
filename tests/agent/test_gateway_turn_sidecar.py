@@ -4,9 +4,8 @@ The gateway relocates per-turn volatile facts OUT of the ephemeral system
 prompt — auto-reset notes, the first-contact intro, voice-channel changes —
 and stages them on ``agent._gateway_turn_context_notes``.
 ``build_turn_context`` consumes them once and delivers them through the same
-api_content sidecar channel as plugin context (string content), or as an
-appended text part on multimodal (list) content, where the string sidecar
-cannot apply and the fact would otherwise silently drop.
+request-only composition path as plugin context. String and multimodal content
+are composed on provider copies; the durable user message remains unchanged.
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ from unittest.mock import patch
 import pytest
 
 from agent.turn_context import (
-    append_notes_to_multimodal_content,
     build_turn_context,
     compose_user_api_content,
     consume_gateway_turn_context_notes,
@@ -144,22 +142,18 @@ class TestConsumeIsOneShot:
         assert consume_gateway_turn_context_notes(agent) == ""
 
 
-class TestStringContentSidecarDelivery:
-    def test_notes_ride_the_api_content_sidecar(self):
-        """String user message: the note lands in the API copy only — the
-        stored content stays clean and the sidecar persists the exact sent
-        bytes (replay keeps them byte-stable in history)."""
+class TestStringContentRequestOnlyDelivery:
+    def test_notes_stay_off_the_durable_message(self):
         agent = _FakeAgent()
         agent._gateway_turn_context_notes = RESET_NOTE
         with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
             ctx = _build(agent)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"
-        assert msg["api_content"] == "hello\n\n" + RESET_NOTE
-        # The composed bytes match what conversation_loop would send.
-        assert msg["api_content"] == compose_user_api_content(
+        assert "api_content" not in msg
+        assert compose_user_api_content(
             "hello", ctx.ext_prefetch_cache, ctx.plugin_user_context
-        )
+        ) == "hello\n\n" + RESET_NOTE
         # Consumed: a later turn on the same cached agent replays nothing.
         assert agent._gateway_turn_context_notes == ""
 
@@ -172,7 +166,10 @@ class TestStringContentSidecarDelivery:
         ):
             ctx = _build(agent)
         msg = ctx.messages[ctx.current_turn_user_idx]
-        assert msg["api_content"] == "hello\n\nPLUGIN-CTX\n\n" + VC_NOTE
+        assert "api_content" not in msg
+        assert compose_user_api_content(
+            msg["content"], ctx.ext_prefetch_cache, ctx.plugin_user_context
+        ) == "hello\n\nPLUGIN-CTX\n\n" + VC_NOTE
 
     def test_no_notes_means_no_stamp(self):
         agent = _FakeAgent()
@@ -182,10 +179,7 @@ class TestStringContentSidecarDelivery:
 
 
 class TestMultimodalFallback:
-    def test_notes_appended_as_text_part_on_list_content(self):
-        """Multimodal turns can't take the string sidecar
-        (compose_user_api_content returns None for lists) — the must-deliver
-        fact is appended as a durable text part instead of dropping."""
+    def test_notes_are_composed_on_request_copy_only(self):
         agent = _FakeAgent()
         agent._gateway_turn_context_notes = RESET_NOTE
         content = [
@@ -195,13 +189,10 @@ class TestMultimodalFallback:
         with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
             ctx = _build(agent, user_message=content)
         msg = ctx.messages[ctx.current_turn_user_idx]
-        assert msg["content"][-1] == {"type": "text", "text": RESET_NOTE}
-        # No string sidecar for list content.
+        assert msg["content"] == content
         assert "api_content" not in msg
-
-    def test_helper_appends_only_to_lists(self):
-        content = [{"type": "text", "text": "hi"}]
-        assert append_notes_to_multimodal_content(content, "NOTE") is True
-        assert content[-1] == {"type": "text", "text": "NOTE"}
-        assert append_notes_to_multimodal_content("string", "NOTE") is False
-        assert append_notes_to_multimodal_content(content, "") is False
+        composed = compose_user_api_content(
+            msg["content"], ctx.ext_prefetch_cache, ctx.plugin_user_context
+        )
+        assert isinstance(composed, list)
+        assert composed[-1] == {"type": "text", "text": "\n\n" + RESET_NOTE}

@@ -33,6 +33,7 @@ from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
+    apply_request_only_turn_context,
     build_turn_context,
     compose_user_api_content,
     reanchor_current_turn_user_idx,
@@ -654,9 +655,6 @@ def run_conversation(
         set_session_context=set_session_context,
         set_current_write_origin=set_current_write_origin,
         ra=_ra,
-        # MoA turns append per-call aggregated context to the API copy of the
-        # user message, so no byte-stable api_content sidecar can be stamped.
-        moa_active=bool(moa_config),
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -861,6 +859,10 @@ def run_conversation(
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
         repaired_seq = repair_message_sequence_with_cursor(agent, messages)
         if repaired_seq > 0:
+            current_turn_user_idx = reanchor_current_turn_user_idx(
+                messages, user_message
+            )
+            agent._persist_user_message_idx = current_turn_user_idx
             request_logger.info(
                 "Repaired %s message-alternation violations before request (session=%s)",
                 repaired_seq,
@@ -871,51 +873,24 @@ def run_conversation(
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
 
-            # api_content is the persistence sidecar carrying the exact bytes
-            # sent to the API for this message when they differ from the clean
-            # stored content (see compose_user_api_content in turn_context).
-            # It is bookkeeping, never a provider field — pop it from EVERY
-            # outgoing copy.
-            _api_content = api_msg.pop("api_content", None)
+            # Legacy databases may still expose upstream's api_content
+            # sidecar. It is never a provider field and its old recall/plugin
+            # bytes must not replace clean historical content.
+            api_msg.pop("api_content", None)
 
-            # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated beyond the api_content stamp, so nothing leaks
-            # into the clean transcript content.
+            # Mark the current user so provider-specific request composition can
+            # place recall correctly on every retry/fallback without mutating
+            # this normalized base copy. Plugin/gateway context remains on the
+            # current user request item for every provider.
             if idx == current_turn_user_idx and msg.get("role") == "user":
-                if isinstance(_api_content, str) and _api_content:
-                    # Stamped by the prologue from the same composition —
-                    # reuse it so the persisted sidecar and the wire cannot
-                    # drift, and so every pass this turn sends identical
-                    # bytes (composed from msg["content"], never from a
-                    # previously-injected copy).
-                    api_msg["content"] = _api_content
-                else:
-                    # Callers that bypass the prologue stamping: compose live.
-                    _composed = compose_user_api_content(
-                        api_msg.get("content", ""),
-                        _ext_prefetch_cache,
-                        _plugin_user_context,
-                    )
-                    if _composed is not None:
-                        api_msg["content"] = _composed
-            elif (
-                isinstance(_api_content, str)
-                and _api_content
-                and msg.get("role") in ("user", "assistant")
-            ):
-                # Historical message: replay the exact bytes sent when it was
-                # live, so the provider prompt-cache prefix stays byte-stable
-                # instead of diverging at the injection point and
-                # re-prefilling everything after it. User rows carry the
-                # prefetch/plugin injection sidecar; user AND assistant rows
-                # can carry a sanitize-divergence sidecar (content that
-                # ``get_messages_as_conversation``'s sanitize_context/strip
-                # would rewrite on reload — see the capture in
-                # ``_flush_messages_to_session_db``).
-                api_msg["content"] = _api_content
+                api_msg["_current_turn_user"] = True
+                _composed = compose_user_api_content(
+                    api_msg.get("content", ""),
+                    "",
+                    _plugin_user_context,
+                )
+                if _composed is not None:
+                    api_msg["content"] = _composed
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved
@@ -942,8 +917,9 @@ def run_conversation(
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
-        # External recall context is injected into the user message, not the system
-        # prompt, so the stable cache prefix remains unchanged.
+        # External recall is added later on a provider-bound copy: Codex
+        # Responses uses a developer item after the current user; other runtimes
+        # use a current-user suffix. The stable system prefix stays unchanged.
         #
         # NOTE: Plugin context from pre_llm_call hooks is injected into the
         # user message (see injection block above), NOT the system prompt.
@@ -966,17 +942,37 @@ def run_conversation(
                 from agent.message_content import flatten_message_text as _flatten_mt
                 from agent.moa_loop import _preset_temperature, aggregate_moa_context
 
-                _moa_context = aggregate_moa_context(
-                    user_prompt=(
+                # MoA auxiliary calls need the same current-turn recall as the
+                # acting model, but on a provider-neutral user-suffix copy: its
+                # advisory renderer intentionally ignores developer-role items.
+                _moa_api_messages = [
+                    dict(message) if isinstance(message, dict) else message
+                    for message in api_messages
+                ]
+                _moa_current_user_idx = apply_request_only_turn_context(
+                    agent,
+                    _moa_api_messages,
+                    current_turn_user_idx=None,
+                    ext_prefetch_cache=_ext_prefetch_cache,
+                    plugin_user_context="",
+                    force_memory_user_suffix=True,
+                )
+                for _message in _moa_api_messages:
+                    if isinstance(_message, dict):
+                        _message.pop("_current_turn_user", None)
+                _moa_user_prompt = (
+                    _flatten_mt(_moa_api_messages[_moa_current_user_idx].get("content"))
+                    if _moa_current_user_idx >= 0
+                    else (
                         original_user_message
                         if isinstance(original_user_message, str)
-                        # Multimodal / decorated content list: extract the
-                        # visible text instead of str()-ing a Python repr of
-                        # the parts (which would leak base64 image payloads
-                        # into the aggregator prompt).
                         else _flatten_mt(original_user_message)
-                    ),
-                    api_messages=api_messages,
+                    )
+                )
+
+                _moa_context = aggregate_moa_context(
+                    user_prompt=_moa_user_prompt,
+                    api_messages=_moa_api_messages,
                     reference_models=moa_config.get("reference_models") or [],
                     aggregator=moa_config.get("aggregator") or {},
                     temperature=_preset_temperature(moa_config, "reference_temperature"),
@@ -1079,12 +1075,63 @@ def run_conversation(
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
 
+        def _build_request_api_messages_for_current_runtime() -> list[dict]:
+            """Compose current recall on a provider-bound copy only.
+
+            Codex Responses receives recall as a developer item immediately
+            after the current user. Other runtimes receive the same recall as a
+            current-user suffix. Historical user turns never receive a prior
+            turn's recall in either shape.
+            """
+            request_messages = [
+                dict(msg) if isinstance(msg, dict) else msg for msg in api_messages
+            ]
+            current_user_index = next(
+                (
+                    idx
+                    for idx, msg in enumerate(request_messages)
+                    if isinstance(msg, dict) and msg.get("_current_turn_user")
+                ),
+                -1,
+            )
+            if current_user_index < 0:
+                current_user_index = next(
+                    (
+                        idx
+                        for idx in range(len(request_messages) - 1, -1, -1)
+                        if isinstance(request_messages[idx], dict)
+                        and request_messages[idx].get("role") == "user"
+                    ),
+                    -1,
+                )
+
+            for msg in request_messages:
+                if isinstance(msg, dict):
+                    msg.pop("_current_turn_user", None)
+
+            apply_request_only_turn_context(
+                agent,
+                request_messages,
+                current_turn_user_idx=current_user_index,
+                ext_prefetch_cache=_ext_prefetch_cache,
+                plugin_user_context="",
+            )
+
+            _sanitize_messages_surrogates(request_messages)
+            return request_messages
+
+        request_api_messages_for_estimate = (
+            _build_request_api_messages_for_current_runtime()
+        )
+
         # One image-stripped message estimate feeds both figures. Was: a
         # str(msg) char walk (re-serialized base64 every call) + a second
         # messages walk inside estimate_request_tokens_rough. Tools added
         # separately (compression needs them: 50+ tools = 20-30K tokens).
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
+        approx_tokens = estimate_messages_tokens_rough(
+            request_api_messages_for_estimate
+        )
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
@@ -1159,6 +1206,10 @@ def run_conversation(
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
             )
+            current_turn_user_idx = reanchor_current_turn_user_idx(
+                messages, user_message
+            )
+            agent._persist_user_message_idx = current_turn_user_idx
             # Reset retry/empty-response state so the compacted request
             # gets a fresh chance instead of inheriting stale recovery
             # counters from the pre-compaction history.
@@ -1189,7 +1240,7 @@ def run_conversation(
         
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
-            agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
+            agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(request_api_messages_for_estimate)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
             agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
         else:
             # Animated thinking spinner in quiet mode
@@ -1284,8 +1335,15 @@ def run_conversation(
                 # echo-back pad for the *current* provider here (idempotent no-op
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
-                agent._reapply_reasoning_echo_for_provider(api_messages)
-                api_kwargs = agent._build_api_kwargs(api_messages)
+                request_api_messages = (
+                    _build_request_api_messages_for_current_runtime()
+                )
+                agent._reapply_reasoning_echo_for_provider(request_api_messages)
+                request_approx_tokens = estimate_messages_tokens_rough(
+                    request_api_messages
+                )
+                request_total_chars = request_approx_tokens * 4
+                api_kwargs = agent._build_api_kwargs(request_api_messages)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -1335,7 +1393,7 @@ def run_conversation(
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
                         if not isinstance(request_messages, list):
-                            request_messages = api_messages
+                            request_messages = request_api_messages
                         # Shallow-copy the outer list so plugins that retain the
                         # reference for async snapshotting don't observe later
                         # mutations of api_messages.  The inner dicts are not
@@ -1370,10 +1428,10 @@ def run_conversation(
                             request_messages=list(request_messages)
                             if isinstance(request_messages, list)
                             else [],
-                            message_count=len(api_messages),
+                            message_count=len(request_api_messages),
                             tool_count=len(agent.tools or []),
-                            approx_input_tokens=approx_tokens,
-                            request_char_count=total_chars,
+                            approx_input_tokens=request_approx_tokens,
+                            request_char_count=request_total_chars,
                             max_tokens=agent.max_tokens,
                             started_at=api_start_time,
                             middleware_trace=list(_llm_middleware_trace),
@@ -4395,9 +4453,8 @@ def run_conversation(
             # In-loop compression rebuilt `messages` with fresh compaction
             # copies, so the pre-compression current-turn index is stale.
             # Re-anchor exactly like the prologue does: a stale index that
-            # lands on a historical user message would make the live-compose
-            # fallback inject this turn's prefetch into that message on the
-            # wire only, diverging the next turn's replayed prefix there.
+            # lands on a historical user message would make request-only recall
+            # attach to the wrong provider-bound item.
             current_turn_user_idx = reanchor_current_turn_user_idx(
                 messages, user_message
             )
@@ -5146,6 +5203,10 @@ def run_conversation(
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
                     )
+                    current_turn_user_idx = reanchor_current_turn_user_idx(
+                        messages, user_message
+                    )
+                    agent._persist_user_message_idx = current_turn_user_idx
                     conversation_history = conversation_history_after_compression(
                         agent, messages
                     )
@@ -5779,7 +5840,10 @@ def run_conversation(
     
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
-    # result dict is returned exactly as before.
+    # result dict is returned exactly as before. Message repair/compression may
+    # have re-anchored the current user during the loop; carry that latest index
+    # into the request-only max-summary path instead of the prologue's stale one.
+    _ctx.current_turn_user_idx = current_turn_user_idx
     from agent.turn_finalizer import finalize_turn
     return finalize_turn(
         agent,
@@ -5797,6 +5861,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        _turn_context=_ctx,
     )
 
 

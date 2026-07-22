@@ -396,6 +396,51 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "extra_body" not in kwargs
 
 
+def test_build_api_kwargs_openai_codex_uses_gateway_key_for_cache_scope(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.session_id = "physical-session-after-compression"
+    agent._gateway_session_key = "agent:main:telegram:dm:424242"
+
+    kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+    assert kwargs["prompt_cache_key"] == "agent:main:telegram:dm:424242"
+    assert kwargs["extra_headers"] == {
+        "session_id": "physical-session-after-compression",
+        "thread-id": "agent:main:telegram:dm:424242",
+        "x-client-request-id": "agent:main:telegram:dm:424242",
+    }
+
+
+def test_codex_prompt_cache_scope_uses_compression_root_only():
+    from agent.chat_completion_helpers import _codex_prompt_cache_scope
+
+    db = SimpleNamespace(get_compression_lineage=lambda _sid: ["root", "child", "tip"])
+    agent = SimpleNamespace(_gateway_session_key="", _session_db=db)
+
+    assert _codex_prompt_cache_scope(agent, "tip") == "root"
+
+
+def test_codex_prompt_cache_scope_does_not_merge_branch_or_delegate_parent():
+    from agent.chat_completion_helpers import _codex_prompt_cache_scope
+
+    db = SimpleNamespace(get_compression_lineage=lambda sid: [sid])
+    agent = SimpleNamespace(_gateway_session_key="", _session_db=db)
+
+    assert _codex_prompt_cache_scope(agent, "branch-or-delegate") is None
+
+
+def test_codex_prompt_cache_scope_falls_back_to_physical_on_lineage_error():
+    from agent.chat_completion_helpers import _codex_prompt_cache_scope
+
+    def _raise(_sid):
+        raise RuntimeError("db unavailable")
+
+    db = SimpleNamespace(get_compression_lineage=_raise)
+    agent = SimpleNamespace(_gateway_session_key="", _session_db=db)
+
+    assert _codex_prompt_cache_scope(agent, "physical-session") == "physical-session"
+
+
 def test_build_api_kwargs_codex_clamps_minimal_effort(monkeypatch):
     """'minimal' reasoning effort is clamped to 'low' on the Responses API.
 

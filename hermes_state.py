@@ -4262,13 +4262,10 @@ class SessionDB:
         platform-specific flows like yuanbao's recall guard to redact a
         message by its platform-side identifier.
 
-        ``api_content`` is the exact content string sent to the API for this
-        message when it differs from ``content`` (ephemeral memory/plugin
-        injections, persist overrides).  It is a byte-fidelity sidecar for
-        prompt-cache-stable replay — stored as sent, except lone surrogates
-        (which sqlite3 cannot bind and which the conversation loop scrubs
-        from every outgoing payload anyway, so the scrubbed form IS the
-        wire bytes).
+        ``api_content`` is a legacy compatibility field retained for databases
+        created by upstream's former exact-wire replay path. Normal runtime
+        callers omit it and provider requests ignore stored values. Explicit
+        compatibility callers still get lone-surrogate scrubbing.
         """
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
@@ -4415,8 +4412,6 @@ class SessionDB:
                 msg.get("platform_message_id") or msg.get("message_id")
             )
 
-            api_content = msg.get("api_content")
-
             conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
@@ -4442,7 +4437,7 @@ class SessionDB:
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
                     1,
-                    _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
+                    None,
                 ),
             )
             inserted += 1
@@ -4570,19 +4565,12 @@ class SessionDB:
     def set_latest_user_api_content(
         self, session_id: str, content: Any, api_content: str
     ) -> int:
-        """Backfill the ``api_content`` sidecar onto the newest ACTIVE user row.
+        """Legacy compatibility writer for an existing ``api_content`` column.
 
-        In-place preflight compaction (:meth:`archive_and_compact`) inserts the
-        current turn's user row BEFORE the turn prologue composes the
-        prefetch/plugin sidecar, and the subsequent crash persist identity-skips
-        every compacted dict — without this backfill the stamped sidecar would
-        never land in the DB and any reload would replay clean content,
-        re-introducing the prompt-cache divergence the sidecar exists to close.
-
-        The ``content`` match is a defensive guard: if the newest active user
-        row is not the message the caller stamped (racing rewrite, unexpected
-        tail shape), nothing is written. Returns the number of rows updated
-        (0 or 1).
+        The request-only runtime no longer calls this method. It remains to
+        avoid a destructive schema/API migration for older integrations. The
+        ``content`` match guards against updating an unrelated newest user row;
+        returns the number of rows updated (0 or 1).
         """
         encoded = self._encode_content(content)
 
@@ -5034,9 +5022,8 @@ class SessionDB:
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
-            # api_content is the byte-fidelity sidecar: the exact string sent
-            # to the API when it differed from the clean content. Return it
-            # verbatim so replay can keep the provider prompt prefix stable.
+            # Return the legacy field for database/API compatibility. Every
+            # model-bound path strips it and uses clean ``content`` instead.
             if row["api_content"]:
                 msg["api_content"] = row["api_content"]
             if include_timestamps and row["timestamp"]:

@@ -863,23 +863,6 @@ def _build_replay_entry(
     providers.
     """
     entry: Dict[str, Any] = {"role": role, "content": content}
-    # api_content sidecar (persist-what-you-send, prompt-cache stability):
-    # forward the exact bytes previously sent to the API for this message so
-    # the agent's api_messages build can substitute them and keep the request
-    # prefix byte-stable across turns. Forward ONLY when this replay pipeline
-    # did not rewrite the content (timestamp injection, auto-continue strip,
-    # mirror prefix): a rewritten clean content means the pipeline decided
-    # different bytes must replay — resending the stored sidecar would
-    # reintroduce exactly what was stripped. Dropping it costs one cache
-    # boundary; resending stripped noise is a behavior regression.
-    _sidecar = msg.get("api_content")
-    if (
-        role in ("user", "assistant")
-        and isinstance(_sidecar, str)
-        and _sidecar
-        and content == msg.get("content")
-    ):
-        entry["api_content"] = _sidecar
     if role == "assistant":
         for _rkey in _ASSISTANT_REPLAY_FIELDS:
             if _rkey not in msg:
@@ -3336,7 +3319,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-turn must-deliver notes relocated out of the ephemeral system
         # prompt (auto-reset note, first-contact intro, voice-channel change).
         # Staged by _handle_message_with_agent, consumed once by run_sync and
-        # delivered on the current user message (api_content sidecar).
+        # delivered on the current request's user-message copy.
         self._pending_turn_sidecar_notes: Dict[str, List[str]] = {}
         # Pinned session-context bytes keyed by the renderer-input change
         # key.  Key hit → reuse pinned bytes verbatim; key miss → re-render
@@ -12609,9 +12592,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Per-turn must-deliver notes.  These used to be appended to
         # context_prompt (the ephemeral system prompt), which guaranteed a
-        # turn1→turn2 system-prompt diff and a full agent rebuild.  They now
-        # ride the current user message via the api_content sidecar instead
-        # (staged below, consumed in run_sync → build_turn_context).
+        # turn1→turn2 system-prompt diff and a full agent rebuild. They now ride
+        # the current request's user-message copy instead (staged below,
+        # consumed in run_sync → build_turn_context).
         turn_sidecar_notes: List[str] = []
 
         # If the previous session expired and was auto-reset, deliver a notice
@@ -21021,8 +21004,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
-            # Must-deliver notes for THIS turn ride the current user message
-            # (api_content sidecar), never the system prompt: staged by
+            # Must-deliver notes for THIS turn ride the current request's user
+            # message copy, never the system prompt: staged by
             # _handle_message_with_agent (auto-reset note, first-contact
             # intro, voice-channel change).  Assigned unconditionally so a
             # reused cached agent never replays a stale note.

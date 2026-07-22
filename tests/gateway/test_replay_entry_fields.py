@@ -253,22 +253,19 @@ class TestBuildReplayEntry:
         assert "tool_call_id" not in entry
 
 
-class TestReplayEntryApiContentSidecar:
-    """The api_content sidecar (persist-what-you-send) must survive the
-    gateway's transcript→agent_history rebuild, or the whole prompt-cache
-    fix is inert on gateway platforms — but only when this pipeline did not
-    rewrite the content (a rewrite means different bytes must replay)."""
+class TestReplayEntryLegacyApiContent:
+    """Legacy api_content must not enter model-fed Gateway history."""
 
-    def test_user_forwards_api_content_when_content_unchanged(self):
+    def test_user_drops_api_content_when_content_unchanged(self):
         msg = {"role": "user", "content": "hi", "api_content": "hi\n\nCTX"}
         entry = _build_replay_entry("user", "hi", msg)
-        assert entry["api_content"] == "hi\n\nCTX"
+        assert "api_content" not in entry
         assert entry["content"] == "hi"
 
-    def test_assistant_forwards_api_content_when_content_unchanged(self):
+    def test_assistant_drops_api_content_when_content_unchanged(self):
         msg = {"role": "assistant", "content": "a", "api_content": "a <memory-context>"}
         entry = _build_replay_entry("assistant", "a", msg)
-        assert entry["api_content"] == "a <memory-context>"
+        assert "api_content" not in entry
 
     def test_dropped_when_pipeline_rewrote_content(self):
         """Timestamp injection / auto-continue strip / mirror prefix change
@@ -290,8 +287,8 @@ class TestReplayEntryApiContentSidecar:
             assert "api_content" not in entry
 
 
-class TestGatewayHistoryBuildForwardsSidecar:
-    def test_end_to_end_history_build_keeps_sidecar(self):
+class TestGatewayHistoryBuildDropsSidecar:
+    def test_end_to_end_history_build_drops_sidecar(self):
         from gateway.run import _build_gateway_agent_history
 
         history = [
@@ -299,7 +296,8 @@ class TestGatewayHistoryBuildForwardsSidecar:
             {"role": "assistant", "content": "hello"},
         ]
         agent_history, _obs = _build_gateway_agent_history(history)
-        assert agent_history[0]["api_content"] == "hi\n\nCTX"
+        assert agent_history[0]["content"] == "hi"
+        assert "api_content" not in agent_history[0]
 
     def test_mirror_prefix_drops_sidecar(self):
         from gateway.run import _build_gateway_agent_history

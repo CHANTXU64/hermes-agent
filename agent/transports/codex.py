@@ -125,6 +125,8 @@ class ResponsesApiTransport(ProviderTransport):
                 x-grok-conv-id header and the Codex cache-scope headers, and is
                 the fallback prompt_cache_key when there is no static prefix to
                 content-address
+            prompt_cache_key: str | None — stable logical gateway/compression
+                cache scope; takes precedence over static content addressing
             max_tokens: int | None — max_output_tokens
             timeout: float | None — per-request timeout forwarded to the SDK
             request_overrides: dict | None — extra kwargs merged in
@@ -271,14 +273,17 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["tool_choice"] = "auto"
             kwargs["parallel_tool_calls"] = True
 
-        session_id = params.get("session_id")
-        # prompt_cache_key is content-addressed from the static prefix
-        # (instructions + tools), NOT session_id — recurring cron jobs carry a
-        # per-fire timestamp in session_id (cron_<id>_<ts>) that made every run
-        # cache-cold. session_id is left untouched for transcript isolation and
-        # the cache-scope routing headers below. Falls back to session_id when
-        # there is no static content to hash.
-        cache_key = _content_cache_key(instructions, response_tools) or session_id
+        session_id = str(params.get("session_id") or "").strip()
+        logical_cache_key = _bounded_prompt_cache_key(params.get("prompt_cache_key"))
+        # A caller-supplied logical key preserves affinity across Gateway or
+        # compression session rotation. Other callers retain upstream's static
+        # content-addressed key (important for recurring cron jobs). The
+        # physical session id remains separate transcript identity.
+        cache_key = (
+            logical_cache_key
+            or _content_cache_key(instructions, response_tools)
+            or session_id
+        )
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
         if not is_github_responses and not is_xai_responses and cache_key:
@@ -358,21 +363,30 @@ class ResponsesApiTransport(ProviderTransport):
             # remain high.  Send session_id / x-client-request-id as HTTP
             # headers while keeping ``prompt_cache_key`` in the body for
             # standard OpenAI routing as a belt-and-braces fallback.
-            cache_scope_id = _bounded_prompt_cache_key(session_id)
-            if cache_scope_id:
-                existing_extra_headers = kwargs.get("extra_headers")
-                merged_extra_headers: Dict[str, str] = {}
-                if isinstance(existing_extra_headers, dict):
-                    merged_extra_headers.update(
-                        {
-                            str(key): str(value)
-                            for key, value in existing_extra_headers.items()
-                            if key and value is not None
-                        }
-                    )
-                merged_extra_headers["session_id"] = cache_scope_id
-                merged_extra_headers["x-client-request-id"] = cache_scope_id
+            physical_session_id = _bounded_prompt_cache_key(session_id)
+            cache_scope_id = _bounded_prompt_cache_key(
+                kwargs.get("prompt_cache_key") or cache_key
+            )
+            existing_extra_headers = kwargs.get("extra_headers")
+            merged_extra_headers: Dict[str, str] = {}
+            if isinstance(existing_extra_headers, dict):
+                merged_extra_headers.update(
+                    {
+                        str(key): str(value)
+                        for key, value in existing_extra_headers.items()
+                        if key and value is not None
+                    }
+                )
+            merged_extra_headers.pop("session-id", None)
+            if physical_session_id:
+                merged_extra_headers["session_id"] = physical_session_id
+                if cache_scope_id:
+                    merged_extra_headers["thread-id"] = cache_scope_id
+                    merged_extra_headers["x-client-request-id"] = cache_scope_id
+            if merged_extra_headers:
                 kwargs["extra_headers"] = merged_extra_headers
+            else:
+                kwargs.pop("extra_headers", None)
 
         max_tokens = params.get("max_tokens")
         if max_tokens is not None and not is_codex_backend:

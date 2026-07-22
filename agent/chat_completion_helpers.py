@@ -30,7 +30,7 @@ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
-from agent.turn_context import substitute_api_content
+from agent.turn_context import apply_request_only_turn_context, strip_legacy_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
@@ -980,6 +980,42 @@ def interruptible_api_call(agent, api_kwargs: dict):
     return result["response"]
 
 
+def _codex_prompt_cache_scope(agent, session_id: str | None) -> str | None:
+    """Return a stable logical cache scope when the runtime has one.
+
+    Gateway routing keys survive physical session rotation. Non-gateway
+    compression children reuse the root compression session. Ordinary CLI and
+    cron sessions with known non-compression lineage return ``None`` so the
+    transport can retain upstream's static content-addressed cache key. Missing
+    or failing lineage lookup falls back to the physical session id.
+    """
+    gateway_key = str(getattr(agent, "_gateway_session_key", "") or "").strip()
+    if gateway_key:
+        return gateway_key
+
+    original = str(session_id or "").strip()
+    if not original:
+        return None
+
+    db = getattr(agent, "_session_db", None)
+    if db is None or not hasattr(db, "get_compression_lineage"):
+        return original
+
+    try:
+        lineage = db.get_compression_lineage(original)
+    except Exception:
+        return original
+
+    if (
+        isinstance(lineage, list)
+        and len(lineage) > 1
+        and original in lineage
+        and isinstance(lineage[0], str)
+        and lineage[0]
+    ):
+        return lineage[0]
+    return None
+
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
@@ -1070,12 +1106,14 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
                     getattr(agent, "log_prefix", ""), exc,
                 )
 
+        session_id = getattr(agent, "session_id", None)
         return _ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
             tools=tools_for_api,
             reasoning_config=agent.reasoning_config,
-            session_id=getattr(agent, "session_id", None),
+            session_id=session_id,
+            prompt_cache_key=_codex_prompt_cache_scope(agent, session_id),
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
@@ -1917,7 +1955,15 @@ def _store_max_iteration_visible_response(messages: list, final_response: str) -
     messages.append({"role": "assistant", "content": final_response})
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
+def handle_max_iterations(
+    agent,
+    messages: list,
+    api_call_count: int,
+    *,
+    current_turn_user_idx: int | None = None,
+    ext_prefetch_cache: str = "",
+    plugin_user_context: str = "",
+) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
 
@@ -1950,20 +1996,23 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # and every Hermes-internal underscore-prefixed scaffolding key.
             for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items", "timestamp"):
                 api_msg.pop(schema_foreign, None)
-            # api_content (the persist-what-you-send sidecar) carries the
-            # exact bytes every main-loop call sent for this message —
-            # substitute it before dropping the key (Hermes bookkeeping,
-            # never a provider field), mirroring the loop's api_messages
-            # build. Popping without substituting would send CLEAN content
-            # here, diverging the summary request's prefix at the EARLIEST
-            # sidecar-carrying message and re-prefilling the whole transcript
-            # at exactly the moment the context is largest.
-            substitute_api_content(api_msg)
+            # Existing databases may expose upstream's retired api_content
+            # sidecar. It is never a provider field and its stale recall/plugin
+            # bytes must not replace clean historical content in this summary.
+            strip_legacy_api_content(api_msg)
             for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
                 api_msg.pop(internal_key, None)
             if _needs_sanitize:
                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=agent.model)
             api_messages.append(api_msg)
+
+        apply_request_only_turn_context(
+            agent,
+            api_messages,
+            current_turn_user_idx=current_turn_user_idx,
+            ext_prefetch_cache=ext_prefetch_cache,
+            plugin_user_context=plugin_user_context,
+        )
 
         effective_system = agent._cached_system_prompt or ""
         if agent.ephemeral_system_prompt:

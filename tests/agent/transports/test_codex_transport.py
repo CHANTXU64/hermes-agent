@@ -304,8 +304,7 @@ class TestCodexBuildKwargs:
         assert "max_output_tokens" not in kw
 
     def test_codex_backend_sets_cache_routing_headers(self, transport):
-        """Codex backend sends session_id / x-client-request-id as HTTP
-        headers (via extra_headers) for cache-scope routing."""
+        """Physical session identity stays separate from stable cache routing."""
         messages = [{"role": "user", "content": "Hi"}]
 
         kw = transport.build_kwargs(
@@ -313,12 +312,15 @@ class TestCodexBuildKwargs:
             messages=messages,
             tools=[],
             session_id="conv-codex-1",
+            prompt_cache_key="agent:main:telegram:dm:42",
             is_codex_backend=True,
         )
 
         headers = kw.get("extra_headers", {})
         assert headers.get("session_id") == "conv-codex-1"
-        assert headers.get("x-client-request-id") == "conv-codex-1"
+        assert headers.get("thread-id") == "agent:main:telegram:dm:42"
+        assert headers.get("x-client-request-id") == "agent:main:telegram:dm:42"
+        assert kw["prompt_cache_key"] == "agent:main:telegram:dm:42"
 
     def test_codex_backend_hashes_overlength_cache_routing_headers(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
@@ -333,13 +335,15 @@ class TestCodexBuildKwargs:
         )
 
         headers = kw["extra_headers"]
-        cache_scope = headers["session_id"]
-        assert cache_scope == headers["x-client-request-id"]
+        physical_session = headers["session_id"]
+        cache_scope = headers["x-client-request-id"]
+        assert physical_session.startswith("pck_")
+        assert len(physical_session) <= 64
+        assert physical_session != long_session_id
+        assert cache_scope == headers["thread-id"]
+        assert cache_scope == kw["prompt_cache_key"]
         assert cache_scope.startswith("pck_")
         assert len(cache_scope) <= 64
-        assert cache_scope != long_session_id
-        assert kw["prompt_cache_key"].startswith("pck_")
-        assert len(kw["prompt_cache_key"]) <= 64
 
     @pytest.mark.parametrize("length", [64, 65])
     def test_codex_cache_scope_boundary(self, transport, length):
@@ -355,7 +359,8 @@ class TestCodexBuildKwargs:
 
         assert scope["x-test"] == "1"
         assert len(scope["session_id"]) <= 64
-        assert scope["x-client-request-id"] == scope["session_id"]
+        assert scope["x-client-request-id"] == scope["thread-id"]
+        assert len(scope["x-client-request-id"]) <= 64
         if length == 64:
             assert scope["session_id"] == session_id
         else:
@@ -422,6 +427,23 @@ class TestCodexBuildKwargs:
 
         assert "extra_headers" not in kw
 
+    def test_codex_backend_drops_obsolete_session_header_without_session_id(
+        self, transport
+    ):
+        messages = [{"role": "user", "content": "Hi"}]
+
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+            request_overrides={
+                "extra_headers": {"x-test": "1", "session-id": "obsolete"}
+            },
+        )
+
+        assert kw["extra_headers"] == {"x-test": "1"}
+
     def test_codex_backend_preserves_caller_extra_headers(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
 
@@ -431,13 +453,17 @@ class TestCodexBuildKwargs:
             tools=[],
             session_id="conv-codex-1",
             is_codex_backend=True,
-            request_overrides={"extra_headers": {"x-test": "1"}},
+            request_overrides={
+                "extra_headers": {"x-test": "1", "session-id": "obsolete"}
+            },
         )
 
         headers = kw.get("extra_headers", {})
         assert headers.get("x-test") == "1"
         assert headers.get("session_id") == "conv-codex-1"
-        assert headers.get("x-client-request-id") == "conv-codex-1"
+        assert "session-id" not in headers
+        assert headers.get("x-client-request-id") == kw["prompt_cache_key"]
+        assert headers.get("thread-id") == kw["prompt_cache_key"]
 
     def test_non_codex_responses_preserves_caller_extra_headers(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
