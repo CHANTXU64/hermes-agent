@@ -8,7 +8,7 @@ merge conflicts.
 import json
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -816,13 +816,13 @@ def test_prefetch_cache_miss_sync_recalls_current_query(provider):
     call_kwargs = provider._client.arecall.call_args.kwargs
     assert call_kwargs["query"] == "current user question"
 
-def test_prefetch_sync_fallback_does_not_cache_for_next_turn(provider):
+def test_prefetch_sync_fallback_carries_actual_recall_for_next_turn(provider):
     result = provider.prefetch("first turn")
+
     assert "Memory 1" in result
-    provider._client.arecall.reset_mock()
-    provider._client.arecall.return_value = SimpleNamespace(results=[])
-    assert provider.prefetch("second turn") == ""
-    provider._client.arecall.assert_called_once()
+    assert provider._prefetch_snapshot.query == "first turn"
+    assert provider._prefetch_snapshot.results == ("Memory 1", "Memory 2")
+    assert provider._prefetch_result == "- Memory 1\n- Memory 2"
 
 def test_prefetch_sync_skipped_in_tools_mode(provider_with_config):
     p = provider_with_config(memory_mode="tools")
@@ -845,47 +845,23 @@ def test_prefetch_sync_errors_are_best_effort(provider):
     provider._client.arecall = AsyncMock(side_effect=RuntimeError("boom"))
     assert provider.prefetch("test") == ""
 
-def test_late_prefetch_generation_cannot_overwrite_newer_result(provider):
-    import threading
-
-    old_started = threading.Event()
-    release_old = threading.Event()
-
-    def _fake_recall_snapshot(query, *, timeout=None):
-        if query == "old query":
-            old_started.set()
-            release_old.wait(timeout=5.0)
-            return SimpleNamespace(query=query, results=("old recall",))
-        return SimpleNamespace(query=query, results=("new recall",))
-
-    provider._recall_snapshot_for_query = _fake_recall_snapshot
-    provider.queue_prefetch("old query")
-    assert old_started.wait(timeout=5.0)
-    old_thread = provider._prefetch_thread
-
-    provider.queue_prefetch("new query")
-    new_thread = provider._prefetch_thread
-    new_thread.join(timeout=5.0)
-    release_old.set()
-    old_thread.join(timeout=5.0)
-
-    assert provider._prefetch_result == "- new recall"
-    assert provider._prefetch_snapshot.query == "new query"
-    assert provider._prefetch_snapshot.results == ("new recall",)
-
-def test_queue_prefetch_clears_cached_result_when_new_generation_returns_empty(provider):
-    provider._prefetch_result = "- old cached recall"
-    provider._recall_snapshot_for_query = lambda query, *, timeout=None: SimpleNamespace(
-        query=query,
-        results=(),
+def test_queue_prefetch_does_not_recall_or_replace_carried_snapshot(provider):
+    provider._prefetch_result = "- actual current recall"
+    provider._prefetch_snapshot = SimpleNamespace(
+        query="specific current query",
+        results=("actual current recall",),
+    )
+    provider._recall_snapshot_for_query = MagicMock(
+        side_effect=AssertionError("post-turn raw query must not recall")
     )
 
-    provider.queue_prefetch("new query")
-    provider._prefetch_thread.join(timeout=5.0)
+    provider.queue_prefetch("继续。", session_id="test-session", turn_id="turn-2")
 
-    assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot.query == "new query"
-    assert provider._prefetch_snapshot.results == ()
+    provider._recall_snapshot_for_query.assert_not_called()
+    assert provider._prefetch_result == "- actual current recall"
+    assert provider._prefetch_snapshot.query == "specific current query"
+    assert provider._prefetch_snapshot.results == ("actual current recall",)
+
 
 def test_sync_turn_buffers_when_auto_retain_off(provider_with_config):
     p = provider_with_config(auto_retain=False)

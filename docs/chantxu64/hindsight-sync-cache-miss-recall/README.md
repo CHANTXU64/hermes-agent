@@ -2,19 +2,31 @@
 
 ## Purpose
 
-Ensure Hindsight `auto_recall` can provide relevant memory context on the current turn when the background prefetch cache is empty. This matters for the first user message in a fresh session and the first turn after context compression/session rotation.
+Ensure Hindsight `auto_recall` can provide relevant memory context on the
+current turn when no prior carried recall exists. This matters for the first
+user message in a fresh session and the first turn after context
+compression/session rotation.
+
+When a previous assistant response is available, P5 may derive a more specific
+query before this fallback is needed. The raw current-query fallback is the
+bounded fail-open path for a fresh turn without that conversational input, a P5
+route failure with no old results, or other no-result cache misses.
 
 ## Difference From Upstream
 
-Upstream-style behavior only returns already-cached background prefetch results. When `_prefetch_result` is empty, the current turn receives no injected memory context and only starts a background prefetch for a later turn.
+Upstream-style behavior only returns an already-cached prefetch result. When
+`_prefetch_result` is empty, the current turn receives no injected memory
+context.
 
 This fork adds a bounded synchronous fallback inside the Hindsight provider:
 
-- `prefetch()` returns cached background recall when available.
-- On cache miss, `prefetch()` can synchronously recall using the current query.
+- `prefetch()` uses the prior turn's carried real recall when available.
+- On cache miss without a usable P5-derived target, `prefetch()` can
+  synchronously recall using the current query.
 - The synchronous fallback uses a short, separate timeout instead of the general Hindsight API timeout.
-- Background prefetch writes are guarded by a generation counter so late or superseded recalls cannot overwrite newer context.
-- A newly queued prefetch generation clears any older cached result before starting, so an empty newer recall cannot leave stale context behind.
+- The actual current-turn recall is carried into the next P5 decision.
+- Hindsight's post-turn `queue_prefetch()` is a no-op; it never recalls the
+  completed turn's raw user text.
 
 ## Files
 
@@ -28,7 +40,7 @@ This fork adds a bounded synchronous fallback inside the Hindsight provider:
 
 Configuration keys in the Hindsight provider config:
 
-- `recall_sync_on_cache_miss`: enables synchronous recall when `prefetch()` has no cached background result. Default: `true`.
+- `recall_sync_on_cache_miss`: enables synchronous recall when `prefetch()` has no carried result. Default: `true`.
 - `recall_sync_timeout_seconds`: timeout for the synchronous fallback recall. Default: `5`.
 
 Existing `auto_recall`, `memory_mode`, `recall_prefetch_method`, tags, types, budget, and max-token settings still apply.
@@ -43,15 +55,18 @@ The fallback is skipped when:
 
 ## Merge Guidance
 
-- Preserve when: this fork still expects first-turn/new-session/compression-session Hindsight recall to inject current-query memory context without waiting for the previous-turn background prefetch.
+- Preserve when: this fork still expects no-snapshot turns to receive bounded
+  current-turn recall—using a P5-derived target when conversational input is
+  available, otherwise the current query—without any previous-turn raw-query
+  background recall.
 - Drop when: upstream implements equivalent current-turn cache-miss recall with stale prefetch protection and a bounded sync timeout.
 - Ask user when: upstream changes the memory prefetch lifecycle, Hindsight provider state model, or session-switch semantics in a way that is similar but not identical.
 
 Conflict handling notes:
 
-- Do not preserve `_prefetch_result` clearing alone as sufficient stale-context protection; generation checks are required because background threads can complete after session switches or newer queued prefetches.
+- Do not preserve `_prefetch_result` clearing alone as sufficient stale-context protection; the structured snapshot must follow the same generation, session-switch, and rewind lifecycle.
 - Do not reuse the general Hindsight API timeout as the sync fallback timeout.
-- Do not let a newer empty background recall leave an older cached result available for consumption.
+- Do not reintroduce a post-turn raw-user-query recall.
 
 ## Verification
 

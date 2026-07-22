@@ -26,10 +26,17 @@ The provider then:
 
 - when `new_query` is non-null, keeps every old result not listed in
   `drop_old_refs`, performs one bounded read-only recall, and appends the new
-  results;
+  results; the exact query and merged results actually used by the current turn
+  become the next turn's previous-recall snapshot;
 - when `new_query` is null, injects no Hindsight context for the current turn,
-  clears the previous structured/text recall snapshot, and suppresses the
-  legacy post-turn background prefetch for that same turn ID;
+  and clears the previous structured/text recall snapshot;
+- the generic post-turn `queue_prefetch()` hook is always a no-op for Hindsight,
+  so the completed turn's raw user text never starts another recall;
+- when no carried snapshot exists but a previous assistant response is
+  available (for example after compression/session rotation), P5 may derive the
+  bounded recall query from that conversational target; a genuinely fresh turn
+  with no previous assistant, or a failed P5 route with no old results, uses the
+  bounded current-query sync fallback;
 - formats non-empty output through the existing Hindsight memory-context
   formatter.
 
@@ -72,13 +79,12 @@ external memory providers. Hindsight declares a provider-specific outer budget
 for its complete bounded pipeline:
 
 ```text
-3-second background-prefetch handoff
-+ configured auxiliary.hindsight_recall_preprocessor.timeout
+configured auxiliary.hindsight_recall_preprocessor.timeout
 + up to 2 × configured recall_sync_timeout_seconds
 + 1-second outer-guard scheduling margin
 ```
 
-With 30-second P5 and 10-second recall settings this outer budget is 54 seconds.
+With 30-second P5 and 10-second recall settings this outer budget is 51 seconds.
 Two recall windows are required for the bounded branch where a P5-generated
 query fails with no old results and Hindsight then retries the current query.
 Each recall still has its own 10-second deadline; the larger outer budget only
@@ -86,7 +92,9 @@ prevents the generic guard from cutting either attempt off first. The 1-second
 margin covers thread startup, stage transitions, and timeout scheduling jitter.
 An explicit `MemoryManager(external_prefetch_timeout=...)` test/application
 override still takes precedence, and providers without a valid declaration keep
-the generic 8-second behavior.
+the generic 8-second behavior. If that outer guard abandons a still-running
+Hindsight call, `MemoryManager` invokes the provider's non-blocking timeout hook
+so its late result cannot become the next turn's carried snapshot.
 
 - Default provider: `openai-codex`
 - Default model: `gpt-5.6-luna`
@@ -110,13 +118,19 @@ backend identity proof. For ordinary non-Codex Chat Completions responses,
 
 ## Structured Prefetch State
 
-Background and synchronous recall retain a private snapshot containing:
+The current turn's actual synchronous recall/merge retains a private snapshot
+containing:
 
 - the actual query sent after input-length clipping;
 - ordered result texts;
 - the historical formatted `_prefetch_result` string for compatibility.
 
-The existing generation guard protects both the text cache and structured snapshot. Starting a newer generation clears both; a late older generation cannot overwrite either. Session switching also clears both. A queued prefetch carries its originating session ID and is checked both before starting its worker and immediately before recall, so a delayed old-session job cannot recall or populate the new session.
+The generation and session guards protect both the text cache and structured
+snapshot while the current turn is recalling. Session switching and rewind
+clear both, so a delayed old-turn result cannot repopulate another session or a
+rewound conversation. `queue_prefetch()` neither starts a worker nor replaces
+the carried snapshot. A stale-session `prefetch()` is rejected before it can
+consume current-session state.
 
 ## Failure Policy
 
@@ -125,20 +139,22 @@ The feature is deliberately fail-open toward memory availability:
 - P5 route unavailable, timeout, model mismatch, exception, or invalid JSON/schema: return the complete old recall cache.
 - P5 requests a new query but that Hindsight recall raises: restore the complete old recall cache.
 - No old cache and P5 fails: use the existing bounded current-query synchronous recall.
-- A valid `new_query=null`: inject no recall context, clear both cached recall
-  representations, and suppress same-turn post-turn prefetch, including a
-  delayed old-session queue invocation that arrives after a session switch.
+- A valid `new_query=null`: inject no recall context and clear both cached
+  recall representations. The post-turn hook is already a no-op.
 - A valid new recall that succeeds with zero results is a real empty result, not an exception.
 
-Occasional redundant recall and conservative retention of a side-topic result are accepted limitations. Do not replace this policy with P6's “old results appear covered, therefore force null” gate.
+Conservative retention of a side-topic result remains an accepted limitation.
+Do not replace this policy with P6's “old results appear covered, therefore
+force null” gate. Do not reintroduce a post-turn raw-user-query recall.
 
 The preprocessor is skipped when Hindsight is in tools-only mode, `auto_recall` is disabled, or the provider is shutting down.
 
 ## Files
 
-- `agent/memory_provider.py` — optional previous-assistant and complete-prefetch-budget contracts.
+- `agent/memory_provider.py` — optional complete-prefetch-budget and timeout-invalidation contracts.
 - `agent/memory_manager.py` — signature-aware forwarding plus provider-specific
-  outer budgets while preserving the generic 8-second fail-open default.
+  outer budgets and timeout notification while preserving the generic 8-second
+  fail-open default.
 - `agent/turn_context.py` — extracts the latest completed non-tool assistant text.
 - `agent/codex_runtime.py` — captures the provider-reported terminal response model separately from the requested model.
 - `agent/auxiliary_client.py` — propagates that terminal model through the Codex chat-compatible adapter.
@@ -148,10 +164,11 @@ The preprocessor is skipped when Hindsight is in tools-only mode, `auto_recall` 
 - `plugins/memory/hindsight/recall_preprocessor.py` — frozen P5 prompt, strict parser, configured direct call.
 - `plugins/memory/hindsight/__init__.py` — structured snapshot, filtering/merge, recall, failure and lifecycle behavior.
 - `tests/fork/test_hindsight_recall_preprocessor.py` — prompt/schema,
-  explicit-route/model-provenance, provider/failure, null lifecycle, and stale
-  session-queue tests.
+  explicit-route/model-provenance, provider/failure, null lifecycle, carried
+  snapshot, and no-post-turn-recall tests.
 - `tests/hermes_cli/test_plugin_auxiliary_tasks.py` — active memory-plugin auxiliary task discovery and defaults.
-- `tests/fork/test_hindsight_provider_regressions.py` — structured generation-race regressions.
+- `tests/fork/test_hindsight_provider_regressions.py` — synchronous carryover,
+  no-op post-turn hook, and provider regressions.
 - `tests/agent/test_turn_context.py` — duck-typed manager compatibility and request-context invariants.
 - `tests/run_agent/test_run_agent_codex_responses.py` and `tests/agent/test_auxiliary_client.py` — terminal model provenance.
 
@@ -169,6 +186,8 @@ Drop only when upstream provides equivalent behavior and the user confirms the r
   model substitutions; preserve suffix-normalization coverage for equivalent
   `custom:*` reserved forms;
 - structured query/result snapshot guarded by generation and session lifecycle;
+- the next P5 decision receives the query/results actually used by the prior
+  turn, while post-turn raw user text never triggers Hindsight recall;
 - fail-open restoration of old memory;
 - no direct forwarding of full assistant text to Hindsight;
 - provider-specific total prefetch budgeting that lets configured P5 and recall
@@ -208,6 +227,15 @@ git diff --check: passed
 P5 prompt SHA-256: 7dfade51638396003e6332f7dbb8da45698d03d715d1d54b2f51658d2edbfa09
 standard task discovery: hindsight_recall_preprocessor present
 effective defaults: openai-codex / gpt-5.6-luna / 30 seconds
+```
+
+Post-turn raw-recall removal and lifecycle-race verification on 2026-07-22:
+
+```text
+focused Hindsight/Agent/Codex/plugin integration suite: 495 passed
+Ruff: All checks passed
+py_compile: passed
+git diff --check: passed
 ```
 
 External-prefetch timeout compatibility verification on 2026-07-19:

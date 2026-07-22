@@ -62,7 +62,6 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
-_PREFETCH_BACKGROUND_JOIN_TIMEOUT_SECONDS = 3.0
 _PREFETCH_MAX_SEQUENTIAL_SYNC_RECALLS = 2
 _PREFETCH_OUTER_TIMEOUT_GRACE_SECONDS = 1.0
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
@@ -719,10 +718,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_result = ""
         self._prefetch_snapshot: _RecallSnapshot | None = None
         self._prefetch_lock = threading.Lock()
-        self._prefetch_thread = None
-        self._prefetch_thread_generation = 0
         self._prefetch_generation = 0
-        self._skip_queue_prefetch_turn_ids: set[str] = set()
+        self._active_prefetch_turn: tuple[str, int] | None = None
         # Single-writer model for retain. sync_turn() enqueues; the writer
         # thread drains sequentially. Avoids spawning ad-hoc threads that
         # can race the interpreter shutdown and emit "cannot schedule new
@@ -800,8 +797,7 @@ class HindsightMemoryProvider(MemoryProvider):
             else 1
         )
         return (
-            _PREFETCH_BACKGROUND_JOIN_TIMEOUT_SECONDS
-            + get_recall_preprocessor_timeout_seconds()
+            get_recall_preprocessor_timeout_seconds()
             + (sync_recall_attempts * self._recall_sync_timeout_seconds)
             + _PREFETCH_OUTER_TIMEOUT_GRACE_SECONDS
         )
@@ -1652,6 +1648,43 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_snapshot_for_query(query, timeout=timeout)
         )
 
+    def _carry_recall_snapshot_to_next_turn(
+        self,
+        snapshot: _RecallSnapshot,
+        *,
+        expected_generation: int,
+        session_id: str = "",
+    ) -> None:
+        """Keep the recall actually used this turn for the next P5 decision."""
+        carried_snapshot = _RecallSnapshot(
+            query=str(snapshot.query or ""),
+            results=tuple(str(text) for text in snapshot.results),
+        )
+        carried_text = self._recall_snapshot_text(carried_snapshot)
+        expected_session_id = str(session_id or "").strip()
+        with self._prefetch_lock:
+            if expected_generation != self._prefetch_generation:
+                logger.debug(
+                    "Prefetch: discarded carried snapshot from stale generation %s",
+                    expected_generation,
+                )
+                return
+            current_session_id = str(self._session_id or "").strip()
+            if (
+                expected_session_id
+                and current_session_id
+                and expected_session_id != current_session_id
+            ):
+                logger.debug(
+                    "Prefetch: discarded carried snapshot for stale session %s "
+                    "(current=%s)",
+                    expected_session_id,
+                    current_session_id,
+                )
+                return
+            self._prefetch_snapshot = carried_snapshot
+            self._prefetch_result = carried_text
+
     def prefetch(
         self,
         query: str,
@@ -1667,15 +1700,24 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Prefetch: skipped (shutting down)")
             return ""
 
-        thread = self._prefetch_thread
-        thread_generation = self._prefetch_thread_generation
-        if thread and thread.is_alive() and thread_generation == self._prefetch_generation:
-            logger.debug("Prefetch: waiting for background thread to complete")
-            thread.join(timeout=_PREFETCH_BACKGROUND_JOIN_TIMEOUT_SECONDS)
-            if thread.is_alive():
-                logger.debug("Prefetch: background thread still running; skipping sync fallback")
-                return ""
+        requested_session_id = str(session_id or "").strip()
+        requested_turn_id = str(turn_id or "").strip()
         with self._prefetch_lock:
+            current_session_id = str(self._session_id or "").strip()
+            if (
+                requested_session_id
+                and current_session_id
+                and requested_session_id != current_session_id
+            ):
+                logger.debug(
+                    "Prefetch: skipped stale session %s (current=%s)",
+                    requested_session_id,
+                    current_session_id,
+                )
+                return ""
+            self._prefetch_generation += 1
+            snapshot_generation = self._prefetch_generation
+            self._active_prefetch_turn = (requested_turn_id, snapshot_generation)
             result = self._prefetch_result
             snapshot = self._prefetch_snapshot
             self._prefetch_result = ""
@@ -1691,6 +1733,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         if preprocessor_snapshot is not None:
             original_results = tuple(preprocessor_snapshot.results)
+            selected_query = preprocessor_snapshot.query
             fall_back_to_current_query = False
             try:
                 decision = run_recall_preprocessor(
@@ -1711,10 +1754,6 @@ class HindsightMemoryProvider(MemoryProvider):
                     fall_back_to_current_query = True
             else:
                 if decision.new_query is None:
-                    skipped_turn_id = str(turn_id or "").strip()
-                    if skipped_turn_id:
-                        with self._prefetch_lock:
-                            self._skip_queue_prefetch_turn_ids.add(skipped_turn_id)
                     logger.debug(
                         "Prefetch: preprocessor skipped recall; clearing recall context"
                     )
@@ -1742,14 +1781,19 @@ class HindsightMemoryProvider(MemoryProvider):
                         selected_results = ()
                         fall_back_to_current_query = True
                 else:
+                    selected_query = new_snapshot.query
                     selected_results += tuple(new_snapshot.results)
 
             if not fall_back_to_current_query:
-                result = self._recall_snapshot_text(
-                    _RecallSnapshot(
-                        query=preprocessor_snapshot.query,
-                        results=selected_results,
-                    )
+                selected_snapshot = _RecallSnapshot(
+                    query=selected_query,
+                    results=selected_results,
+                )
+                result = self._recall_snapshot_text(selected_snapshot)
+                self._carry_recall_snapshot_to_next_turn(
+                    selected_snapshot,
+                    expected_generation=snapshot_generation,
+                    session_id=session_id,
                 )
                 if not result:
                     logger.debug("Prefetch: preprocessor selected no recall context")
@@ -1771,6 +1815,11 @@ class HindsightMemoryProvider(MemoryProvider):
                     timeout=self._recall_sync_timeout_seconds,
                 )
                 result = self._recall_snapshot_text(sync_snapshot)
+                self._carry_recall_snapshot_to_next_turn(
+                    sync_snapshot,
+                    expected_generation=snapshot_generation,
+                    session_id=session_id,
+                )
             except Exception as e:
                 logger.debug("Hindsight sync prefetch failed: %s", e, exc_info=True)
                 return ""
@@ -1780,6 +1829,36 @@ class HindsightMemoryProvider(MemoryProvider):
         logger.debug("Prefetch: returning %d chars of context", len(result))
         return self._format_prefetch_context(result)
 
+    def on_prefetch_timeout(
+        self,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+    ) -> None:
+        """Invalidate only the abandoned Hindsight prefetch generation."""
+        timed_out_session_id = str(session_id or "").strip()
+        timed_out_turn_id = str(turn_id or "").strip()
+        with self._prefetch_lock:
+            current_session_id = str(self._session_id or "").strip()
+            if (
+                timed_out_session_id
+                and current_session_id
+                and timed_out_session_id != current_session_id
+            ):
+                return
+            active_turn = self._active_prefetch_turn
+            if active_turn is None:
+                return
+            active_turn_id, active_generation = active_turn
+            if timed_out_turn_id and timed_out_turn_id != active_turn_id:
+                return
+            if active_generation != self._prefetch_generation:
+                return
+            self._prefetch_generation += 1
+            self._prefetch_result = ""
+            self._prefetch_snapshot = None
+            self._active_prefetch_turn = None
+
     def queue_prefetch(
         self,
         query: str,
@@ -1787,90 +1866,13 @@ class HindsightMemoryProvider(MemoryProvider):
         session_id: str = "",
         turn_id: str = "",
     ) -> None:
-        if self._memory_mode == "tools":
-            logger.debug("Prefetch: skipped (tools-only mode)")
-            return
-        if not self._auto_recall:
-            logger.debug("Prefetch: skipped (auto_recall disabled)")
-            return
-        if self._shutting_down.is_set():
-            logger.debug("Prefetch: skipped (shutting down)")
-            return
-        query = str(query or "").strip()
-        if not query:
-            return
-        queued_session_id = str(session_id or "").strip()
-        completed_turn_id = str(turn_id or "").strip()
-        with self._prefetch_lock:
-            current_session_id = str(self._session_id or "").strip()
-            if (
-                queued_session_id
-                and current_session_id
-                and queued_session_id != current_session_id
-            ):
-                logger.debug(
-                    "Prefetch: skipped stale queued session %s (current=%s)",
-                    queued_session_id,
-                    current_session_id,
-                )
-                return
-            if (
-                completed_turn_id
-                and completed_turn_id in self._skip_queue_prefetch_turn_ids
-            ):
-                self._skip_queue_prefetch_turn_ids.discard(completed_turn_id)
-                self._prefetch_generation += 1
-                self._prefetch_result = ""
-                self._prefetch_snapshot = None
-                logger.debug(
-                    "Prefetch: skipped post-turn recall for cleared turn %s",
-                    completed_turn_id,
-                )
-                return
-            self._prefetch_generation += 1
-            generation = self._prefetch_generation
-            # A new queued query supersedes any previously cached recall.
-            # If this generation returns no text, the next prefetch() should
-            # sync-recall the current query instead of consuming stale context.
-            self._prefetch_result = ""
-            self._prefetch_snapshot = None
+        """Do not recall the completed turn's raw user text.
 
-        def _run():
-            try:
-                with self._prefetch_lock:
-                    current_session_id = str(self._session_id or "").strip()
-                    if generation != self._prefetch_generation:
-                        logger.debug(
-                            "Prefetch: skipped stale generation %s before recall",
-                            generation,
-                        )
-                        return
-                    if (
-                        queued_session_id
-                        and current_session_id
-                        and queued_session_id != current_session_id
-                    ):
-                        logger.debug(
-                            "Prefetch: skipped stale queued session %s before recall "
-                            "(current=%s)",
-                            queued_session_id,
-                            current_session_id,
-                        )
-                        return
-                snapshot = self._recall_snapshot_for_query(query)
-                text = self._recall_snapshot_text(snapshot)
-                with self._prefetch_lock:
-                    if generation == self._prefetch_generation:
-                        self._prefetch_snapshot = snapshot
-                        self._prefetch_result = text
-                    else:
-                        logger.debug("Prefetch: discarded stale generation %s", generation)
-            except Exception as e:
-                logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
-
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
-        self._prefetch_thread_generation = generation
-        self._prefetch_thread.start()
+        ``prefetch()`` carries the exact query/results used for the current turn
+        into the next P5 decision, so the generic post-turn hook is deliberately
+        a no-op for Hindsight.
+        """
+        logger.debug("Prefetch: skipped post-turn raw-query recall")
 
     @staticmethod
     def _retain_message_timestamp(value: Any = None) -> str:
@@ -2983,6 +2985,8 @@ class HindsightMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             self._prefetch_generation += 1
             self._prefetch_result = ""
+            self._prefetch_snapshot = None
+            self._active_prefetch_turn = None
         logger.debug(
             "Hindsight on_session_rewind: session=%s turns_undone=%s marked=%s",
             sid, count, marked,
@@ -3796,9 +3800,10 @@ class HindsightMemoryProvider(MemoryProvider):
         false, switching sessions intentionally clears the manual-only buffer
         without writing it.
 
-        Also wait for any in-flight prefetch from the old session and drop
-        its cached result; otherwise the new session's first ``prefetch()``
-        could read stale recall text from before the switch.
+        Also invalidate the carried-recall generation and clear both recall
+        representations. A timed-out or overlapping ``prefetch()`` from the old
+        session can still finish later, but its generation/session guard then
+        prevents it from carrying stale recall into the new session.
 
         ``parent_session_id`` is recorded for lineage tags on future retains.
         ``reset`` is accepted but not needed for Hindsight's state model —
@@ -3880,22 +3885,13 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._register_atexit()
                 self._retain_queue.put(_flush)
 
-        # 2. Drain any in-flight prefetch from the old session and drop
-        # its cached result so the new session doesn't see stale recall.
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=3.0)
+        # 2. Drop the carried recall so the new session cannot see stale memory.
         with self._prefetch_lock:
             self._prefetch_generation += 1
             self._prefetch_result = ""
             self._prefetch_snapshot = None
+            self._active_prefetch_turn = None
             self._session_id = new_id
-            skipped_turn_ids = getattr(
-                self,
-                "_skip_queue_prefetch_turn_ids",
-                None,
-            )
-            if skipped_turn_ids is not None:
-                skipped_turn_ids.clear()
 
         # 3. Now rotate to the new session.
         parent_id = str(parent_session_id or "").strip()
@@ -3925,7 +3921,7 @@ class HindsightMemoryProvider(MemoryProvider):
         )
 
     def shutdown(self) -> None:
-        logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
+        logger.debug("Hindsight shutdown: stopping writer and closing client")
         # Stop accepting new retain jobs first so anyone still calling
         # sync_turn() during teardown is dropped, not enqueued.
         self._shutting_down.set()
@@ -3945,8 +3941,6 @@ class HindsightMemoryProvider(MemoryProvider):
                     "abandoning %d pending retain(s)",
                     self._retain_queue.qsize(),
                 )
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=5.0)
         if self._client is not None:
             try:
                 if self._mode == "local_embedded":

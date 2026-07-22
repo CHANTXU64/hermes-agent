@@ -26,6 +26,7 @@ class FakeMemoryProvider(MemoryProvider):
         self.initialized = False
         self.synced_turns = []
         self.prefetch_queries = []
+        self.prefetch_timeouts = []
         self.queued_prefetches = []
         self.turn_starts = []
         self.session_end_called = False
@@ -52,6 +53,9 @@ class FakeMemoryProvider(MemoryProvider):
     def prefetch(self, query, *, session_id=""):
         self.prefetch_queries.append(query)
         return self._prefetch_result
+
+    def on_prefetch_timeout(self, *, session_id="", turn_id=""):
+        self.prefetch_timeouts.append((session_id, turn_id))
 
     def queue_prefetch(self, query, *, session_id=""):
         self.queued_prefetches.append(query)
@@ -428,13 +432,18 @@ class TestMemoryManager:
         mgr.add_provider(external)
 
         started = time.monotonic()
-        result = mgr.prefetch_all("query")
+        result = mgr.prefetch_all(
+            "query",
+            session_id="session-1",
+            turn_id="turn-1",
+        )
         elapsed = time.monotonic() - started
 
         assert result == "builtin memory"
         assert elapsed < 0.5
         assert external.started.wait(timeout=1.0)
         assert external.prefetch_queries == ["query"]
+        assert external.prefetch_timeouts == [("session-1", "turn-1")]
 
         started = time.monotonic()
         result = mgr.prefetch_all("query 2")

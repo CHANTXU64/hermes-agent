@@ -193,15 +193,16 @@ Files:
 
 What changed:
 
-- Hindsight auto-recall now has a bounded synchronous fallback when the prefetch
-  cache is empty, so the first user turn in a new session or after compression can
-  receive `<memory-context>` instead of waiting for the previous-turn prefetch.
+- Hindsight auto-recall has a bounded synchronous fallback when no carried prior
+  snapshot exists, so the first user turn in a new session or after compression
+  can receive `<memory-context>` immediately.
 - Added `recall_sync_on_cache_miss` and `recall_sync_timeout_seconds` provider
   settings. Defaults: enabled, 5 seconds.
-- Background prefetch results are guarded by a generation counter so late results
-  from an old query/session cannot overwrite newer recall context.
-- Shared recall/reflect parameter handling now lives in a single helper used by
-  both sync fallback and background prefetch.
+- Current-turn recall snapshots are guarded by a generation counter so a late
+  result from an older turn/session cannot overwrite newer recall context.
+- Shared recall/reflect parameter handling lives in a single helper used by the
+  synchronous current-turn fallback and P5-generated recall. Hindsight's
+  post-turn `queue_prefetch()` hook is intentionally a no-op.
 
 Why it matters:
 
@@ -213,12 +214,14 @@ Why it matters:
 Merge protection:
 
 - Preserve generation checks when refactoring Hindsight prefetch; clearing
-  `_prefetch_result` alone does not stop a late background thread from writing
-  stale context.
+  `_prefetch_result` alone does not stop a timed-out or overlapping older
+  current-turn recall from carrying stale context after a newer turn or session
+  lifecycle event.
 - Preserve a short timeout for synchronous fallback; do not reuse the general
   Hindsight API timeout for first-turn recall.
 - Preserve tests covering cache-miss sync recall, tools/auto_recall guards,
-  reflect mode, and late prefetch generation discard.
+  reflect mode, empty P5 recall snapshots, and public-path late-turn generation
+  discard.
 
 Feature docs: `docs/chantxu64/hindsight-sync-cache-miss-recall/README.md`
 
@@ -250,9 +253,10 @@ Files:
 
 What changed:
 
-- Hindsight background prefetch now keeps the actual recall query and ordered
-  result texts as a structured snapshot alongside the historical formatted
-  cache string.
+- Hindsight carries the actual query and ordered result texts used by the
+  current turn as a structured snapshot alongside the formatted cache string.
+  Its generic post-turn `queue_prefetch()` hook is a no-op, so the completed
+  turn's raw user text never starts another recall.
 - The current user message, latest completed non-tool assistant response, and
   previous real recall are evaluated by the frozen P5 prompt through the
   standard `auxiliary.hindsight_recall_preprocessor` task. Its configurable
@@ -268,9 +272,9 @@ What changed:
   memory provider to Hermes' standard model picker and dashboard registry; the
   bridge is generic and does not special-case Hindsight in the CLI.
 - Strict output parsing accepts only `drop_old_refs` plus a one-line string or
-  null `new_query`. A non-null query preserves un-dropped old results and
-  appends one new read-only recall. A null query clears current/next recall
-  state and suppresses the same turn's legacy background prefetch.
+  null `new_query`. A non-null query preserves un-dropped old results, appends
+  one new read-only recall, and carries that actual merged snapshot to the next
+  P5 decision. A null query clears current/next recall state.
 - `MemoryManager` forwards the previous assistant message only to providers
   whose `prefetch` signature opts in, preserving legacy provider compatibility.
 - Turn setup also checks the duck-typed manager's `prefetch_all` signature before
@@ -280,27 +284,31 @@ What changed:
   model separately from the requested-model compatibility field; P5 validates
   the former before parsing output.
 - Preprocessor or generated-recall failures conservatively restore the full old
-  cache. Generation and session-switch guards clear and protect both cached
-  representations; delayed queue work from an old session is rejected before
-  recall and cannot repopulate a new session.
+  cache. Generation, session-switch, and rewind guards clear and protect both
+  cached representations; a delayed old-turn synchronous result cannot
+  repopulate a new or rewound session.
 - External memory providers may declare a complete synchronous prefetch budget.
   Providers without a declaration retain upstream's generic 8-second fail-open
-  guard. Hindsight declares the sum of its bounded stages: the 3-second legacy
-  background-prefetch handoff, the configured P5 auxiliary timeout, up to two
-  sequential `recall_sync_timeout_seconds` windows, and a 1-second outer-guard
-  scheduling margin. The second recall covers the branch where a P5-generated
+  guard. Hindsight declares the sum of its bounded stages: the configured P5
+  auxiliary timeout, up to two sequential `recall_sync_timeout_seconds`
+  windows, and a 1-second outer-guard scheduling margin. The second recall
+  covers the branch where a P5-generated
   query fails with no old results and the provider retries the current query.
-  With the current 30/10-second settings the outer guard is 54 seconds, so it no
+  With the current 30/10-second settings the outer guard is 51 seconds, so it no
   longer truncates either recall stage at 8 seconds.
+- If the outer guard still times out, `MemoryManager` invokes the provider's
+  non-blocking timeout hook. Hindsight invalidates only the abandoned
+  turn/generation, so its late result cannot become a future carried snapshot.
+  A stale-session prefetch is rejected before consuming current-session state.
 
 Why it matters:
 
 - Short continuations such as “继续” and “修吧” can inherit a specific target
   from the previous assistant analysis without sending those phrases or the
   full assistant response directly to Hindsight.
-- The user accepts occasional duplicate recall and conservative side-topic
-  retention, but does not accept a hard coverage gate that suppresses memory
-  needed for the next answer.
+- The user accepts conservative side-topic retention, but does not accept a
+  hard coverage gate that suppresses memory needed for the next answer or a
+  post-turn duplicate recall using the raw user message.
 
 Merge protection:
 
@@ -313,10 +321,10 @@ Merge protection:
   rejecting `auto`, `main`, bare `custom`, and their reserved `custom:*`
   canonical equivalents. Do not treat the Codex adapter's requested-model
   `.model` compatibility field as independent backend-model evidence.
-- Keep query/result snapshots under the same generation and session lifecycle
-  as `_prefetch_result`; do not preserve one cache representation without the
-  other. Preserve session checks on queued prefetch before worker launch and
-  before recall.
+- Keep query/result snapshots under the same generation, session-switch, and
+  rewind lifecycle as `_prefetch_result`; do not preserve one cache
+  representation without the other. Preserve the no-op post-turn hook and carry
+  only the query/results actually used by the current turn.
 - Preserve fail-open restoration of old recall and the tools/auto_recall/
   shutdown guards.
 - Preserve provider-specific prefetch budgeting. Do not replace the generic

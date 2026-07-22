@@ -130,6 +130,20 @@ class MemoryProvider(ABC):
         """
         return ""
 
+    def on_prefetch_timeout(
+        self,
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+    ) -> None:
+        """Invalidate provider state after MemoryManager abandons a prefetch.
+
+        Called only when the provider's synchronous ``prefetch()`` exceeds the
+        manager's outer fail-open budget. Implementations must return quickly and
+        must not raise; the default is a no-op for backward compatibility.
+        ``turn_id`` identifies the exact abandoned turn when the caller has one.
+        """
+
     def queue_prefetch(
         self,
         query: str,

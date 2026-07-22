@@ -676,6 +676,17 @@ class MemoryManager:
                 provider.name,
                 prefetch_timeout,
             )
+            try:
+                provider.on_prefetch_timeout(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Memory provider '%s' prefetch-timeout hook failed (non-fatal): %s",
+                    provider.name,
+                    exc,
+                )
             return ""
 
         with self._external_prefetch_lock:

@@ -851,54 +851,34 @@ class TestPrefetch:
         assert result.startswith("Custom header:")
         assert "- memory line" in result
 
-    def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
+    def test_queue_prefetch_is_noop_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
         p.queue_prefetch("test")
-        # Should not start a thread
-        assert p._prefetch_thread is None
+        p._client.arecall.assert_not_called()
 
-    def test_queue_prefetch_skipped_when_auto_recall_off(self, provider_with_config):
+    def test_queue_prefetch_is_noop_when_auto_recall_off(self, provider_with_config):
         p = provider_with_config(auto_recall=False)
         p.queue_prefetch("test")
-        assert p._prefetch_thread is None
+        p._client.arecall.assert_not_called()
 
-    def test_queue_prefetch_truncates_query(self, provider_with_config):
+    def test_queue_prefetch_does_not_recall_long_raw_query(self, provider_with_config):
         p = provider_with_config(recall_max_input_chars=10)
-        # Mock _run_sync to capture the query
-        original_query = None
 
-        def _capture_recall(**kwargs):
-            nonlocal original_query
-            original_query = kwargs.get("query", "")
-            return SimpleNamespace(results=[])
+        p.queue_prefetch("a" * 100)
 
-        p._client.arecall = AsyncMock(side_effect=_capture_recall)
+        p._client.arecall.assert_not_called()
 
-        long_query = "a" * 100
-        p.queue_prefetch(long_query)
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
-
-        # The query passed to arecall should be truncated
-        if original_query is not None:
-            assert len(original_query) <= 10
-
-    def test_queue_prefetch_passes_recall_params(self, provider_with_config):
+    def test_queue_prefetch_does_not_recall_with_recall_params(self, provider_with_config):
         p = provider_with_config(
             recall_tags=["t1"],
             recall_tags_match="all",
             recall_max_tokens=1024,
             recall_types=["world"],
         )
-        p.queue_prefetch("test query")
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
 
-        call_kwargs = p._client.arecall.call_args.kwargs
-        assert call_kwargs["max_tokens"] == 1024
-        assert call_kwargs["tags"] == ["t1"]
-        assert call_kwargs["tags_match"] == "all"
-        assert call_kwargs["types"] == ["world"]
+        p.queue_prefetch("test query")
+
+        p._client.arecall.assert_not_called()
 
 
 
@@ -1203,10 +1183,13 @@ class TestShutdownRace:
         # nulled self._client; we assert via the captured handle).
         assert client.aretain_batch.call_count == before_calls
 
-    def test_queue_prefetch_after_shutdown_is_dropped(self, provider):
+    def test_queue_prefetch_after_shutdown_is_noop(self, provider):
+        client = provider._client
         provider.shutdown()
+
         provider.queue_prefetch("late query")
-        assert provider._prefetch_thread is None
+
+        client.arecall.assert_not_called()
 
     def test_shutdown_drains_pending_retains(self, provider):
         """Shutdown must wait for queued retains to complete, not abandon them.
@@ -1286,31 +1269,17 @@ class TestSessionSwitchBufferFlush:
 
 
 
-    def test_in_flight_prefetch_thread_drained_on_switch(self, provider, monkeypatch):
-        """on_session_switch must wait for an in-flight prefetch from the
-        old session to settle before clearing _prefetch_result, otherwise
-        the thread can race and re-populate the field after the clear."""
-        import threading
+    def test_session_switch_clears_carried_recall_snapshot(self, provider):
+        provider._prefetch_result = "- old-session recall"
+        provider._prefetch_snapshot = SimpleNamespace(
+            query="old-session query",
+            results=("old-session recall",),
+        )
 
-        gate = threading.Event()
-        finished = threading.Event()
-
-        def _slow_prefetch():
-            gate.wait(timeout=5.0)
-            with provider._prefetch_lock:
-                provider._prefetch_result = "old-session recall"
-            finished.set()
-
-        provider._prefetch_thread = threading.Thread(target=_slow_prefetch, daemon=True)
-        provider._prefetch_thread.start()
-
-        # Release the prefetch worker so it writes _prefetch_result, then
-        # call on_session_switch — it must join the thread before clearing.
-        gate.set()
         provider.on_session_switch("new-sid")
 
-        assert finished.is_set(), "switch returned before prefetch thread settled"
         assert provider._prefetch_result == ""
+        assert provider._prefetch_snapshot is None
 
     def test_flush_serializes_behind_pending_retains_via_writer_queue(
         self, provider_with_config
