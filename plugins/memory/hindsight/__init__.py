@@ -1879,18 +1879,26 @@ class HindsightMemoryProvider(MemoryProvider):
         logger.debug("Prefetch: skipped post-turn raw-query recall")
 
     @staticmethod
-    def _retain_message_timestamp(value: Any = None) -> str:
+    def _retain_message_timestamp(value: Any = None, *, fallback_now: bool = True) -> str:
         def _local_seconds(dt: datetime) -> str:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
 
         if value is None:
-            return datetime.now().astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+            return (
+                datetime.now().astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+                if fallback_now
+                else ""
+            )
         if isinstance(value, datetime):
             return _local_seconds(value)
         if isinstance(value, bool):
-            return datetime.now().astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+            return (
+                datetime.now().astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+                if fallback_now
+                else ""
+            )
         if isinstance(value, (int, float)):
             seconds = float(value)
             if abs(seconds) > 10_000_000_000:
@@ -1898,7 +1906,11 @@ class HindsightMemoryProvider(MemoryProvider):
             return _local_seconds(datetime.fromtimestamp(seconds, timezone.utc))
         text = str(value).strip()
         if not text:
-            return datetime.now().astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+            return (
+                datetime.now().astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+                if fallback_now
+                else ""
+            )
         try:
             return _local_seconds(datetime.fromisoformat(text.replace("Z", "+00:00")))
         except ValueError:
@@ -1911,17 +1923,24 @@ class HindsightMemoryProvider(MemoryProvider):
         *,
         user_timestamp: Any = None,
         assistant_timestamp: Any = None,
+        fallback_timestamp_now: bool = True,
     ) -> List[Dict[str, str]]:
         return [
             {
                 "role": "user",
                 "content": f"{self._retain_user_prefix}: {user_content}",
-                "timestamp": self._retain_message_timestamp(user_timestamp),
+                "timestamp": self._retain_message_timestamp(
+                    user_timestamp,
+                    fallback_now=fallback_timestamp_now,
+                ),
             },
             {
                 "role": "assistant",
                 "content": f"{self._retain_assistant_prefix}: {assistant_content}",
-                "timestamp": self._retain_message_timestamp(assistant_timestamp),
+                "timestamp": self._retain_message_timestamp(
+                    assistant_timestamp,
+                    fallback_now=fallback_timestamp_now,
+                ),
             },
         ]
 
@@ -2217,12 +2236,21 @@ class HindsightMemoryProvider(MemoryProvider):
             return None
         return json.dumps(cleaned_msgs, ensure_ascii=False)
 
-    def _build_orphan_user_turn(self, user_content: str, *, user_timestamp: Any = None) -> List[Dict[str, str]]:
+    def _build_orphan_user_turn(
+        self,
+        user_content: str,
+        *,
+        user_timestamp: Any = None,
+        fallback_timestamp_now: bool = True,
+    ) -> List[Dict[str, str]]:
         return [
             {
                 "role": "user",
                 "content": f"{self._retain_user_prefix}: {user_content}",
-                "timestamp": self._retain_message_timestamp(user_timestamp),
+                "timestamp": self._retain_message_timestamp(
+                    user_timestamp,
+                    fallback_now=fallback_timestamp_now,
+                ),
             }
         ]
 
@@ -2231,12 +2259,16 @@ class HindsightMemoryProvider(MemoryProvider):
         assistant_content: str,
         *,
         assistant_timestamp: Any = None,
+        fallback_timestamp_now: bool = True,
     ) -> List[Dict[str, str]]:
         return [
             {
                 "role": "assistant",
                 "content": f"{self._retain_assistant_prefix}: {assistant_content}",
-                "timestamp": self._retain_message_timestamp(assistant_timestamp),
+                "timestamp": self._retain_message_timestamp(
+                    assistant_timestamp,
+                    fallback_now=fallback_timestamp_now,
+                ),
             }
         ]
 
@@ -2260,12 +2292,17 @@ class HindsightMemoryProvider(MemoryProvider):
                         assistant_content,
                         user_timestamp=user_timestamp,
                         assistant_timestamp=assistant_timestamp,
+                        fallback_timestamp_now=False,
                     ),
                     ensure_ascii=False,
                 ))
             else:
                 turns.append(json.dumps(
-                    self._build_orphan_user_turn(user_content, user_timestamp=user_timestamp),
+                    self._build_orphan_user_turn(
+                        user_content,
+                        user_timestamp=user_timestamp,
+                        fallback_timestamp_now=False,
+                    ),
                     ensure_ascii=False,
                 ))
             pending_user = None
@@ -2280,6 +2317,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._build_orphan_assistant_turn(
                     assistant_content,
                     assistant_timestamp=assistant_timestamp,
+                    fallback_timestamp_now=False,
                 ),
                 ensure_ascii=False,
             ))
@@ -2391,6 +2429,7 @@ class HindsightMemoryProvider(MemoryProvider):
         *,
         cutoff: str,
         seen_message_ids: set[tuple],
+        allow_unknown_assistant_only: bool = False,
     ) -> List[str]:
         """Keep only replay messages provably newer than persisted history."""
         retained: list[str] = []
@@ -2402,16 +2441,41 @@ class HindsightMemoryProvider(MemoryProvider):
                 continue
             if not isinstance(payload, list):
                 continue
+            identities = cls._retain_turn_replay_identity(turn_json)
+            has_known_old_message = any(
+                identity[2] and identity[2] <= cutoff
+                for identity in identities
+            )
+            has_known_new_message = any(
+                identity[2] and identity[2] > cutoff and identity not in seen
+                for identity in identities
+            )
+            if not has_known_new_message:
+                unknown_assistant_only = bool(
+                    allow_unknown_assistant_only
+                    and identities
+                    and all(
+                        identity[0] == "assistant"
+                        and not identity[2]
+                        and identity not in seen
+                        for identity in identities
+                    )
+                )
+                if not unknown_assistant_only:
+                    continue
+
             later_messages: list[dict] = []
-            for message, identity in zip(payload, cls._retain_turn_replay_identity(turn_json)):
-                if (
-                    isinstance(message, dict)
-                    and identity[2]
-                    and identity[2] > cutoff
-                    and identity not in seen
-                ):
-                    later_messages.append(message)
-                    seen.add(identity)
+            for message, identity in zip(payload, identities):
+                if not isinstance(message, dict) or identity in seen:
+                    continue
+                if has_known_old_message and not (identity[2] and identity[2] > cutoff):
+                    # A missing timestamp in an overlapping historical turn is
+                    # unknown, not evidence that the message happened after the
+                    # persisted cutoff. Only an explicit newer timestamp can
+                    # split a genuinely later event out of such a turn.
+                    continue
+                later_messages.append(message)
+                seen.add(identity)
             if later_messages:
                 retained.append(json.dumps(later_messages, ensure_ascii=False))
         return retained
@@ -2437,6 +2501,37 @@ class HindsightMemoryProvider(MemoryProvider):
                 for existing_index in range(existing_cursor, len(existing_canonical))
                 if incoming_value == existing_canonical[existing_index]
             ]
+            exact_canonical_identity = next(
+                (
+                    existing_index
+                    for existing_index in candidates
+                    if incoming_ids[incoming_index] == existing_ids[existing_index]
+                ),
+                None,
+            )
+            if candidates and exact_canonical_identity is None:
+                incoming_timestamps = [
+                    timestamp
+                    for _role, _content, timestamp in incoming_ids[incoming_index]
+                    if timestamp
+                ]
+                candidate_timestamps = [
+                    timestamp
+                    for existing_index in candidates
+                    for _role, _content, timestamp in existing_ids[existing_index]
+                    if timestamp
+                ]
+                incoming_has_complete_timestamps = (
+                    len(incoming_timestamps) == len(incoming_ids[incoming_index])
+                )
+                if (
+                    incoming_has_complete_timestamps
+                    and candidate_timestamps
+                    and min(incoming_timestamps) > max(candidate_timestamps)
+                ):
+                    # Stable timestamps prove that this identical text recurred
+                    # after every persisted candidate. It is not a replay anchor.
+                    continue
             match_kind = "exact"
             if not candidates:
                 incoming_identity = incoming_ids[incoming_index]
@@ -2504,11 +2599,28 @@ class HindsightMemoryProvider(MemoryProvider):
         existing_cursor = 0
         for incoming_index, existing_index, match_kind in matched_pairs:
             merged.extend(existing_turns[existing_cursor:existing_index])
-            for candidate_index in range(incoming_cursor, incoming_index):
-                if incoming_ids[candidate_index] not in seen_ids:
-                    merged.append(incoming_turns[candidate_index])
-                    seen_ids.add(incoming_ids[candidate_index])
-                    seen_message_ids.update(incoming_ids[candidate_index])
+            unmatched_prefix = incoming_turns[incoming_cursor:incoming_index]
+            previous_existing_timestamps = [
+                timestamp
+                for turn_json in existing_turns[:existing_index]
+                for _role, _content, timestamp in cls._retain_turn_replay_identity(turn_json)
+                if timestamp
+            ]
+            if unmatched_prefix and previous_existing_timestamps:
+                safe_prefix = cls._retain_turns_strictly_after(
+                    unmatched_prefix,
+                    cutoff=max(previous_existing_timestamps),
+                    seen_message_ids=seen_message_ids,
+                    allow_unknown_assistant_only=True,
+                )
+            else:
+                safe_prefix = unmatched_prefix
+            for candidate_turn in safe_prefix:
+                candidate_identity = cls._retain_turn_replay_identity(candidate_turn)
+                if candidate_identity not in seen_ids:
+                    merged.append(candidate_turn)
+                    seen_ids.add(candidate_identity)
+                    seen_message_ids.update(candidate_identity)
             if match_kind == "shared_user" and len(existing_ids[existing_index]) == 1:
                 # The persisted row was an orphan user and the replay now closes
                 # that unambiguous user event with an assistant response.
@@ -3498,7 +3610,26 @@ class HindsightMemoryProvider(MemoryProvider):
                 and incoming_times
                 and min(incoming_times) > max(existing_times)
             )
-            if len(incoming) <= len(existing) and existing[: len(incoming)] == incoming:
+            canonical_prefix_overlap = (
+                existing[: len(incoming)] == incoming
+                if len(incoming) <= len(existing)
+                else incoming[: len(existing)] == existing
+            )
+            identity_prefix_exact = (
+                existing_ids[: len(incoming_ids)] == incoming_ids
+                if len(incoming_ids) <= len(existing_ids)
+                else incoming_ids[: len(existing_ids)] == existing_ids
+            )
+            anchored_canonical_rewrite = bool(
+                canonical_prefix_overlap
+                and not identity_prefix_exact
+                and any(identity in set(existing_ids) for identity in incoming_ids)
+            )
+            if (
+                len(incoming) <= len(existing)
+                and existing[: len(incoming)] == incoming
+                and not anchored_canonical_rewrite
+            ):
                 if existing_ids[: len(incoming_ids)] == incoming_ids:
                     return 0, before_counter, before_counter
                 if not incoming_follows_existing:
@@ -3507,7 +3638,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 # Distinct identities whose complete timestamp range follows the
                 # persisted history are new turns, not replay duplication.
                 start_index = 0
-            elif incoming[: len(existing)] == existing:
+            elif incoming[: len(existing)] == existing and not anchored_canonical_rewrite:
                 if incoming_ids[: len(existing_ids)] == existing_ids:
                     start_index = len(existing)
                 elif incoming_follows_existing:
@@ -3623,7 +3754,25 @@ class HindsightMemoryProvider(MemoryProvider):
         if session_id:
             self._session_id = str(session_id).strip()
 
-        transcript_turns = self._build_turns_from_conversation_messages(messages or [])
+        transcript_messages = [dict(message) for message in (messages or [])]
+        final_assistant = self._stringify_retain_content(assistant_content).strip()
+        if final_assistant:
+            for message in reversed(transcript_messages):
+                if str(message.get("role") or "").strip() != "assistant":
+                    continue
+                if message.get("tool_calls") or message.get("finish_reason") == "tool_calls":
+                    continue
+                content = self._stringify_retain_content(message.get("content")).strip()
+                if content != final_assistant:
+                    continue
+                if message.get("_timestamp", message.get("timestamp")) in (None, ""):
+                    # Only the response completing this sync is known to be new.
+                    # Historical replay messages with no source timestamp stay
+                    # unknown so overlap recovery cannot promote them via now().
+                    message["_timestamp"] = self._retain_message_timestamp()
+                break
+
+        transcript_turns = self._build_turns_from_conversation_messages(transcript_messages)
         if transcript_turns:
             added, before_counter, after_counter = self._append_session_turns(transcript_turns)
             if added == 0:
