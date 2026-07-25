@@ -3461,6 +3461,48 @@ class AIAgent:
             except Exception:
                 pass
 
+    def _messages_for_external_memory(self, messages: list | None) -> list | None:
+        """Copy transcript rows and attach trusted /steer provenance for memory only."""
+        events = getattr(self, "_memory_oob_user_events", None)
+        self._memory_oob_user_events = []
+        if messages is None or not isinstance(events, list) or not events:
+            return messages
+
+        copied = [dict(message) if isinstance(message, dict) else message for message in messages]
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            user_text = str(event.get("user_text") or "").strip()
+            if not user_text:
+                continue
+            target_index = next(
+                (
+                    index
+                    for index, message in enumerate(messages)
+                    if isinstance(message, dict)
+                    and id(message) == event.get("message_object_id")
+                ),
+                None,
+            )
+            if target_index is None and event.get("tool_call_id"):
+                target_index = next(
+                    (
+                        index
+                        for index in range(len(messages) - 1, -1, -1)
+                        if isinstance(messages[index], dict)
+                        and messages[index].get("role") == "tool"
+                        and messages[index].get("tool_call_id") == event.get("tool_call_id")
+                    ),
+                    None,
+                )
+            if target_index is None or not isinstance(copied[target_index], dict):
+                continue
+            trusted = copied[target_index].get("_hermes_oob_user_messages")
+            trusted_values = list(trusted) if isinstance(trusted, list) else []
+            trusted_values.append(user_text)
+            copied[target_index]["_hermes_oob_user_messages"] = trusted_values
+        return copied
+
     def _sync_external_memory_for_turn(
         self,
         *,
@@ -3495,6 +3537,7 @@ class AIAgent:
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
+        memory_messages = self._messages_for_external_memory(messages)
         if interrupted:
             return
         if not (self._memory_manager and final_response and original_user_message):
@@ -3508,8 +3551,8 @@ class AIAgent:
             return
         try:
             sync_kwargs = {"session_id": self.session_id or ""}
-            if messages is not None:
-                sync_kwargs["messages"] = messages
+            if memory_messages is not None:
+                sync_kwargs["messages"] = memory_messages
             self._memory_manager.sync_all(
                 user_text,
                 response_text,

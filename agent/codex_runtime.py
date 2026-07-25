@@ -783,18 +783,18 @@ def run_codex_app_server_turn(
         should_review_skills = True
         agent._iters_since_skill = 0
 
-    # External memory provider sync (mirrors line ~15439). Skipped on
-    # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
-        try:
-            agent._sync_external_memory_for_turn(
-                original_user_message=original_user_message,
-                final_response=turn.final_text,
-                interrupted=False,
-                messages=messages,
-            )
-        except Exception:
-            logger.debug("external memory sync raised", exc_info=True)
+    # External memory provider sync (mirrors line ~15439). Interrupted/error
+    # turns enter the helper only to clear transient OOB provenance; the helper
+    # returns before persisting partial conversation content.
+    try:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=turn.final_text,
+            interrupted=turn.interrupted or turn.error is not None,
+            messages=messages,
+        )
+    except Exception:
+        logger.debug("external memory sync raised", exc_info=True)
 
     # Background review fork — same cadence + signature as the default
     # path (line ~15449). Only fires when a trigger actually tripped AND

@@ -1974,6 +1974,20 @@ class HindsightMemoryProvider(MemoryProvider):
         "[ASYNC DELEGATION BATCH COMPLETE",
         "[ASYNC DELEGATION COMPLETE",
     )
+    _RETAIN_SYSTEM_CONTINUATION_PREFIXES = (
+        "[System: Your previous response was truncated",
+        "[System: The previous response was cut off",
+        "[System: Your previous tool call",
+    )
+    _RETAIN_BACKGROUND_PROCESS_PREFIX = "[IMPORTANT: Background process "
+    _RETAIN_WATCH_DISABLED_PREFIX = "[IMPORTANT: Watch patterns disabled for process "
+    _RETAIN_HANDOFF_PREFIX = "[Session was just handed off from CLI ("
+    _RETAIN_OOB_USER_OPEN = (
+        "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered mid-turn; "
+        "not tool output]"
+    )
+    _RETAIN_OOB_USER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
+    _RETAIN_OOB_TRUSTED_FIELD = "_hermes_oob_user_messages"
     _RETAIN_NOISE_MARKERS = (
         _RETAIN_OBJECTIVE_HEADER,
         "[Your active task list was preserved across context compression]",
@@ -2029,10 +2043,93 @@ class HindsightMemoryProvider(MemoryProvider):
         return text
 
     @classmethod
+    def _is_skill_invocation_runtime_event(cls, content: Any) -> bool:
+        """Match a complete Hermes skill-invocation header, not quoted prefixes."""
+        text = cls._stringify_retain_content(content).replace("\r\n", "\n").lstrip()
+        first_line = text.split("\n", 1)[0].strip()
+        single_skill = re.fullmatch(
+            r'\[IMPORTANT: The user has invoked the "[^"\n]+" skill, '
+            r'indicating they want you to follow its instructions\. '
+            r'The full skill content is loaded below\.\]',
+            first_line,
+        )
+        skill_bundle = re.fullmatch(
+            r'\[IMPORTANT: The user has invoked the "[^"\n]+" (?:stacked )?skill bundle, '
+            r'loading \d+ skills together\. Treat every skill below as active '
+            r'guidance for this turn\.\]',
+            first_line,
+        )
+        return bool(single_skill or skill_bundle)
+
+    @classmethod
+    def _extract_skill_invocation_user_instruction(cls, content: Any) -> str:
+        if not cls._is_skill_invocation_runtime_event(content):
+            return ""
+        try:
+            from agent.skill_commands import extract_user_instruction_from_skill_message
+
+            instruction = extract_user_instruction_from_skill_message(
+                cls._stringify_retain_content(content)
+            )
+        except Exception:
+            return ""
+        return cls._stringify_retain_content(instruction).strip() if instruction else ""
+
+    @classmethod
+    def _has_closed_runtime_envelope(cls, text: str) -> bool:
+        normalized = (text or "").strip()
+        saw_internal_boundary = False
+        for boundary in re.finditer(r"\]\n\n", normalized):
+            saw_internal_boundary = True
+            remainder = normalized[boundary.end():].lstrip()
+            while remainder.startswith("---"):
+                remainder = remainder[3:].lstrip()
+            if (
+                cls._starts_with_lcm_summary_block(remainder)
+                or any(remainder.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS)
+            ):
+                return True
+        if saw_internal_boundary:
+            # A closed runtime-shaped prefix followed by ordinary prose is a
+            # user quotation/extension, even when that prose also ends in `]`.
+            return False
+        return normalized.endswith("]")
+
+    @classmethod
+    def _is_assistant_producing_runtime_event(cls, content: Any) -> bool:
+        """Return whether an exact synthetic row can produce visible output.
+
+        Runtime envelopes are recognized by reserved framework markers, not by
+        command/output or business text. System continuation and handoff rows
+        require their complete closing bracket; process and skill-injection rows
+        may contain or be followed by larger synthetic payload blocks.
+        """
+        text = cls._stringify_retain_content(content).strip()
+        if text.startswith(cls._RETAIN_OBJECTIVE_HEADER):
+            text = text[len(cls._RETAIN_OBJECTIVE_HEADER):].lstrip("\n").strip()
+        if not text:
+            return False
+        if cls._is_skill_invocation_runtime_event(text):
+            return True
+        if (
+            text.startswith(cls._RETAIN_BACKGROUND_PROCESS_PREFIX)
+            and "\nCommand: " in text
+            and ("\nOutput:\n" in text or "\nMatched output:\n" in text)
+            and cls._has_closed_runtime_envelope(text)
+        ):
+            return True
+        if not text.endswith("]"):
+            return False
+        if text.startswith(cls._RETAIN_SYSTEM_CONTINUATION_PREFIXES):
+            return True
+        return text.startswith((cls._RETAIN_WATCH_DISABLED_PREFIX, cls._RETAIN_HANDOFF_PREFIX))
+
+    @classmethod
     def _starts_with_retain_noise_marker(cls, content: str) -> bool:
         text = (content or "").lstrip()
         return (
             cls._starts_with_lcm_summary_block(text)
+            or cls._is_assistant_producing_runtime_event(text)
             or any(text.startswith(marker) for marker in cls._RETAIN_NOISE_MARKERS)
         )
 
@@ -2054,6 +2151,7 @@ class HindsightMemoryProvider(MemoryProvider):
         return (
             cls._is_tool_budget_exhausted_notice(text)
             or cls._starts_with_recent_summary_block(text)
+            or cls._is_assistant_producing_runtime_event(text)
             or any(text.startswith(marker) for marker in cls._RETAIN_ASYNC_COMPLETION_MARKERS)
         )
 
@@ -2143,6 +2241,9 @@ class HindsightMemoryProvider(MemoryProvider):
         if cls._is_tool_budget_exhausted_notice(text):
             return ""
 
+        if cls._is_skill_invocation_runtime_event(text):
+            return cls._extract_skill_invocation_user_instruction(text)
+
         # Pure synthetic messages (todo/async/externalized/LCM summary blocks).
         # Objective header was already stripped above when present.
         if cls._starts_with_retain_noise_marker(text):
@@ -2180,7 +2281,124 @@ class HindsightMemoryProvider(MemoryProvider):
             return True
         if text.startswith("Operation interrupted"):
             return True
-        return cls._starts_with_retain_noise_marker(text)
+        # Assistant-side synthetic rows are limited to compaction summaries.
+        # User-side runtime markers can also be legitimate quoted Assistant
+        # output and must not be filtered solely by matching their text.
+        return cls._starts_with_lcm_summary_block(text)
+
+    @classmethod
+    def _extract_retain_out_of_band_user_messages(
+        cls,
+        message: Dict[str, Any],
+    ) -> List[str]:
+        """Extract the contiguous suffix of exactly bounded mid-turn user steers."""
+        role = str(message.get("role") or "").strip()
+        if role not in {"tool", "user"}:
+            return []
+        raw_content = message.get("content")
+        candidates: List[str] = []
+        if isinstance(raw_content, str):
+            candidates.append(raw_content)
+        elif isinstance(raw_content, list):
+            for block in raw_content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        candidates.append(text)
+        marker_start = f"{cls._RETAIN_OOB_USER_OPEN}\n"
+        marker_end = f"\n{cls._RETAIN_OOB_USER_CLOSE}"
+        extracted: List[str] = []
+        for candidate in reversed(candidates):
+            remaining = candidate.rstrip()
+            candidate_messages: List[str] = []
+            while remaining.endswith(marker_end):
+                start_index = remaining.rfind(marker_start)
+                if start_index < 0:
+                    break
+                prefix = remaining[:start_index]
+                if prefix and not prefix.endswith("\n\n"):
+                    break
+                user_text = remaining[
+                    start_index + len(marker_start):-len(marker_end)
+                ].strip()
+                if not user_text:
+                    break
+                candidate_messages.append(user_text)
+                remaining = prefix[:-2] if prefix.endswith("\n\n") else prefix
+                remaining = remaining.rstrip()
+            if not candidate_messages:
+                break
+            extracted = list(reversed(candidate_messages)) + extracted
+        if role == "tool":
+            trusted_values = message.get(cls._RETAIN_OOB_TRUSTED_FIELD)
+            if not isinstance(trusted_values, list):
+                return []
+            trusted = [
+                cls._stringify_retain_content(value).strip()
+                for value in trusted_values
+                if cls._stringify_retain_content(value).strip()
+            ]
+            trusted_cursor = 0
+            verified: List[str] = []
+            for extracted_value in extracted:
+                try:
+                    match_index = trusted.index(extracted_value, trusted_cursor)
+                except ValueError:
+                    continue
+                verified.append(extracted_value)
+                trusted_cursor = match_index + 1
+            return verified
+        return extracted
+
+    @classmethod
+    def _extract_retain_out_of_band_user_message(
+        cls,
+        message: Dict[str, Any],
+    ) -> str | None:
+        messages = cls._extract_retain_out_of_band_user_messages(message)
+        return messages[-1] if messages else None
+
+    @classmethod
+    def _extract_retain_clarify_exchange(
+        cls,
+        message: Dict[str, Any],
+    ) -> tuple[str, str | None] | None:
+        """Extract the user-visible clarify card and its real user response."""
+        if str(message.get("role") or "").strip() != "tool":
+            return None
+        if str(message.get("tool_name") or "").strip() != "clarify":
+            return None
+        raw_content = message.get("content")
+        if isinstance(raw_content, str):
+            marker_boundary = f"\n\n{cls._RETAIN_OOB_USER_OPEN}\n"
+            if marker_boundary in raw_content and raw_content.rstrip().endswith(
+                cls._RETAIN_OOB_USER_CLOSE
+            ):
+                raw_content = raw_content.split(marker_boundary, 1)[0]
+        try:
+            payload = json.loads(cls._stringify_retain_content(raw_content))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        question = cls._stringify_retain_content(payload.get("question")).strip()
+        if not question:
+            return None
+        choices = payload.get("choices_offered")
+        choice_texts = [
+            cls._stringify_retain_content(choice).strip()
+            for choice in choices
+            if cls._stringify_retain_content(choice).strip()
+        ] if isinstance(choices, list) else []
+        visible_question = question
+        if choice_texts:
+            visible_question += "\n\nChoices offered:\n" + "\n".join(
+                f"- {choice}" for choice in choice_texts
+            )
+        response = cls._stringify_retain_content(payload.get("user_response")).strip()
+        if not response or re.fullmatch(r"\[user did not respond within \d+m\]", response):
+            response = None
+        return visible_question, response
 
     def _sanitize_persisted_turn_json(self, turn_json: str) -> str | None:
         """Rewrite/drop a provider-owned retained turn before reuse or submit.
@@ -2329,8 +2547,46 @@ class HindsightMemoryProvider(MemoryProvider):
             content = self._stringify_retain_content(msg.get("content")).strip()
             if not role or not content:
                 continue
+            if role == "tool":
+                clarify_exchange = self._extract_retain_clarify_exchange(msg)
+                out_of_band_users = self._extract_retain_out_of_band_user_messages(msg)
+                if not clarify_exchange and not out_of_band_users:
+                    continue
+                event_timestamp = msg.get("_timestamp", msg.get("timestamp"))
+                if clarify_exchange:
+                    visible_question, user_response = clarify_exchange
+                    _flush_pending_async_assistant()
+                    pending_async_completion = False
+                    if pending_user and not pending_assistant:
+                        pending_assistant = (visible_question, event_timestamp)
+                        _flush_pending_turn()
+                    else:
+                        _flush_pending_turn()
+                        turns.append(json.dumps(
+                            self._build_orphan_assistant_turn(
+                                visible_question,
+                                assistant_timestamp=event_timestamp,
+                                fallback_timestamp_now=False,
+                            ),
+                            ensure_ascii=False,
+                        ))
+                    if user_response:
+                        pending_user = (user_response, event_timestamp)
+                        pending_assistant = None
+                    else:
+                        # A timeout is framework state, not user speech. The
+                        # model can still emit a visible timeout/follow-up.
+                        pending_async_completion = True
+                for out_of_band_user in out_of_band_users:
+                    _flush_pending_async_assistant()
+                    _flush_pending_turn()
+                    pending_async_completion = False
+                    pending_user = (out_of_band_user, event_timestamp)
+                    pending_assistant = None
+                continue
             if role == "user":
-                cleaned_user = self._clean_retain_user_content(content)
+                out_of_band_user = self._extract_retain_out_of_band_user_message(msg)
+                cleaned_user = out_of_band_user or self._clean_retain_user_content(content)
                 if not cleaned_user:
                     # Synthetic user injections are not conversation turns.
                     # A tool-budget notice arrives while the real request may
@@ -2347,7 +2603,12 @@ class HindsightMemoryProvider(MemoryProvider):
                     if pending_user and (pending_assistant or preserves_visible_assistant):
                         _flush_pending_turn()
                     _flush_pending_async_assistant()
-                    pending_async_completion = preserves_visible_assistant
+                    if preserves_visible_assistant:
+                        pending_async_completion = True
+                    # Pure runtime-noise rows are transparent while an async or
+                    # rehydration trigger is still waiting for its visible final
+                    # assistant. A real user, a completed assistant event, or a
+                    # new assistant-producing trigger closes/switches the boundary.
                     continue
                 _flush_pending_async_assistant()
                 _flush_pending_turn()
@@ -2422,6 +2683,19 @@ class HindsightMemoryProvider(MemoryProvider):
         identity = cls._retain_turn_replay_identity(turn_json)
         return str(identity[0][2]) if identity else ""
 
+    @staticmethod
+    def _retain_timestamp_order_value(value: str) -> float | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+
     @classmethod
     def _retain_turns_strictly_after(
         cls,
@@ -2493,6 +2767,25 @@ class HindsightMemoryProvider(MemoryProvider):
         incoming_canonical = [cls._retain_turn_canonical(turn) for turn in incoming_turns]
         matched_pairs: list[tuple[int, int, str]] = []
         existing_cursor = 0
+
+        def _next_exact_existing_index(
+            incoming_index: int,
+            existing_start: int,
+        ) -> int | None:
+            for future_index in range(incoming_index + 1, len(incoming_ids)):
+                future_exact = next(
+                    (
+                        existing_index
+                        for existing_index in range(existing_start, len(existing_ids))
+                        if incoming_ids[future_index]
+                        and incoming_ids[future_index] == existing_ids[existing_index]
+                    ),
+                    None,
+                )
+                if future_exact is not None:
+                    return future_exact
+            return None
+
         for incoming_index, incoming_value in enumerate(incoming_canonical):
             if not incoming_value:
                 continue
@@ -2529,9 +2822,30 @@ class HindsightMemoryProvider(MemoryProvider):
                     and candidate_timestamps
                     and min(incoming_timestamps) > max(candidate_timestamps)
                 ):
-                    # Stable timestamps prove that this identical text recurred
-                    # after every persisted candidate. It is not a replay anchor.
-                    continue
+                    future_exact = _next_exact_existing_index(
+                        incoming_index,
+                        existing_cursor,
+                    )
+                    has_candidate_before_future_anchor = (
+                        future_exact is not None
+                        and any(candidate < future_exact for candidate in candidates)
+                    )
+                    has_novel_prefix_before_future_anchor = (
+                        future_exact is not None
+                        and any(
+                            incoming_canonical[prefix_index]
+                            and incoming_canonical[prefix_index]
+                            not in existing_canonical[:future_exact]
+                            for prefix_index in range(incoming_index)
+                        )
+                    )
+                    if not (
+                        has_candidate_before_future_anchor
+                        and has_novel_prefix_before_future_anchor
+                    ):
+                        # Stable timestamps prove that this identical text recurred
+                        # after every persisted candidate. It is not a replay anchor.
+                        continue
             match_kind = "exact"
             if not candidates:
                 incoming_identity = incoming_ids[incoming_index]
@@ -2582,6 +2896,37 @@ class HindsightMemoryProvider(MemoryProvider):
                 ),
                 None,
             )
+            if exact_identity is None:
+                # A later exact anchor bounds which repeated canonical candidate
+                # can represent this partial replay position. Timestamp drift on
+                # the repeated item must not force the earliest textual match.
+                next_exact_existing = _next_exact_existing_index(
+                    incoming_index,
+                    existing_cursor,
+                )
+                if next_exact_existing is not None:
+                    bounded = [
+                        candidate for candidate in candidates
+                        if candidate < next_exact_existing
+                    ]
+                    if not bounded:
+                        continue
+                    candidates = bounded
+
+                    if len(candidates) > 1:
+                        incoming_time = cls._retain_timestamp_order_value(
+                            cls._retain_turn_replay_timestamp(incoming_turns[incoming_index])
+                        )
+                        timed_candidates = []
+                        if incoming_time is not None:
+                            for candidate in candidates:
+                                candidate_time = cls._retain_timestamp_order_value(
+                                    cls._retain_turn_replay_timestamp(existing_turns[candidate])
+                                )
+                                if candidate_time is not None:
+                                    timed_candidates.append((abs(candidate_time - incoming_time), candidate))
+                        if timed_candidates:
+                            candidates = [min(timed_candidates)[1]]
             existing_index = exact_identity if exact_identity is not None else candidates[0]
             matched_pairs.append((incoming_index, existing_index, match_kind))
             existing_cursor = existing_index + 1

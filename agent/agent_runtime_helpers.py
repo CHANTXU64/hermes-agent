@@ -3427,6 +3427,18 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             messages[target_idx]["content"] = f"{existing_content}{marker}"
     else:
         messages[target_idx]["content"] = existing_content + marker
+    memory_events = getattr(agent, "_memory_oob_user_events", None)
+    if not isinstance(memory_events, list):
+        memory_events = []
+        agent._memory_oob_user_events = memory_events
+    target_message = messages[target_idx]
+    memory_events.append(
+        {
+            "message_object_id": id(target_message),
+            "tool_call_id": target_message.get("tool_call_id"),
+            "user_text": steer_text,
+        }
+    )
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s",
         len(steer_text),

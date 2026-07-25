@@ -8,6 +8,7 @@ and prompt-cache integrity.
 from __future__ import annotations
 
 import threading
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -88,8 +89,45 @@ class TestSteerInjection:
         assert "ls output B" in messages[3]["content"]
         assert STEER_MARKER_OPEN in messages[3]["content"]
         assert "please also check auth.log" in messages[3]["content"]
+        assert "_hermes_oob_user_messages" not in messages[3]
+        assert agent._memory_oob_user_events == [
+            {
+                "message_object_id": id(messages[3]),
+                "tool_call_id": "b",
+                "user_text": "please also check auth.log",
+            }
+        ]
         # And pending_steer is consumed.
         assert agent._pending_steer is None
+
+    def test_external_memory_copy_receives_trusted_steer_provenance(self):
+        agent = _bare_agent()
+        setattr(agent, "session_id", "steer-memory-session")
+        memory_manager = MagicMock()
+        setattr(agent, "_memory_manager", memory_manager)
+        agent.steer("retain this real correction")
+        messages = [
+            {"role": "user", "content": "initial request"},
+            {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+            {"role": "tool", "content": "tool output", "tool_call_id": "call-1"},
+        ]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+        agent._sync_external_memory_for_turn(
+            original_user_message="initial request",
+            final_response="final corrected answer",
+            interrupted=False,
+            messages=messages,
+        )
+
+        memory_messages = memory_manager.sync_all.call_args.kwargs["messages"]
+        assert memory_messages is not messages
+        assert memory_messages[2] is not messages[2]
+        assert memory_messages[2]["_hermes_oob_user_messages"] == [
+            "retain this real correction"
+        ]
+        assert "_hermes_oob_user_messages" not in messages[2]
+        assert agent._memory_oob_user_events == []
 
     def test_no_op_when_no_steer_pending(self):
         agent = _bare_agent()

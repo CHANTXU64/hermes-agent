@@ -1317,6 +1317,111 @@ def test_partial_replay_anchor_prefers_timestamp_identity_for_repeated_text(prov
     ]
 
 
+def test_partial_replay_anchor_uses_following_exact_anchor_when_repeated_time_drifts(
+    provider_with_config,
+):
+    p = provider_with_config(auto_retain=False)
+
+    def assistant_event(content, timestamp):
+        return json.dumps(
+            [{"role": "assistant", "content": f"Assistant: {content}", "timestamp": timestamp}],
+            ensure_ascii=False,
+        )
+
+    existing = [
+        assistant_event("same repeated result", "2026-07-16T01:00:00"),
+        assistant_event("existing middle event", "2026-07-16T01:01:00"),
+        assistant_event("same repeated result", "2026-07-16T01:02:00"),
+        assistant_event("later exact anchor", "2026-07-16T01:03:00"),
+    ]
+    incoming = [
+        assistant_event("new event before second repeat", "2026-07-16T01:01:30"),
+        assistant_event("same repeated result", "2026-07-16T01:01:59"),
+        assistant_event("later exact anchor", "2026-07-16T01:03:00"),
+    ]
+
+    merged = p._merge_overlapping_replayed_turns(existing, incoming)
+
+    assert merged is not None
+    assert [json.loads(turn)[0]["content"] for turn in merged] == [
+        "Assistant: same repeated result",
+        "Assistant: existing middle event",
+        "Assistant: new event before second repeat",
+        "Assistant: same repeated result",
+        "Assistant: later exact anchor",
+    ]
+
+
+def test_partial_replay_anchor_handles_timestamp_drift_past_candidate(
+    provider_with_config,
+):
+    p = provider_with_config(auto_retain=False)
+
+    def assistant_event(content, timestamp):
+        return json.dumps(
+            [{"role": "assistant", "content": f"Assistant: {content}", "timestamp": timestamp}],
+            ensure_ascii=False,
+        )
+
+    existing = [
+        assistant_event("same repeated result", "2026-07-16T01:00:00"),
+        assistant_event("existing middle event", "2026-07-16T01:01:00"),
+        assistant_event("same repeated result", "2026-07-16T01:02:00"),
+        assistant_event("later exact anchor", "2026-07-16T01:03:00"),
+    ]
+    incoming = [
+        assistant_event("new event before second repeat", "2026-07-16T01:01:30"),
+        assistant_event("same repeated result", "2026-07-16T01:02:01"),
+        assistant_event("later exact anchor", "2026-07-16T01:03:00"),
+    ]
+
+    merged = p._merge_overlapping_replayed_turns(existing, incoming)
+
+    assert merged is not None
+    contents = [json.loads(turn)[0]["content"] for turn in merged]
+    assert contents == [
+        "Assistant: same repeated result",
+        "Assistant: existing middle event",
+        "Assistant: new event before second repeat",
+        "Assistant: same repeated result",
+        "Assistant: later exact anchor",
+    ]
+    assert contents.count("Assistant: same repeated result") == 2
+
+
+def test_partial_replay_does_not_anchor_repeat_after_following_exact_anchor(
+    provider_with_config,
+):
+    p = provider_with_config(auto_retain=False)
+
+    def assistant_event(content, timestamp):
+        return json.dumps(
+            [{"role": "assistant", "content": f"Assistant: {content}", "timestamp": timestamp}],
+            ensure_ascii=False,
+        )
+
+    existing = [
+        assistant_event("later exact anchor", "2026-07-16T01:03:00"),
+        assistant_event("same repeated result", "2026-07-16T01:04:00"),
+        assistant_event("tail", "2026-07-16T01:05:00"),
+    ]
+    incoming = [
+        assistant_event("same repeated result", "2026-07-16T01:02:00"),
+        assistant_event("later exact anchor", "2026-07-16T01:03:00"),
+        assistant_event("tail", "2026-07-16T01:05:00"),
+    ]
+
+    merged = p._merge_overlapping_replayed_turns(existing, incoming)
+
+    assert merged is not None
+    assert [json.loads(turn)[0]["content"] for turn in merged] == [
+        "Assistant: same repeated result",
+        "Assistant: later exact anchor",
+        "Assistant: same repeated result",
+        "Assistant: tail",
+    ]
+
+
 def test_lcm_durable_and_depth_summaries_are_dropped(provider_with_config):
     p = provider_with_config(auto_retain=False)
     p.sync_turn("[Durable Summary (d2, node 9)]\nlong durable dump", "should not keep")

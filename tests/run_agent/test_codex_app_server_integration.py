@@ -86,6 +86,42 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    @pytest.mark.parametrize(
+        ("interrupted", "error"),
+        [(True, None), (False, "codex failed")],
+    )
+    def test_partial_codex_turn_clears_pending_memory_steer_sidecar(
+        self,
+        monkeypatch,
+        interrupted,
+        error,
+    ):
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="partial",
+                projected_messages=[{"role": "assistant", "content": "partial"}],
+                interrupted=interrupted,
+                error=error,
+                turn_id="turn-interrupted-1",
+                thread_id="thread-interrupted-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        agent = _make_codex_agent()
+        agent._memory_oob_user_events = [
+            {
+                "message_object_id": 123,
+                "tool_call_id": "old-call",
+                "user_text": "old correction",
+            }
+        ]
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello")
+
+        assert result["partial"] is True
+        assert agent._memory_oob_user_events == []
+
     def test_request_only_recall_is_not_written_to_persistent_codex_thread(self, monkeypatch):
         sent_inputs = []
 
