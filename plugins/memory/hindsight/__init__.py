@@ -1882,7 +1882,12 @@ class HindsightMemoryProvider(MemoryProvider):
     def _retain_message_timestamp(value: Any = None, *, fallback_now: bool = True) -> str:
         def _local_seconds(dt: datetime) -> str:
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+                # Retained timestamps are serialized as naive local wall-clock
+                # strings. Treating one of those strings as UTC during replay
+                # shifts it by the host offset and can split a real user/assistant
+                # turn at the replay cutoff. Re-attach the local zone so this
+                # normalization stays idempotent.
+                dt = dt.astimezone()
             return dt.astimezone().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
 
         if value is None:

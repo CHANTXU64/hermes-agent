@@ -8,7 +8,9 @@ stores only: no LLM, OpenAI/Codex, Hindsight API, or external network calls.
 from __future__ import annotations
 
 import json
+import os
 import threading
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -1364,6 +1366,93 @@ def test_hindsight_transcript_replay_does_not_refresh_historical_missing_timesta
         assert repeated_content.count("Assistant: new answer after restart") == 1
     finally:
         provider3.shutdown()
+
+
+def test_hindsight_replay_preserves_user_with_numeric_and_naive_local_timestamps(
+    tmp_path,
+    monkeypatch,
+):
+    """A naive local ISO timestamp must stay in the same time domain as its paired epoch."""
+    original_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "UTC-8")
+    time.tzset()
+
+    session_id = "restart-replay-mixed-timestamp-representations"
+    previous_turn = [
+        {
+            "role": "user",
+            "content": "previous request",
+            "timestamp": datetime(2026, 7, 27, 1, 52, 0, tzinfo=timezone.utc).timestamp(),
+        },
+        {
+            "role": "assistant",
+            "content": "previous answer",
+            "timestamp": "2026-07-27T09:52:33",
+        },
+    ]
+    later_turn = [
+        {
+            "role": "user",
+            "content": "好",
+            "timestamp": datetime(2026, 7, 27, 1, 57, 16, tzinfo=timezone.utc).timestamp(),
+        },
+        {
+            "role": "assistant",
+            "content": "好。当前结论固定为：",
+            "timestamp": "2026-07-27T09:57:32",
+        },
+    ]
+
+    try:
+        provider1, _client1 = _initialized_hindsight_provider(
+            tmp_path,
+            monkeypatch,
+            session_id=session_id,
+        )
+        provider1.sync_turn(
+            user_content="previous request",
+            assistant_content="previous answer",
+            session_id=session_id,
+            messages=previous_turn,
+        )
+        provider1.shutdown()
+
+        provider2, client2 = _initialized_hindsight_provider(
+            tmp_path,
+            monkeypatch,
+            session_id=session_id,
+        )
+        try:
+            provider2.sync_turn(
+                user_content="好",
+                assistant_content="好。当前结论固定为：",
+                session_id=session_id,
+                messages=later_turn,
+            )
+            info = provider2.retain_persisted_session_lineage(session_id=session_id)
+            provider2._retain_queue.join()
+
+            assert info["turn_count"] == 2
+            content = client2.aretain_batch.call_args.kwargs["items"][0]["content"]
+            turns = json.loads(content)
+            assert [[message["role"] for message in turn] for turn in turns] == [
+                ["user", "assistant"],
+                ["user", "assistant"],
+            ]
+            assert turns[1][0] == {
+                "role": "user",
+                "content": "User: 好",
+                "timestamp": "2026-07-27T09:57:16",
+            }
+            assert turns[1][1]["timestamp"] == "2026-07-27T09:57:32"
+        finally:
+            provider2.shutdown()
+    finally:
+        if original_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", original_tz)
+        time.tzset()
 
 
 def test_hindsight_transcript_replay_keeps_new_tail_when_media_and_assistant_grouping_both_change(
