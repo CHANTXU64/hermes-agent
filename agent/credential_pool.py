@@ -725,11 +725,17 @@ class CredentialPool:
                 self._entries[idx] = new
                 return
 
-    def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+    def _persist(
+        self,
+        *,
+        removed_ids: Optional[List[str]] = None,
+        status_clear_preconditions: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
         write_credential_pool(
             self.provider,
             [entry.to_dict() for entry in self._entries],
             removed_ids=removed_ids,
+            status_clear_preconditions=status_clear_preconditions,
         )
 
     def _is_terminal_auth_failure(
@@ -1677,6 +1683,7 @@ class CredentialPool:
         """
         now = time.time()
         cleared_any = False
+        status_clear_preconditions: Dict[str, Dict[str, Any]] = {}
         entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
         for entry in self._entries:
@@ -1759,6 +1766,10 @@ class CredentialPool:
                 # the re-auth case for OAuth singletons.
                 continue
             if entry.last_status == STATUS_EXHAUSTED:
+                status_clear_precondition = {
+                    "last_status": entry.last_status,
+                    "last_status_at": entry.last_status_at,
+                }
                 if _is_openai_codex_usage_limit_exhaustion(entry):
                     last_probe_at = _parse_absolute_timestamp(entry.codex_probe_at) or 0.0
                     if entry.codex_probe_at is not None and now - last_probe_at >= OPENAI_CODEX_EXHAUSTED_PROBE_INTERVAL_SECONDS:
@@ -1776,6 +1787,9 @@ class CredentialPool:
                             self._replace_entry(entry, cleared)
                             entry = cleared
                             cleared_any = True
+                            status_clear_preconditions.setdefault(
+                                entry.id, status_clear_precondition
+                            )
                         else:
                             probed = replace(entry, codex_probe_at=now)
                             self._replace_entry(entry, probed)
@@ -1808,6 +1822,9 @@ class CredentialPool:
                     self._replace_entry(entry, cleared)
                     entry = cleared
                     cleared_any = True
+                    status_clear_preconditions.setdefault(
+                        entry.id, status_clear_precondition
+                    )
             if refresh and self._entry_needs_refresh(entry):
                 refreshed = self._refresh_entry(entry, force=False)
                 if refreshed is None:
@@ -1818,7 +1835,10 @@ class CredentialPool:
             pruned_ids = set(entries_to_prune)
             self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
-            self._persist(removed_ids=entries_to_prune)
+            self._persist(
+                removed_ids=entries_to_prune,
+                status_clear_preconditions=status_clear_preconditions,
+            )
         return available
 
     def _log_no_available_entries(self) -> None:

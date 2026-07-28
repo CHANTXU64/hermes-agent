@@ -3,13 +3,18 @@
 from tests.test_hermes_state import db as db  # re-export pytest fixture
 
 
-def test_get_messages_as_conversation_can_omit_timestamps(db, monkeypatch):
+def test_get_messages_as_conversation_can_omit_timestamps(db):
     db.create_session(session_id="s_timestamp_opt", source="cli")
-    times = iter([1710000000.0, 1710000001.0])
-    monkeypatch.setattr("hermes_state.time.time", lambda: next(times))
 
-    db.append_message("s_timestamp_opt", role="user", content="hello")
-    db.append_message("s_timestamp_opt", role="assistant", content="world")
+    db.append_message(
+        "s_timestamp_opt", role="user", content="hello", timestamp=1710000000.0
+    )
+    db.append_message(
+        "s_timestamp_opt",
+        role="assistant",
+        content="world",
+        timestamp=1710000001.0,
+    )
 
     default_messages = db.get_messages_as_conversation("s_timestamp_opt")
     assert default_messages == [

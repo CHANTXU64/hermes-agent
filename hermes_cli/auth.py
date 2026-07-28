@@ -1472,6 +1472,7 @@ def _merge_disk_cooldown_state(
     entry: Dict[str, Any],
     disk_entry: Optional[Dict[str, Any]],
     provider_id: str,
+    status_clear_precondition: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Keep a newer on-disk cooldown/quarantine over a stale in-memory one.
 
@@ -1508,6 +1509,24 @@ def _merge_disk_cooldown_state(
         if mem_access and disk_access and mem_access != disk_access:
             return entry
         disk_ts = _parse_absolute_timestamp(disk_entry.get("last_status_at")) or 0.0
+        if (
+            isinstance(status_clear_precondition, dict)
+            and entry.get("last_status") not in (STATUS_DEAD, STATUS_EXHAUSTED)
+            and disk_status == status_clear_precondition.get("last_status")
+        ):
+            observed_ts = (
+                _parse_absolute_timestamp(
+                    status_clear_precondition.get("last_status_at")
+                )
+                or 0.0
+            )
+            if disk_ts == observed_ts:
+                # The caller proved this exact cooldown stale (for example a
+                # live Codex quota probe succeeded).  Let that intentional
+                # clear win, but only while the disk row is still the same
+                # status generation.  A concurrent newer 429 has a different
+                # last_status_at and continues through the normal merge below.
+                return entry
         mem_ts = _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0
         if disk_ts <= mem_ts:
             return entry
@@ -1530,6 +1549,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    status_clear_preconditions: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1547,7 +1567,12 @@ def write_credential_pool(
     snapshot cannot erase a cooldown/quarantine another process just wrote.
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
-    merge does not resurrect them from the on-disk copy.
+    merge does not resurrect them from the on-disk copy. Pass
+    ``status_clear_preconditions`` when a caller intentionally cleared a
+    cooldown after observing it: each entry id maps to the observed
+    ``last_status`` and ``last_status_at``. The clear wins only if the on-disk
+    row still represents that exact status generation, preserving any newer
+    concurrent cooldown.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
@@ -1575,7 +1600,12 @@ def write_credential_pool(
         }
         merged: List[Dict[str, Any]] = [
             _merge_disk_cooldown_state(
-                entry, existing_by_id.get(entry.get("id")), provider_id
+                entry,
+                existing_by_id.get(entry.get("id")),
+                provider_id,
+                (status_clear_preconditions or {}).get(
+                    str(entry.get("id") or "")
+                ),
             )
             if isinstance(entry, dict)
             else entry

@@ -138,6 +138,130 @@ def test_openai_codex_exhausted_entry_probe_can_clear_before_provider_reset(tmp_
     assert persisted["last_error_reset_at"] is None
 
 
+def test_upstream_codex_quota_probe_clear_is_persisted(tmp_path, monkeypatch):
+    """The upstream early-reset probe must clear the observed cooldown on disk."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    now = time.time()
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "weekly-reset",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                        "last_status": "exhausted",
+                        "last_status_at": now - 7200,
+                        "last_error_code": 429,
+                        "last_error_reason": "usage_limit_reached",
+                        "last_error_message": "The usage limit has been reached",
+                        "last_error_reset_at": now + 7 * 24 * 60 * 60,
+                        # Keep the fork probe inside its own interval so this
+                        # regression exercises the upstream probe path only.
+                        "codex_probe_at": now,
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool.CredentialPool._codex_quota_restored_upstream",
+        lambda self, entry: True,
+    )
+
+    from agent.credential_pool import load_pool
+
+    entry = load_pool("openai-codex").select()
+
+    assert entry is not None
+    assert entry.last_status == "ok"
+    persisted = json.loads(
+        (tmp_path / "hermes" / "auth.json").read_text()
+    )["credential_pool"]["openai-codex"][0]
+    assert persisted["last_status"] == "ok"
+    assert persisted["last_error_code"] is None
+    assert persisted["last_error_reset_at"] is None
+
+
+def test_codex_probe_clear_does_not_erase_newer_concurrent_cooldown(
+    tmp_path, monkeypatch
+):
+    """A probe may clear only the exact cooldown it observed before probing."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: None,
+    )
+    auth_path = tmp_path / "hermes" / "auth.json"
+    now = time.time()
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "weekly-reset",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                        "last_status": "exhausted",
+                        "last_status_at": now - 7200,
+                        "last_error_code": 429,
+                        "last_error_reason": "usage_limit_reached",
+                        "last_error_message": "The old usage limit",
+                        "last_error_reset_at": now + 7 * 24 * 60 * 60,
+                        "codex_probe_at": now - 1900,
+                    }
+                ]
+            },
+        },
+    )
+
+    def _probe_then_concurrent_429(entry):
+        payload = json.loads(auth_path.read_text())
+        disk_entry = payload["credential_pool"]["openai-codex"][0]
+        disk_entry.update(
+            last_status="exhausted",
+            last_status_at=now + 1,
+            last_error_code=429,
+            last_error_reason="newer_concurrent_rate_limit",
+            last_error_message="A newer process observed another 429",
+            last_error_reset_at=now + 14 * 24 * 60 * 60,
+        )
+        auth_path.write_text(json.dumps(payload))
+        return True
+
+    monkeypatch.setattr(
+        "agent.credential_pool._probe_openai_codex_entry_available",
+        _probe_then_concurrent_429,
+    )
+
+    from agent.credential_pool import load_pool
+
+    load_pool("openai-codex").select()
+
+    persisted = json.loads(auth_path.read_text())["credential_pool"][
+        "openai-codex"
+    ][0]
+    assert persisted["last_status"] == "exhausted"
+    assert persisted["last_error_reason"] == "newer_concurrent_rate_limit"
+    assert persisted["last_error_reset_at"] == now + 14 * 24 * 60 * 60
+
+
 def test_openai_codex_probe_does_not_clear_when_any_usage_window_is_full(monkeypatch):
     from agent.credential_pool import PooledCredential, _probe_openai_codex_entry_available
 

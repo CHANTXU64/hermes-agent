@@ -1270,6 +1270,68 @@ runtime regression tests and this merge note.
 Upstream status: fork-only.
 
 
+### 20. Credential cooldown intentional-clear persistence
+
+Status: active fork maintenance
+
+Date: 2026-07-28
+
+Files:
+
+- `agent/credential_pool.py`
+- `hermes_cli/auth.py`
+- `tests/fork/test_codex_credential_pool.py`
+- `tests/fork/test_hermes_state_transcript.py` (upstream merge compatibility)
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- A live Codex quota probe that proves an observed 429 cooldown stale now
+  clears that exact status generation in `auth.json`, while a newer cooldown
+  written concurrently by another process remains protected.
+
+What changed:
+
+- `CredentialPool._available_entries()` records the `last_status` and
+  `last_status_at` of every cooldown it intentionally clears and forwards
+  those preconditions through `_persist()`.
+- `write_credential_pool()` accepts the preconditions at its existing locked
+  read/merge/write boundary. It bypasses stale-snapshot cooldown adoption only
+  when the disk row still matches the exact observed status generation.
+- A disk row with a different status or timestamp continues through upstream's
+  normal `_merge_disk_cooldown_state()` path, so a concurrent newer 429/DEAD
+  quarantine cannot be erased by the probe result.
+- Both the fork's throttled Codex usage probe and upstream's quota-restored
+  probe use the same persistence contract.
+- The fork transcript timestamp regression now supplies explicit message
+  timestamps. Upstream compression-lock enforcement legitimately samples the
+  same module clock inside each append, so globally replacing `time.time()`
+  with a two-value iterator no longer represented the behavior under test.
+
+Merge protection:
+
+- Do not replace the generation-matched clear with an unconditional
+  `cleared_ids` bypass; that would reintroduce the cross-process lost-update
+  bug upstream's cooldown merge prevents.
+- Preserve until upstream's credential-pool writer distinguishes an
+  intentional, evidence-backed status clear from a stale healthy snapshot.
+
+Verification:
+
+- RED before production edits: the existing fork probe and a new upstream
+  probe regression both left `auth.json` at `last_status=exhausted`; the
+  concurrent-newer-cooldown control already passed.
+- Focused post-fix credential/state and upstream cooldown-merge regressions:
+  `11 passed`.
+- Complete fork gate: `534 passed` with `8` third-party deprecation warnings.
+- Credential-pool/auth adjacent regressions: `195 passed`.
+- Ruff, `py_compile`, and `git diff --check` passed.
+
+Upstream status: the conflicting quota-clear and stale-snapshot protection
+paths are both still present in the current upstream baseline; this fork adds
+the missing concurrency-safe bridge between them.
+
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -1330,6 +1392,11 @@ deltas are expected in these areas:
   - `tests/run_agent/test_run_agent_codex_responses.py`
   - `tests/run_agent/test_codex_app_server_integration.py`
   - `tests/fork/test_codex_request_only_memory_context.py`
+- Credential cooldown intentional-clear persistence:
+  - `agent/credential_pool.py`
+  - `hermes_cli/auth.py`
+  - `tests/fork/test_codex_credential_pool.py`
+  - `tests/fork/test_hermes_state_transcript.py`
 - Clarify attachment reply context:
   - `gateway/run.py`
   - `tools/clarify_gateway.py`
@@ -1374,9 +1441,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 19 major entries.
+Documented entries: 20 major entries.
 
-Active / current entries: 17.
+Active / current entries: 18.
 
 Historical reverted / abandoned areas: 2.
 
