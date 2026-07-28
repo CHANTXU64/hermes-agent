@@ -1202,6 +1202,74 @@ focused runtime test plus this merge note.
 Upstream status: fork-only.
 
 
+### 19. Clarify attachment replies preserve media paths
+
+Status: active
+
+Date: 2026-07-28
+
+Files:
+
+- `gateway/run.py`
+- `tools/clarify_gateway.py`
+- `tools/clarify_tool.py`
+- `tests/gateway/test_clarify_active_session_bypass.py`
+- `tests/tools/test_clarify_gateway.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- A pending Gateway Clarify preserves attachment paths as separate response
+  context without corrupting the user's canonical text or selected choices.
+
+What changed:
+
+- The Gateway passes the raw typed reply and media context separately to the
+  resolver. Numeric, label, and multi-select replies are normalized before the
+  context is attached, so `user_response` keeps its original string/list shape.
+- `ClarifyResponsePayload` carries the canonical response and optional context
+  through the blocking callback. `clarify_tool` exposes that context as a
+  separate `response_context` field only when an attachment was present.
+- Clarify media placeholders translate host cache paths with
+  `to_agent_visible_cache_path()`, so Docker-backed agents receive mounted
+  `/root/.hermes/cache/...` paths rather than unreadable host paths.
+- Open-ended Clarifies accept text-plus-media and media-only replies. Typed
+  choice replies can carry media without changing the selected option. A
+  choice prompt with media but no actual selection remains unresolved.
+- Text-only replies, native button callbacks, slash-command bypass, timeout,
+  and existing queue/vision placeholders remain unchanged.
+
+Why it matters:
+
+- Without the media context, an agent asked to “use this attachment” may search
+  the filesystem and pick a stale file. If media is concatenated before choice
+  parsing, numeric and multi-select answers stop resolving; if host paths are
+  exposed to a Docker agent, the correct file is still unreadable.
+
+Merge protection:
+
+- Preserve until upstream's pending-Clarify interception carries agent-visible
+  attachment paths in a field separate from canonical choice/text responses.
+- Do not move this after normal media processing: the active agent is blocked
+  waiting for the Clarify answer, so the early interception must retain the
+  media context itself.
+- Preserve the string-only callback path when no attachment is present, so
+  native platform button adapters remain backward compatible.
+
+Verification:
+
+```bash
+.venv/bin/python -m pytest tests/gateway/test_clarify_active_session_bypass.py tests/tools/test_clarify_gateway.py tests/tools/test_clarify_tool.py -q -o 'addopts='
+.venv/bin/python -m py_compile gateway/run.py tools/clarify_gateway.py tools/clarify_tool.py tests/gateway/test_clarify_active_session_bypass.py tests/tools/test_clarify_gateway.py
+git diff --check
+```
+
+Feature docs: none — this is a narrow Gateway interception contract covered by
+runtime regression tests and this merge note.
+
+Upstream status: fork-only.
+
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -1262,6 +1330,12 @@ deltas are expected in these areas:
   - `tests/run_agent/test_run_agent_codex_responses.py`
   - `tests/run_agent/test_codex_app_server_integration.py`
   - `tests/fork/test_codex_request_only_memory_context.py`
+- Clarify attachment reply context:
+  - `gateway/run.py`
+  - `tools/clarify_gateway.py`
+  - `tools/clarify_tool.py`
+  - `tests/gateway/test_clarify_active_session_bypass.py`
+  - `tests/tools/test_clarify_gateway.py`
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
 - Multi Telegram bots (account_id session slots):
@@ -1300,9 +1374,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 17 major entries.
+Documented entries: 19 major entries.
 
-Active functional areas: 14.
+Active / current entries: 17.
 
 Historical reverted / abandoned areas: 2.
 

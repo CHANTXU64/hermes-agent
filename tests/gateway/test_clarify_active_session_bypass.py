@@ -32,10 +32,11 @@ class _ClarifyBypassAdapter(BasePlatformAdapter):
         return {"id": chat_id, "type": "private"}
 
 
-def _event(text="custom answer"):
+def _event(text="custom answer", **kwargs):
+    message_type = kwargs.pop("message_type", MessageType.TEXT)
     return MessageEvent(
         text=text,
-        message_type=MessageType.TEXT,
+        message_type=message_type,
         source=SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="12345",
@@ -43,6 +44,7 @@ def _event(text="custom answer"):
             user_id="user1",
         ),
         message_id="msg1",
+        **kwargs,
     )
 
 
@@ -119,3 +121,105 @@ async def test_gateway_clarify_reply_resumes_typing_before_returning_empty_ack()
 
     assert result == ""
     assert "12345" not in adapter._typing_paused
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply_text", ["请用这个附件继续处理", ""])
+async def test_gateway_clarify_reply_preserves_document_path(reply_text):
+    """A document sent as the clarify answer must reach the blocked agent."""
+    _clear_clarify_state()
+    from gateway.run import GatewayRunner
+    from tools import clarify_gateway as cm
+    from tools.clarify_tool import ClarifyResponsePayload
+
+    document_path = "/Users/robot/.hermes/cache/documents/doc_123_情况说明.docx"
+    agent_path = "/root/.hermes/cache/documents/doc_123_情况说明.docx"
+    event = _event(
+        reply_text,
+        message_type=MessageType.DOCUMENT,
+        media_urls=[document_path],
+        media_types=[
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ],
+    )
+    adapter = _ClarifyBypassAdapter()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized = lambda source: True
+    runner._session_key_for_source = lambda source: "clarify-document-session"
+    runner._adapter_for_source = lambda source: adapter
+    runner._update_prompt_pending = {}
+
+    cm.register(
+        "clarify-document",
+        "clarify-document-session",
+        "请发送需要处理的文件",
+        None,
+    )
+
+    with (
+        patch(
+            "tools.credential_files.to_agent_visible_cache_path",
+            return_value=agent_path,
+        ) as to_agent_path,
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = await runner._handle_message(event)
+
+    answer = cm.wait_for_response("clarify-document", timeout=0.1)
+    assert result == ""
+    assert isinstance(answer, ClarifyResponsePayload)
+    assert answer.user_response == reply_text
+    assert agent_path in answer.response_context
+    to_agent_path.assert_called_once_with(document_path)
+
+
+@pytest.mark.asyncio
+async def test_gateway_clarify_choice_with_document_keeps_canonical_choice():
+    """Attachment context must not change typed choice normalization."""
+    _clear_clarify_state()
+    from gateway.run import GatewayRunner
+    from tools import clarify_gateway as cm
+    from tools.clarify_tool import ClarifyResponsePayload
+
+    document_path = "/Users/robot/.hermes/cache/documents/doc_456_scope.pdf"
+    agent_path = "/root/.hermes/cache/documents/doc_456_scope.pdf"
+    event = _event(
+        "2",
+        message_type=MessageType.DOCUMENT,
+        media_urls=[document_path],
+        media_types=["application/pdf"],
+    )
+    adapter = _ClarifyBypassAdapter()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized = lambda source: True
+    runner._session_key_for_source = lambda source: "clarify-choice-session"
+    runner._adapter_for_source = lambda source: adapter
+    runner._update_prompt_pending = {}
+
+    cm.register(
+        "clarify-choice",
+        "clarify-choice-session",
+        "请选择处理方式",
+        ["只查看", "继续处理"],
+    )
+
+    with (
+        patch(
+            "tools.credential_files.to_agent_visible_cache_path",
+            return_value=agent_path,
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = await runner._handle_message(event)
+
+    answer = cm.wait_for_response("clarify-choice", timeout=0.1)
+    assert result == ""
+    assert isinstance(answer, ClarifyResponsePayload)
+    assert answer.user_response == "继续处理"
+    assert agent_path in answer.response_context

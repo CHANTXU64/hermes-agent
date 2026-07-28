@@ -78,6 +78,7 @@ def _make_runtime_runner():
     runner.stop = AsyncMock()
     runner._update_platform_runtime_status = MagicMock()
     runner._sync_voice_mode_state_to_adapter = MagicMock()
+    runner._ensure_reconnect_watcher_running = MagicMock()
     runner._handle_message = AsyncMock()
     runner._is_user_authorized = MagicMock(return_value=True)
     return runner
@@ -386,6 +387,29 @@ async def test_named_account_fatal_does_not_remove_primary_and_queues_own_config
     assert runner._failed_telegram_accounts["work"]["config"].token == "222:BBB"
     adapter.disconnect.assert_awaited_once()
     runner.stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_named_account_fatal_without_primary_queues_without_stopping_gateway():
+    """A named retry queue is not a stranded primary Telegram platform."""
+    runner = _make_runtime_runner()
+    adapter = StubTelegramAdapter(token="222:BBB", account_id="work")
+    adapter.disconnect = AsyncMock()
+    adapter._set_fatal_error("network_error", "DNS failure", retryable=True)
+    runner._telegram_account_adapters = {"work": adapter}
+    runner._safe_adapter_disconnect = AsyncMock()
+
+    await runner._handle_adapter_fatal_error(adapter)
+
+    assert "work" not in runner._telegram_account_adapters
+    assert runner._failed_telegram_accounts["work"]["config"] is adapter.config
+    runner._safe_adapter_disconnect.assert_awaited_once_with(
+        adapter, Platform.TELEGRAM
+    )
+    runner._ensure_reconnect_watcher_running.assert_called_once_with()
+    runner.stop.assert_not_awaited()
+    assert runner._exit_with_failure is False
+    assert runner._exit_reason is None
 
 
 @pytest.mark.asyncio

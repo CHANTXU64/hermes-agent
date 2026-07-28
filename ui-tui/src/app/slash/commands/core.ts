@@ -278,19 +278,19 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
-    help: 'toggle compact transcript',
-    name: 'compact',
+    help: 'toggle compact display',
+    name: 'density',
     run: (arg, ctx) => {
       const next = flagFromArg(arg, ctx.ui.compact)
 
       if (next === null) {
-        return ctx.transcript.sys('usage: /compact [on|off|toggle]')
+        return ctx.transcript.sys('usage: /density [on|off|toggle]')
       }
 
       patchUiState({ compact: next })
-      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'compact', value: next ? 'on' : 'off' }).catch(() => {})
+      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'density', value: next ? 'on' : 'off' }).catch(() => {})
 
-      queueMicrotask(() => ctx.transcript.sys(`compact ${next ? 'on' : 'off'}`))
+      queueMicrotask(() => ctx.transcript.sys(`density ${next ? 'on' : 'off'}`))
     }
   },
 
@@ -551,6 +551,40 @@ export const coreCommands: SlashCommand[] = [
           })
         )
         .catch(ctx.guardedErr)
+    }
+  },
+
+  {
+    help: 'toggle focus view — show only your prompt and the final response [on|off|status]',
+    name: 'focus',
+    run: (arg, ctx) => {
+      const mode = arg.trim().toLowerCase()
+      const current = ctx.ui.focusView
+
+      // `/focus status` reports without writing, matching the CLI surface.
+      if (mode === 'status' || mode === 'show' || mode === '?') {
+        return ctx.transcript.sys(
+          current ? 'focus view on — only your prompt and the final response' : 'focus view off'
+        )
+      }
+
+      const next = flagFromArg(mode, current)
+
+      if (next === null) {
+        return ctx.transcript.sys('usage: /focus [on|off|status]')
+      }
+
+      // Display-only: Python owns the tool_progress stash/restore so /focus off
+      // returns to whatever /verbose mode the user had. Optimistically patch the
+      // badge so the status bar flips on the same frame.
+      patchUiState({ focusView: next })
+      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'focus', value: next ? 'on' : 'off' }).catch(() => {})
+
+      queueMicrotask(() =>
+        ctx.transcript.sys(
+          next ? 'focus view enabled — just your prompt and the final response' : 'focus view disabled'
+        )
+      )
     }
   },
 
