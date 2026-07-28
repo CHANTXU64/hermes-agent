@@ -133,6 +133,49 @@ class TestSweep:
         _orphan("ob-1")
         assert dl.sweep_recoverable() == []
 
+    def test_session_reset_supersedes_only_that_sessions_recoverable_rows(self):
+        session_key = "agent:main:telegram:dm:123"
+        _record(
+            oid="old-reply",
+            session_key=session_key,
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+        )
+        dl.mark_failed("old-reply", "network down")
+        _record(
+            oid="other-reply",
+            session_key="agent:main:telegram:dm:456",
+            platform="telegram",
+            chat_id="456",
+            thread_id=None,
+        )
+        dl.mark_failed("other-reply", "network down")
+        _orphan("old-reply")
+        _orphan("other-reply")
+
+        assert dl.supersede_session_obligations(session_key) == 1
+        assert _row("old-reply")["state"] == "superseded"
+
+        claimed = dl.sweep_recoverable(deliverable_platforms={"telegram"})
+        assert [row["obligation_id"] for row in claimed] == ["other-reply"]
+
+    @pytest.mark.parametrize("late_state", ["attempting", "failed", "delivered"])
+    def test_superseded_is_terminal_against_late_send_updates(self, late_state):
+        _record()
+        assert dl.supersede_session_obligations(
+            "agent:main:slack:channel:C1"
+        ) == 1
+
+        if late_state == "attempting":
+            dl.mark_attempting("ob-1")
+        elif late_state == "failed":
+            dl.mark_failed("ob-1", "late network failure")
+        else:
+            dl.mark_delivered("ob-1")
+
+        assert _row("ob-1")["state"] == "superseded"
+
     def test_attempts_cap_abandons(self):
         _record()
         _orphan("ob-1")

@@ -2,7 +2,7 @@
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -114,6 +114,21 @@ async def test_new_command_rotates_only_after_retain_acknowledgement():
     assert calls[:2] == ["retain", "reset"]
     assert "Hindsight 已确认接收" in result
     assert "2 turns" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/new", "/reset"])
+async def test_new_command_supersedes_old_delivery_obligations(command):
+    runner = _make_runner()
+    session_key = build_session_key(_make_source())
+
+    with patch(
+        "gateway.delivery_ledger.supersede_session_obligations",
+        return_value=1,
+    ) as supersede:
+        await runner._handle_reset_command(_make_event(command))
+
+    supersede.assert_called_once_with(session_key)
 
 
 @pytest.mark.asyncio

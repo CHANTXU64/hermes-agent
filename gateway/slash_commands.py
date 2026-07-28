@@ -297,6 +297,30 @@ class GatewaySlashCommandsMixin:
             new_entry = await self.async_session_store.get_or_create_session(source, force_new=True)
             header = await asyncio.to_thread(self._telegram_topic_new_header, source) or t("gateway.reset.header_new")
 
+        # The durable delivery ledger is keyed by the platform route, which
+        # intentionally survives /new. Retire any old-session replies only
+        # after the replacement session exists; otherwise a later gateway
+        # restart can redeliver them into this fresh conversation.
+        try:
+            from gateway.delivery_ledger import supersede_session_obligations
+
+            superseded = await asyncio.to_thread(
+                supersede_session_obligations,
+                session_key,
+            )
+            if superseded:
+                logger.info(
+                    "Superseded %d undelivered response(s) at session reset for %s",
+                    superseded,
+                    session_key,
+                )
+        except Exception:
+            logger.debug(
+                "delivery ledger session-reset boundary update failed for %s",
+                session_key,
+                exc_info=True,
+            )
+
         # Set session title if provided with /new <title>
         _title_arg = event.get_command_args().strip()
         _title_note = ""

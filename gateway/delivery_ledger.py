@@ -29,6 +29,8 @@ ambiguous sends):
 - ``failed``      — definitively rejected once; the restart is a natural
   retry boundary. Also carries the marker.
 - ``delivered``   — nothing to do; retention prunes.
+- ``superseded``  — an explicit /new or /reset ended the originating
+  conversation before recovery; never redeliver into the replacement session.
 
 Poison rows cannot spin: attempts are capped, stale rows expire, and both
 transition to ``abandoned`` (kept briefly for inspection, then pruned).
@@ -223,12 +225,33 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def supersede_session_obligations(session_key: str) -> int:
+    """Retire undelivered replies when their conversation is explicitly reset.
+
+    ``session_key`` is the durable platform route and survives ``/new``. Without
+    this boundary transition, a later gateway restart can recover an old
+    response into the replacement Hermes session. Delivered rows and other
+    routes are untouched. Returns the number of rows transitioned.
+    """
+    if not session_key:
+        return 0
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='superseded', updated_at=?, last_error='session_reset'
+               WHERE session_key=?
+                 AND state IN ('pending', 'attempting', 'failed')""",
+            (time.time(), session_key),
+        )
+        return int(cursor.rowcount)
+
+
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?
-               WHERE obligation_id=?""",
+               WHERE obligation_id=? AND state!='superseded'""",
             (state, time.time(), error[:500] if error else None, obligation_id),
         )
 
@@ -313,7 +336,8 @@ def _prune(now: Optional[float] = None) -> None:
         with _transaction() as conn:
             conn.execute(
                 """DELETE FROM delivery_obligations
-                   WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""",
+                   WHERE state IN ('delivered', 'abandoned', 'superseded')
+                     AND updated_at < ?""",
                 (cutoff,),
             )
             total = conn.execute(

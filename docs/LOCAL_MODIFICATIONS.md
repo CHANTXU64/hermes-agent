@@ -1357,6 +1357,58 @@ paths are both still present in the current upstream baseline; this fork adds
 the missing concurrency-safe bridge between them.
 
 
+### 21. Delivery-ledger session-reset boundary
+
+Status: active fork maintenance
+
+Date: 2026-07-29
+
+Files:
+
+- `gateway/delivery_ledger.py`
+- `gateway/slash_commands.py`
+- `tests/gateway/test_delivery_ledger.py`
+- `tests/gateway/test_session_model_reset.py`
+- `website/docs/user-guide/messaging/index.md`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- A successful explicit `/new` or `/reset` now transitions undelivered final
+  responses for the replaced conversation route to terminal `superseded`
+  state. Gateway startup recovery cannot inject those old answers into the
+  fresh Hermes session.
+- Normal same-session crash/restart redelivery remains unchanged. The boundary
+  update is route-scoped, leaves other chats untouched, and is terminal against
+  late send acknowledgements or failures from the old turn.
+
+Why it matters:
+
+- Upstream's delivery ledger persists `session_key`, which identifies a stable
+  platform route, but not the Hermes session generation behind that route.
+  `/new` intentionally reuses the route, so a failed old response could be
+  recovered after restart even though the user had explicitly started fresh.
+
+Merge protection:
+
+- Preserve the explicit session-boundary transition until upstream associates
+  delivery obligations with the originating Hermes session or provides an
+  equivalent terminal supersession mechanism.
+- Do not disable ordinary startup redelivery or remove the recovered-reply
+  ambiguity marker as a substitute for this boundary check.
+
+Verification:
+
+- Regression tests cover route-scoped supersession, both `/new` and `/reset`,
+  startup-sweep exclusion, and late-state-update terminality.
+
+Feature docs: none — this is a narrow lifecycle invariant covered by the
+delivery documentation, regression tests, and this merge note.
+
+Upstream status: the durable delivery ledger is upstream; the explicit
+session-reset boundary is fork-only.
+
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -1422,6 +1474,12 @@ deltas are expected in these areas:
   - `hermes_cli/auth.py`
   - `tests/fork/test_codex_credential_pool.py`
   - `tests/fork/test_hermes_state_transcript.py`
+- Delivery-ledger session-reset boundary:
+  - `gateway/delivery_ledger.py`
+  - `gateway/slash_commands.py`
+  - `tests/gateway/test_delivery_ledger.py`
+  - `tests/gateway/test_session_model_reset.py`
+  - `website/docs/user-guide/messaging/index.md`
 - Clarify attachment reply context:
   - `gateway/run.py`
   - `tools/clarify_gateway.py`
@@ -1466,9 +1524,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 20 major entries.
+Documented entries: 21 major entries.
 
-Active / current entries: 18.
+Active / current entries: 19.
 
 Historical reverted / abandoned areas: 2.
 

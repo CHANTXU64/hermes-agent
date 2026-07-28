@@ -228,6 +228,9 @@ Semantics are honest at-least-once:
   may not have received it) is redelivered with a visible
   "♻️ Recovered reply — … may be a duplicate" prefix. Ambiguity is labeled,
   never silently resent.
+- An explicit `/new` or `/reset` supersedes undelivered responses from the
+  conversation being replaced, so a later gateway restart cannot redeliver an
+  old answer into the fresh session.
 - Redelivery is bounded: 3 attempts, 24-hour freshness, then the row is
   abandoned. Delivered rows are pruned after 7 days.
 
