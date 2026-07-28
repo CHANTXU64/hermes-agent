@@ -2301,6 +2301,10 @@ async def test_gateway_retain_document_uses_sessionstore_sessiondb_lineage_and_c
         _agent_cache={session_key: (agent, object())},
         _agent_cache_lock=threading.Lock(),
     )
+    runner._retain_hindsight_session = GatewayRunner._retain_hindsight_session.__get__(
+        runner,
+        type(runner),
+    )
     runner._handle_retain_command = GatewayRunner._handle_retain_command.__get__(runner, type(runner))
     event = MessageEvent(text="/retain", message_type=MessageType.COMMAND, source=source)
 

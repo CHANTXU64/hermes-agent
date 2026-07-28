@@ -96,6 +96,18 @@ describe('submissionCore.submitPrompt — synchronous busy (queue-race fix)', ()
     expect(calls).not.toContain('input.detect_drop')
   })
 
+  it('queues without touching the old session while a new-session boundary is pending', () => {
+    const { gw, calls } = makeDeferredGateway()
+    const enqueue = vi.fn()
+    patchUiState({ sessionBoundaryPending: true, status: 'retaining previous session…' })
+
+    submitPrompt('send after reset', makeDeps(gw, { enqueue }))
+
+    expect(enqueue).toHaveBeenCalledWith('send after reset')
+    expect(calls).toEqual([])
+    expect(getUiState().status).toBe('retaining previous session…')
+  })
+
   it('after detect_drop resolves (no file), it issues prompt.submit', async () => {
     const { calls, gw, resolveDrop } = makeDeferredGateway()
 

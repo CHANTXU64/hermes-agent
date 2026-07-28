@@ -16,6 +16,7 @@ import type {
 } from '../../../gatewayTypes.js'
 import { writeClipboardText } from '../../../lib/clipboard.js'
 import { writeOsc52Clipboard } from '../../../lib/osc52.js'
+import { rpcErrorMessage } from '../../../lib/rpc.js'
 import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } from '../../../lib/terminalSetup.js'
 import type { Msg, PanelSection } from '../../../types.js'
 import type { StatusBarMode } from '../../interfaces.js'
@@ -179,20 +180,72 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
-    aliases: ['new'],
+    aliases: ['new', 'reset'],
     help: 'start a new session',
     name: 'clear',
     run: (arg, ctx, cmd) => {
+      if (ctx.ui.sessionBoundaryPending) {
+        ctx.transcript.sys('a session switch is already in progress')
+
+        return
+      }
+
       if (ctx.session.guardBusySessionSwitch('switch sessions')) {
         return
       }
 
-      const isNew = cmd.startsWith('/new')
+      const isNew = cmd.startsWith('/new') || cmd.startsWith('/reset')
       const requestedTitle = isNew ? arg.trim() : ''
 
-      const commit = () => {
+      const startFreshSession = () => {
         patchUiState({ status: 'forging session…' })
-        ctx.session.newSession(isNew ? 'new session started' : undefined, requestedTitle || undefined)
+
+        return ctx.session.newSession(isNew ? 'new session started' : undefined, requestedTitle || undefined)
+      }
+
+      const commit = () => {
+        if (!isNew || !ctx.sid) {
+          return startFreshSession()
+        }
+
+        patchUiState({ sessionBoundaryPending: true, status: 'retaining previous session…' })
+        ctx.gateway
+          .rpc<{ queued?: boolean; turn_count?: number }>('session.retain_before_new', {
+            session_id: ctx.sid
+          })
+          .then(async r => {
+            if (ctx.stale() || !r) {
+              return
+            }
+
+            if (r.queued) {
+              const count = Number(r.turn_count || 0)
+              const countNote = count ? ` (${count} turns)` : ''
+              ctx.transcript.sys(`Hindsight accepted the previous-session retain request${countNote}.`)
+            }
+
+            try {
+              await Promise.resolve(startFreshSession())
+            } catch (e) {
+              if (!ctx.stale()) {
+                ctx.transcript.sys(`Failed to start a new session after Retain: ${rpcErrorMessage(e)}`)
+              }
+            }
+          })
+          .catch(e => {
+            if (!ctx.stale()) {
+              ctx.transcript.sys(
+                `Hindsight Retain failed; current session preserved: ${rpcErrorMessage(e)}`
+              )
+            }
+          })
+          .finally(() => {
+            patchUiState(state => ({
+              ...state,
+              sessionBoundaryPending: false,
+              status: state.status === 'retaining previous session…' ? 'ready' : state.status
+            }))
+          })
       }
 
       if (NO_CONFIRM_DESTRUCTIVE) {

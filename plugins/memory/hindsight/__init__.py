@@ -46,7 +46,7 @@ import time
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
@@ -245,8 +245,11 @@ def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None,
     return str(version) if version else None
 
 
-def _check_api_supports_update_mode_append(api_url: str,
-                                           api_key: str | None = None) -> bool:
+def _check_api_supports_update_mode_append(
+    api_url: str,
+    api_key: str | None = None,
+    timeout: float | None = None,
+) -> bool:
     """Cached capability check for ``update_mode='append'`` on *api_url*.
 
     Probes once per URL per process. Returns False on any probe failure —
@@ -258,7 +261,12 @@ def _check_api_supports_update_mode_append(api_url: str,
     with _append_capability_lock:
         if api_url in _append_capability_cache:
             return _append_capability_cache[api_url]
-    version = _fetch_hindsight_api_version(api_url, api_key)
+    probe_timeout = 5.0 if timeout is None else max(0.001, min(5.0, timeout))
+    version = _fetch_hindsight_api_version(
+        api_url,
+        api_key,
+        timeout=probe_timeout,
+    )
     supported = _meets_minimum_version(version, _MIN_VERSION_FOR_UPDATE_MODE_APPEND)
     with _append_capability_lock:
         # Re-check after acquiring the lock in case a concurrent probe filled it.
@@ -450,6 +458,17 @@ def _load_config() -> dict:
             }
         },
     }
+
+
+def get_retain_on_new_settings() -> tuple[bool, float]:
+    """Return profile-scoped retain-before-reset settings without starting a provider."""
+    config = _load_config()
+    enabled = _parse_bool_setting(config.get("retain_on_new"), False)
+    timeout = max(
+        0.1,
+        _parse_float_setting(config.get("retain_on_new_timeout_seconds"), 30.0),
+    )
+    return enabled, timeout
 
 
 def _normalize_retain_tags(value: Any) -> List[str]:
@@ -757,6 +776,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_retain = True
         self._retain_every_n_turns = 1
         self._retain_async = True
+        self._retain_on_new = False
+        self._retain_on_new_timeout_seconds = 30.0
         self._retain_context = "conversation between Hermes Agent and the User"
         self._turn_counter = 0
         self._session_turns: list[str] = []  # accumulates ALL turns for the session
@@ -1098,6 +1119,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
+            {"key": "retain_on_new", "description": "Retain the current persisted session before explicit /new or /reset; abort reset on failure", "default": False},
+            {"key": "retain_on_new_timeout_seconds", "description": "Maximum seconds /new or /reset waits for pending memory work and the Hindsight retain request", "default": 30},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
@@ -1288,7 +1311,13 @@ class HindsightMemoryProvider(MemoryProvider):
             return session_id, "append"
         return fallback_document_id, None
 
-    def _resolve_full_retain_target_for_session(self, session_id: str, fallback_document_id: str) -> tuple[str, str | None]:
+    def _resolve_full_retain_target_for_session(
+        self,
+        session_id: str,
+        fallback_document_id: str,
+        *,
+        probe_timeout: float | None = None,
+    ) -> tuple[str, str | None]:
         """Pick (document_id, update_mode) for full manual session retains.
 
         Manual `/retain` submits the complete reconstructed session document, so
@@ -1298,7 +1327,11 @@ class HindsightMemoryProvider(MemoryProvider):
         """
         if not session_id:
             return fallback_document_id, None
-        if _check_api_supports_update_mode_append(self._probe_url(), self._api_key):
+        if _check_api_supports_update_mode_append(
+            self._probe_url(),
+            self._api_key,
+            timeout=probe_timeout,
+        ):
             return session_id, "replace"
         return session_id, None
 
@@ -1459,6 +1492,17 @@ class HindsightMemoryProvider(MemoryProvider):
         # Retain controls
         self._auto_retain = self._config.get("auto_retain", True)
         self._retain_every_n_turns = max(1, int(self._config.get("retain_every_n_turns", 1)))
+        self._retain_on_new = _parse_bool_setting(
+            self._config.get("retain_on_new"),
+            False,
+        )
+        self._retain_on_new_timeout_seconds = max(
+            0.1,
+            _parse_float_setting(
+                self._config.get("retain_on_new_timeout_seconds"),
+                30.0,
+            ),
+        )
         self._retain_context = self._config.get("retain_context", "conversation between Hermes Agent and the User")
 
         # Recall controls
@@ -3749,15 +3793,76 @@ class HindsightMemoryProvider(MemoryProvider):
             result["lineage_session_ids"] = lineage
         return result
 
+    @property
+    def retain_on_new_enabled(self) -> bool:
+        """Whether explicit /new and /reset must retain before rotating."""
+        return self._retain_on_new
+
+    @property
+    def retain_on_new_timeout_seconds(self) -> float:
+        """Maximum time a session reset may wait for retain acknowledgement."""
+        return self._retain_on_new_timeout_seconds
+
+    def retain_before_session_reset(
+        self,
+        *,
+        session_id: str,
+        parent_session_id: str = "",
+        flush_pending: Callable[..., bool] | None = None,
+    ) -> Dict[str, Any]:
+        """Synchronously retain the old session before an explicit reset."""
+        if not self._retain_on_new:
+            return {"enabled": False, "queued": False}
+        timeout = self._retain_on_new_timeout_seconds
+        started = time.monotonic()
+        if flush_pending is not None and not flush_pending(timeout=timeout):
+            raise TimeoutError(
+                f"Pending memory work did not finish within {timeout:g}s"
+            )
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Hindsight retain did not finish within {timeout:g}s"
+            )
+        return self.retain_persisted_session_lineage(
+            session_id=session_id,
+            parent_session_id=parent_session_id,
+            wait=True,
+            timeout=remaining,
+        )
+
     def retain_persisted_session_lineage(
         self,
         *,
         session_id: str = "",
         parent_session_id: str = "",
+        wait: bool = False,
+        timeout: float | None = None,
     ) -> Dict[str, Any]:
-        """Queue a manual retain from the provider-owned SQLite turn store."""
+        """Retain a session reconstructed from the provider-owned turn store.
+
+        Manual ``/retain`` keeps the historical non-blocking behavior. Session
+        rotation may pass ``wait=True`` so a failed retain can abort ``/new``
+        before the old session is discarded.
+        """
         if self._shutting_down.is_set():
             raise RuntimeError("Hindsight provider is shutting down")
+
+        deadline = None
+        if wait and timeout is not None:
+            deadline = time.monotonic() + timeout
+
+        def _remaining_timeout() -> float | None:
+            if deadline is None:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Hindsight retain did not finish within {timeout:g}s"
+                )
+            return remaining
+
+        _remaining_timeout()
 
         target_session_id = str(session_id or self._session_id or "").strip()
         parent_id = str(parent_session_id or self._parent_session_id or "").strip()
@@ -3765,13 +3870,19 @@ class HindsightMemoryProvider(MemoryProvider):
             target_session_id,
             parent_session_id=parent_id,
         )
+        _remaining_timeout()
         if not turns:
             return {"queued": False, "turn_count": 0, "message": "No persisted turns to retain."}
 
         fallback_document_id = self._document_id
         if target_session_id and target_session_id != self._session_id:
             fallback_document_id = f"{target_session_id}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-        document_id, update_mode = self._resolve_full_retain_target_for_session(retain_document_id or target_session_id, fallback_document_id)
+        document_id, update_mode = self._resolve_full_retain_target_for_session(
+            retain_document_id or target_session_id,
+            fallback_document_id,
+            probe_timeout=_remaining_timeout(),
+        )
+        _remaining_timeout()
         content = "[" + ",".join(turns) + "]"
         bank_id = self._bank_id
         retain_async_flag = self._retain_async
@@ -3798,9 +3909,32 @@ class HindsightMemoryProvider(MemoryProvider):
             )
             logger.debug("Hindsight persisted retain succeeded")
 
+        completed = threading.Event() if wait else None
+        failure: list[BaseException] = []
+
+        def _run_retain() -> None:
+            try:
+                _do_retain()
+            except BaseException as exc:
+                failure.append(exc)
+                raise
+            finally:
+                if completed is not None:
+                    completed.set()
+
         self._ensure_writer()
         self._register_atexit()
-        self._retain_queue.put(_do_retain)
+        _remaining_timeout()
+        self._retain_queue.put(_run_retain if wait else _do_retain)
+        if completed is not None:
+            if not completed.wait(timeout=_remaining_timeout()):
+                raise TimeoutError(
+                    f"Hindsight retain did not finish within {timeout:g}s"
+                    if timeout is not None
+                    else "Hindsight retain did not finish"
+                )
+            if failure:
+                raise failure[0]
         return {
             "queued": True,
             "turn_count": num_turns,

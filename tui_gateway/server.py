@@ -5482,6 +5482,82 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
     }
 
 
+def _retain_hindsight_before_session_reset(session: dict) -> dict:
+    """Synchronously retain the live TUI session before explicit /new."""
+    tokens = _set_session_context(session["session_key"])
+    try:
+        agent = session.get("agent")
+        memory_manager = getattr(agent, "_memory_manager", None) if agent else None
+        provider = memory_manager.get_provider("hindsight") if memory_manager else None
+        if provider is None:
+            from plugins.memory.hindsight import get_retain_on_new_settings
+
+            enabled, _ = get_retain_on_new_settings()
+            if not enabled:
+                return {"enabled": False, "queued": False}
+            raise RuntimeError("Hindsight memory provider is unavailable")
+        if not bool(getattr(provider, "retain_on_new_enabled", False)):
+            return {"enabled": False, "queued": False}
+
+        retain_before_reset = getattr(
+            provider,
+            "retain_before_session_reset",
+            None,
+        )
+        if not callable(retain_before_reset):
+            raise RuntimeError(
+                "Hindsight provider does not support retain-before-reset"
+            )
+
+        session_id = str(
+            getattr(agent, "session_id", "")
+            or session.get("session_key")
+            or ""
+        ).strip()
+        if not session_id:
+            return {"queued": False, "message": "No persisted turns to retain."}
+        parent_session_id = ""
+        try:
+            db = _get_db()
+            if db is not None:
+                row = db.get_session(session_id)
+                parent_session_id = str((row or {}).get("parent_session_id") or "")
+        except Exception:
+            pass
+        data = retain_before_reset(
+            session_id=session_id,
+            parent_session_id=parent_session_id,
+            flush_pending=getattr(memory_manager, "flush_pending", None),
+        )
+        return data if isinstance(data, dict) else {"queued": False}
+    finally:
+        _clear_session_context(tokens)
+
+
+@method("session.retain_before_new")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    if session is None:
+        return _err(rid, 4040, "session not found")
+    if session.get("running"):
+        return _err(
+            rid,
+            4094,
+            "session busy — interrupt the current turn before starting a new session",
+        )
+    try:
+        data = _retain_hindsight_before_session_reset(session)
+    except Exception as exc:
+        return _err(
+            rid,
+            5032,
+            "Hindsight Retain failed; current session preserved: " + str(exc),
+        )
+    return _ok(rid, data)
+
+
 def _reset_session_agent(sid: str, session: dict) -> dict:
     tokens = _set_session_context(session["session_key"])
     try:

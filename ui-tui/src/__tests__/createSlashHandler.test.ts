@@ -423,33 +423,78 @@ describe('createSlashHandler', () => {
     })
   })
 
-  it('passes /new <title> through to the session lifecycle', () => {
-    const ctx = buildCtx()
+  it('retains before passing /new <title> to the session lifecycle', async () => {
+    patchUiState({ sid: 'sid-current' })
+    const rpc = vi.fn(() => Promise.resolve({ queued: true, turn_count: 2 }))
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
 
     createSlashHandler(ctx)('/new sprint planning')
     getOverlayState().confirm?.onConfirm()
 
-    expect(ctx.session.newSession).toHaveBeenCalledWith('new session started', 'sprint planning')
-    expect(ctx.gateway.rpc).not.toHaveBeenCalled()
+    expect(rpc).toHaveBeenCalledWith('session.retain_before_new', { session_id: 'sid-current' })
+    await vi.waitFor(() => {
+      expect(ctx.session.newSession).toHaveBeenCalledWith('new session started', 'sprint planning')
+    })
   })
 
-  it('routes the /reset catalog alias through the local fresh-session lifecycle', () => {
-    const ctx = buildCtx({
-      local: {
-        catalog: {
-          canon: {
-            '/new': '/new',
-            '/reset': '/new'
-          }
-        }
-      }
+  it('keeps the TUI session boundary closed until retain and newSession both finish', async () => {
+    patchUiState({ busyInputMode: 'interrupt', sid: 'sid-current' })
+    let resolveRetain!: (value: { queued: boolean }) => void
+    let resolveNew!: (value: null | string) => void
+
+    const retainPromise = new Promise<{ queued: boolean }>(resolve => {
+      resolveRetain = resolve
     })
+
+    const newPromise = new Promise<null | string>(resolve => {
+      resolveNew = resolve
+    })
+
+    const rpc = vi.fn(() => retainPromise)
+    const newSession = vi.fn(() => newPromise)
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc }, session: { ...buildSession(), newSession } })
+
+    createSlashHandler(ctx)('/new')
+    getOverlayState().confirm?.onConfirm()
+
+    expect(getUiState().sessionBoundaryPending).toBe(true)
+    expect(getUiState().busy).toBe(false)
+    resolveRetain({ queued: false })
+    await vi.waitFor(() => expect(newSession).toHaveBeenCalled())
+    expect(getUiState().sessionBoundaryPending).toBe(true)
+
+    resolveNew('sid-new')
+    await vi.waitFor(() => expect(getUiState().sessionBoundaryPending).toBe(false))
+  })
+
+  it('routes /reset through the retained fresh-session lifecycle without a catalog', async () => {
+    patchUiState({ sid: 'sid-current' })
+    const rpc = vi.fn(() => Promise.resolve({ queued: false }))
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
 
     createSlashHandler(ctx)('/reset')
     getOverlayState().confirm?.onConfirm()
 
-    expect(ctx.session.newSession).toHaveBeenCalledWith('new session started', undefined)
-    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+    expect(rpc).toHaveBeenCalledWith('session.retain_before_new', { session_id: 'sid-current' })
+    await vi.waitFor(() => {
+      expect(ctx.session.newSession).toHaveBeenCalledWith('new session started', undefined)
+    })
+  })
+
+  it('keeps the current TUI session when retain-before-new fails', async () => {
+    patchUiState({ sid: 'sid-current' })
+    const rpc = vi.fn(() => Promise.reject(new Error('retain api unavailable')))
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    createSlashHandler(ctx)('/new')
+    getOverlayState().confirm?.onConfirm()
+
+    await vi.waitFor(() => {
+      expect(ctx.transcript.sys).toHaveBeenCalledWith(
+        expect.stringContaining('current session preserved')
+      )
+    })
+    expect(ctx.session.newSession).not.toHaveBeenCalled()
   })
 
   it('keeps visible scrollback when branching a TUI session', async () => {

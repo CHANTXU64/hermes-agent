@@ -149,6 +149,62 @@ def _reset_session_id_context():
     _VAR_MAP["HERMES_SESSION_ID"].set(_UNSET)
 
 
+@pytest.mark.parametrize("command", ["/new", "/reset"])
+def test_new_command_keeps_old_session_when_retain_on_new_fails(tmp_path, command):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    provider = MagicMock()
+    provider.retain_on_new_enabled = True
+    provider.retain_before_session_reset.side_effect = RuntimeError(
+        "retain api unavailable"
+    )
+    memory_manager = MagicMock()
+    memory_manager.get_provider.return_value = provider
+    cli.agent._memory_manager = memory_manager
+
+    cprint = MagicMock()
+    with patch.dict(
+        cli._retain_hindsight_before_new.__func__.__globals__,
+        {"_cprint": cprint},
+    ):
+        cli.process_command(command)
+
+    assert cli.session_id == old_session_id
+    assert cli._session_db.get_session(old_session_id)["end_reason"] is None
+    provider.retain_before_session_reset.assert_called_once_with(
+        session_id=old_session_id,
+        parent_session_id="",
+        flush_pending=memory_manager.flush_pending,
+    )
+    output = "\n".join(str(call.args[0]) for call in cprint.call_args_list)
+    assert "当前会话仍保留" in output
+    assert "retain api unavailable" in output
+
+
+def test_new_command_retains_persisted_session_when_local_history_is_empty(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    old_session_id = cli.session_id
+    cli.conversation_history = []
+    provider = MagicMock()
+    provider.retain_on_new_enabled = True
+    provider.retain_before_session_reset.return_value = {
+        "queued": True,
+        "turn_count": 2,
+    }
+    memory_manager = MagicMock()
+    memory_manager.get_provider.return_value = provider
+    cli.agent._memory_manager = memory_manager
+
+    cli.process_command("/new")
+
+    assert cli.session_id != old_session_id
+    provider.retain_before_session_reset.assert_called_once_with(
+        session_id=old_session_id,
+        parent_session_id="",
+        flush_pending=memory_manager.flush_pending,
+    )
+
+
 def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path):
     cli = _prepare_cli_with_active_session(tmp_path)
     old_session_id = cli.session_id

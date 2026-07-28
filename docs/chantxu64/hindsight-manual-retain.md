@@ -63,6 +63,26 @@ hindsight_retain_turns
 
 只保留这一个用户手打命令。没有其它别名。
 
+## `/new` / `/reset` 前自动保存（可选）
+
+在当前 profile 的 `$HERMES_HOME/hindsight/config.json` 中可启用：
+
+```json
+{
+  "retain_on_new": true,
+  "retain_on_new_timeout_seconds": 30
+}
+```
+
+- `retain_on_new` 默认 `false`；不会因为 `auto_retain=false` 而自动开启，也不会把每轮自动 Retain 打开。
+- `retain_on_new_timeout_seconds` 默认 `30` 秒、最小 `0.1` 秒，是 pending memory drain、persisted payload 重建、Hindsight API capability probe 与 Retain API 请求合计使用的一个总超时预算；capability probe 自身的网络 timeout 也不会超过当时的剩余预算。
+- 启用后，CLI、Gateway 聊天平台和 TUI 的显式 `/new` 及其 `/reset` 别名，都会先等待当前 persisted session lineage 的 Retain API 请求成功返回，再创建新会话。
+- TUI 在 Retain 与新会话建立期间关闭 session boundary；此时输入的普通 prompt 只进入现有本地队列，不会提交到旧 session。Retain 失败时队列回到旧 session 继续处理，成功时由新 session 接续处理。
+- Retain 失败、超时、Provider 不可用或缺少同步门禁能力时，`/new` / `/reset` 失败关闭：旧会话不结束、不旋转、不清空，并向用户显示错误。
+- API 请求成功返回表示 Hindsight 已确认接收请求；当 Hindsight 配置为异步处理时，不把后续服务端提取完成冒充为同步完成。
+- 没有 persisted turns 时属于正常成功边界，可以继续创建新会话。
+- 手动 `/retain` 保持原来的非阻塞提交行为；该开关只改变显式 `/new` / `/reset` 的 session boundary。
+
 ## 行为说明
 
 - 每个完成 turn 的 `sync_turn()` 都会先把同源 retain payload 写入 `hindsight/retain_turns.sqlite3`。

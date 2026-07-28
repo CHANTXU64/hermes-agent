@@ -169,6 +169,10 @@ export function useSubmission(opts: UseSubmissionOptions) {
       const live = getUiState()
       const mode = live.busyInputMode
 
+      if (live.sessionBoundaryPending) {
+        return composerActions.enqueue(full)
+      }
+
       const enqueueText = () => {
         if (opts.fallbackToFront) {
           composerRefs.queueRef.current.unshift(full)

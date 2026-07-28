@@ -43,7 +43,15 @@ export function markSubmitting(): void {
 // shell escape, with a live session). Pulled out of useSubmission so the
 // synchronous-busy invariant above is unit-testable without React test infra.
 export function submitPrompt(text: string, deps: SubmitPromptDeps, showUserMessage = true): void {
-  const sid = getUiState().sid
+  const ui = getUiState()
+
+  if (ui.sessionBoundaryPending) {
+    deps.enqueue(text)
+
+    return
+  }
+
+  const sid = ui.sid
 
   if (!sid) {
     return deps.sys('session not ready yet')

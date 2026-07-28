@@ -1,6 +1,7 @@
 """Tests that /new (and its /reset alias) clears session-scoped overrides."""
 from datetime import datetime
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -60,10 +61,59 @@ def _make_runner():
     runner._pending_approvals = {}
     runner._session_db = None
     runner._agent_cache_lock = None  # disables _evict_cached_agent lock path
+    runner._retain_hindsight_session = AsyncMock(
+        return_value={"enabled": False, "queued": False}
+    )
     runner._is_user_authorized = lambda _source: True
     runner._format_session_info = lambda: ""
 
     return runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/new", "/reset"])
+async def test_new_command_keeps_old_session_when_retain_on_new_fails(command):
+    runner = _make_runner()
+    old_entry = runner.session_store._entries[
+        build_session_key(_make_source())
+    ]
+    runner._retain_hindsight_session = AsyncMock(
+        side_effect=RuntimeError("retain api unavailable")
+    )
+
+    result = await runner._handle_reset_command(_make_event(command))
+
+    assert "当前会话仍保留" in result
+    assert "retain api unavailable" in result
+    assert runner.session_store._entries[old_entry.session_key].session_id == "sess-1"
+    runner.session_store.reset_session.assert_not_called()
+    runner.hooks.emit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_new_command_rotates_only_after_retain_acknowledgement():
+    runner = _make_runner()
+    calls = []
+
+    async def retain_before_new(*_args, **_kwargs):
+        calls.append("retain")
+        return {"queued": True, "turn_count": 2}
+
+    runner._retain_hindsight_session = retain_before_new
+    reset_mock = cast(Any, runner.session_store.reset_session)
+    new_entry = reset_mock.return_value
+
+    def reset_session(source):
+        calls.append("reset")
+        return new_entry
+
+    reset_mock.side_effect = reset_session
+
+    result = await runner._handle_reset_command(_make_event("/new"))
+
+    assert calls[:2] == ["retain", "reset"]
+    assert "Hindsight 已确认接收" in result
+    assert "2 turns" in result
 
 
 @pytest.mark.asyncio

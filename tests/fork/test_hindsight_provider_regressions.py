@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import plugins.memory.hindsight as hindsight_module
 
 from plugins.memory.hindsight import (
     RETAIN_SESSION_SCHEMA,
@@ -44,6 +45,189 @@ def test_retain_session_schema_has_no_required_params():
     assert RETAIN_SESSION_SCHEMA["name"] == "hindsight_retain_session"
     assert RETAIN_SESSION_SCHEMA["parameters"]["properties"] == {}
     assert RETAIN_SESSION_SCHEMA["parameters"]["required"] == []
+
+
+def test_retain_on_new_config_is_opt_in(provider_with_config):
+    default_provider = provider_with_config(auto_retain=False)
+    enabled_provider = provider_with_config(
+        auto_retain=False,
+        retain_on_new=True,
+        retain_on_new_timeout_seconds=7,
+    )
+
+    assert default_provider.retain_on_new_enabled is False
+    assert enabled_provider.retain_on_new_enabled is True
+    assert enabled_provider.retain_on_new_timeout_seconds == 7.0
+
+
+def test_retain_on_new_settings_are_exposed_in_config_schema(provider):
+    schema = {item["key"]: item for item in provider.get_config_schema()}
+
+    assert schema["retain_on_new"]["default"] is False
+    assert schema["retain_on_new_timeout_seconds"]["default"] == 30
+
+
+def test_waited_persisted_retain_propagates_api_failure(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    p.sync_turn("keep this request", "keep this answer")
+    p._client.aretain_batch.side_effect = RuntimeError("retain api unavailable")
+
+    with pytest.raises(RuntimeError, match="retain api unavailable"):
+        p.retain_persisted_session_lineage(
+            session_id="test-session",
+            wait=True,
+            timeout=1,
+        )
+
+
+def test_retain_before_session_reset_drains_pending_memory_work(provider_with_config):
+    p = provider_with_config(
+        auto_retain=False,
+        retain_on_new=True,
+        retain_on_new_timeout_seconds=7,
+    )
+    p.sync_turn("keep this request", "keep this answer")
+    flush_pending = MagicMock(return_value=True)
+
+    result = p.retain_before_session_reset(
+        session_id="test-session",
+        flush_pending=flush_pending,
+    )
+
+    assert result["queued"] is True
+    flush_pending.assert_called_once_with(timeout=7.0)
+    assert p._client.aretain_batch.call_count == 1
+
+
+def test_retain_before_session_reset_uses_one_total_timeout(
+    provider_with_config,
+    monkeypatch,
+):
+    p = provider_with_config(
+        auto_retain=False,
+        retain_on_new=True,
+        retain_on_new_timeout_seconds=7,
+    )
+    p.retain_persisted_session_lineage = MagicMock(
+        return_value={"queued": True, "turn_count": 1}
+    )
+    monotonic = MagicMock(side_effect=[100.0, 103.0])
+    monkeypatch.setattr(hindsight_module.time, "monotonic", monotonic)
+
+    p.retain_before_session_reset(
+        session_id="test-session",
+        flush_pending=MagicMock(return_value=True),
+    )
+
+    p.retain_persisted_session_lineage.assert_called_once_with(
+        session_id="test-session",
+        parent_session_id="",
+        wait=True,
+        timeout=4.0,
+    )
+
+
+def test_retain_before_session_reset_aborts_when_pending_work_does_not_drain(
+    provider_with_config,
+):
+    p = provider_with_config(
+        auto_retain=False,
+        retain_on_new=True,
+        retain_on_new_timeout_seconds=7,
+    )
+    p.sync_turn("keep this request", "keep this answer")
+
+    with pytest.raises(
+        TimeoutError,
+        match="Pending memory work did not finish within 7s",
+    ):
+        p.retain_before_session_reset(
+            session_id="test-session",
+            flush_pending=MagicMock(return_value=False),
+        )
+
+    p._client.aretain_batch.assert_not_called()
+
+
+def test_waited_persisted_retain_times_out_while_api_request_is_running(
+    provider_with_config,
+):
+    p = provider_with_config(auto_retain=False)
+    p.sync_turn("keep this request", "keep this answer")
+    p._run_hindsight_operation = MagicMock(
+        side_effect=lambda _operation: threading.Event().wait(0.05)
+    )
+
+    with pytest.raises(
+        TimeoutError,
+        match="Hindsight retain did not finish within 0.01s",
+    ):
+        p.retain_persisted_session_lineage(
+            session_id="test-session",
+            wait=True,
+            timeout=0.01,
+        )
+
+    p._retain_queue.join()
+
+
+def test_waited_persisted_retain_caps_capability_probe_to_remaining_budget(
+    provider_with_config,
+    monkeypatch,
+):
+    p = provider_with_config(auto_retain=False)
+    p.sync_turn("keep this request", "keep this answer")
+    observed_timeouts = []
+    _clear_capability_cache()
+
+    def _fetch_version(_api_url, _api_key=None, timeout=5.0):
+        observed_timeouts.append(timeout)
+        return "0.5.6"
+
+    monkeypatch.setattr(hindsight_module, "_fetch_hindsight_api_version", _fetch_version)
+
+    try:
+        result = p.retain_persisted_session_lineage(
+            session_id="test-session",
+            wait=True,
+            timeout=0.25,
+        )
+
+        assert result["queued"] is True
+        assert len(observed_timeouts) == 1
+        assert 0 < observed_timeouts[0] <= 0.25
+    finally:
+        _clear_capability_cache()
+
+
+def test_retain_before_session_reset_counts_payload_preparation_in_total_timeout(
+    provider_with_config,
+):
+    p = provider_with_config(
+        auto_retain=False,
+        retain_on_new=True,
+        retain_on_new_timeout_seconds=0.2,
+    )
+    p.sync_turn("keep this request", "keep this answer")
+    original_resolve = p._resolve_full_retain_target_for_session
+
+    def _slow_resolve(*args, **kwargs):
+        threading.Event().wait(0.12)
+        return original_resolve(*args, **kwargs)
+
+    p._resolve_full_retain_target_for_session = _slow_resolve
+    p._run_hindsight_operation = MagicMock(
+        side_effect=lambda _operation: threading.Event().wait(0.12)
+    )
+
+    with pytest.raises(
+        TimeoutError,
+        match="Hindsight retain did not finish within",
+    ):
+        p.retain_before_session_reset(session_id="test-session")
+
+    p._retain_queue.join()
+
 
 def test_get_tool_schemas_does_not_expose_retain_session(provider):
     schemas = provider.get_tool_schemas()

@@ -27,7 +27,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Awaitable, Callable, Optional, Union, cast
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
@@ -116,12 +116,47 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
-    async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+    async def _handle_reset_command(
+        self,
+        event: MessageEvent,
+        *,
+        retain_data: Optional[dict[str, Any]] = None,
+    ) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
         
-        # Get existing session key
+        # Get existing session key and snapshot the old entry before any reset
+        # mutation. A configured retain-on-new gate must be able to fail closed
+        # while leaving the current session completely untouched.
         session_key = self._session_key_for_source(source)
+        session_store: Any = getattr(self, "session_store")
+        old_entry = session_store._entries.get(session_key)
+        _retain_before_new = cast(
+            Optional[Callable[..., Awaitable[dict[str, Any]]]],
+            getattr(self, "_retain_hindsight_session", None),
+        )
+        preflight_complete = retain_data is not None
+        if retain_data is None:
+            retain_data = {"enabled": False, "queued": False}
+        if callable(_retain_before_new) and not preflight_complete:
+            try:
+                retain_data = await _retain_before_new(
+                    event,
+                    wait=True,
+                    only_if_retain_on_new=True,
+                )
+            except Exception as retain_exc:
+                logger.warning(
+                    "Hindsight retain-on-new failed for session %s; reset aborted: %s",
+                    session_key,
+                    retain_exc,
+                    exc_info=True,
+                )
+                return (
+                    "⚠️ Hindsight Retain 失败，未创建新会话；"
+                    f"当前会话仍保留。错误：{retain_exc}"
+                )
+
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped. The
         # in-flight run's own guarded release (run_generation=old) will return
@@ -129,10 +164,6 @@ class GatewaySlashCommandsMixin:
         # from becoming a zombie that silently drops all later messages (#28686).
         # Idempotent, so the run's finally calling it again is harmless.
         self._release_running_agent_state(session_key)
-
-        # Snapshot the old entry so on_session_finalize can report the
-        # expiring session id before reset_session() rotates it.
-        old_entry = self.session_store._entries.get(session_key)
 
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.
@@ -288,6 +319,13 @@ class GatewaySlashCommandsMixin:
                 # sanitize_title returned empty (whitespace-only / unprintable)
                 _title_note = t("gateway.reset.title_empty_untitled")
         header = header + _title_note
+        if retain_data.get("queued"):
+            turn_count = int(retain_data.get("turn_count") or 0)
+            count_note = f"（{turn_count} turns）" if turn_count else ""
+            header += (
+                "\n✓ Hindsight 已确认接收上一会话的 Retain 请求"
+                f"{count_note}。"
+            )
 
         # When /new runs inside a Telegram DM topic lane, rewrite the
         # (chat_id, thread_id) → session_id binding so the next message

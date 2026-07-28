@@ -11782,11 +11782,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # /reset and /new must bypass the running-agent guard so they
             # actually dispatch as commands instead of being queued as user
             # text (which would be fed back to the agent with the same
-            # broken history — #2170).  Interrupt the agent first, then
-            # clear the adapter's pending queue so the stale "/reset" text
-            # doesn't get re-processed as a user message after the
-            # interrupt completes.
+            # broken history — #2170).  Run the fail-closed Hindsight gate
+            # before interrupting or clearing any live session state.  After
+            # acknowledgement, interrupt the agent and clear the adapter's
+            # pending queue so stale "/reset" text is not re-processed as a
+            # user message when the interrupted run completes.
             if _cmd_def_inner and _cmd_def_inner.name == "new":
+                try:
+                    retain_data = await self._retain_hindsight_session(
+                        event,
+                        wait=True,
+                        only_if_retain_on_new=True,
+                    )
+                except Exception as retain_exc:
+                    logger.warning(
+                        "Hindsight retain-on-new failed for session %s; reset aborted: %s",
+                        _quick_key,
+                        retain_exc,
+                        exc_info=True,
+                    )
+                    return (
+                        "⚠️ Hindsight Retain 失败，未创建新会话；"
+                        f"当前会话仍保留。错误：{retain_exc}"
+                    )
                 # Clear any pending messages so the old text doesn't replay
                 await self._interrupt_and_clear_session(
                     _quick_key,
@@ -11796,7 +11814,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 # Clean up the running agent entry so the reset handler
                 # doesn't think an agent is still active.
-                return await self._handle_reset_command(event)
+                return await self._handle_reset_command(
+                    event,
+                    retain_data=retain_data,
+                )
 
             # /queue <prompt> — queue without interrupting.
             # Semantics: each /queue invocation produces its own full agent
@@ -15497,16 +15518,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
 
-    async def _handle_retain_command(self, event: MessageEvent) -> str:
-        """Handle /retain — manually flush buffered Hindsight turns."""
+    async def _retain_hindsight_session(
+        self,
+        event: MessageEvent,
+        *,
+        wait: bool = False,
+        only_if_retain_on_new: bool = False,
+    ) -> dict:
+        """Retain the selected session through the active Hindsight provider.
+
+        ``/retain`` uses the historical non-blocking path. Explicit session
+        reset uses ``wait=True`` and fails closed when the opt-in switch is on.
+        """
         source = event.source
         session_store = getattr(self, "session_store", None)
         session_entry = None
         if session_store is not None:
             try:
-                # Match the normal message path: SessionStore is the source of
-                # truth for the currently selected conversation after /resume
-                # and across gateway restarts.
                 session_entry = session_store.get_or_create_session(source)
             except Exception:
                 session_entry = None
@@ -15532,6 +15560,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         memory_manager = getattr(agent, "_memory_manager", None) if agent is not None else None
         provider = memory_manager.get_provider("hindsight") if memory_manager else None
+        owned_provider = False
         if provider is None:
             try:
                 from hermes_cli.config import cfg_get, load_config
@@ -15539,7 +15568,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from plugins.memory import load_memory_provider
 
                 config = load_config()
-                if (cfg_get(config, "memory", "provider") or "").strip() == "hindsight":
+                hindsight_configured = (
+                    (cfg_get(config, "memory", "provider") or "").strip()
+                    == "hindsight"
+                )
+                if only_if_retain_on_new:
+                    if not hindsight_configured:
+                        return {"enabled": False, "queued": False}
+                    from plugins.memory.hindsight import get_retain_on_new_settings
+
+                    enabled, _ = get_retain_on_new_settings()
+                    if not enabled:
+                        return {"enabled": False, "queued": False}
+                if hindsight_configured:
                     candidate = load_memory_provider("hindsight")
                     if candidate and candidate.is_available():
                         init_kwargs = {
@@ -15563,12 +15604,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 pass
                         candidate.initialize(**init_kwargs)
                         provider = candidate
-            except Exception:
+                        owned_provider = True
+            except Exception as exc:
+                if only_if_retain_on_new:
+                    raise RuntimeError(
+                        f"Hindsight memory provider could not be initialized: {exc}"
+                    ) from exc
                 provider = None
         if not provider or not hasattr(provider, "retain_persisted_session_lineage"):
-            return "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。"
+            if only_if_retain_on_new:
+                raise RuntimeError("Hindsight memory provider is unavailable")
+            return {
+                "available": False,
+                "queued": False,
+                "message": "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。",
+            }
+
+        if only_if_retain_on_new and not bool(
+            getattr(provider, "retain_on_new_enabled", False)
+        ):
+            return {"enabled": False, "queued": False}
+
         try:
-            data = None
             session_id = str(
                 current_session_id
                 or getattr(agent, "session_id", "")
@@ -15583,15 +15640,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     parent_session_id = str((row or {}).get("parent_session_id") or "")
                 except Exception:
                     parent_session_id = ""
-            if session_id and hasattr(provider, "retain_persisted_session_lineage"):
-                data = provider.retain_persisted_session_lineage(
-                    session_id=session_id,
-                    parent_session_id=parent_session_id,
+            if not session_id:
+                return {"queued": False, "message": "No persisted turns to retain."}
+
+            retain_kwargs: dict[str, Any] = {
+                "session_id": session_id,
+                "parent_session_id": parent_session_id,
+            }
+            if wait:
+                retain_before_reset = getattr(
+                    provider,
+                    "retain_before_session_reset",
+                    None,
                 )
-            elif data is None:
-                data = {"queued": False, "message": "No persisted turns to retain."}
+                if not callable(retain_before_reset):
+                    raise RuntimeError(
+                        "Hindsight provider does not support retain-before-reset"
+                    )
+                data = await asyncio.to_thread(
+                    retain_before_reset,
+                    **retain_kwargs,
+                    flush_pending=getattr(memory_manager, "flush_pending", None),
+                )
+            else:
+                data = provider.retain_persisted_session_lineage(**retain_kwargs)
             if data is None:
-                data = {"queued": False, "message": "No persisted turns to retain."}
+                return {"queued": False, "message": "No persisted turns to retain."}
+            return cast(dict[str, Any], data)
+        finally:
+            if owned_provider and wait and hasattr(provider, "shutdown"):
+                await asyncio.to_thread(provider.shutdown)
+
+    async def _handle_retain_command(self, event: MessageEvent) -> str:
+        """Handle /retain — manually flush buffered Hindsight turns."""
+        try:
+            data = await self._retain_hindsight_session(event)
+            if not data.get("available", True):
+                return str(data.get("message"))
             if not data.get("queued"):
                 return str(data.get("message") or "No buffered turns to retain.")
             return "Buffered session turns queued for retain."

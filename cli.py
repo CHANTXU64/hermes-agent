@@ -7779,6 +7779,60 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return None
         return history_snapshot
 
+    def _retain_hindsight_before_new(self) -> bool:
+        """Apply the opt-in Hindsight retain gate before explicit /new."""
+        if not self.agent or not self.session_id:
+            return True
+
+        memory_manager = getattr(self.agent, "_memory_manager", None)
+        provider = memory_manager.get_provider("hindsight") if memory_manager else None
+        if provider is None:
+            configured_provider = str(
+                (CLI_CONFIG.get("memory") or {}).get("provider") or ""
+            ).strip()
+            if configured_provider != "hindsight":
+                return True
+            from plugins.memory.hindsight import get_retain_on_new_settings
+
+            enabled, _ = get_retain_on_new_settings()
+            if not enabled:
+                return True
+            _cprint(
+                "  ⚠️ Hindsight Retain 失败，未创建新会话；"
+                "当前会话仍保留。错误：Hindsight memory provider is unavailable"
+            )
+            return False
+
+        if not bool(getattr(provider, "retain_on_new_enabled", False)):
+            return True
+        retain_before_reset = getattr(provider, "retain_before_session_reset", None)
+        if not callable(retain_before_reset):
+            _cprint(
+                "  ⚠️ Hindsight Retain 失败，未创建新会话；"
+                "当前会话仍保留。错误：Provider 不支持 retain-before-reset"
+            )
+            return False
+
+        parent_session_id = ""
+        if self._session_db and self.session_id:
+            row = self._session_db.get_session(self.session_id)
+            parent_session_id = str((row or {}).get("parent_session_id") or "")
+        try:
+            data = retain_before_reset(
+                session_id=self.session_id,
+                parent_session_id=parent_session_id,
+                flush_pending=getattr(memory_manager, "flush_pending", None),
+            )
+        except Exception as exc:
+            _cprint(
+                "  ⚠️ Hindsight Retain 失败，未创建新会话；"
+                f"当前会话仍保留。错误：{exc}"
+            )
+            return False
+        if isinstance(data, dict) and data.get("queued"):
+            _cprint("  ✓ Previous session retained before reset.")
+        return True
+
     def new_session(self, silent=False, title=None):
         """Start a fresh session with a new session ID and cleared agent state."""
         old_session_id = self.session_id
@@ -9611,6 +9665,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 cmd_original=cmd_original,
             ) is None:
                 return True  # confirmation cancelled — command handled, keep REPL alive
+            if not self._retain_hindsight_before_new():
+                return True
             self.new_session(title=title)
         elif canonical == "resume":
             self._handle_resume_command(cmd_original)

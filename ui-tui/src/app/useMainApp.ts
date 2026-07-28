@@ -749,6 +749,7 @@ export function useMainApp(gw: GatewayClient) {
     if (
       !ui.sid ||
       ui.busy ||
+      ui.sessionBoundaryPending ||
       composerRefs.queueEditRef.current !== null ||
       composerRefs.queueRef.current.length === 0
     ) {
@@ -761,7 +762,7 @@ export function useMainApp(gw: GatewayClient) {
       patchUiState({ busy: true, status: 'running…' })
       sendQueued(next)
     }
-  }, [ui.sid, ui.busy, composerActions, composerRefs, sendQueued])
+  }, [ui.sid, ui.busy, ui.sessionBoundaryPending, composerActions, composerRefs, sendQueued])
 
   const { pagerPageSize } = useInputHandlers({
     actions: {

@@ -38,6 +38,129 @@ def _make_runner():
 
 
 @pytest.mark.asyncio
+async def test_retain_on_new_waits_for_pending_turns_and_api_acknowledgement():
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+    provider = MagicMock()
+    provider.retain_on_new_enabled = True
+    provider.retain_before_session_reset.return_value = {
+        "queued": True,
+        "turn_count": 2,
+    }
+    memory_manager = SimpleNamespace(
+        get_provider=lambda name: provider if name == "hindsight" else None,
+        flush_pending=MagicMock(return_value=True),
+    )
+    agent = SimpleNamespace(_memory_manager=memory_manager, session_id="sid-1")
+    runner._agent_cache[session_key] = (agent, "sig")
+    session_entry = SimpleNamespace(session_key=session_key, session_id="sid-1")
+    db = SimpleNamespace(get_session=lambda sid: {"parent_session_id": "parent-1"})
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _db=db,
+        get_or_create_session=MagicMock(return_value=session_entry),
+    )
+
+    result = await runner._retain_hindsight_session(
+        _make_event(),
+        wait=True,
+        only_if_retain_on_new=True,
+    )
+
+    assert result == {"queued": True, "turn_count": 2}
+    provider.retain_before_session_reset.assert_called_once_with(
+        session_id="sid-1",
+        parent_session_id="parent-1",
+        flush_pending=memory_manager.flush_pending,
+    )
+    provider.retain_persisted_session_lineage.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_retain_on_new_disabled_does_not_drain_or_retain():
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+    provider = MagicMock()
+    provider.retain_on_new_enabled = False
+    memory_manager = SimpleNamespace(
+        get_provider=lambda name: provider if name == "hindsight" else None,
+        flush_pending=MagicMock(return_value=True),
+    )
+    runner._agent_cache[session_key] = (
+        SimpleNamespace(_memory_manager=memory_manager, session_id="sid-1"),
+        "sig",
+    )
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _db=SimpleNamespace(get_session=lambda sid: {"parent_session_id": ""}),
+        get_or_create_session=MagicMock(
+            return_value=SimpleNamespace(session_key=session_key, session_id="sid-1")
+        ),
+    )
+
+    result = await runner._retain_hindsight_session(
+        _make_event(),
+        wait=True,
+        only_if_retain_on_new=True,
+    )
+
+    assert result == {"enabled": False, "queued": False}
+    memory_manager.flush_pending.assert_not_called()
+    provider.retain_before_session_reset.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_retain_on_new_cold_path_loads_provider(monkeypatch):
+    import hermes_cli.config as config_module
+    import plugins.memory as memory_plugins
+    import plugins.memory.hindsight as hindsight_module
+
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+    session_entry = SimpleNamespace(session_key=session_key, session_id="sid-1")
+    runner.__dict__["session_store"] = SimpleNamespace(
+        _db=SimpleNamespace(
+            get_session=lambda sid: {"parent_session_id": "parent-1"}
+        ),
+        get_or_create_session=MagicMock(return_value=session_entry),
+    )
+    provider = MagicMock()
+    provider.retain_before_session_reset.return_value = {
+        "queued": True,
+        "turn_count": 2,
+    }
+    load_provider = MagicMock(return_value=provider)
+    monkeypatch.setattr(
+        hindsight_module,
+        "get_retain_on_new_settings",
+        lambda: (True, 7.0),
+    )
+    monkeypatch.setattr(
+        memory_plugins,
+        "load_memory_provider",
+        load_provider,
+    )
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: {"memory": {"provider": "hindsight"}},
+    )
+
+    result = await runner._retain_hindsight_session(
+        _make_event(),
+        wait=True,
+        only_if_retain_on_new=True,
+    )
+
+    assert result == {"queued": True, "turn_count": 2}
+    load_provider.assert_called_once_with("hindsight")
+    provider.initialize.assert_called_once()
+    provider.retain_before_session_reset.assert_called_once()
+    provider.shutdown.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_retain_command_uses_persisted_turn_store_even_when_session_transcript_available():
     runner = _make_runner()
     source = _make_source()

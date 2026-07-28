@@ -371,6 +371,77 @@ async def test_start_command_is_noop_during_active_session():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("command_text", ["/new", "/reset"])
+async def test_active_session_retain_failure_does_not_interrupt_before_reset(
+    command_text,
+):
+    """Retain-on-new must fail before the active Gateway session is mutated."""
+    runner = _make_runner()
+    event = _make_event(text=command_text)
+    session_key = build_session_key(event.source)
+
+    fake_agent = MagicMock()
+    fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
+    runner._running_agents[session_key] = fake_agent
+    runner._pending_messages[session_key] = "keep queued work"
+    active_event = asyncio.Event()
+    runner.adapters[Platform.TELEGRAM]._active_sessions[session_key] = active_event
+    runner._retain_hindsight_session = AsyncMock(
+        side_effect=RuntimeError("retain api unavailable")
+    )
+    runner._handle_reset_command = AsyncMock(return_value="reset unexpectedly ran")
+
+    result = await runner._handle_message(event)
+
+    assert isinstance(result, str)
+    assert "当前会话仍保留" in result
+    assert "retain api unavailable" in result
+    fake_agent.interrupt.assert_not_called()
+    assert runner._running_agents[session_key] is fake_agent
+    assert runner._pending_messages[session_key] == "keep queued work"
+    assert runner._session_run_generation.get(session_key, 0) == 0
+    assert not active_event.is_set()
+    runner._handle_reset_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_active_session_retain_acknowledgement_precedes_interrupt_and_reset():
+    """The running-session fast path must retain exactly once before mutation."""
+    runner = _make_runner()
+    event = _make_event(text="/new")
+    session_key = build_session_key(event.source)
+    retain_data = {"queued": True, "turn_count": 2}
+    calls = []
+
+    fake_agent = MagicMock()
+    fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
+    fake_agent.interrupt.side_effect = lambda _reason: calls.append("interrupt")
+    runner._running_agents[session_key] = fake_agent
+
+    async def retain_before_new(*_args, **_kwargs):
+        calls.append("retain")
+        return retain_data
+
+    async def reset_handler(_event, *, retain_data=None):
+        calls.append("reset")
+        assert retain_data == {"queued": True, "turn_count": 2}
+        return "reset complete"
+
+    runner._retain_hindsight_session = AsyncMock(side_effect=retain_before_new)
+    runner._handle_reset_command = AsyncMock(side_effect=reset_handler)
+
+    result = await runner._handle_message(event)
+
+    assert result == "reset complete"
+    assert calls == ["retain", "interrupt", "reset"]
+    runner._retain_hindsight_session.assert_awaited_once_with(
+        event,
+        wait=True,
+        only_if_retain_on_new=True,
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("command_text", "handler_attr", "handler_result"),
     [
