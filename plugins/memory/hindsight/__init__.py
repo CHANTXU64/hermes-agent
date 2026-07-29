@@ -3030,9 +3030,21 @@ class HindsightMemoryProvider(MemoryProvider):
                     merged.append(candidate_turn)
                     seen_ids.add(candidate_identity)
                     seen_message_ids.update(candidate_identity)
-            if match_kind == "shared_user" and len(existing_ids[existing_index]) == 1:
-                # The persisted row was an orphan user and the replay now closes
-                # that unambiguous user event with an assistant response.
+            recovers_orphan_assistant = bool(
+                match_kind == "shared_message"
+                and len(existing_ids[existing_index]) == 1
+                and existing_ids[existing_index][0][0] == "assistant"
+                and incoming_ids[incoming_index]
+                and incoming_ids[incoming_index][0][0] == "user"
+                and existing_ids[existing_index][0] in incoming_ids[incoming_index]
+            )
+            if (
+                match_kind == "shared_user"
+                and len(existing_ids[existing_index]) == 1
+            ) or recovers_orphan_assistant:
+                # A later replay can complete either side of an orphan event:
+                # append the Assistant to an orphan User, or restore the real
+                # User that belongs to an already persisted Assistant.
                 merged.append(incoming_turns[incoming_index])
                 seen_ids.add(incoming_ids[incoming_index])
                 seen_message_ids.update(incoming_ids[incoming_index])
@@ -3346,7 +3358,14 @@ class HindsightMemoryProvider(MemoryProvider):
                         and identity
                         and identity[0] == old_identity[0]
                     )
-                    if identity == old_identity or closes_orphan_user:
+                    recovers_orphan_assistant = bool(
+                        len(old_identity) == 1
+                        and old_identity[0][0] == "assistant"
+                        and identity
+                        and identity[0][0] == "user"
+                        and old_identity[0] in identity
+                    )
+                    if identity == old_identity or closes_orphan_user or recovers_orphan_assistant:
                         owners[incoming_index] = old_entries[old_index][1]
                         old_index += 1
                         if old_index == len(old_entries):

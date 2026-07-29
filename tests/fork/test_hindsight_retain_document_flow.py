@@ -1173,6 +1173,70 @@ def test_hindsight_transcript_replay_matches_stable_answer_across_user_represent
         provider2.shutdown()
 
 
+def test_hindsight_transcript_replay_recovers_user_for_persisted_orphan_assistant(
+    tmp_path,
+    monkeypatch,
+):
+    """A later complete transcript must enrich the same persisted assistant event."""
+    session_id = "restart-replay-orphan-assistant-completion"
+    assistant = {
+        "role": "assistant",
+        "content": "commit completed",
+        "timestamp": 1710000161.0,
+    }
+    async_completion = {
+        "role": "user",
+        "content": "[ASYNC DELEGATION COMPLETE — deleg-submit]",
+        "timestamp": 1710000160.0,
+    }
+
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content=async_completion["content"],
+        assistant_content=assistant["content"],
+        session_id=session_id,
+        messages=[async_completion, assistant],
+    )
+    provider1.shutdown()
+
+    provider2, _client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    replay = [
+        {"role": "user", "content": "提交", "timestamp": 1710000160.5},
+        assistant,
+    ]
+    try:
+        provider2.sync_turn(
+            user_content="提交",
+            assistant_content=assistant["content"],
+            session_id=session_id,
+            messages=replay,
+        )
+        # Replaying the same complete transcript again must remain idempotent.
+        provider2.sync_turn(
+            user_content="提交",
+            assistant_content=assistant["content"],
+            session_id=session_id,
+            messages=replay,
+        )
+        turns, _lineage, _document_id = provider2._load_persisted_retain_turns(session_id)
+        retained = [json.loads(turn) for turn in turns]
+
+        assert len(retained) == 1
+        assert [message["role"] for message in retained[0]] == ["user", "assistant"]
+        assert retained[0][0]["content"] == "User: 提交"
+        assert retained[0][1]["content"] == "Assistant: commit completed"
+    finally:
+        provider2.shutdown()
+
+
 def test_hindsight_transcript_replay_persists_same_length_orphan_completion(tmp_path, monkeypatch):
     """Completing a persisted orphan user must replace the same-length local row."""
     session_id = "restart-replay-orphan-completion"
