@@ -3,6 +3,11 @@
 Purpose: track deviations from upstream `NousResearch/hermes-agent` so future
 upstream merges do not accidentally delete active fork behavior.
 
+Repository:
+
+- Fork: https://github.com/CHANTXU64/hermes-agent
+- Upstream: https://github.com/NousResearch/hermes-agent
+
 This file is an audit and merge guide. It is not a blind rule to keep every old
 fork change forever. Historical entries marked as reverted must not be revived
 unless the user explicitly asks for them.
@@ -471,6 +476,8 @@ Merge protection:
   used by background review.
 
 Upstream status: reverted fork-only experiment.
+
+## Active modifications (continued)
 
 ### 9. Hindsight manual full-session retain
 
@@ -1411,6 +1418,88 @@ Upstream status: the durable delivery ledger is upstream; the explicit
 session-reset boundary is fork-only.
 
 
+### 22. Transport disconnect classification stays out of context compression
+
+Status: active
+
+Date: 2026-07-29
+
+Files:
+
+- `agent/error_classifier.py`
+- `agent/conversation_loop.py`
+- `tests/agent/test_error_classifier.py`
+- `tests/agent/test_thinking_timeout_guidance.py`
+- `tests/fork/test_transport_disconnect_classification.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- A status-less network or stream disconnect remains a retryable transport
+  timeout regardless of session size; it no longer triggers context compression
+  from token-count or message-count pressure alone.
+
+What changed:
+
+- Disconnect signatures such as `peer closed connection`, `server
+  disconnected`, `unexpected eof`, and `incomplete chunked read` return
+  `FailoverReason.timeout` with `should_compress=False` when no HTTP status is
+  available.
+- Removed the prior inference that a disconnect above 60% of the configured
+  context window, above an absolute token threshold, or above a message-count
+  threshold was evidence of `context_overflow`.
+- Explicit provider context-overflow responses still return
+  `FailoverReason.context_overflow` with `should_compress=True`.
+- The existing generic HTTP 400 large-request heuristic and proactive pre-API
+  context-size compression remain unchanged.
+- Reasoning-model-specific timeout guidance remains a presentation/recovery
+  layer after the common transport classification; it no longer changes the
+  base classifier result.
+
+Why it matters:
+
+- A dropped connection proves that transport failed, but session size alone
+  does not prove the provider rejected the request for excessive context.
+- Misclassifying a network interruption as context overflow can start an
+  unnecessary LCM compression cycle and ultimately report a misleading
+  `Cannot compress further` result instead of the original network failure.
+
+Merge protection:
+
+- Preserve when: upstream still converts a status-less disconnect into context
+  overflow based only on estimated tokens or message count.
+- Drop when: upstream provides an equivalent separation between transport
+  failures and explicit or locally confirmed context overflow, with regression
+  coverage for both paths.
+- Ask user when: upstream adds a typed provider/gateway signal that can reliably
+  distinguish an oversized-request disconnect from an ordinary network drop.
+
+Verification:
+
+```bash
+./venv/bin/python -m pytest tests/fork/test_transport_disconnect_classification.py -q -o 'addopts='
+./venv/bin/python -m pytest tests/agent/test_error_classifier.py tests/agent/test_thinking_timeout_guidance.py -q -o 'addopts='
+./venv/bin/python -m pytest tests/fork -q -o 'addopts='
+./venv/bin/ruff check agent/error_classifier.py agent/conversation_loop.py tests/agent/test_error_classifier.py tests/agent/test_thinking_timeout_guidance.py tests/fork/test_transport_disconnect_classification.py
+git diff --check
+```
+
+2026-07-29 verification results:
+
+- Fork-owned disconnect contract: `5 passed`.
+- Error-classifier and thinking-timeout suites: `257 passed`.
+- Adjacent API recovery/failover suites: `169 passed`.
+- Complete fork gate: `552 passed`, with 8 third-party deprecation warnings.
+- Ruff, `py_compile`, and `git diff --check` passed.
+
+Feature docs: none — this is a localized classifier/recovery-routing contract
+covered by upstream-adjacent tests, a fork-owned regression suite, and this
+merge note.
+
+Upstream status: fork-only; current upstream still contains the disconnect plus
+large-session context-overflow inference.
+
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -1482,6 +1571,13 @@ deltas are expected in these areas:
   - `tests/gateway/test_delivery_ledger.py`
   - `tests/gateway/test_session_model_reset.py`
   - `website/docs/user-guide/messaging/index.md`
+- Transport disconnect classification:
+  - `agent/error_classifier.py`
+  - `agent/conversation_loop.py`
+  - `tests/agent/test_error_classifier.py`
+  - `tests/agent/test_thinking_timeout_guidance.py`
+  - `tests/fork/test_transport_disconnect_classification.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
 - Clarify attachment reply context:
   - `gateway/run.py`
   - `tools/clarify_gateway.py`
@@ -1526,11 +1622,11 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 21 major entries.
+Documented entries: 22 major entries.
 
 Active / current entries: 19.
 
-Historical reverted / abandoned areas: 2.
+Historical reverted / abandoned areas: 3.
 
 Fork-only non-merge commits represented here: see
 `git log --no-merges upstream/main..HEAD`.
