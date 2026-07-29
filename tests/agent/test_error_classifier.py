@@ -771,14 +771,14 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.format_error
         assert result.should_compress is False
 
-    # ── Server disconnect + large session ──
+    # ── Server disconnects stay transport errors ──
 
-    def test_disconnect_large_session_context_overflow(self):
-        """Server disconnect with large session → context overflow."""
+    def test_disconnect_large_session_is_timeout(self):
+        """Session size alone must not turn a disconnect into overflow."""
         e = Exception("server disconnected without sending complete message")
         result = classify_api_error(e, approx_tokens=150000, context_length=200000)
-        assert result.reason == FailoverReason.context_overflow
-        assert result.should_compress is True
+        assert result.reason == FailoverReason.timeout
+        assert result.should_compress is False
 
     def test_disconnect_small_session_timeout(self):
         """Server disconnect with small session → timeout."""
@@ -1388,7 +1388,8 @@ class TestClassifyApiError:
     def test_peer_closed_large_session(self):
         e = Exception("peer closed connection without sending complete message")
         result = classify_api_error(e, approx_tokens=130000, context_length=200000)
-        assert result.reason == FailoverReason.context_overflow
+        assert result.reason == FailoverReason.timeout
+        assert result.should_compress is False
 
     # ── Chinese error messages ──
 
@@ -1593,14 +1594,14 @@ class TestAdversarialEdgeCases:
         assert result.reason == FailoverReason.rate_limit
 
     def test_disconnect_pattern_ordering(self):
-        """Disconnect + large session must beat generic transport catch."""
+        """Message-only disconnect signatures must classify as transport errors."""
         class FakeRemoteProtocol(Exception):
             pass
         # Type name isn't in _TRANSPORT_ERROR_TYPES but message has disconnect pattern
         e = Exception("peer closed connection without sending complete message")
         result = classify_api_error(e, approx_tokens=150000, context_length=200000)
-        assert result.reason == FailoverReason.context_overflow
-        assert result.should_compress is True
+        assert result.reason == FailoverReason.timeout
+        assert result.should_compress is False
 
     def test_credit_balance_too_low(self):
         e = MockAPIError(
@@ -1677,12 +1678,13 @@ class TestAdversarialEdgeCases:
         assert result.reason == FailoverReason.context_overflow
 
     def test_disconnect_large_by_message_count(self):
-        """Server disconnect with 200+ messages should trigger context overflow."""
+        """Message count alone must not turn a disconnect into overflow."""
         e = Exception("server disconnected without sending complete message")
         result = classify_api_error(
             e, approx_tokens=5000, context_length=200000, num_messages=250,
         )
-        assert result.reason == FailoverReason.context_overflow
+        assert result.reason == FailoverReason.timeout
+        assert result.should_compress is False
 
     def test_openrouter_wrapped_model_not_found_in_metadata_raw(self):
         e = MockAPIError(
@@ -1861,11 +1863,8 @@ class TestSSLTransientPatterns:
         assert result.reason == FailoverReason.timeout
         assert result.should_compress is False
 
-    def test_plain_disconnect_on_large_session_still_compresses(self):
-        """Regression guard: the context-overflow-via-disconnect path
-        (non-SSL disconnects on large sessions) must still trigger
-        compression.  Only SSL-specific disconnects skip it.
-        """
+    def test_plain_disconnect_on_large_session_stays_timeout(self):
+        """Large sessions do not change a plain disconnect into overflow."""
         e = Exception("Server disconnected without sending a response")
         result = classify_api_error(
             e,
@@ -1873,8 +1872,8 @@ class TestSSLTransientPatterns:
             context_length=200000,
             num_messages=300,
         )
-        assert result.reason == FailoverReason.context_overflow
-        assert result.should_compress is True
+        assert result.reason == FailoverReason.timeout
+        assert result.should_compress is False
 
     def test_real_ssl_error_type_classifies_as_timeout(self):
         """Real ssl.SSLError instance — the type name alone (not message)

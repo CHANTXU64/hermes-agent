@@ -1,15 +1,13 @@
-"""Tests for the reasoning-model thinking-timeout detection + guidance.
+"""Tests for transport classification and reasoning-model timeout guidance.
 
 Two layers:
 
-1. **Classifier override (Part 1, ``agent/error_classifier.py:720-738``)**:
-   A transport disconnect on a reasoning model is reclassified as
-   ``FailoverReason.timeout`` even when the session is large — instead
-   of routing to the compression branch via
-   ``FailoverReason.context_overflow`` which would silently delete
-   conversation history on a phantom context-length error.
+1. **Transport classification (``agent/error_classifier.py``)**:
+   A connection drop stays ``FailoverReason.timeout`` regardless of model
+   family or session size. It does not enter the compression branch without
+   an explicit context-overflow signal.
 
-2. **Detection + guidance (Part 2, ``agent/thinking_timeout_guidance.py``)**:
+2. **Detection + guidance (``agent/thinking_timeout_guidance.py``)**:
    When the classifier says timeout AND the model is in the reasoning
    allowlist AND the error message has a transport-kill signature,
    the user gets actionable guidance (raise stale_timeout, lower
@@ -17,11 +15,8 @@ Two layers:
    "use execute_code with Python's open() for large files" advice
    that fires for the unrelated large-file-write stream-drop case.
 
-Both behaviors were previously broken: the existing
-``test_disconnect_large_session_context_overflow`` test in
-``tests/agent/test_error_classifier.py`` confirms that non-reasoning
-models still route to context_overflow on a large session, so the
-reasoning-model override is strictly targeted.
+The guidance remains reasoning-model-specific even though the underlying
+transport classification is now uniform across model families.
 """
 
 from __future__ import annotations
@@ -55,15 +50,14 @@ def _classified(reason: str = "timeout", **kwargs) -> SimpleNamespace:
     return SimpleNamespace(**defaults)
 
 
-# ── Part 1: classifier override (agent/error_classifier.py:720-738) ──
+# ── Part 1: transport-disconnect classification ──
 
 
 def _make_session(disconnect_message: str, model: str, *, num_messages: int = 250):
     """Construct inputs to classify_api_error for a disconnect+large-session case."""
     e = Exception(disconnect_message)
-    # 128k context_length; 130k approx_tokens puts us over 0.6 of context
-    # AND > 120k absolute threshold; 250 messages is also > 200 threshold.
-    # Without the reasoning-model override, this routes to context_overflow.
+    # Keep pressure high to prove neither token nor message count changes the
+    # transport classification.
     return e, {
         "provider": "nvidia",
         "model": model,
@@ -74,13 +68,11 @@ def _make_session(disconnect_message: str, model: str, *, num_messages: int = 25
 
 
 class TestClassifierOverride:
-    """The reasoning-model override at error_classifier.py:720-738.
+    """Transport disconnect classification for reasoning and chat models.
 
-    Verifies the new behavior: a transport disconnect on a reasoning
-    model on a LARGE session now routes to FailoverReason.timeout
-    instead of context_overflow.  Without this fix, the compression
-    branch would fire on a phantom overflow and silently delete
-    conversation history.
+    A transport disconnect stays a timeout regardless of model family or
+    session size. Reasoning-model detection remains relevant to the separate
+    user guidance path, but no longer changes the base error classification.
     """
 
     def test_reasoning_model_disconnect_on_large_session_is_timeout(self):
@@ -91,15 +83,11 @@ class TestClassifierOverride:
         )
         result = classify_api_error(e, **kwargs)
         assert result.reason == FailoverReason.timeout, (
-            "Reasoning-model transport disconnect on a large session "
-            "should route to FailoverReason.timeout (not "
-            "context_overflow) — the upstream proxy idle-kill is far "
-            "more likely than a true context-length error on a "
-            "thinking model."
+            "A transport disconnect should remain FailoverReason.timeout "
+            "regardless of session size or model family."
         )
         assert result.should_compress is False, (
-            "Compression would silently delete conversation history on "
-            "a phantom overflow — must not fire for reasoning models."
+            "A disconnect without explicit overflow evidence must not compress."
         )
 
     @pytest.mark.parametrize("model", [
@@ -110,7 +98,7 @@ class TestClassifierOverride:
         "qwen/qwq-32b-preview",
         "x-ai/grok-4-fast-reasoning",
     ])
-    def test_all_known_reasoning_models_override(self, model):
+    def test_all_known_reasoning_models_route_to_timeout(self, model):
         from agent.error_classifier import classify_api_error, FailoverReason
         e, kwargs = _make_session(
             "server disconnected without sending complete message",
@@ -120,23 +108,16 @@ class TestClassifierOverride:
         assert result.reason == FailoverReason.timeout
         assert result.should_compress is False
 
-    def test_non_reasoning_model_large_session_still_routes_to_context_overflow(self):
-        """Regression guard: existing test_disconnect_large_session_context_overflow
-        behavior must be preserved for non-reasoning models.
-
-        Without the override, this case routes to context_overflow +
-        should_compress=True (the existing, intentional behavior for
-        chat models that hit true context-length errors via proxy
-        disconnect).  With the override, it stays that way.
-        """
+    def test_non_reasoning_model_large_session_routes_to_timeout(self):
+        """Chat-model disconnects also remain transport errors."""
         from agent.error_classifier import classify_api_error, FailoverReason
         e, kwargs = _make_session(
             "server disconnected without sending complete message",
             model="gpt-4o",
         )
         result = classify_api_error(e, **kwargs)
-        assert result.reason == FailoverReason.context_overflow
-        assert result.should_compress is True
+        assert result.reason == FailoverReason.timeout
+        assert result.should_compress is False
 
     @pytest.mark.parametrize("model", [
         "olmo-1",
@@ -146,20 +127,18 @@ class TestClassifierOverride:
         "qwen2-72b-instruct",
         "x-ai/grok-3",
     ])
-    def test_non_reasoning_models_all_keep_context_overflow(self, model):
+    def test_non_reasoning_models_all_route_to_timeout(self, model):
         from agent.error_classifier import classify_api_error, FailoverReason
         e, kwargs = _make_session(
             "server disconnected without sending complete message",
             model=model,
         )
         result = classify_api_error(e, **kwargs)
-        assert result.reason == FailoverReason.context_overflow
+        assert result.reason == FailoverReason.timeout
+        assert result.should_compress is False
 
     def test_reasoning_model_small_session_still_routes_to_timeout(self):
-        """Sanity check: a reasoning model with a SMALL session also
-        routes to timeout (the original behavior, unchanged by the
-        override since the override's result matches the small-session
-        branch's result)."""
+        """A reasoning-model disconnect on a small session is also timeout."""
         from agent.error_classifier import classify_api_error, FailoverReason
         e = Exception("server disconnected")
         result = classify_api_error(
@@ -173,9 +152,7 @@ class TestClassifierOverride:
 
     def test_reasoning_model_with_status_code_does_not_match_disconnect_pattern(self):
         """Status-code errors take the HTTP-status path in the
-        classifier, not the disconnect-with-large-session path.
-        The reasoning-model override is INSIDE the disconnect branch
-        and doesn't fire for HTTP errors."""
+        classifier, not the status-less disconnect path."""
         from agent.error_classifier import classify_api_error, FailoverReason
         e = Exception("server disconnected")
         # Inject a status_code attribute to simulate an HTTP error
@@ -190,8 +167,7 @@ class TestClassifierOverride:
         )
         # 503 specifically routes to overloaded (per the 5xx → 503/529
         # handling in error_classifier.py). The key assertion is that
-        # the reasoning-model override is NOT reached — neither
-        # timeout nor context_overflow.
+        # the status-less disconnect branch is not reached.
         assert result.reason != FailoverReason.timeout
         assert result.reason != FailoverReason.context_overflow
         assert result.should_compress is False

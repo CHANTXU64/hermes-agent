@@ -4559,8 +4559,9 @@ def run_conversation(
 
                 # Check for context-length errors BEFORE generic 4xx handler.
                 # The classifier detects context overflow from: explicit error
-                # messages, generic 400 + large session heuristic (#1630), and
-                # server disconnect + large session pattern (#2153).
+                # messages and the generic 400 + large session heuristic (#1630).
+                # Transport disconnects remain transport errors regardless of
+                # session size.
                 is_context_length_error = (
                     classified.reason == FailoverReason.context_overflow
                 )
@@ -5252,10 +5253,9 @@ def run_conversation(
                         # Thinking-timeout guidance overrides the generic
                         # stream-drop guidance — the latter is wrong for
                         # this case (it suggests splitting large file
-                        # writes, which isn't what happened).  See the
-                        # reasoning-model override at
-                        # agent/error_classifier.py:720-738 and the
-                        # detection block above for context.
+                        # writes, which isn't what happened). Classification
+                        # remains a transport timeout; the detection block above
+                        # adds reasoning-model-specific guidance.
                         from agent.thinking_timeout_guidance import (
                             build_thinking_timeout_guidance,
                         )

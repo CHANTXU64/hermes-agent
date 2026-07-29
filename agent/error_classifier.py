@@ -518,12 +518,10 @@ _TRANSPORT_ERROR_TYPES = frozenset({
     "APITimeoutError",
 })
 
-# Server disconnect patterns (no status code, but transport-level).
-# These are the "ambiguous" patterns — a plain connection close could be
-# transient transport hiccup OR server-side context overflow rejection
-# (common when the API gateway disconnects instead of returning an HTTP
-# error for oversized requests).  A large session + one of these patterns
-# triggers the context-overflow-with-compression recovery path.
+# Server disconnect patterns (no status code, transport-level).
+# These message signatures may be wrapped in generic exceptions, so recognize
+# them explicitly as retryable transport failures. Session size does not turn
+# them into context-overflow evidence.
 _SERVER_DISCONNECT_PATTERNS = [
     "server disconnected",
     "peer closed connection",
@@ -611,7 +609,7 @@ def classify_api_error(
       3. Error code classification (from body)
       4. Message pattern matching (billing vs rate_limit vs context vs auth)
       5. SSL/TLS transient alert patterns → retry as timeout
-      6. Server disconnect + large session → context overflow
+      6. Server disconnect signatures → transport timeout
       7. Transport error heuristics
       8. Fallback: unknown (retryable with backoff)
 
@@ -888,46 +886,17 @@ def classify_api_error(
     if any(p in error_msg for p in _SSL_TRANSIENT_PATTERNS):
         return _result(FailoverReason.timeout, retryable=True)
 
-    # ── 6. Server disconnect + large session → context overflow ─────
-    # Must come BEFORE generic transport error catch — a disconnect on
-    # a large session is more likely context overflow than a transient
-    # transport hiccup.  Without this ordering, RemoteProtocolError
-    # always maps to timeout regardless of session size.
+    # ── 6. Server disconnect signatures → transport timeout ─────────
+    # A dropped connection is direct evidence of a transport failure, while
+    # session size is only a pressure signal.  Do not turn a disconnect into
+    # context_overflow based on token or message-count heuristics: explicit
+    # provider overflow responses are classified earlier, and proactive
+    # request-size checks own size-based compression before the API call.
+    # Keep this before the generic transport catch so message-only signatures
+    # wrapped in a plain Exception are still recognized as transport failures.
 
     is_disconnect = any(p in error_msg for p in _SERVER_DISCONNECT_PATTERNS)
     if is_disconnect and not status_code:
-        # Reasoning-model override: a transport disconnect on a reasoning
-        # model is much more likely the upstream proxy idle-killing a
-        # long thinking stream than a true context overflow — even on
-        # large sessions.  The default disconnect+large-session routing
-        # below would otherwise send the user into the compression
-        # branch (should_compress=True) and silently delete
-        # conversation history on a phantom context-length error.
-        # Reasoning models have multi-minute thinking phases that
-        # routinely exceed the cloud gateway's idle window (NVIDIA
-        # NIM ~120s — first-party repro at NVIDIA/NemoClaw#4846;
-        # OpenAI worker / Anthropic stream-idle similar).  The
-        # per-reasoning-model stale-timeout floor in
-        # agent/reasoning_timeouts.py raises the stale-detector
-        # threshold to tolerate long thinking, so a true
-        # transport-layer failure here is recoverable via the retry
-        # path — not via context compression.  Reclassify as timeout.
-        # (Part 1 of Fixes #52310.)
-        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
-        if get_reasoning_stale_timeout_floor(model) is not None:
-            return _result(FailoverReason.timeout, retryable=True)
-        # Absolute token/message-count thresholds are only a proxy for smaller
-        # context windows.  Large-context sessions can have hundreds of
-        # messages while still being far below their actual token budget.
-        is_large = approx_tokens > context_length * 0.6 or (
-            context_length <= 256000 and (approx_tokens > 120000 or num_messages > 200)
-        )
-        if is_large:
-            return _result(
-                FailoverReason.context_overflow,
-                retryable=True,
-                should_compress=True,
-            )
         return _result(FailoverReason.timeout, retryable=True)
 
     # ── 7b. Stale-call circuit breaker → failover immediately ──────
