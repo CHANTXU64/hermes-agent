@@ -9,9 +9,48 @@ Also verifies that internal control interrupt reasons like "Stop requested"
 do not get recycled into the pending-user-message follow-up path.
 """
 
+from datetime import datetime
+import inspect
 from types import SimpleNamespace
 
-from gateway.run import _is_control_interrupt_message
+from gateway.run import (
+    GatewayRunner,
+    _is_control_interrupt_message,
+    _prepare_gateway_user_message_metadata,
+)
+
+
+class TestQueuedFollowupPersistenceMetadata:
+    def test_pending_event_keeps_its_own_text_timestamp_and_message_id(self):
+        event = SimpleNamespace(
+            timestamp="2026-07-31T04:00:00+00:00",
+            message_id="telegram-followup-2",
+        )
+
+        model_text, persisted_text, persisted_timestamp, persisted_message_id = (
+            _prepare_gateway_user_message_metadata(
+                event,
+                "queued correction",
+                inject_timestamp=False,
+            )
+        )
+
+        assert model_text == "queued correction"
+        assert persisted_text == "queued correction"
+        assert persisted_timestamp == datetime.fromisoformat(
+            event.timestamp
+        ).timestamp()
+        assert persisted_message_id == "telegram-followup-2"
+
+
+    def test_recursive_followup_forwards_persistence_metadata(self):
+        source = inspect.getsource(GatewayRunner._run_agent_inner)
+        marker = "followup_result = await self._run_agent("
+        recursive_call = source[source.index(marker) :]
+
+        assert "persist_user_message=next_persist_user_message" in recursive_call
+        assert "persist_user_timestamp=next_persist_user_timestamp" in recursive_call
+        assert "persist_user_message_id=next_persist_user_message_id" in recursive_call
 
 
 def _extract_channel_prompt(pending_event):

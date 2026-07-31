@@ -6,6 +6,7 @@ merge conflicts.
 """
 
 import json
+import sqlite3
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -78,6 +79,11 @@ def test_waited_persisted_retain_propagates_api_failure(provider_with_config):
             wait=True,
             timeout=1,
         )
+
+    row = _latest_submission_row(p)
+    assert row[2] == "failed"
+    assert row[3] is not None
+    assert row[4] == "retain api unavailable"
 
 
 def test_retain_before_session_reset_drains_pending_memory_work(provider_with_config):
@@ -270,6 +276,166 @@ def test_retain_session_direct_flush_works_in_context_mode(provider_with_config)
     call_kwargs = p._client.aretain_batch.call_args.kwargs
     assert call_kwargs["document_id"].startswith("test-session-")
     assert "context user" in call_kwargs["items"][0]["content"]
+
+def test_direct_flush_records_exact_successful_submission(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    p.sync_turn("ledger user", "ledger assistant")
+
+    p.flush_retained_turns()
+    p._retain_queue.join()
+
+    submitted_content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+    with sqlite3.connect(p._retain_store_path) as conn:
+        row = conn.execute(
+            "SELECT document_id, content_json, status, completed_at, error "
+            "FROM hindsight_retain_submissions ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert row[0] == p._client.aretain_batch.call_args.kwargs["document_id"]
+    assert row[1] == submitted_content
+    assert row[2] == "succeeded"
+    assert row[3] is not None
+    assert row[4] == ""
+
+
+def test_session_switch_flush_records_exact_successful_submission(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    p.sync_turn("switch ledger user", "switch ledger assistant")
+    p._auto_retain = True
+
+    p.on_session_switch("next-session")
+    p._retain_queue.join()
+
+    submitted_content = p._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+    with sqlite3.connect(p._retain_store_path) as conn:
+        row = conn.execute(
+            "SELECT document_id, content_json, status, completed_at, error "
+            "FROM hindsight_retain_submissions ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert row[0] == p._client.aretain_batch.call_args.kwargs["document_id"]
+    assert row[1] == submitted_content
+    assert row[2] == "succeeded"
+    assert row[3] is not None
+    assert row[4] == ""
+
+
+def _latest_submission_row(provider):
+    with sqlite3.connect(provider._retain_store_path) as conn:
+        return conn.execute(
+            "SELECT document_id, content_json, status, completed_at, error "
+            "FROM hindsight_retain_submissions ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+
+def test_direct_flush_records_failed_submission(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    p.sync_turn("failed ledger user", "failed ledger assistant")
+    p._client.aretain_batch.side_effect = RuntimeError("retain unavailable")
+
+    p.flush_retained_turns()
+    p._retain_queue.join()
+
+    row = _latest_submission_row(p)
+    assert row[2] == "failed"
+    assert row[3] is not None
+    assert row[4] == "retain unavailable"
+
+
+def test_session_switch_flush_records_failed_submission(provider_with_config):
+    p = provider_with_config(auto_retain=False)
+    p.sync_turn("failed switch user", "failed switch assistant")
+    p._client.aretain_batch.side_effect = RuntimeError("switch retain unavailable")
+    p._auto_retain = True
+
+    p.on_session_switch("next-session")
+    p._retain_queue.join()
+
+    row = _latest_submission_row(p)
+    assert row[2] == "failed"
+    assert row[3] is not None
+    assert row[4] == "switch retain unavailable"
+
+
+def test_direct_flush_ledger_insert_failure_preserves_retry_state(
+    provider_with_config,
+    monkeypatch,
+):
+    p = provider_with_config(auto_retain=False)
+    p.sync_turn("ledger insert user", "ledger insert assistant")
+    original_begin = p._begin_retain_submission
+
+    def fail_begin(**_kwargs):
+        raise sqlite3.OperationalError("ledger locked")
+
+    monkeypatch.setattr(p, "_begin_retain_submission", fail_begin)
+
+    with pytest.raises(sqlite3.OperationalError, match="ledger locked"):
+        p.flush_retained_turns()
+
+    assert p._last_queued_flush_count == 0
+    assert p._retain_flush_pending is False
+    p._client.aretain_batch.assert_not_called()
+
+    monkeypatch.setattr(p, "_begin_retain_submission", original_begin)
+    assert p.flush_retained_turns()["queued"] is True
+    p._retain_queue.join()
+    p._client.aretain_batch.assert_called_once()
+
+
+def test_direct_flush_enqueue_failure_rolls_back_retry_state(
+    provider_with_config,
+    monkeypatch,
+):
+    p = provider_with_config(auto_retain=False)
+    p.sync_turn("enqueue user", "enqueue assistant")
+    original_put = p._retain_queue.put
+
+    def fail_put(_item):
+        raise RuntimeError("queue unavailable")
+
+    monkeypatch.setattr(p._retain_queue, "put", fail_put)
+
+    with pytest.raises(RuntimeError, match="queue unavailable"):
+        p.flush_retained_turns()
+
+    assert p._last_queued_flush_count == 0
+    assert p._retain_flush_pending is False
+    row = _latest_submission_row(p)
+    assert row[2] == "failed"
+    assert row[4] == "queue unavailable"
+
+    monkeypatch.setattr(p._retain_queue, "put", original_put)
+    assert p.flush_retained_turns()["queued"] is True
+    p._retain_queue.join()
+    p._client.aretain_batch.assert_called_once()
+
+
+def test_session_switch_ledger_insert_failure_preserves_old_session_for_retry(
+    provider_with_config,
+    monkeypatch,
+):
+    p = provider_with_config(auto_retain=False)
+    p.sync_turn("switch insert user", "switch insert assistant")
+    p._auto_retain = True
+    original_begin = p._begin_retain_submission
+
+    def fail_begin(**_kwargs):
+        raise sqlite3.OperationalError("ledger locked")
+
+    monkeypatch.setattr(p, "_begin_retain_submission", fail_begin)
+
+    with pytest.raises(sqlite3.OperationalError, match="ledger locked"):
+        p.on_session_switch("next-session")
+
+    assert p._session_id == "test-session"
+    assert p._last_queued_flush_count == 0
+    assert len(p._session_turns) == 1
+    p._client.aretain_batch.assert_not_called()
+
+    monkeypatch.setattr(p, "_begin_retain_submission", original_begin)
+    p.on_session_switch("next-session")
+    p._retain_queue.join()
+    p._client.aretain_batch.assert_called_once()
+
 
 def test_retain_session_second_call_does_not_repeat_same_turns(provider_with_config):
     p = provider_with_config(auto_retain=False)
@@ -1298,6 +1464,7 @@ def test_transcript_sync_strips_model_switch_note_from_multimodal_user_content(p
     assert "model was just switched" not in turn[0]["content"]
     assert "检查这张图" in turn[0]["content"]
     assert "https://example.com/image.png" in turn[0]["content"]
+    assert "[Image attached]" in turn[0]["content"]
     assert turn[1]["content"] == "Assistant: 图片已检查"
 
 
@@ -1684,6 +1851,23 @@ def test_transcript_sync_preserves_real_user_recent_summary_lookalike(provider_w
     assert turn[1]["content"] == "Assistant: 正常回答"
 
 
+def test_hindsight_preserves_safe_image_marker_url_but_strips_local_path():
+    provider = hindsight_module.HindsightMemoryProvider()
+    safe_url = "https://example.com/screenshot.png"
+
+    safe = provider._clean_retain_user_content(
+        f"check this\n\n[Image attached at: {safe_url}]"
+    )
+    local = provider._clean_retain_user_content(
+        "check this\n\n[Image attached at: /tmp/screenshot.png]"
+    )
+
+    assert safe_url in safe
+    assert "[Image attached]" in safe
+    assert "/tmp/screenshot.png" not in local
+    assert "[Image attached]" in local
+
+
 def test_clean_on_retain_strips_historical_runtime_payload_but_keeps_visible_content(provider_with_config):
     p = provider_with_config(auto_retain=False)
     # Simulate pre-fix dirty rows already in sqlite.
@@ -1832,6 +2016,7 @@ def test_clean_on_retain_strips_historical_runtime_payload_but_keeps_visible_con
     assert "已检查" in content
     assert "检查历史图片" in content
     assert "https://example.com/historical.png" in content
+    assert "[Image attached]" in content
     assert content.index("user-visible async result") < content.index("继续")
     for forbidden in (
         "ASYNC DELEGATION",

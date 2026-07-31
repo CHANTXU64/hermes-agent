@@ -22,6 +22,7 @@ $HERMES_HOME/hindsight/retain_turns.sqlite3
 
 ```text
 hindsight_retain_turns
+hindsight_retain_submissions
 ```
 
 每行保存：
@@ -44,6 +45,14 @@ hindsight_retain_turns
   {"role": "assistant", "content": "Assistant: ...", "timestamp": "..."}
 ]
 ```
+
+Gateway 可提供平台消息号时，user message 还会带内部
+`_hermes_source_occurrence_id`。这个标识持久化同一平台事件的身份；它不按
+文本去重，因此两个消息号不同、文字相同的真实消息仍是两个 occurrence。
+
+`hindsight_retain_submissions` 在请求排队前记录 exact outbound
+`content_json`，并在请求返回或失败后记录 `succeeded` / `failed`、完成时间
+和错误。进程在完成前中断时，行保留为 `queued`，不会伪装成成功。
 
 通常一行对应一个 `user → assistant` turn。内部 async completion 触发后如果产生用户实际看见的正式 assistant 结果，该结果会单独保存为 assistant-only event：
 
@@ -87,6 +96,8 @@ hindsight_retain_turns
 
 - 每个完成 turn 的 `sync_turn()` 都会先把同源 retain payload 写入 `hindsight/retain_turns.sqlite3`。
 - 当 `sync_turn()` 收到 `messages` transcript 时，优先从完整 transcript 构建 retain turns，而不是只使用最终 `user_content` / `assistant_content` 标量对。这样 gateway 中一个长任务先收到用户 A、后被用户 B 打断并最终完成时，persisted document 仍从 A 开始。
+- Gateway 初始消息与排队 follow-up 都把各自的干净 user text、平台时间和平台消息号传到当前 Agent turn；StateDB 的 `platform_message_id` 与 persisted retain user occurrence 使用同一来源标识。重启、压缩或 replay 改变本地时间戳时，同一非空 occurrence id 仍只保留一次；不同 occurrence id 的相同文本不会合并。
+- 多模态同一消息的原生 image part 与 Gateway 简化文本只生成一个 retain occurrence；payload 不保存 `data:image/...;base64`、本地图片路径或像素数据，保留规范化的 `[Image attached]` 占位；原消息已有的安全 `http(s)` 图片 URL 作为回源引用保留。
 - transcript replay 写入前会先镜像 `retain_turns.sqlite3` 中当前逻辑 document 的 `active=1` rows 到内存 buffer；provider 重启或压缩切换后再次收到 full transcript 或只含尾部的压缩窗口时，通过 role/content 锚点识别已持久化 turns，只把新出现的 async assistant-only events 按窗口顺序合并进完整历史。合并会软停用旧 rows、保留已匹配 root/child rows 的 session 归属，并写入一份顺序正确的新 active sequence；下一次自动 retain（包括未到阈值就发生 session switch 的旧 buffer flush）强制使用 `replace`，避免把窗口以 `append` 再重复一次。重放中的历史消息若没有来源 timestamp，会保持时间未知，不能通过新生成的 `now()` 冒充新事件；仅本次 `sync_turn()` 真正完成的 final Assistant 可补当前时间。两个稳定锚点之间可按结构恢复缺时间的 assistant-only event，但无锚点窗口不能把缺时间消息当成新尾部。带完整稳定时间戳、且明确晚于旧 canonical candidates 的同文本事件仍视为真实重复并保留。旧 rows 的 `retain_document_id` 为空时，通过已解析 lineage 软停用。
 - transcript 构建会过滤 tool output、assistant tool-call stub、`[Recent Summary ...]`、`Operation interrupted:` 通知、空 assistant 消息和同一 user segment 中的中间 assistant 草稿。真实 user segment 只保留最后用户可见 assistant；async completion 后的最后一个 eligible 用户可见正式 assistant 结果按原顺序保留为 assistant-only event。async marker 前若存在 orphan real user，会先单独保存该 user，避免把 async result 错配给它。
 - 2026-07-10 起额外过滤运行时合成注入：`[Session Arc Summary ...]`、`[Durable Summary ...]`、`[Depth-N Summary ...]`、`[Current user objective preserved from compacted history]`、`[Your active task list was preserved across context compression]`、`[Externalized payload: ...]`、`[ASYNC DELEGATION BATCH COMPLETE ...]`、`[ASYNC DELEGATION COMPLETE ...]`、`[OUT-OF-BAND USER MESSAGE ...]`，以及位于用户内容开头的 `[Note: model was just switched ... Adjust your self-identification accordingly.]`。模型切换提示只从纯文本开头或多模态消息的首个 text part 删除完整固定 marker，后面的真实用户原话和全部非文本 part 继续保留。2026-07-16 起 async completion 只丢内部 payload，保留其后的用户可见 assistant 结果；其它纯噪声消息整段丢弃，夹带真实用户原话时只保留残留真实文本。assistant 侧同类摘要/interrupt 也不入档。`/retain` 提交前会对历史 `turn_json` 再清洗（clean-on-retain），并用相同规则保留历史 async visible assistant。标量 `sync_turn(user, assistant)` 走同一规则。过滤按 marker，不按业务词。
@@ -182,9 +193,10 @@ bank_id = current configured bank
 
 ## 重复提交
 
-当前实现不维护 retained cursor，也不会在 retain 成功后清理 `retain_turns.sqlite3`。也就是说，同一个 `retain_document_id` 反复执行 `/retain`，append 模式下可能重复提交完整 logical document。
-
-这是有意保持简单：当前使用目标是“一个会话结束后手动保存一次”。
+当前实现不在 retain 成功后清理 `retain_turns.sqlite3`。手动 `/retain` 每次都从
+active persisted turns 重建完整 logical document，并在 API 支持显式更新模式时
+使用 `replace`；不会把完整文档按 `append` 重复叠加。自动 retain 的正常增量路径
+仍按 append watermark 发送新 turns。
 
 ## 返回结果
 
@@ -205,6 +217,10 @@ bank_id = current configured bank
 - CLI `/retain` 调用 provider 的 persisted lineage retain，而不是读取原始 SessionDB transcript。
 - 即使 SessionDB 中存在 LCM/压缩生成的 `[Recent Summary ...]` 消息，`/retain` 也不会把它当作 Hindsight Document 内容源。
 - `sync_turn()` 会持久化和自动 retain 同源的 turn payload。
+- 平台消息号会贯通 Gateway 当前消息、排队 follow-up、Agent current user turn、StateDB `platform_message_id` 和 Hindsight persisted occurrence；provider restart 后同一 occurrence 即使时间戳变化也不会重复，而不同平台 occurrence 的相同文本仍分别保留。
+- 多模态 native/simplified 双表示只保留一个 turn，并验证提交 payload 不含 base64 或本地图片路径。
+- manual persisted-lineage、transcript compatibility、正常自动 flush 与 session-switch flush 四条 document-bearing 提交路径都会写 exact payload submission ledger，并在成功/失败后结束 `queued` 状态；进程在结果前中断时保留 `queued`，供监控明确判为证据未决。
+- 监控按成功账本顺序重建提交代次：`replace` 重置完整代次，`append` 只把该 delta 接到上一成功代次，空模式按旧 API 的完整覆盖处理；未知模式或畸形 payload 使后续 append 保持未决，直到明确 reset。远端 `original_text` 必须与某一可证明代次语义一致，否则保持 unresolved，不用 active rows 或时间邻近猜测。
 - `sync_turn(..., messages=...)` 会通过完整流程测试验证：gateway interrupt / 多用户消息同一完成 turn 时，Hindsight Document `original_text` 从真实第一条用户消息开始，而不是从后来的纠偏消息开始。
 - async completion 回归会验证内部 payload 不进入 persisted/manual retain，最后一个用户可见 final assistant 以 assistant-only event 保留，prior orphan user 不会被误配，并且后续真实 user/assistant 顺序不变；clean-on-retain 对历史 dirty async turn 使用相同规则。Restart/partial replay 回归还验证 pre-fix 中间缺口会合并进完整 persisted history，软替换本地 active rows，自动 retain 使用 `replace`，不会产生 `old + replay window` 重复乱序；缺来源时间的历史 Assistant 不会被刷新为当前时间或在连续重放中再次插入，稳定时间证明为后来发生的相同序列仍保留，两个稳定锚点之间缺时间的 assistant-only event 仍能恢复。
 - Manual `/retain` 会按 `retain_document_id` 聚合同一压缩 logical document；即使 B/C 在 SessionDB 中表现为 siblings，也能从 C retain 到 A+B+C。

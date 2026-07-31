@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
@@ -934,6 +935,26 @@ def test_hindsight_document_original_text_starts_from_real_first_user_turn_after
         assert item["context"] == "conversation between Hermes Agent and the User"
 
         content = item["content"]
+        with sqlite3.connect(tmp_path / "hindsight" / "retain_turns.sqlite3") as conn:
+            submission = conn.execute(
+                """
+                SELECT bank_id, document_id, update_mode, content_json, status,
+                       completed_at, error
+                FROM hindsight_retain_submissions
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        assert submission is not None
+        assert submission[:5] == (
+            "test-bank",
+            session_id,
+            "replace",
+            content,
+            "succeeded",
+        )
+        assert submission[5] is not None
+        assert submission[6] == ""
         turns = json.loads(content)
         assert turns[0][0]["content"] == f"User: {real_first_user}", (
             "Hindsight Document original_text starts from real first user turn after gateway "
@@ -1103,6 +1124,217 @@ def test_hindsight_transcript_replay_keeps_persisted_answer_and_later_assistant_
         assert turns[2][0]["content"] == "User: second request after restart"
     finally:
         provider2.shutdown()
+
+
+def test_hindsight_replayed_platform_occurrence_survives_provider_restart(
+    tmp_path,
+    monkeypatch,
+):
+    session_id = "stable-occurrence-restart"
+    provider1, _ = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    try:
+        first = provider1._build_turns_from_conversation_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "same platform event",
+                    "message_id": "telegram-update-123",
+                    "timestamp": 1710000160.0,
+                },
+                {
+                    "role": "assistant",
+                    "content": "same completed answer",
+                    "timestamp": 1710000161.0,
+                },
+            ]
+        )
+        assert provider1._append_session_turns(first)[0] == 1
+    finally:
+        provider1.shutdown()
+
+    provider2, _ = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    try:
+        replay = provider2._build_turns_from_conversation_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "same platform event",
+                    "message_id": "telegram-update-123",
+                    "timestamp": 1710000460.0,
+                },
+                {
+                    "role": "assistant",
+                    "content": "same completed answer",
+                    "timestamp": 1710000461.0,
+                },
+            ]
+        )
+
+        added, _, _ = provider2._append_session_turns(replay)
+        persisted, _, _ = provider2._load_persisted_retain_turns(session_id)
+
+        assert added == 0
+        assert len(persisted) == 1
+        persisted_messages = json.loads(persisted[0])
+        assert persisted_messages[0]["_hermes_source_occurrence_id"] == (
+            "message_id:telegram-update-123"
+        )
+    finally:
+        provider2.shutdown()
+
+
+def test_hindsight_replayed_platform_user_occurrence_is_not_retained_twice():
+    """A restored copy of one platform message must not create a second User turn."""
+    provider = HindsightMemoryProvider()
+    repeated_user = {
+        "role": "user",
+        "content": "check the fork maintenance omissions",
+        "message_id": "telegram-update-123",
+    }
+    messages = [
+        {**repeated_user, "timestamp": 1710000160.0},
+        {"role": "assistant", "content": "I need to inspect the fork rules."},
+        {**repeated_user, "timestamp": 1710000460.0},
+        {"role": "assistant", "content": "The audit found one missing fork test."},
+    ]
+
+    retained = [
+        json.loads(turn)
+        for turn in provider._build_turns_from_conversation_messages(messages)
+    ]
+
+    users = [message for turn in retained for message in turn if message["role"] == "user"]
+    assistants = [
+        message for turn in retained for message in turn if message["role"] == "assistant"
+    ]
+    assert len(users) == 1
+    assert [message["content"] for message in assistants] == [
+        "Assistant: I need to inspect the fork rules.",
+        "Assistant: The audit found one missing fork test.",
+    ]
+
+
+def test_hindsight_preserves_identical_text_from_distinct_platform_occurrences():
+    provider = HindsightMemoryProvider()
+    messages = [
+        {
+            "role": "user",
+            "content": "repeat this constraint",
+            "message_id": "telegram-update-1",
+            "timestamp": 1710000160.0,
+        },
+        {"role": "assistant", "content": "first acknowledgement"},
+        {
+            "role": "user",
+            "content": "repeat this constraint",
+            "message_id": "telegram-update-2",
+            "timestamp": 1710000460.0,
+        },
+        {"role": "assistant", "content": "second acknowledgement"},
+    ]
+
+    retained = [
+        json.loads(turn)
+        for turn in provider._build_turns_from_conversation_messages(messages)
+    ]
+
+    assert [turn[0]["content"] for turn in retained] == [
+        "User: repeat this constraint",
+        "User: repeat this constraint",
+    ]
+
+
+def test_hindsight_collapses_native_and_simplified_image_representations():
+    """One image occurrence must not become two retained turns or retain pixels."""
+    provider = HindsightMemoryProvider()
+    question = "What do you see in this image?"
+    image_path = "/tmp/example.png"
+    answer = "The screenshot shows a DHCP self-assigned address."
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"{question}\n\n[Image attached at: {image_path}]",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                },
+            ],
+        },
+        {"role": "assistant", "content": answer, "timestamp": 1710000161.0},
+        {
+            "role": "user",
+            "content": f"{question}\n\n[Image attached at: {image_path}]\n[screenshot]",
+            "timestamp": 1710000160.0,
+        },
+        {"role": "assistant", "content": answer},
+    ]
+
+    retained = [
+        json.loads(turn)
+        for turn in provider._build_turns_from_conversation_messages(messages)
+    ]
+
+    assert len(retained) == 1
+    assert retained[0][0] == {
+        "role": "user",
+        "content": f"User: {question}\n\n[Image attached]",
+        "timestamp": provider._retain_message_timestamp(1710000160.0),
+    }
+    assert retained[0][1]["content"] == f"Assistant: {answer}"
+    assert retained[0][1]["timestamp"] == provider._retain_message_timestamp(1710000161.0)
+    serialized = json.dumps(retained, ensure_ascii=False)
+    assert "data:image" not in serialized
+    assert "base64" not in serialized
+    assert image_path not in serialized
+
+
+def test_hindsight_collapses_public_url_and_simplified_image_representations():
+    """Safe public image references survive while duplicate runtime views collapse."""
+    provider = HindsightMemoryProvider()
+    question = "What do you see in this image?"
+    image_url = "https://example.com/image.png"
+    image_path = "/tmp/example.png"
+    answer = "A single screenshot."
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        },
+        {"role": "assistant", "content": answer, "timestamp": 1710000161.0},
+        {
+            "role": "user",
+            "content": f"{question}\n\n[Image attached at: {image_path}]\n[screenshot]",
+            "timestamp": 1710000160.0,
+        },
+        {"role": "assistant", "content": answer},
+    ]
+
+    retained = [
+        json.loads(turn)
+        for turn in provider._build_turns_from_conversation_messages(messages)
+    ]
+
+    assert len(retained) == 1
+    serialized = json.dumps(retained, ensure_ascii=False)
+    assert image_url in serialized
+    assert image_path not in serialized
+    assert retained[0][0]["timestamp"] == provider._retain_message_timestamp(1710000160.0)
+    assert retained[0][1]["timestamp"] == provider._retain_message_timestamp(1710000161.0)
 
 
 def test_hindsight_transcript_replay_matches_stable_answer_across_user_representation_change(

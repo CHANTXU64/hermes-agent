@@ -261,6 +261,17 @@ def test_task_id_passthrough():
     assert agent._current_task_id == "fixed-task"
 
 
+def test_persist_user_message_id_is_attached_to_current_turn():
+    agent = _FakeAgent()
+    ctx = _build(agent, persist_user_message_id="telegram-update-123")
+
+    assert ctx.messages[-1] == {
+        "role": "user",
+        "content": "hello",
+        "message_id": "telegram-update-123",
+    }
+
+
 def test_persist_user_message_becomes_original():
     agent = _FakeAgent()
     ctx = _build(agent, user_message="api-prefixed", persist_user_message="clean")

@@ -1134,6 +1134,41 @@ def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
     return bool(mt)
 
 
+def _prepare_gateway_user_message_metadata(
+    event: Any,
+    message_text: str,
+    *,
+    inject_timestamp: bool,
+) -> tuple[str, str, Optional[float], Optional[str]]:
+    """Return model text plus clean persistence metadata for one inbound event."""
+    persisted_text = message_text
+    persisted_timestamp: Optional[float] = None
+    message_id = str(getattr(event, "message_id", None) or "").strip() or None
+
+    from hermes_time import get_timezone as _get_evt_tz
+    from gateway.message_timestamps import (
+        coerce_message_timestamp as _coerce_msg_ts,
+        render_user_content_with_timestamp as _render_msg_ts,
+        strip_leading_message_timestamps as _strip_msg_ts,
+    )
+
+    event_tz = _get_evt_tz()
+    persisted_text, embedded_timestamp = _strip_msg_ts(message_text, tz=event_tz)
+    event_timestamp = _coerce_msg_ts(
+        getattr(event, "timestamp", None),
+        tz=event_tz,
+    )
+    persisted_timestamp = (
+        event_timestamp if event_timestamp is not None else embedded_timestamp
+    )
+    model_text = (
+        _render_msg_ts(persisted_text, persisted_timestamp, tz=event_tz)
+        if inject_timestamp
+        else persisted_text
+    )
+    return model_text, persisted_text, persisted_timestamp, message_id
+
+
 def _build_gateway_agent_history(
     history: List[Dict[str, Any]],
     *,
@@ -14534,34 +14569,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # human-readable prefix the model sees) is gated behind
         # gateway.message_timestamps.enabled — default OFF.
         try:
-            from hermes_time import get_timezone as _get_evt_tz
-            from gateway.message_timestamps import (
-                coerce_message_timestamp as _coerce_msg_ts,
-                render_user_content_with_timestamp as _render_msg_ts,
-                strip_leading_message_timestamps as _strip_msg_ts,
+            (
+                message_text,
+                persist_user_message,
+                persist_user_timestamp,
+                persist_user_message_id,
+            ) = _prepare_gateway_user_message_metadata(
+                event,
+                message_text,
+                inject_timestamp=_message_timestamps_enabled(_load_gateway_config()),
             )
-            _evt_tz = _get_evt_tz()
-            _evt_ts = getattr(event, "timestamp", None)
-            if message_text and isinstance(message_text, str):
-                _clean_message_text, _embedded_ts = _strip_msg_ts(
-                    message_text, tz=_evt_tz)
-                persist_user_message = _clean_message_text
-                _event_epoch = _coerce_msg_ts(_evt_ts, tz=_evt_tz)
-                persist_user_timestamp = (
-                    _event_epoch if _event_epoch is not None else _embedded_ts
-                )
-                if _message_timestamps_enabled(_load_gateway_config()):
-                    message_text = _render_msg_ts(
-                        _clean_message_text,
-                        persist_user_timestamp,
-                        tz=_evt_tz,
-                    )
-                else:
-                    # Toggle off: model sees the clean message; the timestamp
-                    # is still stored as metadata for later opt-in.
-                    message_text = _clean_message_text
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
+            persist_user_message_id = (
+                str(getattr(event, "message_id", None) or "").strip() or None
+            )
 
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
@@ -14610,6 +14632,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_message_id=persist_user_message_id,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -20878,6 +20901,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -20896,6 +20920,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_message_id=persist_user_message_id,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -20907,6 +20932,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_message_id=persist_user_message_id,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -21028,6 +21054,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23144,6 +23171,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+                if persist_user_message_id:
+                    _conversation_kwargs["persist_user_message_id"] = persist_user_message_id
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
@@ -24142,6 +24171,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_persist_user_message = None
+                next_persist_user_timestamp = None
+                next_persist_user_message_id = None
                 next_session_key = session_key
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
@@ -24172,6 +24204,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if next_message is None:
                         return result
+                    try:
+                        (
+                            next_message,
+                            next_persist_user_message,
+                            next_persist_user_timestamp,
+                            next_persist_user_message_id,
+                        ) = _prepare_gateway_user_message_metadata(
+                            pending_event,
+                            next_message,
+                            inject_timestamp=_message_timestamps_enabled(
+                                _load_gateway_config()
+                            ),
+                        )
+                    except Exception as _followup_metadata_err:
+                        logger.debug(
+                            "Queued follow-up metadata preparation failed (non-fatal): %s",
+                            _followup_metadata_err,
+                        )
+                        next_persist_user_message_id = (
+                            str(getattr(pending_event, "message_id", None) or "").strip()
+                            or None
+                        )
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
 
@@ -24204,6 +24258,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
+                if not isinstance(next_message, str):
+                    return result or {"final_response": response, "messages": history}
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
@@ -24215,6 +24271,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    persist_user_message=next_persist_user_message,
+                    persist_user_timestamp=next_persist_user_timestamp,
+                    persist_user_message_id=next_persist_user_message_id,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

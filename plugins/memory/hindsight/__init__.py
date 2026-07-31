@@ -1987,17 +1987,21 @@ class HindsightMemoryProvider(MemoryProvider):
         *,
         user_timestamp: Any = None,
         assistant_timestamp: Any = None,
+        user_occurrence_id: str = "",
         fallback_timestamp_now: bool = True,
     ) -> List[Dict[str, str]]:
-        return [
-            {
+        user_message = {
                 "role": "user",
                 "content": f"{self._retain_user_prefix}: {user_content}",
                 "timestamp": self._retain_message_timestamp(
                     user_timestamp,
                     fallback_now=fallback_timestamp_now,
                 ),
-            },
+            }
+        if user_occurrence_id:
+            user_message["_hermes_source_occurrence_id"] = user_occurrence_id
+        return [
+            user_message,
             {
                 "role": "assistant",
                 "content": f"{self._retain_assistant_prefix}: {assistant_content}",
@@ -2274,6 +2278,83 @@ class HindsightMemoryProvider(MemoryProvider):
             return None
         return json.dumps(cleaned_parts, ensure_ascii=False)
 
+    @staticmethod
+    def _normalize_retain_image_markers(text: str) -> str:
+        """Canonicalize runtime image hints without retaining paths or pixels."""
+        normalized = re.sub(
+            r"\[Image attached at(?::)?\s*(https?://[^\]\s]+)\]",
+            lambda match: f"[Image attached]\nImage URL: {match.group(1)}",
+            str(text or ""),
+            flags=re.IGNORECASE,
+        )
+        normalized = re.sub(
+            r"\[Image attached at(?::)?\s*[^\]\n]+\]",
+            "[Image attached]",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        normalized = re.sub(
+            r"(?m)^\s*\[screenshot\]\s*$",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"\n{3,}", "\n\n", normalized).strip()
+
+    @classmethod
+    def _canonicalize_retain_multimodal_content(cls, content: Any) -> str | None:
+        """Return text-only retain content for an OpenAI image-part payload."""
+        parts = content
+        if isinstance(parts, str):
+            stripped = parts.strip()
+            if not stripped.startswith("["):
+                return None
+            try:
+                parts = json.loads(stripped)
+            except Exception:
+                return None
+        if not isinstance(parts, list):
+            return None
+        image_types = {"image", "image_url", "input_image"}
+        has_image = any(
+            isinstance(part, dict) and str(part.get("type") or "") in image_types
+            for part in parts
+        )
+        if not has_image:
+            return None
+        texts = [
+            cls._stringify_retain_content(part.get("text")).strip()
+            for part in parts
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and cls._stringify_retain_content(part.get("text")).strip()
+        ]
+        safe_image_urls: list[str] = []
+        for part in parts:
+            if not isinstance(part, dict) or str(part.get("type") or "") not in image_types:
+                continue
+            image_value = part.get("image_url")
+            if isinstance(image_value, dict):
+                image_value = image_value.get("url")
+            if image_value is None:
+                image_value = part.get("url")
+            image_url = str(image_value or "").strip()
+            if image_url.startswith(("https://", "http://")) and image_url not in safe_image_urls:
+                safe_image_urls.append(image_url)
+        text = "\n\n".join(texts)
+        normalized = cls._normalize_retain_image_markers(text)
+        if "[Image attached]" not in normalized:
+            normalized = f"{normalized}\n\n[Image attached]" if normalized else "[Image attached]"
+        if safe_image_urls:
+            missing_url_lines = [
+                f"Image URL: {image_url}"
+                for image_url in safe_image_urls
+                if f"Image URL: {image_url}" not in normalized.splitlines()
+            ]
+            if missing_url_lines:
+                normalized += "\n" + "\n".join(missing_url_lines)
+        return normalized
+
     @classmethod
     def _clean_retain_user_content(cls, content: Any) -> str:
         """Return retainable user text after stripping synthetic runtime noise.
@@ -2284,7 +2365,12 @@ class HindsightMemoryProvider(MemoryProvider):
         noise message becomes empty and is dropped. Mixed messages keep only
         the real user text that remains after marker blocks are removed.
         """
-        text = cls._stringify_retain_content(content).replace("\r\n", "\n").strip()
+        canonical_multimodal = cls._canonicalize_retain_multimodal_content(content)
+        text = (
+            canonical_multimodal
+            if canonical_multimodal is not None
+            else cls._stringify_retain_content(content)
+        ).replace("\r\n", "\n").strip()
         if not text:
             return ""
 
@@ -2336,7 +2422,7 @@ class HindsightMemoryProvider(MemoryProvider):
             cleaned = cleaned[:-3].rstrip("\n").strip()
         if cleaned in {"", "---", "-"}:
             return ""
-        return cleaned
+        return cls._normalize_retain_image_markers(cleaned)
 
     @classmethod
     def _is_retain_noise_assistant_content(cls, content: Any) -> bool:
@@ -2421,6 +2507,18 @@ class HindsightMemoryProvider(MemoryProvider):
     ) -> str | None:
         messages = cls._extract_retain_out_of_band_user_messages(message)
         return messages[-1] if messages else None
+
+    @staticmethod
+    def _retain_source_occurrence_id(message: Dict[str, Any]) -> str:
+        """Return a stable runtime/platform identity when the source exposes one."""
+        persisted = str(message.get("_hermes_source_occurrence_id") or "").strip()
+        if persisted:
+            return persisted
+        for key in ("_hermes_source_message_id", "message_id", "platform_message_id"):
+            value = str(message.get(key) or "").strip()
+            if value:
+                return f"{key}:{value}"
+        return ""
 
     @classmethod
     def _extract_retain_clarify_exchange(
@@ -2523,10 +2621,10 @@ class HindsightMemoryProvider(MemoryProvider):
         user_content: str,
         *,
         user_timestamp: Any = None,
+        user_occurrence_id: str = "",
         fallback_timestamp_now: bool = True,
     ) -> List[Dict[str, str]]:
-        return [
-            {
+        user_message = {
                 "role": "user",
                 "content": f"{self._retain_user_prefix}: {user_content}",
                 "timestamp": self._retain_message_timestamp(
@@ -2534,7 +2632,9 @@ class HindsightMemoryProvider(MemoryProvider):
                     fallback_now=fallback_timestamp_now,
                 ),
             }
-        ]
+        if user_occurrence_id:
+            user_message["_hermes_source_occurrence_id"] = user_occurrence_id
+        return [user_message]
 
     def _build_orphan_assistant_turn(
         self,
@@ -2556,16 +2656,18 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _build_turn_group_from_conversation_messages(self, messages: List[Dict[str, Any]]) -> List[str]:
         turns: List[str] = []
-        pending_user: tuple[str, Any] | None = None
+        pending_user: tuple[str, Any, str] | None = None
         pending_assistant: tuple[str, Any] | None = None
         pending_async_completion = False
         pending_async_assistant: tuple[str, Any] | None = None
+        seen_user_occurrences: set[str] = set()
+        duplicate_anchor_assistant = ""
 
         def _flush_pending_turn() -> None:
             nonlocal pending_user, pending_assistant
             if not pending_user:
                 return
-            user_content, user_timestamp = pending_user
+            user_content, user_timestamp, user_occurrence_id = pending_user
             if pending_assistant:
                 assistant_content, assistant_timestamp = pending_assistant
                 turns.append(json.dumps(
@@ -2574,6 +2676,7 @@ class HindsightMemoryProvider(MemoryProvider):
                         assistant_content,
                         user_timestamp=user_timestamp,
                         assistant_timestamp=assistant_timestamp,
+                        user_occurrence_id=user_occurrence_id,
                         fallback_timestamp_now=False,
                     ),
                     ensure_ascii=False,
@@ -2583,6 +2686,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     self._build_orphan_user_turn(
                         user_content,
                         user_timestamp=user_timestamp,
+                        user_occurrence_id=user_occurrence_id,
                         fallback_timestamp_now=False,
                     ),
                     ensure_ascii=False,
@@ -2635,7 +2739,7 @@ class HindsightMemoryProvider(MemoryProvider):
                             ensure_ascii=False,
                         ))
                     if user_response:
-                        pending_user = (user_response, event_timestamp)
+                        pending_user = (user_response, event_timestamp, "")
                         pending_assistant = None
                     else:
                         # A timeout is framework state, not user speech. The
@@ -2645,7 +2749,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     _flush_pending_async_assistant()
                     _flush_pending_turn()
                     pending_async_completion = False
-                    pending_user = (out_of_band_user, event_timestamp)
+                    pending_user = (out_of_band_user, event_timestamp, "")
                     pending_assistant = None
                 continue
             if role == "user":
@@ -2674,10 +2778,24 @@ class HindsightMemoryProvider(MemoryProvider):
                     # assistant. A real user, a completed assistant event, or a
                     # new assistant-producing trigger closes/switches the boundary.
                     continue
+                occurrence_id = self._retain_source_occurrence_id(msg)
+                if occurrence_id and occurrence_id in seen_user_occurrences:
+                    duplicate_anchor_assistant = pending_assistant[0] if pending_assistant else ""
+                    _flush_pending_async_assistant()
+                    _flush_pending_turn()
+                    pending_async_completion = True
+                    continue
+                if occurrence_id:
+                    seen_user_occurrences.add(occurrence_id)
                 _flush_pending_async_assistant()
                 _flush_pending_turn()
                 pending_async_completion = False
-                pending_user = (cleaned_user, msg.get("_timestamp", msg.get("timestamp")))
+                duplicate_anchor_assistant = ""
+                pending_user = (
+                    cleaned_user,
+                    msg.get("_timestamp", msg.get("timestamp")),
+                    occurrence_id,
+                )
                 pending_assistant = None
                 continue
             if role == "assistant" and self._is_retain_noise_assistant_content(content):
@@ -2688,6 +2806,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 continue
             if not pending_user:
                 if pending_async_completion:
+                    if duplicate_anchor_assistant and content == duplicate_anchor_assistant:
+                        pending_async_completion = False
+                        duplicate_anchor_assistant = ""
+                        continue
                     # Mirror normal user segments: retain the last eligible
                     # assistant, not an intermediate progress/draft message.
                     pending_async_assistant = (
@@ -2703,7 +2825,134 @@ class HindsightMemoryProvider(MemoryProvider):
 
         _flush_pending_turn()
         _flush_pending_async_assistant()
-        return turns
+        return self._collapse_adjacent_replay_representations(turns)
+
+    @classmethod
+    def _collapse_adjacent_replay_representations(cls, turns: List[str]) -> List[str]:
+        """Merge adjacent copies whose identical messages carry complementary timestamps."""
+        collapsed: List[str] = []
+        for turn_json in turns:
+            if not collapsed:
+                collapsed.append(turn_json)
+                continue
+            exact_match = (
+                cls._retain_turn_canonical(collapsed[-1])
+                == cls._retain_turn_canonical(turn_json)
+            )
+            old_urls = cls._retain_turn_safe_image_urls(collapsed[-1])
+            new_urls = cls._retain_turn_safe_image_urls(turn_json)
+            representation_match = (
+                bool(old_urls) != bool(new_urls)
+                and cls._retain_turn_representation_canonical(collapsed[-1])
+                == cls._retain_turn_representation_canonical(turn_json)
+            )
+            if not exact_match and not representation_match:
+                collapsed.append(turn_json)
+                continue
+            try:
+                previous = json.loads(collapsed[-1])
+                current = json.loads(turn_json)
+            except Exception:
+                collapsed.append(turn_json)
+                continue
+            if (
+                not isinstance(previous, list)
+                or not isinstance(current, list)
+                or len(previous) != len(current)
+            ):
+                collapsed.append(turn_json)
+                continue
+            merged: List[Dict[str, Any]] = []
+            complementary = False
+            compatible = True
+            for old_message, new_message in zip(previous, current):
+                if not isinstance(old_message, dict) or not isinstance(new_message, dict):
+                    compatible = False
+                    break
+                old_timestamp = str(old_message.get("timestamp") or "")
+                new_timestamp = str(new_message.get("timestamp") or "")
+                if old_timestamp and new_timestamp and old_timestamp != new_timestamp:
+                    compatible = False
+                    break
+                complementary = complementary or bool(old_timestamp) != bool(new_timestamp)
+                merged_message = dict(old_message)
+                old_content = str(old_message.get("content") or "")
+                new_content = str(new_message.get("content") or "")
+                if (
+                    not cls._retain_safe_image_urls_from_text(old_content)
+                    and cls._retain_safe_image_urls_from_text(new_content)
+                ):
+                    merged_message["content"] = new_content
+                merged_message["timestamp"] = old_timestamp or new_timestamp
+                merged.append(merged_message)
+            if not compatible or not complementary:
+                collapsed.append(turn_json)
+                continue
+            collapsed[-1] = json.dumps(merged, ensure_ascii=False)
+        return collapsed
+
+    @staticmethod
+    def _retain_safe_image_urls_from_text(text: str) -> tuple[str, ...]:
+        return tuple(
+            re.findall(r"(?m)^Image URL: (https?://\S+)\s*$", str(text or ""))
+        )
+
+    @classmethod
+    def _retain_turn_safe_image_urls(cls, turn_json: str) -> tuple[str, ...]:
+        try:
+            payload = json.loads(turn_json)
+        except Exception:
+            return tuple()
+        if not isinstance(payload, list):
+            return tuple()
+        return tuple(
+            image_url
+            for message in payload
+            if isinstance(message, dict)
+            for image_url in cls._retain_safe_image_urls_from_text(
+                str(message.get("content") or "")
+            )
+        )
+
+    @classmethod
+    def _retain_turn_representation_canonical(cls, turn_json: str) -> tuple:
+        try:
+            payload = json.loads(turn_json)
+        except Exception:
+            return (("raw", str(turn_json)),)
+        if not isinstance(payload, list):
+            return (("raw", str(payload)),)
+        canonical = []
+        for message in payload:
+            if not isinstance(message, dict):
+                canonical.append(("raw", str(message)))
+                continue
+            content = re.sub(
+                r"(?m)^Image URL: https?://\S+\s*$",
+                "",
+                str(message.get("content") or ""),
+            )
+            content = re.sub(r"\n{3,}", "\n\n", content).strip()
+            canonical.append((str(message.get("role") or ""), content))
+        return tuple(canonical)
+
+    @staticmethod
+    def _retain_turn_source_occurrence_id(turn_json: str) -> str:
+        try:
+            payload = json.loads(turn_json)
+        except Exception:
+            return ""
+        if not isinstance(payload, list):
+            return ""
+        for message in payload:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            occurrence_id = str(
+                message.get("_hermes_source_occurrence_id") or ""
+            ).strip()
+            if occurrence_id:
+                return occurrence_id
+        return ""
 
     @staticmethod
     def _retain_turn_canonical(turn_json: str) -> tuple:
@@ -3204,7 +3453,74 @@ class HindsightMemoryProvider(MemoryProvider):
             "CREATE INDEX IF NOT EXISTS idx_hindsight_retain_turns_document_active "
             "ON hindsight_retain_turns(retain_document_id, active, id)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hindsight_retain_submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bank_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                update_mode TEXT NOT NULL DEFAULT '',
+                content_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                queued_at REAL NOT NULL,
+                completed_at REAL,
+                error TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hindsight_retain_submissions_document "
+            "ON hindsight_retain_submissions(bank_id, document_id, id)"
+        )
         return conn
+
+    def _begin_retain_submission(
+        self,
+        *,
+        bank_id: str,
+        document_id: str,
+        update_mode: str | None,
+        content: str,
+    ) -> int:
+        """Persist the exact outbound document payload before it is queued."""
+        with self._retain_store_connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO hindsight_retain_submissions
+                (bank_id, document_id, update_mode, content_json, status, queued_at)
+                VALUES (?, ?, ?, ?, 'queued', ?)
+                """,
+                (bank_id, document_id, update_mode or "", content, time.time()),
+            )
+            if cursor.lastrowid is None:
+                raise RuntimeError("Hindsight retain submission ledger did not return an id")
+            return int(cursor.lastrowid)
+
+    def _finish_retain_submission(self, submission_id: int, error: BaseException | None = None) -> None:
+        try:
+            with self._retain_store_connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE hindsight_retain_submissions
+                    SET status = ?, completed_at = ?, error = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "failed" if error is not None else "succeeded",
+                        time.time(),
+                        str(error) if error is not None else "",
+                        int(submission_id),
+                    ),
+                )
+        except Exception:
+            # The remote side effect may already have happened. Leave the row
+            # queued/unresolved rather than turning a successful API call into
+            # an apparent retain failure that could be retried and duplicated.
+            logger.warning(
+                "Failed to finish Hindsight retain submission ledger row %s",
+                submission_id,
+                exc_info=True,
+            )
 
     def _lookup_retain_document_id(self, conn: sqlite3.Connection, session_id: str) -> str:
         sid = str(session_id or "").strip()
@@ -3777,6 +4093,12 @@ class HindsightMemoryProvider(MemoryProvider):
         retain_async_flag = self._retain_async
         retain_context = self._retain_context
         num_turns = len(turns)
+        submission_id = self._begin_retain_submission(
+            bank_id=bank_id,
+            document_id=document_id,
+            update_mode=update_mode,
+            content=content,
+        )
 
         def _do_retain() -> None:
             item: Dict[str, Any] = {"content": content}
@@ -3788,14 +4110,19 @@ class HindsightMemoryProvider(MemoryProvider):
                 "Hindsight transcript retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
                 bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns,
             )
-            self._run_hindsight_operation(
-                lambda client: client.aretain_batch(
-                    bank_id=bank_id,
-                    items=[item],
-                    document_id=document_id,
-                    retain_async=retain_async_flag,
+            try:
+                self._run_hindsight_operation(
+                    lambda client: client.aretain_batch(
+                        bank_id=bank_id,
+                        items=[item],
+                        document_id=document_id,
+                        retain_async=retain_async_flag,
+                    )
                 )
-            )
+            except BaseException as exc:
+                self._finish_retain_submission(submission_id, exc)
+                raise
+            self._finish_retain_submission(submission_id)
             logger.debug("Hindsight transcript retain succeeded")
 
         self._ensure_writer()
@@ -3907,6 +4234,12 @@ class HindsightMemoryProvider(MemoryProvider):
         retain_async_flag = self._retain_async
         retain_context = self._retain_context
         num_turns = len(turns)
+        submission_id = self._begin_retain_submission(
+            bank_id=bank_id,
+            document_id=document_id,
+            update_mode=update_mode,
+            content=content,
+        )
 
         def _do_retain() -> None:
             item: Dict[str, Any] = {"content": content}
@@ -3918,14 +4251,19 @@ class HindsightMemoryProvider(MemoryProvider):
                 "Hindsight persisted retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d, lineage=%s",
                 bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns, lineage,
             )
-            self._run_hindsight_operation(
-                lambda client: client.aretain_batch(
-                    bank_id=bank_id,
-                    items=[item],
-                    document_id=document_id,
-                    retain_async=retain_async_flag,
+            try:
+                self._run_hindsight_operation(
+                    lambda client: client.aretain_batch(
+                        bank_id=bank_id,
+                        items=[item],
+                        document_id=document_id,
+                        retain_async=retain_async_flag,
+                    )
                 )
-            )
+            except BaseException as exc:
+                self._finish_retain_submission(submission_id, exc)
+                raise
+            self._finish_retain_submission(submission_id)
             logger.debug("Hindsight persisted retain succeeded")
 
         completed = threading.Event() if wait else None
@@ -4016,6 +4354,12 @@ class HindsightMemoryProvider(MemoryProvider):
             num_turns = len(flush_turns)
             flush_up_to = total_turns
             retain_generation = self._retain_generation
+            submission_id = self._begin_retain_submission(
+                bank_id=self._bank_id,
+                document_id=document_id,
+                update_mode=update_mode,
+                content=content,
+            )
             self._last_queued_flush_count = flush_up_to
             if update_mode == "append":
                 self._retain_flush_pending = True
@@ -4024,6 +4368,7 @@ class HindsightMemoryProvider(MemoryProvider):
         retain_context = self._retain_context
 
         def _do_retain() -> None:
+            remote_succeeded = False
             try:
                 item = self._build_retain_kwargs(
                     content,
@@ -4045,13 +4390,17 @@ class HindsightMemoryProvider(MemoryProvider):
                         retain_async=retain_async_flag,
                     )
                 )
+                remote_succeeded = True
+                self._finish_retain_submission(submission_id)
                 with self._retain_flush_lock:
                     if self._retain_generation == retain_generation:
                         self._last_flushed_turn_count = max(self._last_flushed_turn_count, flush_up_to)
                         if force_replace:
                             self._retain_force_replace = False
                 logger.debug("Hindsight retain succeeded")
-            except Exception:
+            except BaseException as exc:
+                if not remote_succeeded:
+                    self._finish_retain_submission(submission_id, exc)
                 with self._retain_flush_lock:
                     if self._retain_generation == retain_generation:
                         if self._last_queued_flush_count == flush_up_to:
@@ -4062,9 +4411,18 @@ class HindsightMemoryProvider(MemoryProvider):
                     if self._retain_generation == retain_generation:
                         self._retain_flush_pending = False
 
-        self._ensure_writer()
-        self._register_atexit()
-        self._retain_queue.put(_do_retain)
+        try:
+            self._ensure_writer()
+            self._register_atexit()
+            self._retain_queue.put(_do_retain)
+        except BaseException as exc:
+            self._finish_retain_submission(submission_id, exc)
+            with self._retain_flush_lock:
+                if self._retain_generation == retain_generation:
+                    if self._last_queued_flush_count == flush_up_to:
+                        self._last_queued_flush_count = self._last_flushed_turn_count
+                    self._retain_flush_pending = False
+            raise
         return {
             "queued": True,
             "document_id": document_id,
@@ -4109,6 +4467,35 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._session_turns:
             existing = [self._retain_turn_canonical(turn) for turn in self._session_turns]
             incoming = [self._retain_turn_canonical(turn) for turn in turns]
+            existing_occurrences = [
+                self._retain_turn_source_occurrence_id(turn)
+                for turn in self._session_turns
+            ]
+            incoming_occurrences = [
+                self._retain_turn_source_occurrence_id(turn) for turn in turns
+            ]
+            if (
+                incoming_occurrences
+                and all(incoming_occurrences)
+                and len(incoming_occurrences) <= len(existing_occurrences)
+                and existing_occurrences[: len(incoming_occurrences)]
+                == incoming_occurrences
+            ):
+                return 0, before_counter, before_counter
+            if (
+                existing_occurrences
+                and all(existing_occurrences)
+                and len(incoming_occurrences) > len(existing_occurrences)
+                and incoming_occurrences[: len(existing_occurrences)]
+                == existing_occurrences
+            ):
+                new_turns = turns[len(existing_occurrences) :]
+                for turn in new_turns:
+                    self._session_turns.append(turn)
+                    self._turn_counter += 1
+                    self._turn_index = self._turn_counter
+                    self._persist_retain_turn(turn)
+                return len(new_turns), before_counter, self._turn_counter
             existing_ids = [self._retain_turn_replay_identity(turn) for turn in self._session_turns]
             incoming_ids = [self._retain_turn_replay_identity(turn) for turn in turns]
             existing_times = [
@@ -4506,7 +4893,6 @@ class HindsightMemoryProvider(MemoryProvider):
                 old_turns = list(self._session_turns[old_start_index:old_total_turns])
             else:
                 old_turns = list(self._session_turns[:old_total_turns])
-            self._last_queued_flush_count = old_total_turns
             old_metadata = self._build_metadata(
                 message_count=len(old_turns) * 2,
                 turn_index=old_turn_index,
@@ -4517,6 +4903,7 @@ class HindsightMemoryProvider(MemoryProvider):
             if old_parent_session_id:
                 old_lineage_tags.append(f"parent:{old_parent_session_id}")
             old_content = "[" + ",".join(old_turns) + "]"
+            submission_id: int | None = None
 
             def _flush():
                 try:
@@ -4542,7 +4929,11 @@ class HindsightMemoryProvider(MemoryProvider):
                             retain_async=self._retain_async,
                         )
                     )
-                except Exception as e:
+                    if submission_id is not None:
+                        self._finish_retain_submission(submission_id)
+                except BaseException as e:
+                    if submission_id is not None:
+                        self._finish_retain_submission(submission_id, e)
                     logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
 
             # Route the flush through the same writer queue sync_turn
@@ -4552,9 +4943,20 @@ class HindsightMemoryProvider(MemoryProvider):
             # keeps shutdown's drain semantics intact. Skip enqueue if
             # shutdown has already fired — the writer is draining/gone.
             if not self._shutting_down.is_set():
-                self._ensure_writer()
-                self._register_atexit()
-                self._retain_queue.put(_flush)
+                submission_id = self._begin_retain_submission(
+                    bank_id=self._bank_id,
+                    document_id=old_document_id,
+                    update_mode=old_update_mode,
+                    content=old_content,
+                )
+                try:
+                    self._ensure_writer()
+                    self._register_atexit()
+                    self._retain_queue.put(_flush)
+                except BaseException as exc:
+                    self._finish_retain_submission(submission_id, exc)
+                    raise
+                self._last_queued_flush_count = old_total_turns
 
         # 2. Drop the carried recall so the new session cannot see stale memory.
         with self._prefetch_lock:
