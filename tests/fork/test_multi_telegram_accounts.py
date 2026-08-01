@@ -99,6 +99,52 @@ def test_normalize_account_id():
     assert normalize_account_id("-leading") is None
 
 
+def test_named_account_auth_denial_still_allows_explicit_dm_pairing(monkeypatch):
+    """Named-account auth must not suppress an explicit DM pairing policy."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    adapter.config = PlatformConfig(
+        enabled=True,
+        token="222:BBB",
+        extra={
+            "account_id": "work",
+            "unauthorized_dm_behavior": "pair",
+        },
+    )
+    async def handle_message(event):
+        return None
+
+    adapter._message_handler = handle_message
+    seen = {}
+
+    def auth_check(user_id, chat_type, chat_id):
+        seen.update(
+            user_id=user_id,
+            chat_type=chat_type,
+            chat_id=chat_id,
+        )
+        return False
+
+    adapter.set_authorization_check(auth_check)
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=999, username="guest", full_name="Guest"),
+        chat=SimpleNamespace(id=999, type="private", is_forum=False),
+        sender_chat=None,
+        message_thread_id=None,
+        is_topic_message=False,
+    )
+
+    source = adapter._source_from_message_for_auth(message)
+    assert source.account_id == "work"
+    assert adapter._is_user_authorized_from_message(message) is True
+    assert seen == {
+        "user_id": "999",
+        "chat_type": "dm",
+        "chat_id": "999",
+    }
+
+
 def test_primary_session_key_byte_compatible():
     src = SessionSource(
         platform=Platform.TELEGRAM,
