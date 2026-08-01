@@ -2527,20 +2527,8 @@ def _custom_api_response_format(output_path: str, cfg: Dict[str, Any]) -> str:
     return suffix or "mp3"
 
 
-def _extract_custom_api_audio_bytes(response: Any) -> bytes:
-    """Extract raw audio bytes from a custom TTS HTTP response."""
-    content_type = response.headers.get("Content-Type", "")
-    if "audio/" in content_type or "application/octet-stream" in content_type:
-        return response.content
-
-    try:
-        data = response.json()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Custom TTS API returned unexpected Content-Type '{content_type}' "
-            f"({len(response.content)} bytes)"
-        ) from exc
-
+def _extract_custom_api_audio_bytes_from_json(data: Any) -> bytes:
+    """Extract raw audio bytes from a parsed custom TTS JSON response."""
     if not isinstance(data, dict):
         raise RuntimeError("Custom TTS API JSON response was not an object")
 
@@ -2584,6 +2572,22 @@ def _extract_custom_api_audio_bytes(response: Any) -> bytes:
         if message:
             raise RuntimeError(f"Custom TTS API error: {message}")
     raise RuntimeError("Custom TTS API returned no audio data")
+
+
+def _extract_custom_api_audio_bytes(response: Any) -> bytes:
+    """Extract bounded audio bytes from a custom TTS HTTP response."""
+    content_type = response.headers.get("Content-Type", "")
+    if "audio/" in content_type or "application/octet-stream" in content_type:
+        return _read_tts_response_bytes(response, label="Custom TTS API")
+
+    try:
+        data = _read_tts_response_json(response, label="Custom TTS API")
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Custom TTS API returned unexpected Content-Type '{content_type}'"
+        ) from exc
+
+    return _extract_custom_api_audio_bytes_from_json(data)
 
 
 def _generate_custom_api_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
@@ -2633,46 +2637,65 @@ def _generate_custom_api_tts(text: str, output_path: str, tts_config: Dict[str, 
         },
         json=payload,
         timeout=cfg["timeout"],
+        stream=True,
     )
     if response.status_code != 200:
+        raw_body = _read_tts_response_bytes(response, label="Custom TTS API")
+        detail = raw_body.decode("utf-8", errors="replace").strip()[:300]
         try:
-            err_body = response.json()
+            err_body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
             error = err_body.get("error", {}) if isinstance(err_body, dict) else {}
-            detail = error.get("message", "") if isinstance(error, dict) else ""
-            detail = detail or response.text[:300]
-        except Exception:
-            detail = response.text[:300]
+            error_detail = error.get("message", "") if isinstance(error, dict) else ""
+            if not error_detail and isinstance(err_body, dict):
+                error_detail = err_body.get("message", "")
+            if error_detail:
+                detail = str(error_detail)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+            pass
         raise RuntimeError(
-            f"Custom TTS API error (HTTP {response.status_code}): {detail}"
+            f"Custom TTS API error (HTTP {response.status_code})"
+            + (f": {detail}" if detail else "")
         )
 
     audio_url = ""
     if cfg["mode"] == "dashscope_multimodal":
-        try:
-            data = response.json()
-        except Exception:
-            data = {}
-        if isinstance(data, dict):
-            output_obj = data.get("output")
-            output = output_obj if isinstance(output_obj, dict) else {}
-            audio_obj = output.get("audio")
-            audio = audio_obj if isinstance(audio_obj, dict) else {}
-            audio_url = str(audio.get("url") or "").strip()
-            audio_data = str(audio.get("data") or "").strip()
-            if audio_data:
-                audio_bytes = base64.b64decode(audio_data)
-            elif audio_url:
-                audio_response = requests.get(audio_url, timeout=cfg["timeout"])
-                if audio_response.status_code != 200:
-                    raise RuntimeError(
-                        f"Custom TTS API audio download failed (HTTP {audio_response.status_code})"
-                    )
-                audio_bytes = audio_response.content
-            else:
-                # Fall back to generic JSON extract for provider variants.
-                audio_bytes = _extract_custom_api_audio_bytes(response)
-        else:
+        content_type = response.headers.get("Content-Type", "")
+        if "audio/" in content_type or "application/octet-stream" in content_type:
             audio_bytes = _extract_custom_api_audio_bytes(response)
+        else:
+            try:
+                data = _read_tts_response_json(response, label="Custom TTS API")
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+                data = {}
+            if isinstance(data, dict):
+                output_obj = data.get("output")
+                output = output_obj if isinstance(output_obj, dict) else {}
+                audio_obj = output.get("audio")
+                audio = audio_obj if isinstance(audio_obj, dict) else {}
+                audio_url = str(audio.get("url") or "").strip()
+                audio_data = str(audio.get("data") or "").strip()
+                if audio_data:
+                    audio_bytes = base64.b64decode(audio_data)
+                elif audio_url:
+                    audio_response = requests.get(
+                        audio_url,
+                        timeout=cfg["timeout"],
+                        stream=True,
+                    )
+                    if audio_response.status_code != 200:
+                        _close_response(audio_response)
+                        raise RuntimeError(
+                            f"Custom TTS API audio download failed (HTTP {audio_response.status_code})"
+                        )
+                    audio_bytes = _read_tts_response_bytes(
+                        audio_response,
+                        label="Custom TTS API audio download",
+                    )
+                else:
+                    # Fall back to generic JSON extract for provider variants.
+                    audio_bytes = _extract_custom_api_audio_bytes_from_json(data)
+            else:
+                audio_bytes = _extract_custom_api_audio_bytes_from_json(data)
     else:
         audio_bytes = _extract_custom_api_audio_bytes(response)
     if not audio_bytes:

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import inspect
 
+from gateway.config import GatewayConfig
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.run import GatewayRunner
 
 KANBAN_METHODS = [
     "_kanban_notifier_watcher",
@@ -24,5 +26,17 @@ KANBAN_METHODS = [
 def test_mixin_defines_kanban_methods():
     for m in KANBAN_METHODS:
         assert hasattr(GatewayKanbanWatchersMixin, m), f"mixin missing {m}"
+
+
+def test_gateway_runner_freezes_kanban_notifier_profile_at_init(monkeypatch):
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_active_profile_name",
+        lambda self: "startup-profile",
+    )
+
+    runner = GatewayRunner(GatewayConfig())
+
+    assert runner._kanban_notifier_profile == "startup-profile"
 
 

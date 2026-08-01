@@ -5814,7 +5814,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Conversation-scoped per-session state (/model, /model --once,
         # /reasoning, /fast overrides; per-turn sidecar notes; ephemeral
         # context pin; last-delivered voice-channel context) lives on
-        # SessionState.conversation — see gateway/session_state.py.        self._kanban_notifier_profile = self._active_profile_name()
+        # SessionState.conversation — see gateway/session_state.py.
+        self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
@@ -14526,7 +14527,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Any recognized slash command: dispatch according to its
             # declared busy_policy (dispatch / interrupt_then_dispatch /
             # reject). Unrecognized commands and plain text fall through
-            # to the interrupt/queue logic below.            if _cmd_def_inner:
+            # to the interrupt/queue logic below.
+            if _cmd_def_inner:
                 return await self._dispatch_busy_slash_command(
                     event, _cmd_def_inner, _quick_key, source,
                 )

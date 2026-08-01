@@ -720,6 +720,7 @@ What changed:
 - Default custom TTS config targets Alibaba DashScope Qwen TTS: `https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation`, `mode: dashscope_multimodal`, model `qwen3-tts-flash`, voice `Cherry`, and `api_key_env: QWEN_API_KEY`.
 - The DashScope multimodal mode posts `model` plus `input.text` / `input.voice`, then downloads the returned `output.audio.url` into the requested audio file.
 - A generic `audio_speech` mode remains available for OpenAI-compatible `/audio/speech` endpoints.
+- Custom API JSON, direct-audio, and DashScope URL-download responses use the upstream bounded streaming reader and the shared TTS response-size limit.
 - Telegram voice delivery can convert custom TTS output to Opus/OGG for voice-compatible media.
 - Added focused tests for OpenAI-compatible request construction, DashScope multimodal request construction, URL audio download, JSON base64 audio parsing, and missing `QWEN_API_KEY` errors.
 
@@ -736,13 +737,14 @@ Merge protection:
   upstream changes to TTS provider discovery.
 - Preserve `api_key_env` lookup through `get_env_value()` so keys in `~/.hermes/.env` work.
 - Preserve DashScope multimodal handling of `output.audio.url`; Qwen TTS does not use the OpenAI-compatible `/audio/speech` endpoint shape by default.
+- Keep custom API POST responses and DashScope audio downloads on the shared bounded streaming reader; do not restore eager `response.content` / `response.json()` reads.
 - Preserve the generic `audio_speech` mode unless upstream provides a verified equivalent configurable HTTP TTS provider.
 - Preserve Telegram Opus conversion behavior for `custom_api` when voice-compatible delivery is needed.
 
 Verification:
 
 ```bash
-scripts/run_tests.sh tests/agent/test_tts_registry.py tests/fork/test_custom_qwen_tts.py tests/tools/test_tts_plugin_dispatch.py tests/tools/test_tts_command_providers.py tests/tools/test_tts_opus_routing.py tests/tools/test_tts_max_text_length.py -q
+scripts/run_tests.sh tests/agent/test_tts_registry.py tests/fork/test_custom_qwen_tts.py tests/tools/test_tts_response_body_cap.py tests/tools/test_tts_plugin_dispatch.py tests/tools/test_tts_command_providers.py tests/tools/test_tts_opus_routing.py tests/tools/test_tts_max_text_length.py -q
 ```
 
 - 2026-07-10 upstream sync: upstream's newer provider registry exposed a logical
