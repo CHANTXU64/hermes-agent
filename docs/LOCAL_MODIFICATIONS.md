@@ -646,55 +646,56 @@ Feature docs: `docs/chantxu64/hindsight-manual-retain.md`.
 
 Upstream status: fork-only.
 
-### 10. Custom OpenAI-compatible STT provider
+### 10. Custom hosted STT provider
 
 Status: active
 
-Date: 2026-05-22
+Date: 2026-05-22; Qwen Audio 3.0 update 2026-08-01
 
 Files:
 
 - `tools/transcription_tools.py`
-- `tests/tools/test_transcription.py`
-- `tests/tools/test_transcription_dotenv_fallback.py`
-- `hermes_cli/config.py`
+- `hermes_cli/config_defaults.py`
 - `agent/transcription_registry.py`
+- `tests/fork/test_custom_stt.py`
+- `docs/LOCAL_MODIFICATIONS.md`
 
 Summary:
 
-- Adds a configurable OpenAI-compatible STT provider so the fork can use hosted ASR endpoints such as Alibaba DashScope Qwen STT without hardcoding a vendor-specific provider.
+- Adds a configurable custom STT provider that supports generic OpenAI-compatible endpoints and Alibaba DashScope multimodal ASR, with `qwen-audio-3.0-asr-flash` as the fork default.
 
 What changed:
 
 - Added `stt.provider: custom_api` dispatch in `tools/transcription_tools.py`.
 - Added `stt.custom_api` config for `base_url`, `api_key` / `api_key_env`, `model`, `endpoint`, `mode`, `response_format`, `language`, `prompt`, and `timeout`.
-- The custom provider supports both multipart audio uploads and DashScope-style chat-completions audio input, using a single `input_audio` content item with a Base64 Data URL.
-- It parses common transcription response shapes: `{text: ...}`, plain text, and `{choices:[{message:{content: ...}}]}`.
-- Added tests for provider selection, dotenv/env-key resolution, request construction, response parsing, and `transcribe_audio()` dispatch.
+- Preserved generic multipart audio uploads and DashScope-style chat-completions audio input.
+- Added `dashscope_multimodal` mode for Qwen-Audio-3.0-ASR-Flash. It posts a Base64 Data URL through DashScope's `input.messages[].content[].input_audio` shape, requests a non-SSE response, and reads `output.text`.
+- Runtime custom STT defaults now target `qwen-audio-3.0-asr-flash` at DashScope's multimodal generation endpoint. Neutral `DEFAULT_CONFIG` schema leaves preserve legacy endpoint inference and the `config.yaml` > `STT_CUSTOM_API_*` environment > runtime-default resolution order. Its effective prompt is empty because DashScope treats text messages as ASR context rather than transcription instructions; compatible modes retain their historical prompt default.
+- Custom STT language hints follow the shared provider/global resolution order for compatible multipart and chat-completions modes. DashScope multimodal does not use a language hint. Unsupported mode names fail before any network request.
+- It parses common transcription response shapes: `{text: ...}`, plain text, `{choices:[{message:{content: ...}}]}`, and DashScope `{output:{text: ...}}`.
+- Added tests for provider selection, dotenv/env-key resolution, default configuration, all three request modes, response parsing, and `transcribe_audio()` dispatch.
 
 Why it matters:
 
-- The user's gateway can use Alibaba Qwen STT through config only, without hardcoding a vendor-specific provider or credential name.
+- The user's gateway can use the evaluated Qwen Audio 3.0 STT model through normal Hermes configuration while retaining generic custom endpoint support.
 - Future upstream merges must not collapse custom STT back into OpenAI-only credentials or hardcoded provider names.
 
 Merge protection:
 
 - Preserve explicit `stt.provider: custom_api` behavior and do not silently fall back to another STT provider when custom credentials are missing.
-- Preserve `custom_api` as a native/built-in STT provider name in
-  `agent/transcription_registry.py`; command providers and plugin providers must
-  not shadow the fork's configured custom STT implementation.
+- Preserve `custom_api` as a native/built-in STT provider name in `agent/transcription_registry.py`; command providers and plugin providers must not shadow the fork's configured custom STT implementation.
 - Preserve `api_key_env` lookup through `get_env_value()` so keys in `~/.hermes/.env` work.
-- Preserve the Qwen ASR configuration shape: `QWEN_API_KEY`, model `qwen3-asr-flash-2026-02-10`, DashScope compatible base URL, and `/chat/completions` mode.
-- Preserve response parsing for both OpenAI-style `{text: ...}` and chat-style `choices[0].message.content` responses unless upstream has a verified equivalent.
+- Preserve the Qwen Audio 3.0 configuration shape: `QWEN_API_KEY`, model `qwen-audio-3.0-asr-flash`, base URL `https://dashscope.aliyuncs.com`, endpoint `/api/v1/services/aigc/multimodal-generation/generation`, and `dashscope_multimodal` mode.
+- Preserve response parsing for OpenAI-compatible and DashScope multimodal response shapes unless upstream has a verified equivalent.
 
 Verification:
 
 ```bash
-python -m py_compile tools/transcription_tools.py hermes_cli/config.py tests/tools/test_transcription.py tests/tools/test_transcription_dotenv_fallback.py
-python -m pytest tests/tools/test_transcription.py tests/tools/test_transcription_dotenv_fallback.py tests/tools/test_transcription_tools.py -q -o 'addopts='
+python -m py_compile tools/transcription_tools.py hermes_cli/config_defaults.py tests/fork/test_custom_stt.py
+python -m pytest tests/fork/test_custom_stt.py tests/tools/test_transcription.py tests/tools/test_transcription_dotenv_fallback.py tests/hermes_cli/test_config.py tests/gateway/test_stt_config.py -q -o 'addopts='
 ```
 
-Feature docs: none — STT provider extension documented in this index.
+Feature docs: none — this remains a focused provider extension fully described in the index.
 
 Upstream status: fork-only.
 

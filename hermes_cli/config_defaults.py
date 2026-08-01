@@ -1449,9 +1449,10 @@ DEFAULT_CONFIG = {
         # the raw transcript is also echoed back to the user as a 🎙️ message.
         # Set false to keep STT for the agent while suppressing that user-facing echo.
         "echo_transcripts": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe) | "deepinfra"
-        # Global language hint applied to EVERY provider unless a per-provider
-        # language overrides it. Defaults to "en" — Whisper auto-detection
+        "provider": "local",  # "local" | "groq" | "openai" | "mistral" | "xai" | "custom_api" | "elevenlabs" | "deepinfra"
+        # Global language hint applied to providers and request modes that
+        # support one, unless a per-provider language overrides it. Defaults
+        # to "en" — Whisper auto-detection
         # frequently misidentifies short/accented clips, which reads as
         # "STT transcribed the wrong language". Set to "" to restore
         # auto-detect, or to your language code ("es", "zh", "uk", ...).
@@ -1481,6 +1482,25 @@ DEFAULT_CONFIG = {
         },
         "xai": {
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+        },
+        "custom_api": {
+            # Neutral schema leaves keep load_config()'s deep merge from
+            # overriding legacy endpoint inference or STT_CUSTOM_API_* env
+            # fallbacks. Runtime defaults are resolved in transcription_tools.
+            "base_url": None,
+            "api_key": "",
+            "api_key_env": None,
+            "model": None,
+            "endpoint": None,
+            "mode": None,
+            "response_format": None,
+            # Language hints are sent only by compatible multipart and
+            # chat-completions modes; DashScope multimodal does not use one.
+            "language": None,
+            # None selects the mode-aware default: no prompt for DashScope
+            # multimodal; the historical instruction for compatible modes.
+            "prompt": None,
+            "timeout": None,
         },
         "elevenlabs": {
             "model_id": "scribe_v2",  # scribe_v2, scribe_v1
