@@ -267,7 +267,13 @@ What changed:
   previous real recall are evaluated by the frozen P5 prompt through the
   standard `auxiliary.hindsight_recall_preprocessor` task. Its configurable
   provider/model/timeout defaults remain `openai-codex / gpt-5.6-luna / 30s`,
-  with no generic model/provider fallback.
+  with no generic model/provider fallback. This task alone opts into OpenAI
+  Priority Processing through `extra_body.service_tier: priority`; the Codex
+  auxiliary adapter projects that explicit task-local value to the Responses
+  API's top-level `service_tier` field. Plugin-default `extra_body` remains
+  bound to its default provider: selecting a different provider without an
+  explicit `extra_body` drops the inherited request-body defaults, while an
+  explicit user `extra_body` still wins.
 - Dynamic `main`/`auto` routes are rejected. Bare `custom` is rejected unless
   this task has its own `base_url`, preventing fallback through global custom or
   unrelated API-key providers. Non-Codex provider-reported `response.model`

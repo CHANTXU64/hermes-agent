@@ -243,6 +243,7 @@ def test_hindsight_registers_recall_preprocessor_as_auxiliary_task():
         "provider": "openai-codex",
         "model": "gpt-5.6-luna",
         "timeout": 30,
+        "extra_body": {"service_tier": "priority"},
     }
 
 

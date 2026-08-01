@@ -114,7 +114,7 @@ def test_get_plugin_auxiliary_tasks_includes_active_memory_provider(
         "base_url": "",
         "api_key": "",
         "timeout": 30,
-        "extra_body": {},
+        "extra_body": {"service_tier": "priority"},
     }
 
 
@@ -254,5 +254,67 @@ def test_reset_aux_to_auto_resets_plugin_tasks(tmp_path, monkeypatch, patched_ma
 # ── auxiliary_client._get_auxiliary_task_config defaults layering ────────────
 
 
+def _patch_plugin_task_config(monkeypatch, user_task_config):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"plugin_task": user_task_config}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+        lambda: [
+            {
+                "key": "plugin_task",
+                "defaults": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-luna",
+                    "timeout": 30,
+                    "extra_body": {"service_tier": "priority"},
+                },
+            }
+        ],
+    )
 
 
+def test_provider_override_does_not_inherit_plugin_default_extra_body(monkeypatch):
+    from agent import auxiliary_client as aux
+
+    _patch_plugin_task_config(
+        monkeypatch,
+        {"provider": "xai-oauth", "model": "grok-4"},
+    )
+
+    assert aux._get_auxiliary_task_config("plugin_task") == {
+        "provider": "xai-oauth",
+        "model": "grok-4",
+        "timeout": 30,
+    }
+
+
+def test_same_provider_override_keeps_plugin_default_extra_body(monkeypatch):
+    from agent import auxiliary_client as aux
+
+    _patch_plugin_task_config(
+        monkeypatch,
+        {"provider": "openai-codex", "model": "gpt-5.5"},
+    )
+
+    assert aux._get_auxiliary_task_config("plugin_task")["extra_body"] == {
+        "service_tier": "priority"
+    }
+
+
+def test_provider_override_keeps_explicit_user_extra_body(monkeypatch):
+    from agent import auxiliary_client as aux
+
+    _patch_plugin_task_config(
+        monkeypatch,
+        {
+            "provider": "xai-oauth",
+            "model": "grok-4",
+            "extra_body": {"custom_option": True},
+        },
+    )
+
+    assert aux._get_auxiliary_task_config("plugin_task")["extra_body"] == {
+        "custom_option": True
+    }

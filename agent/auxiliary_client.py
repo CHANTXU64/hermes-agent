@@ -1037,6 +1037,13 @@ class _CodexCompletionsAdapter:
         # same behavior as the main agent's Codex transport.
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
+            # Auxiliary task config carries request-body overrides in
+            # ``extra_body``. Responses expects Priority Processing at the
+            # top level, so forward it only when that specific task opted in.
+            service_tier = extra_body.get("service_tier")
+            if isinstance(service_tier, str) and service_tier.strip():
+                resp_kwargs["service_tier"] = service_tier.strip()
+
             reasoning_cfg = extra_body.get("reasoning")
             if isinstance(reasoning_cfg, dict):
                 if reasoning_cfg.get("enabled") is False:
@@ -7017,6 +7024,26 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
                 if isinstance(_defaults, dict):
                     merged = dict(_defaults)
                     merged.update(task_config)
+                    # Request-body defaults belong to the plugin's default
+                    # provider route. If the user explicitly selects a
+                    # different provider without setting extra_body, do not
+                    # leak provider-specific wire options (for example OpenAI
+                    # service_tier) into that route. An explicit user
+                    # extra_body, including {}, still wins via the shallow
+                    # merge above.
+                    default_provider = _defaults.get("provider")
+                    user_provider = task_config.get("provider")
+                    if (
+                        "provider" in task_config
+                        and "extra_body" not in task_config
+                        and _normalize_aux_provider(
+                            default_provider if isinstance(default_provider, str) else ""
+                        )
+                        != _normalize_aux_provider(
+                            user_provider if isinstance(user_provider, str) else ""
+                        )
+                    ):
+                        merged.pop("extra_body", None)
                     return merged
                 break
     except Exception:

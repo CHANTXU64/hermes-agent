@@ -2787,6 +2787,19 @@ class TestCodexAdapterReasoningTranslation:
         assert "include" not in captured
 
 
+    def test_service_tier_priority_translated_to_top_level(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"service_tier": "priority"},
+        )
+        assert captured.get("service_tier") == "priority"
+
+    def test_no_extra_body_means_no_service_tier(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(messages=[{"role": "user", "content": "hi"}])
+        assert "service_tier" not in captured
+
 
     def test_reasoning_effort_null_falls_back_to_medium(self):
         """Parity with agent/transports/codex.py::build_kwargs() — falsy
