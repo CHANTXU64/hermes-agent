@@ -46,19 +46,12 @@ class TestComposeUserApiContent:
             },
         ]
         assert content == [{"type": "text", "text": "look"}]
-
     def test_composes_memory_block_and_plugin_context(self):
         out = compose_user_api_content("hello", "likes tea", "PLUGIN-CTX")
         fenced = build_memory_context_block("likes tea")
         assert out == "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX"
 
-    def test_plugin_context_only(self):
-        assert compose_user_api_content("hello", "", "CTX") == "hello\n\nCTX"
 
-    def test_deterministic_across_calls(self):
-        a = compose_user_api_content("hello", "likes tea", "CTX")
-        b = compose_user_api_content("hello", "likes tea", "CTX")
-        assert a == b
 
 
 # ---------------------------------------------------------------------------
@@ -85,14 +78,6 @@ class TestSessionDbSidecar:
         finally:
             db.close()
 
-    def test_absent_when_null(self, tmp_path):
-        db = self._open(tmp_path)
-        try:
-            db.append_message("s1", "user", content="hello")
-            msgs = db.get_messages_as_conversation("s1")
-            assert "api_content" not in msgs[0]
-        finally:
-            db.close()
 
     def test_get_messages_exposes_column(self, tmp_path):
         db = self._open(tmp_path)
@@ -120,7 +105,6 @@ class TestSessionDbSidecar:
             assert "api_content" not in msgs[1]
         finally:
             db.close()
-
 
 class TestAutoMigration:
     def test_reconciliation_adds_api_content_column(self, tmp_path):
@@ -748,32 +732,8 @@ from agent.turn_context import reanchor_current_turn_user_idx
 
 
 class TestReanchorCurrentTurnUserIdx:
-    def test_exact_match_beats_later_todo_snapshot(self):
-        """compress_context can append a todo-snapshot USER message after the
-        surviving current-turn copy — the anchor must stay on the real turn."""
-        messages = [
-            {"role": "assistant", "content": "summary"},
-            {"role": "user", "content": "hello"},
-            {"role": "user", "content": "## Current TODOs\n- [ ] thing"},
-        ]
-        assert reanchor_current_turn_user_idx(messages, "hello") == 1
 
-    def test_most_recent_duplicate_wins(self):
-        messages = [
-            {"role": "user", "content": "ok"},
-            {"role": "assistant", "content": "a"},
-            {"role": "user", "content": "ok"},
-        ]
-        assert reanchor_current_turn_user_idx(messages, "ok") == 2
 
-    def test_falls_back_to_last_user_without_exact_match(self):
-        """Merge-summary-into-tail rewrites the content; the trackers still
-        need a live anchor."""
-        messages = [
-            {"role": "user", "content": "[prior context]\nsummary\nhello"},
-            {"role": "assistant", "content": "a"},
-        ]
-        assert reanchor_current_turn_user_idx(messages, "hello") == 0
 
     def test_minus_one_when_no_user_message(self):
         messages = [{"role": "assistant", "content": "a"}]

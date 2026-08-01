@@ -101,9 +101,9 @@ describe('submissionCore.submitPrompt — synchronous busy (queue-race fix)', ()
     const enqueue = vi.fn()
     patchUiState({ sessionBoundaryPending: true, status: 'retaining previous session…' })
 
-    submitPrompt('send after reset', makeDeps(gw, { enqueue }))
+    submitPrompt('expanded payload', makeDeps(gw, { enqueue }), true, 'compact display')
 
-    expect(enqueue).toHaveBeenCalledWith('send after reset')
+    expect(enqueue).toHaveBeenCalledWith('expanded payload', 'compact display')
     expect(calls).toEqual([])
     expect(getUiState().status).toBe('retaining previous session…')
   })

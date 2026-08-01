@@ -71,6 +71,42 @@ def _make_runner():
 
 
 @pytest.mark.asyncio
+async def test_new_command_only_clears_own_session():
+    """/new must only clear the override for the session that triggered it."""
+    runner = _make_runner()
+    session_key = build_session_key(_make_source())
+    other_key = "other_session_key"
+
+    runner._session_model_overrides[session_key] = {
+        "model": "gpt-4o",
+        "provider": "openai",
+        "api_key": "sk-test",
+        "base_url": "",
+        "api_mode": "openai",
+    }
+    runner._session_model_overrides[other_key] = {
+        "model": "claude-sonnet-4-6",
+        "provider": "anthropic",
+        "api_key": "***",
+        "base_url": "",
+        "api_mode": "anthropic",
+    }
+    runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
+    runner._session_reasoning_overrides[other_key] = {"enabled": True, "effort": "low"}
+    runner._pending_model_notes[session_key] = "[Note: switched to gpt-4o.]"
+    runner._pending_model_notes[other_key] = "[Note: switched to claude-sonnet-4-6.]"
+
+    await runner._handle_reset_command(_make_event("/new"))
+
+    assert session_key not in runner._session_model_overrides
+    assert other_key in runner._session_model_overrides
+    assert session_key not in runner._session_reasoning_overrides
+    assert other_key in runner._session_reasoning_overrides
+    assert session_key not in runner._pending_model_notes
+    assert other_key in runner._pending_model_notes
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("command", ["/new", "/reset"])
 async def test_new_command_keeps_old_session_when_retain_on_new_fails(command):
     runner = _make_runner()
@@ -129,78 +165,3 @@ async def test_new_command_supersedes_old_delivery_obligations(command):
         await runner._handle_reset_command(_make_event(command))
 
     supersede.assert_called_once_with(session_key)
-
-
-@pytest.mark.asyncio
-async def test_new_command_clears_session_model_override():
-    """/new must remove the session-scoped model override for that session."""
-    runner = _make_runner()
-    session_key = build_session_key(_make_source())
-
-    # Simulate a prior /model switch stored as a session override
-    runner._session_model_overrides[session_key] = {
-        "model": "gpt-4o",
-        "provider": "openai",
-        "api_key": "***",
-        "base_url": "",
-        "api_mode": "openai",
-    }
-    runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
-    runner._pending_model_notes[session_key] = "[Note: switched to gpt-4o.]"
-
-    await runner._handle_reset_command(_make_event("/new"))
-
-    assert session_key not in runner._session_model_overrides
-    assert session_key not in runner._session_reasoning_overrides
-    assert session_key not in runner._pending_model_notes
-
-
-@pytest.mark.asyncio
-async def test_new_command_no_override_is_noop():
-    """/new with no prior model override must not raise."""
-    runner = _make_runner()
-    session_key = build_session_key(_make_source())
-
-    assert session_key not in runner._session_model_overrides
-    assert session_key not in runner._session_reasoning_overrides
-
-    await runner._handle_reset_command(_make_event("/new"))
-
-    assert session_key not in runner._session_model_overrides
-    assert session_key not in runner._session_reasoning_overrides
-
-
-@pytest.mark.asyncio
-async def test_new_command_only_clears_own_session():
-    """/new must only clear the override for the session that triggered it."""
-    runner = _make_runner()
-    session_key = build_session_key(_make_source())
-    other_key = "other_session_key"
-
-    runner._session_model_overrides[session_key] = {
-        "model": "gpt-4o",
-        "provider": "openai",
-        "api_key": "sk-test",
-        "base_url": "",
-        "api_mode": "openai",
-    }
-    runner._session_model_overrides[other_key] = {
-        "model": "claude-sonnet-4-6",
-        "provider": "anthropic",
-        "api_key": "***",
-        "base_url": "",
-        "api_mode": "anthropic",
-    }
-    runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
-    runner._session_reasoning_overrides[other_key] = {"enabled": True, "effort": "low"}
-    runner._pending_model_notes[session_key] = "[Note: switched to gpt-4o.]"
-    runner._pending_model_notes[other_key] = "[Note: switched to claude-sonnet-4-6.]"
-
-    await runner._handle_reset_command(_make_event("/new"))
-
-    assert session_key not in runner._session_model_overrides
-    assert other_key in runner._session_model_overrides
-    assert session_key not in runner._session_reasoning_overrides
-    assert other_key in runner._session_reasoning_overrides
-    assert session_key not in runner._pending_model_notes
-    assert other_key in runner._pending_model_notes

@@ -1,4 +1,3 @@
-import { attachedImageNotice } from '../domain/messages.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type { InputDetectDropResponse, PromptSubmitResponse } from '../gatewayTypes.js'
 import type { Msg } from '../types.js'
@@ -12,7 +11,7 @@ export const isSessionBusyError = (e: unknown) => e instanceof Error && SESSION_
 
 export interface SubmitPromptDeps {
   appendMessage: (msg: Msg) => void
-  enqueue: (text: string) => void
+  enqueue: (text: string, display?: string) => void
   expand: (text: string) => string
   gw: GatewayClient
   setLastUserMsg: (value: string) => void
@@ -42,11 +41,20 @@ export function markSubmitting(): void {
 // Submit a ready prompt (already resolved to be neither a slash command nor a
 // shell escape, with a live session). Pulled out of useSubmission so the
 // synchronous-busy invariant above is unit-testable without React test infra.
-export function submitPrompt(text: string, deps: SubmitPromptDeps, showUserMessage = true): void {
+//
+// `displayOverride` is what the transcript shows when it differs from what the
+// agent receives — a `/skill` invocation expands into the whole skill body, and
+// that scaffolding is model-facing only.
+export function submitPrompt(
+  text: string,
+  deps: SubmitPromptDeps,
+  showUserMessage = true,
+  displayOverride?: string
+): void {
   const ui = getUiState()
 
   if (ui.sessionBoundaryPending) {
-    deps.enqueue(text)
+    deps.enqueue(text, displayOverride || text)
 
     return
   }
@@ -71,7 +79,7 @@ export function submitPrompt(text: string, deps: SubmitPromptDeps, showUserMessa
     deps.setLastUserMsg(text)
 
     if (show) {
-      deps.appendMessage({ role: 'user', text: displayText })
+      deps.appendMessage({ role: 'user', text: displayOverride || displayText })
     }
 
     patchUiState({ busy: true, status: 'running…' })
@@ -80,13 +88,21 @@ export function submitPrompt(text: string, deps: SubmitPromptDeps, showUserMessa
 
     deps.gw
       .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })
+      .then(r => {
+        // The gateway consumed a typed voice stop phrase server-side (voice
+        // chat ended, no turn started) — release the busy latch; the
+        // voice.transcript {stop_phrase} event handles the mode flags + notice.
+        if (r?.voice_stopped) {
+          patchUiState({ busy: false, status: 'ready' })
+        }
+      })
       .catch((e: Error) => {
         // Defensive: prompt.submit no longer rejects a mid-turn send with
         // "session busy" (the gateway queues it and returns success), but keep
         // the re-queue path as a safety net for any future/legacy gateway that
         // still errors, so a message is never silently dropped.
         if (isSessionBusyError(e)) {
-          deps.enqueue(submitText)
+          deps.enqueue(submitText, displayOverride || displayText)
           patchUiState({ busy: true, status: 'queued for next turn' })
 
           return deps.sys(`queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? '…' : ''}"`)
@@ -100,17 +116,16 @@ export function submitPrompt(text: string, deps: SubmitPromptDeps, showUserMessa
   // Always ask the backend whether this looks like a file drop. The backend's
   // _detect_file_drop handles paths with spaces, quotes, Windows drive letters,
   // and escaped characters correctly.
+  //
+  // No notice is emitted for a match: an image dropped into the composer already
+  // shows as an `[[ Image N ]]` token, and a matched non-image path is rewritten
+  // in place. Announcing it a second time above the status bar was the old
+  // out-of-band attachment UI.
   deps.gw
     .request<InputDetectDropResponse>('input.detect_drop', { session_id: sid, text })
     .then(r => {
       if (!r?.matched) {
         return startSubmit(text, deps.expand(text), showUserMessage)
-      }
-
-      if (r.is_image) {
-        turnController.pushActivity(attachedImageNotice(r))
-      } else {
-        turnController.pushActivity(`detected file: ${r.name}`)
       }
 
       startSubmit(r.text || text, deps.expand(r.text || text), showUserMessage)

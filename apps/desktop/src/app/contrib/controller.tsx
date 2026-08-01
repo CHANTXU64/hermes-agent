@@ -1,14 +1,14 @@
 import { useStore } from '@nanostores/react'
-import { computed } from 'nanostores'
+import { atom, computed } from 'nanostores'
 import type { CSSProperties, ReactElement, PointerEvent as ReactPointerEvent } from 'react'
 
 import { PREVIEW_RAIL_MAX_WIDTH, PREVIEW_RAIL_MIN_WIDTH } from '@/app/chat/right-rail'
 import { SessionStatusDot } from '@/app/chat/session-status-dot'
-import { PALETTE_AREA, type PaletteContribution } from '@/app/command-palette/contrib'
+import { PALETTE_AREA, type PaletteContribution, paletteToggle } from '@/app/command-palette/contrib'
 import { type StatusbarItem } from '@/app/shell/statusbar-controls'
 import { IdleMount } from '@/components/idle-mount'
-import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
-import { allPaneIds, group, split } from '@/components/pane-shell/tree/model'
+import { $layoutEditMode, toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
+import { allPaneIds, group, groupLeafIds, split } from '@/components/pane-shell/tree/model'
 import { LayoutTreeRoot } from '@/components/pane-shell/tree/renderer'
 import type { DoubleTapContext } from '@/components/pane-shell/tree/renderer/drag-session'
 import {
@@ -23,12 +23,11 @@ import {
   registerLayoutResetHandler,
   registerPaneCloser,
   registerPaneOpener,
+  removeTreePane,
   resetLayoutTree,
   revealTreePane,
   setPaneCollapsed,
   setTreePaneHidden,
-  setTreeSideCollapsed,
-  treeSideOfPane,
   watchContributedPanes
 } from '@/components/pane-shell/tree/store'
 import { SidebarProvider } from '@/components/ui/sidebar'
@@ -38,9 +37,10 @@ import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
 import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
 import { sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
-import { LayoutDashboard, PanelBottom } from '@/lib/icons'
+import { FileText, LayoutDashboard, PanelBottom, Terminal, Zap } from '@/lib/icons'
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
-import { Codecs, persistentAtom } from '@/lib/persisted'
+import { setYoloEnabled } from '@/lib/yolo-session'
+import { pruneComposerPopoutZones } from '@/store/composer-popout'
 import {
   $fileBrowserOpen,
   $panesFlipped,
@@ -55,9 +55,9 @@ import {
 } from '@/store/layout'
 import { $previewOpenRequest, $previewTabs, closeRightRail } from '@/store/preview'
 import { $reviewOpen, closeReview, REVIEW_PANE_ID } from '@/store/review'
-import { $currentCwd, $selectedStoredSessionId, $sessions, sessionMatchesStoredId } from '@/store/session'
+import { $currentCwd, $selectedStoredSessionId, $sessions, $yoloActive, sessionMatchesStoredId } from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
-import { $statusbarVisible, toggleStatusbarVisible } from '@/store/statusbar-prefs'
+import { $statusbarVisible } from '@/store/statusbar-prefs'
 
 import type { SessionDragPayload } from '../chat/composer/inline-refs'
 import { watchRouteTiles } from '../chat/route-tile'
@@ -227,17 +227,6 @@ registry.registerMany([
       maxWidth: FILE_BROWSER_MAX_WIDTH
     },
     render: () => idle(<ReviewPaneContent />)
-  },
-  {
-    // Optional chrome — in NO default layout. Adoption stacks it with the
-    // terminal; $logsOpen (default off, ⌘K "Toggle logs") reveals it.
-    id: 'logs',
-    area: 'panes',
-    title: 'logs',
-    // revealOnPreset: the Quad layout places logs, so applying it turns the
-    // logs pane on (like a ⌘K "Toggle logs") instead of leaving it collapsed.
-    data: { placement: 'bottom', height: '20vh', minHeight: '7.5rem', maxHeight: '80vh', revealOnPreset: true },
-    render: () => idle(<LogsPane />)
   }
 ])
 
@@ -266,18 +255,15 @@ registry.registerMany([
       run: toggleLayoutEditMode
     } satisfies KeybindContribution
   },
-  {
+  paletteToggle({
     id: 'layout.editMode',
-    area: PALETTE_AREA,
-    data: {
-      id: 'layout.editMode',
-      label: 'Toggle layout edit mode',
-      action: 'layout.editMode',
-      icon: LayoutDashboard,
-      keywords: ['layout', 'zones', 'panes', 'edit', 'rearrange'],
-      run: toggleLayoutEditMode
-    } satisfies PaletteContribution
-  },
+    label: 'Toggle layout edit mode',
+    action: 'layout.editMode',
+    icon: LayoutDashboard,
+    keywords: ['layout', 'zones', 'panes', 'edit', 'rearrange'],
+    get: () => $layoutEditMode.get(),
+    set: enabled => $layoutEditMode.set(enabled)
+  }),
   // The agent's write -> see loop: rescan <hermes home>/desktop-plugins
   // without relaunching (same-id reloads dispose the previous incarnation).
   {
@@ -303,18 +289,15 @@ registry.registerMany([
   },
   // Hiding the bar removes the surface that would otherwise offer it back, so
   // ⌘K is the guaranteed door in (alongside the rebindable ⌘⇧S).
-  {
+  paletteToggle({
     id: 'view.toggleStatusbar',
-    area: PALETTE_AREA,
-    data: {
-      id: 'view.toggleStatusbar',
-      label: 'Toggle status bar',
-      action: 'view.toggleStatusbar',
-      icon: PanelBottom,
-      keywords: ['status bar', 'statusbar', 'bottom bar', 'hide', 'show', 'chrome'],
-      run: toggleStatusbarVisible
-    } satisfies PaletteContribution
-  },
+    label: 'Toggle status bar',
+    action: 'view.toggleStatusbar',
+    icon: PanelBottom,
+    keywords: ['status bar', 'statusbar', 'bottom bar', 'hide', 'show', 'chrome'],
+    get: () => $statusbarVisible.get(),
+    set: enabled => $statusbarVisible.set(enabled)
+  }),
   // The keybind panel's non-titlebar door (the keyboard icon is gone).
   {
     id: 'keybinds.panel',
@@ -387,7 +370,7 @@ const QUAD_TREE = split(
   'column',
   [
     split('row', [group(['sessions', 'files']), group(['workspace'])], [1, 3]),
-    split('row', [group(['terminal']), group(['preview', 'review', 'logs'])], [1.4, 1])
+    split('row', [group(['terminal']), group(['preview', 'review'])], [1.4, 1])
   ],
   [3, 1]
 )
@@ -414,6 +397,15 @@ watchContributedPanes()
 // main.
 watchSessionTiles()
 watchRouteTiles()
+
+// Composer pop-out state is keyed by layout zone, so drop entries for zones the
+// user has since closed or merged away — otherwise a long-lived install keeps a
+// row for every split it has ever had.
+$layoutTree.subscribe(tree => {
+  if (tree) {
+    pruneComposerPopoutZones(groupLeafIds(tree))
+  }
+})
 
 // Mirror sidebar pins into the backend keep-flag so the auto-archive sweep
 // never hides a pinned chat (and pre-existing pins migrate transparently).
@@ -488,7 +480,12 @@ function bindPaneVisibility(
 // TOOL PANELS (terminal, logs): like bindPaneVisibility but the toggle COLLAPSES
 // the zone to a persistent rail (tab stays) instead of hiding it — the
 // IntelliJ/VS-Code tool-window model. Restore routes back through `open` (rail
-// click / chevron) so ⌃`/the button stay truthful; the tab's ✕ removes it.
+// click / chevron) so ⌃`/the button stay truthful; Close removes the tab.
+//
+// OPEN goes through revealTreePane, not setPaneCollapsed: Close DISMISSES the
+// pane, and setPaneCollapsed can't act on a pane that has left the tree — the
+// toggle would flip its store with nothing coming back. revealTreePane
+// un-dismisses and re-adopts.
 function bindPaneCollapse(
   paneId: string,
   $open: { get(): boolean; listen(fn: (open: boolean) => void): void },
@@ -497,7 +494,7 @@ function bindPaneCollapse(
 ) {
   markCollapsePane(paneId)
   setPaneCollapsed(paneId, !$open.get())
-  $open.listen(isOpen => setPaneCollapsed(paneId, !isOpen))
+  $open.listen(isOpen => (isOpen ? revealTreePane(paneId) : setPaneCollapsed(paneId, true)))
   registerPaneCloser(paneId, close)
   registerPaneOpener(paneId, open)
 }
@@ -571,6 +568,19 @@ bindPaneCollapse(
   () => setTerminalTakeover(false),
   () => setTerminalTakeover(true)
 )
+// ⌘K door onto the same store the keybind and statusbar pill flip — was a
+// one-way "open" row under Go to, so it never showed on/off and couldn't hide.
+registry.register(
+  paletteToggle({
+    id: 'view.showTerminal',
+    label: 'Toggle terminal',
+    action: 'view.showTerminal',
+    icon: Terminal,
+    keywords: ['terminal', 'shell', 'console', 'pty'],
+    get: () => $terminalTakeover.get(),
+    set: setTerminalTakeover
+  })
+)
 
 // Preview EXISTS only while something is previewed (old-shell semantics:
 // closing the last preview tab closes the pane; a new target opens + fronts
@@ -580,25 +590,84 @@ const $previewVisible = computed($previewTabs, tabs => tabs.length > 0)
 
 bindPaneVisibility('preview', $previewVisible, closeRightRail)
 
-// Logs are optional chrome: off by default, toggled from ⌘K, persisted.
-const $logsOpen = persistentAtom('hermes.desktop.logsOpen', false, Codecs.bool)
+// Logs are ⌘K-ONLY chrome: the pane contribution EXISTS only while $logsOpen
+// is on. Off (the default) keeps logs out of the registry and the tree
+// entirely — no secondary tab riding the terminal strip, no preset or
+// adoption path that resurrects it. Session-only on purpose (not persisted):
+// a fresh boot never re-opens logs automatically. The palette toggle is the
+// single door in; tab ✕ / ⌘W / the toggle itself remove it again.
+const $logsOpen = atom(false)
 
-bindPaneCollapse(
-  'logs',
-  $logsOpen,
-  () => $logsOpen.set(false),
-  () => $logsOpen.set(true)
-)
-registry.register({
-  id: 'logs.toggle',
-  area: PALETTE_AREA,
-  data: {
+let unregisterLogsPane: (() => void) | null = null
+
+const syncLogsPane = (open: boolean) => {
+  if (open) {
+    unregisterLogsPane ??= registry.register({
+      id: 'logs',
+      area: 'panes',
+      title: 'logs',
+      // Same tool-panel sizing rule as the terminal above. dock: its OWN zone
+      // beside the terminal — never a tab in the terminal's strip.
+      data: {
+        placement: 'bottom',
+        dock: { pane: 'terminal', pos: 'right' },
+        height: '20vh',
+        minHeight: '7.5rem',
+        maxHeight: '80vh'
+      },
+      render: () => idle(<LogsPane />)
+    })
+    // Summoning logs is explicit intent — front it (un-dismisses if a ✕ close
+    // left a dismissal record behind).
+    revealTreePane('logs')
+  } else {
+    unregisterLogsPane?.()
+    unregisterLogsPane = null
+
+    // No dismissal record — the next toggle-on must re-adopt cleanly. Also
+    // sweeps 'logs' out of persisted trees from before it was summon-only.
+    // Guarded: removePane rebuilds the tree even for an absent pane, and a
+    // no-op boot sweep would commit (and persist) a fresh identical tree.
+    const tree = $layoutTree.get()
+
+    if (tree && allPaneIds(tree).includes('logs')) {
+      removeTreePane('logs')
+    }
+  }
+}
+
+// Tool-panel tab semantics (✕ / ⌘W route through the store) so the palette
+// toggle stays truthful either way.
+markCollapsePane('logs')
+registerPaneCloser('logs', () => $logsOpen.set(false))
+registerPaneOpener('logs', () => $logsOpen.set(true))
+syncLogsPane($logsOpen.get())
+$logsOpen.listen(syncLogsPane)
+
+registry.register(
+  paletteToggle({
     id: 'logs.toggle',
     label: 'Toggle logs',
+    icon: FileText,
     keywords: ['logs', 'agent log', 'tail', 'debug'],
-    run: () => $logsOpen.set(!$logsOpen.get())
-  } satisfies PaletteContribution
-})
+    get: () => $logsOpen.get(),
+    set: enabled => $logsOpen.set(enabled)
+  })
+)
+
+// YOLO (dangerous-command approval bypass) is a status-bar zap and a /yolo
+// command; ⌘K is the third door onto the SAME store function, so a user who
+// lives in the palette never has to hunt for the pill.
+registry.register(
+  paletteToggle({
+    id: 'session.yolo',
+    label: 'Toggle yolo',
+    icon: Zap,
+    keywords: ['yolo', 'approvals', 'auto-approve', 'bypass', 'dangerous', 'commands'],
+    get: () => $yoloActive.get(),
+    set: enabled => void setYoloEnabled(enabled).catch(() => undefined)
+  })
+)
 
 // Sessions/files Close = collapse their SIDE (⌘B/⌘J truthful, titlebar button
 // flips back) — but only while the pane actually lives in that root side
@@ -619,18 +688,6 @@ registerPaneCloser('files', () =>
 // the side, unhide, front — a NEW target while already visible still fronts.
 const revealPreview = () => {
   dockPaneBeside('preview', 'files')
-
-  // The preview shares a collapsible column with the file tree, and
-  // revealTreePane un-collapses a column through its bound store — here ⌘J /
-  // $fileBrowserOpen, which IS the tree's toggle. Going through it would open
-  // the tree every time a preview opened. Un-collapse the column directly and
-  // leave the toggle alone, so a preview can appear on its own.
-  const side = treeSideOfPane('preview')
-
-  if (side) {
-    setTreeSideCollapsed(side, false)
-  }
-
   revealTreePane('preview')
 }
 

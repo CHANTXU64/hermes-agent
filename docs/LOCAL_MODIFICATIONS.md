@@ -151,6 +151,7 @@ Files:
 - `tools/skills_sync.py`
 - `hermes_cli/config.py`
 - `hermes_cli/main.py`
+- `hermes_cli/update_cmd.py`
 - `tests/tools/test_skills_sync.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
