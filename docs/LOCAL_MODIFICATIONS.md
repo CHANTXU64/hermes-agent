@@ -650,7 +650,7 @@ Upstream status: fork-only.
 
 Status: active
 
-Date: 2026-05-22; Qwen Audio 3.0 update 2026-08-01
+Date: 2026-05-22; Qwen Audio 3.0 update 2026-08-01; custom keyword context 2026-08-02
 
 Files:
 
@@ -667,10 +667,11 @@ Summary:
 What changed:
 
 - Added `stt.provider: custom_api` dispatch in `tools/transcription_tools.py`.
-- Added `stt.custom_api` config for `base_url`, `api_key` / `api_key_env`, `model`, `endpoint`, `mode`, `response_format`, `language`, `prompt`, and `timeout`.
+- Added `stt.custom_api` config for `base_url`, `api_key` / `api_key_env`, `model`, `endpoint`, `mode`, `response_format`, `language`, `prompt`, `keywords`, and `timeout`.
 - Preserved generic multipart audio uploads and DashScope-style chat-completions audio input.
 - Added `dashscope_multimodal` mode for Qwen-Audio-3.0-ASR-Flash. It posts a Base64 Data URL through DashScope's `input.messages[].content[].input_audio` shape, requests a non-SSE response, and reads `output.text`.
 - Runtime custom STT defaults now target `qwen-audio-3.0-asr-flash` at DashScope's multimodal generation endpoint. Neutral `DEFAULT_CONFIG` schema leaves preserve legacy endpoint inference and the `config.yaml` > `STT_CUSTOM_API_*` environment > runtime-default resolution order. Its effective prompt is empty because DashScope treats text messages as ASR context rather than transcription instructions; compatible modes retain their historical prompt default.
+- DashScope multimodal mode normalizes `keywords` as an ordered, de-duplicated list. A configured `prompt` and/or keyword list is sent as an `input_text` context message immediately before the audio message; empty values preserve the prior audio-only request shape.
 - Custom STT language hints follow the shared provider/global resolution order for compatible multipart and chat-completions modes. DashScope multimodal does not use a language hint. Unsupported mode names fail before any network request.
 - It parses common transcription response shapes: `{text: ...}`, plain text, `{choices:[{message:{content: ...}}]}`, and DashScope `{output:{text: ...}}`.
 - Added tests for provider selection, dotenv/env-key resolution, default configuration, all three request modes, response parsing, and `transcribe_audio()` dispatch.
@@ -686,6 +687,7 @@ Merge protection:
 - Preserve `custom_api` as a native/built-in STT provider name in `agent/transcription_registry.py`; command providers and plugin providers must not shadow the fork's configured custom STT implementation.
 - Preserve `api_key_env` lookup through `get_env_value()` so keys in `~/.hermes/.env` work.
 - Preserve the Qwen Audio 3.0 configuration shape: `QWEN_API_KEY`, model `qwen-audio-3.0-asr-flash`, base URL `https://dashscope.aliyuncs.com`, endpoint `/api/v1/services/aigc/multimodal-generation/generation`, and `dashscope_multimodal` mode.
+- Preserve `stt.custom_api.keywords` and its DashScope `input_text` context mapping; do not move keywords into the audio item or send an empty context message.
 - Preserve response parsing for OpenAI-compatible and DashScope multimodal response shapes unless upstream has a verified equivalent.
 
 Verification:

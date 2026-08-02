@@ -1500,6 +1500,8 @@ DEFAULT_CONFIG = {
             # None selects the mode-aware default: no prompt for DashScope
             # multimodal; the historical instruction for compatible modes.
             "prompt": None,
+            # DashScope multimodal sends these as ASR context before the audio.
+            "keywords": [],
             "timeout": None,
         },
         "elevenlabs": {

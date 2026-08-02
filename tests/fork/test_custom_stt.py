@@ -170,6 +170,7 @@ def test_default_config_recognizes_and_resolves_latest_qwen_custom_stt(monkeypat
         "response_format",
         "language",
         "prompt",
+        "keywords",
         "timeout",
     } <= custom_schema.keys()
 
@@ -247,6 +248,7 @@ def test_loaded_custom_stt_uses_environment_before_qwen_defaults(tmp_path, monke
         "response_format": "verbose_json",
         "language": "en",
         "prompt": "environment prompt",
+        "keywords": [],
         "timeout": 37.5,
     }
 
@@ -307,6 +309,39 @@ def test_default_custom_api_preserves_empty_prompt_and_global_language():
     assert cfg["prompt"] == ""
 
 
+def test_custom_api_normalizes_keyword_list():
+    from tools.transcription_tools import _resolve_custom_api_config
+
+    cfg = _resolve_custom_api_config(
+        {
+            "custom_api": {
+                "base_url": "https://dashscope.aliyuncs.com",
+                "api_key": "key",
+                "keywords": ["里仁洞", " FIP ", "", "里仁洞"],
+            },
+        }
+    )
+
+    assert cfg["keywords"] == ["里仁洞", "FIP"]
+
+
+@pytest.mark.parametrize("invalid_keywords", [123, True, {"里仁洞": 1}])
+def test_custom_api_ignores_invalid_keyword_types(invalid_keywords):
+    from tools.transcription_tools import _resolve_custom_api_config
+
+    cfg = _resolve_custom_api_config(
+        {
+            "custom_api": {
+                "base_url": "https://dashscope.aliyuncs.com",
+                "api_key": "key",
+                "keywords": invalid_keywords,
+            },
+        }
+    )
+
+    assert cfg["keywords"] == []
+
+
 def test_default_custom_api_targets_latest_qwen_audio_model():
     from tools.transcription_tools import _resolve_custom_api_config
 
@@ -360,7 +395,8 @@ def test_successful_dashscope_multimodal_response(tmp_path):
             "model": "qwen-audio-3.0-asr-flash",
             "endpoint": "/api/v1/services/aigc/multimodal-generation/generation",
             "mode": "dashscope_multimodal",
-            "prompt": "Convert this audio to text.",
+            "prompt": "这是中建项目语音。",
+            "keywords": ["里仁洞", "FIP"],
         },
     }
     with patch("tools.transcription_tools._load_stt_config", return_value=cfg), \
@@ -377,11 +413,20 @@ def test_successful_dashscope_multimodal_response(tmp_path):
         "Content-Type": "application/json",
         "X-DashScope-SSE": "disable",
     }
-    content = captured["json"]["input"]["messages"][0]["content"]
+    content = captured["json"]["input"]["messages"][1]["content"]
     assert captured["json"] == {
         "model": "qwen-audio-3.0-asr-flash",
         "input": {
             "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "这是中建项目语音。\n关键词：里仁洞、FIP",
+                        }
+                    ],
+                },
                 {
                     "role": "user",
                     "content": [
@@ -396,6 +441,41 @@ def test_successful_dashscope_multimodal_response(tmp_path):
         "parameters": {"format": "ogg"},
     }
     assert content[0]["input_audio"]["data"].startswith("data:audio/ogg;base64,")
+
+
+def test_dashscope_multimodal_omits_empty_context(tmp_path):
+    from tools.transcription_tools import _transcribe_custom_api
+
+    audio_file = tmp_path / "test.ogg"
+    audio_file.write_bytes(b"fake audio")
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"output": {"text": "文本"}}
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured.update(kwargs)
+        return response
+
+    cfg = {
+        "custom_api": {
+            "base_url": "https://dashscope.aliyuncs.com",
+            "api_key": "key",
+            "model": "qwen-audio-3.0-asr-flash",
+            "endpoint": "/api/v1/services/aigc/multimodal-generation/generation",
+            "mode": "dashscope_multimodal",
+            "prompt": "",
+            "keywords": [],
+        },
+    }
+    with patch("tools.transcription_tools._load_stt_config", return_value=cfg), \
+         patch("requests.post", side_effect=fake_post):
+        result = _transcribe_custom_api(str(audio_file), "qwen-audio-3.0-asr-flash")
+
+    assert result["success"] is True
+    messages = captured["json"]["input"]["messages"]
+    assert len(messages) == 1
+    assert messages[0]["content"][0]["type"] == "input_audio"
 
 
 def test_invalid_custom_api_mode_fails_before_request(tmp_path):

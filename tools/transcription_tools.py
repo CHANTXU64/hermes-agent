@@ -250,6 +250,16 @@ def _resolve_custom_api_config(stt_config: Optional[dict] = None) -> Dict[str, A
     if prompt_value is None:
         prompt_value = "" if mode == "dashscope_multimodal" else "请将这段音频转写为文本。"
     prompt = str(prompt_value).strip()
+    keywords_value = custom_cfg.get("keywords") or []
+    if isinstance(keywords_value, str):
+        keywords_value = [keywords_value]
+    elif not isinstance(keywords_value, (list, tuple, set)):
+        keywords_value = []
+    keywords = list(dict.fromkeys(
+        keyword
+        for item in keywords_value
+        if (keyword := str(item).strip())
+    ))
     timeout_value = custom_cfg.get("timeout")
     if timeout_value is None or timeout_value == "":
         timeout_value = os.getenv("STT_CUSTOM_API_TIMEOUT")
@@ -270,6 +280,7 @@ def _resolve_custom_api_config(stt_config: Optional[dict] = None) -> Dict[str, A
         "response_format": response_format,
         "language": language,
         "prompt": prompt,
+        "keywords": keywords,
         "timeout": timeout,
     }
 
@@ -2369,23 +2380,40 @@ def _transcribe_custom_api(file_path: str, model_name: str) -> Dict[str, Any]:
                 "webm": "audio/webm",
             }.get(audio_format, f"audio/{audio_format}")
             audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
+            messages: list[Dict[str, Any]] = []
+            context_parts = []
+            if cfg["prompt"]:
+                context_parts.append(cfg["prompt"])
+            if cfg["keywords"]:
+                context_parts.append(f"关键词：{'、'.join(cfg['keywords'])}")
+            if context_parts:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "\n".join(context_parts),
+                            }
+                        ],
+                    }
+                )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": f"data:{mime_type};base64,{audio_b64}",
+                            },
+                        }
+                    ],
+                }
+            )
             payload = {
                 "model": model_name,
-                "input": {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_audio",
-                                    "input_audio": {
-                                        "data": f"data:{mime_type};base64,{audio_b64}",
-                                    },
-                                }
-                            ],
-                        }
-                    ]
-                },
+                "input": {"messages": messages},
                 "parameters": {"format": audio_format},
             }
             response = requests.post(
