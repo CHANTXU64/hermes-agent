@@ -173,6 +173,37 @@ class TestClarifySchema:
         assert "do not embed the answer options" in question_text
 
 
+    def test_schema_requires_one_plain_language_decision_and_named_plan(self):
+        """Approval cards must ask one understandable decision, not an internal work package."""
+        schema_text = CLARIFY_SCHEMA["description"].lower()
+        question_text = (
+            CLARIFY_SCHEMA["parameters"]["properties"]["question"]["description"]
+            .lower()
+        )
+
+        assert "one user decision per card" in schema_text
+        assert "plain language" in schema_text
+        assert "2-5 short sentences" in question_text
+        assert "complete plan" in question_text
+        assert "whether to execute that named plan" in question_text
+
+
+    def test_schema_rejects_invisible_context_and_post_choice_scope_growth(self):
+        """Local paths and task labels cannot carry consent or expand it later."""
+        schema_text = CLARIFY_SCHEMA["description"].lower()
+        choices_text = (
+            CLARIFY_SCHEMA["parameters"]["properties"]["choices"]["description"]
+            .lower()
+        )
+
+        assert "local path" in schema_text
+        assert "authorizes only the scope stated in the card" in schema_text
+        assert "material scope added later requires a new clarification" in schema_text
+        assert "each choice must stand alone" in choices_text
+        assert "task 1-3" in choices_text
+        assert "the recommended scope" in choices_text
+
+
     def test_max_choices_is_four(self):
         """MAX_CHOICES constant should be 4."""
         assert MAX_CHOICES == 4
