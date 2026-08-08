@@ -8,6 +8,7 @@ and prompt-cache integrity.
 from __future__ import annotations
 
 import threading
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -191,6 +192,103 @@ class TestActiveTurnRedirect:
 
 
 class TestActiveTurnRedirectCheckpoint:
+    def test_request_copy_consumes_live_sidecar_but_drops_legacy_sidecar(self):
+        """Only sidecars created by the active redirect reach the provider."""
+        from agent.conversation_loop import (
+            _apply_active_turn_redirect,
+            _clone_message_for_send,
+            _consume_request_only_api_content,
+            _strip_request_only_api_content,
+        )
+
+        agent = _bare_agent()
+        agent._current_streamed_assistant_text = "Visible draft."
+        messages = [
+            {
+                "role": "user",
+                "content": "historical clean text",
+                "api_content": "historical stale provider bytes",
+            },
+            {"role": "assistant", "content": "committed assistant item"},
+        ]
+
+        _apply_active_turn_redirect(agent, messages, "Use Postgres instead.")
+        api_messages = []
+        for message in messages:
+            api_message = cast(dict[str, Any], _clone_message_for_send(message))
+            _consume_request_only_api_content(api_message)
+            api_messages.append(api_message)
+
+        assert api_messages[0]["content"] == "historical clean text"
+        assert api_messages[-1]["content"].endswith("Use Postgres instead.")
+        assert "Visible draft." in api_messages[-1]["content"]
+        assert all("api_content" not in message for message in api_messages)
+        assert all(
+            "_request_only_api_content" not in message for message in api_messages
+        )
+
+        malformed = {
+            "role": "user",
+            "content": "clean malformed fallback",
+            "api_content": ["not", "redirect", "text"],
+            "_request_only_api_content": True,
+        }
+        _consume_request_only_api_content(malformed)
+        assert malformed == {
+            "role": "user",
+            "content": "clean malformed fallback",
+        }
+
+        # The other redirect shape stores the scaffold on an assistant
+        # checkpoint before the clean user correction; it must use the same
+        # request-only consumption path.
+        agent._current_streamed_assistant_text = "Tool-loop draft."
+        tool_tail = [{"role": "user", "content": "start"}]
+        _apply_active_turn_redirect(agent, tool_tail, "Change course.")
+        tool_tail_api = []
+        for message in tool_tail:
+            api_message = cast(dict[str, Any], _clone_message_for_send(message))
+            _consume_request_only_api_content(api_message)
+            tool_tail_api.append(api_message)
+
+        assert "Tool-loop draft." in tool_tail_api[-2]["content"]
+        assert tool_tail_api[-1]["content"] == "Change course."
+        assert all("api_content" not in message for message in tool_tail_api)
+        assert all(
+            "_request_only_api_content" not in message for message in tool_tail_api
+        )
+
+        _strip_request_only_api_content(tool_tail)
+        assert tool_tail[-1]["content"] == "Change course."
+        assert all("api_content" not in message for message in tool_tail)
+        assert all(
+            "_request_only_api_content" not in message for message in tool_tail
+        )
+
+    def test_early_turn_result_strips_request_only_sidecar(self):
+        from agent.conversation_loop import _content_policy_blocked_result
+
+        messages = [
+            {
+                "role": "user",
+                "content": "clean correction",
+                "api_content": "provider-only correction scaffold",
+                "_request_only_api_content": True,
+            }
+        ]
+
+        result = _content_policy_blocked_result(
+            messages,
+            1,
+            final_response="blocked",
+            error_detail="policy",
+        )
+
+        assert result["messages"] == [
+            {"role": "user", "content": "clean correction"}
+        ]
+        assert messages == result["messages"]
+
     def test_assistant_tail_puts_correction_last(self):
         from agent.conversation_loop import _apply_active_turn_redirect
 
@@ -530,6 +628,24 @@ class TestSteerMarkerContract:
         emitted = format_steer_marker("hi")
         assert STEER_MARKER_OPEN in emitted and STEER_MARKER_CLOSE in emitted
         assert STEER_MARKER_OPEN in STEER_CHANNEL_NOTE and STEER_MARKER_CLOSE in STEER_CHANNEL_NOTE
+
+    def test_system_prompt_scopes_freshness_to_unanswered_marker(self):
+        """A delivered marker remains in immutable history on later API calls.
+
+        The prompt contract must distinguish the unanswered tail occurrence
+        from one followed by an assistant response, or a model can interpret a
+        historical steer as newly delivered and repeat non-idempotent work.
+        """
+        from agent.prompt_builder import STEER_CHANNEL_NOTE
+
+        assert "latest tool-result batch" in STEER_CHANNEL_NOTE
+        assert "no later assistant message follows it" in STEER_CHANNEL_NOTE
+        assert "do not treat it as a new message" in STEER_CHANNEL_NOTE
+        assert "repeat completed work" in STEER_CHANNEL_NOTE
+
+        emitted = format_steer_marker("deploy once")
+        assert "delivered once at this position" in emitted
+        assert "not a new delivery when replayed" in emitted
 
     def test_marker_no_longer_uses_the_distrusted_label(self):
         """Regression: the bare 'User guidance:' line read as tool content and

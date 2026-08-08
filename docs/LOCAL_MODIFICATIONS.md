@@ -188,7 +188,7 @@ Upstream status: fork-only.
 
 ### 8. Hindsight synchronous cache-miss recall
 
-Date: 2026-05-22
+Date: 2026-05-22; upstream merge boundary reconfirmed 2026-08-08
 
 Files:
 
@@ -228,6 +228,9 @@ Merge protection:
 - Preserve tests covering cache-miss sync recall, tools/auto_recall guards,
   reflect mode, empty P5 recall snapshots, and public-path late-turn generation
   discard.
+- Upstream's post-turn queued-prefetch retain-drain feature is not applicable
+  while this provider intentionally keeps `queue_prefetch()` as a no-op. Do not
+  expose its settings or retain-operation polling as if that path were active.
 
 Feature docs: `docs/chantxu64/hindsight-sync-cache-miss-recall/README.md`
 
@@ -773,7 +776,7 @@ Upstream status: fork-only.
 
 Status: active fork maintenance
 
-Date: 2026-06-16, restored 2026-07-22 after upstream sync
+Date: 2026-06-16, restored 2026-07-22; upstream routing merged 2026-08-08
 
 Decision and behavior:
 
@@ -804,7 +807,11 @@ Decision and behavior:
 - New normal CLI, Gateway, branch, compression, and session-flush paths do not
   write or forward `api_content`. The nullable SQLite column and low-level
   reader/writer compatibility remain so existing databases require no unsafe
-  schema migration; legacy values are stripped before model requests.
+  schema migration; legacy values are stripped before model requests. The one
+  live-only exception is active-turn redirect scaffolding: an in-memory marker
+  lets the same-turn provider copy consume its sidecar, while persistence and
+  later replay still keep only clean transcript content, including early
+  terminal-return paths and rich Gateway tool-call replay.
 - In-place compression does not backfill a sidecar. Max-iteration summaries and
   Gateway replay also ignore legacy values.
 - `codex_app_server` remains separate: request-only recall is prefetched for the
@@ -819,13 +826,22 @@ Codex Responses cache routing:
   root returned by compression-only lineage. Branch and delegate parent links
   do not merge cache scope. If lineage lookup is unavailable or fails, routing
   falls back to the physical session id.
-- Known ordinary non-compression sessions retain upstream's bounded,
-  content-addressed `prompt_cache_key` derived from static instructions and tool
-  schema, including the 64-character hardening.
+- Known ordinary non-compression sessions use upstream's bounded,
+  content-addressed `prompt_cache_key` derived from physical session scope,
+  static instructions, and tool schema, including the 64-character hardening.
+  Recurring Cron fire timestamps are removed from the physical cache scope so
+  different runs of the same job share a stable key while different jobs remain
+  isolated.
 - Codex backend HTTP routing is:
-  - `session_id` = physical Hermes session id
+  - `session_id` = raw physical Hermes session id
   - `thread-id` = logical/bounded `prompt_cache_key`
   - `x-client-request-id` = logical/bounded `prompt_cache_key`
+- Both cache-routing headers mirror the effective body `prompt_cache_key`.
+  Explicit top-level overrides take precedence over an `extra_body` spelling;
+  an extra-body-only override still becomes the effective key. Only non-empty
+  string overrides qualify, so malformed top-level values cannot shadow a valid
+  extra-body key. The duplicate extra-body field is removed before the SDK
+  builds the request, so body and headers cannot diverge during merge.
 - Do not restore the obsolete `session-id` spelling.
 
 Primary files:
@@ -834,6 +850,7 @@ Primary files:
 - `agent/conversation_loop.py`
 - `agent/codex_responses_adapter.py`
 - `agent/chat_completion_helpers.py`
+- `agent/model_metadata.py`
 - `agent/turn_finalizer.py`
 - `agent/transports/codex.py`
 - `run_agent.py`
@@ -843,6 +860,7 @@ Primary files:
 - `hermes_cli/cli_commands_mixin.py`
 - `hermes_state.py` (schema compatibility only)
 - `tests/agent/test_api_content_sidecar.py`
+- `tests/agent/test_model_metadata.py`
 - `tests/agent/test_gateway_turn_sidecar.py`
 - `tests/agent/transports/test_codex_transport.py`
 - `tests/gateway/test_replay_entry_fields.py`

@@ -52,32 +52,34 @@ def _final_response(text: str):
 def test_current_recall_uses_developer_after_clean_user(monkeypatch):
     agent = _build_agent(monkeypatch)
     captured = {}
+    prompt = "Explain the database migration plan"
 
     def _api_call(api_kwargs):
         captured.update(api_kwargs)
         return _final_response("ok")
 
     _configure(agent, _api_call)
-    result = agent.run_conversation("hello")
+    result = agent.run_conversation(prompt)
 
     assert result["completed"] is True
     assert "remembered fact" not in captured["instructions"]
     input_items = captured["input"]
     user_index = next(
         i for i, item in enumerate(input_items)
-        if item.get("role") == "user" and item.get("content") == "hello"
+        if item.get("role") == "user" and item.get("content") == prompt
     )
     developer = input_items[user_index + 1]
     assert developer["role"] == "developer"
     assert developer["content"].startswith("<memory-context>")
-    assert "remembered fact for hello" in developer["content"]
-    assert result["messages"][0]["content"] == "hello"
+    assert f"remembered fact for {prompt}" in developer["content"]
+    assert result["messages"][0]["content"] == prompt
     assert "<memory-context>" not in json.dumps(result["messages"])
 
 
 def test_current_recall_developer_position_is_stable_across_tool_loop(monkeypatch):
     agent = _build_agent(monkeypatch)
     captured = []
+    prompt = "Review the database migration plan"
 
     def _api_call(api_kwargs):
         captured.append(api_kwargs)
@@ -110,7 +112,7 @@ def test_current_recall_developer_position_is_stable_across_tool_loop(monkeypatc
     _configure(agent, _api_call)
     setattr(agent, "_execute_tool_calls", _execute_tool_calls)
     getattr(agent, "valid_tool_names").add("read_file")
-    result = agent.run_conversation("hello")
+    result = agent.run_conversation(prompt)
 
     assert result["completed"] is True
     assert len(captured) == 2
@@ -125,7 +127,7 @@ def test_current_recall_developer_position_is_stable_across_tool_loop(monkeypatc
     )
     assert developer_index == user_index + 1
     assert developer_index < function_call_index < function_output_index
-    assert "remembered fact for hello" in second_input[developer_index]["content"]
+    assert f"remembered fact for {prompt}" in second_input[developer_index]["content"]
     assert second_input[-1].get("role") != "developer"
 
 

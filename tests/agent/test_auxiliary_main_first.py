@@ -126,8 +126,8 @@ class TestResolveAutoMainFirst:
             "agent.auxiliary_client._read_main_model",
             return_value="claude-opus-4-8",
         ) as mock_read_main_model, patch(
-            "agent.auxiliary_client._resolve_auto",
-            return_value=(runtime_client, "gpt-5.5"),
+            "agent.auxiliary_client._resolve_auto_route",
+            return_value=(runtime_client, "gpt-5.5", "openai-codex"),
         ) as mock_resolve_auto:
             from agent.auxiliary_client import resolve_provider_client
 
@@ -444,6 +444,8 @@ class TestResolveVisionCustomProvider:
         """custom main with recorded runtime endpoint → Step 1 builds a client."""
         import agent.auxiliary_client as aux
 
+        monkeypatch.setattr(aux, "_RUNTIME_MAIN_PROVIDER", "custom")
+        monkeypatch.setattr(aux, "_RUNTIME_MAIN_MODEL", "claude-opus-4-8")
         monkeypatch.setattr(aux, "_RUNTIME_MAIN_BASE_URL", "https://my.endpoint.example/v1")
         monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_KEY", "sk-runtime-key")
         monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_MODE", "anthropic_messages")
@@ -479,6 +481,8 @@ class TestResolveVisionCustomProvider:
         """A ``custom:<name>`` provider id also forwards the runtime endpoint."""
         import agent.auxiliary_client as aux
 
+        monkeypatch.setattr(aux, "_RUNTIME_MAIN_PROVIDER", "custom:copilot-gateway")
+        monkeypatch.setattr(aux, "_RUNTIME_MAIN_MODEL", "claude-opus-4-8")
         monkeypatch.setattr(aux, "_RUNTIME_MAIN_BASE_URL", "https://named.example/v1")
         monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_KEY", "sk-named")
         monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_MODE", "")
@@ -512,6 +516,8 @@ class TestResolveVisionCustomProvider:
         """No recorded runtime endpoint → resolve the configured custom endpoint."""
         import agent.auxiliary_client as aux
 
+        monkeypatch.setattr(aux, "_RUNTIME_MAIN_PROVIDER", "custom")
+        monkeypatch.setattr(aux, "_RUNTIME_MAIN_MODEL", "claude-opus-4-8")
         monkeypatch.setattr(aux, "_RUNTIME_MAIN_BASE_URL", "")
         monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_KEY", "")
         monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_MODE", "")

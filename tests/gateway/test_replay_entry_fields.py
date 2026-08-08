@@ -141,3 +141,43 @@ class TestGatewayHistoryBuildDropsSidecar:
         assert agent_history[0]["content"] == "hi"
         assert "api_content" not in agent_history[0]
 
+    def test_rich_tool_sequence_drops_only_request_sidecar(self):
+        from gateway.run import _build_gateway_agent_history
+
+        history = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+                "api_content": "provider-only scaffold",
+                "_request_only_api_content": True,
+                "timestamp": 123.0,
+            },
+            {
+                "role": "tool",
+                "content": "done",
+                "tool_call_id": "call-1",
+                "name": "terminal",
+                "api_content": "provider-only tool sidecar",
+                "_request_only_api_content": True,
+                "observed": False,
+            },
+        ]
+
+        agent_history, _obs = _build_gateway_agent_history(history)
+
+        assert agent_history[0]["tool_calls"] == history[0]["tool_calls"]
+        assert agent_history[1]["tool_call_id"] == "call-1"
+        assert agent_history[1]["name"] == "terminal"
+        assert all("api_content" not in message for message in agent_history)
+        assert all(
+            "_request_only_api_content" not in message
+            for message in agent_history
+        )
+

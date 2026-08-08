@@ -25,7 +25,12 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
+from agent.auxiliary_client import (
+    AuxiliaryExplicitCancellation,
+    _is_connection_error,
+    aux_interrupt_protection,
+    call_llm,
+)
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
@@ -101,6 +106,13 @@ SUMMARY_PREFIX = (
     "Respond ONLY to the latest user message that appears AFTER this "
     "summary — that message is the single source of truth for what to do "
     "right now. "
+    "If no user message appears AFTER this summary, do nothing: do not "
+    "resume, wrap up, or continue work from "
+    f"'{HISTORICAL_TASK_HEADING}' or any other section, do not call tools, "
+    "and wait for a new user message. This handoff must never become the "
+    "active turn by itself. (Exception: if tool results or your own "
+    "tool calls appear after this summary, you are mid-way through an "
+    "in-flight exchange — continue that exchange normally.) "
     "Topic overlap with the summary does NOT mean you should resume its "
     "task: even on similar topics, the latest user message WINS. Treat ONLY "
     "the latest message as the active task and discard stale items from "
@@ -144,6 +156,7 @@ COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 # rolling summary, so dropping or rewriting one destroys history.
 MICRO_COMPACT_MARKER_KEY = "_micro_compact_marker"
 _DB_PERSISTED_MARKER = "_db_persisted"
+PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY = "_proactive_prune_rearm_tokens"
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
 COMPRESSION_CONTINUATION_USER_CONTENT = (
@@ -254,7 +267,38 @@ _MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]
 # written by that build generation; prepend only. tests/agent/
 # test_summary_prefix_semantics.py byte-pins every entry to enforce this.
 _HISTORICAL_SUMMARY_PREFIXES = (
-    # Pre-#69619: identical to the current prefix except the stale-item
+    # Pre-#80622: identical to the current prefix except it lacked the
+    # explicit "if no user message appears AFTER this summary, do nothing"
+    # clause. Standalone reference handoffs persisted by that build could
+    # occupy the active user slot after a completed assistant stop and
+    # resume stale Historical Task Snapshot work.
+    "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
+    "into the summary below. This is a handoff from a previous context "
+    "window — treat it as background reference, NOT as active instructions. "
+    "Do NOT answer questions or fulfill requests mentioned in this summary; "
+    "they were already addressed. "
+    "Respond ONLY to the latest user message that appears AFTER this "
+    "summary — that message is the single source of truth for what to do "
+    "right now. "
+    "Topic overlap with the summary does NOT mean you should resume its "
+    "task: even on similar topics, the latest user message WINS. Treat ONLY "
+    "the latest message as the active task and discard stale items from "
+    "'## Historical Task Snapshot' entirely — do not 'wrap up' or "
+    "'finish' work described there unless the latest message explicitly "
+    "asks for it. "
+    "Reverse signals in the latest message (e.g. 'stop', 'undo', 'roll "
+    "back', 'just verify', 'don't do that anymore', 'never mind', a new "
+    "topic) must immediately end any in-flight work described in the "
+    "summary; do not re-surface it in later turns. "
+    "IMPORTANT: Your persistent memory (MEMORY.md, USER.md) in the system "
+    "prompt is ALWAYS authoritative and active — never ignore or deprioritize "
+    "memory content due to this compaction note. "
+    "None of the above restricts HOW you work: your tools remain fully "
+    "active — keep calling them normally for the active task (edit files, "
+    "run commands, search) instead of merely narrating what you would do. "
+    "The current session state (files, config, etc.) may reflect work "
+    "described here — avoid repeating it:",
+    # Pre-#69619: identical to the then-current prefix except the stale-item
     # discard clause named all four historical headings (the three
     # section headers removed by #69619 were still in the template).
     # Summaries persisted by builds immediately before #69619 carry this
@@ -636,6 +680,12 @@ _ACTIVE_TASK_MAX_CHARS = 1400
 # high for small/light tails, but using all 20 as a hard floor here would bring
 # back the old large-tool-output case where nothing can be compacted.
 _MAX_TAIL_MESSAGE_FLOOR = 8
+
+# Pre-LLM feasibility skip (#60451): when the compressible middle is below
+# this fraction of threshold_tokens (and a prior real-usage ineffectiveness
+# strike exists), skip the LLM summary call — deterministic dropping alone
+# recovers the negligible savings such a summary could deliver.
+_FEASIBILITY_SKIP_MIDDLE_FRACTION = 0.10
 # Under context pressure (protected-tail tool bodies alone exceed the soft
 # tail budget), demote large completed tool/file outputs even inside the
 # protected region — but always keep this many trailing messages verbatim so
@@ -1328,11 +1378,13 @@ class ContextCompressor(ContextEngine):
         self._consecutive_timeout_failures = 0
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
+        self._last_feasibility_skip = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._anti_thrash_recovery_deadline = 0.0
+        self._prellm_skip_count = 0
         self._fallback_compression_streak = 0
         self._verify_compaction_cleared_threshold = False
         self._last_compression_made_progress = False
@@ -1343,10 +1395,12 @@ class ContextCompressor(ContextEngine):
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
+        self._pending_request_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
         self._last_compression_telemetry = None
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
+        self._proactive_prune_rearm_tokens = 0
 
         # Micro-compaction state reset
         self._micro_compact_cursor = 0
@@ -1384,6 +1438,7 @@ class ContextCompressor(ContextEngine):
             "protected_head_tokens": None,
             "protected_tail_tokens": None,
             "middle_window_tokens": None,
+            "prellm_skip_count": 0,
             "aux_prompt_tokens": None,
             "aux_output_reservation": None,
             "aux_provider": "",
@@ -1594,11 +1649,13 @@ class ContextCompressor(ContextEngine):
         self._consecutive_timeout_failures = 0
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
+        self._last_feasibility_skip = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._anti_thrash_recovery_deadline = 0.0
+        self._prellm_skip_count = 0
         self._fallback_compression_streak = 0
         self._verify_compaction_cleared_threshold = False
         self._last_compression_made_progress = False
@@ -1610,10 +1667,12 @@ class ContextCompressor(ContextEngine):
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
+        self._pending_request_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
         self._last_compression_telemetry = None
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
+        self._proactive_prune_rearm_tokens = 0
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
@@ -1625,10 +1684,13 @@ class ContextCompressor(ContextEngine):
         self._consecutive_timeout_failures = 0
         self._fallback_compression_streak = 0
         self._ineffective_compression_count = 0
+        self._prellm_skip_count = 0
         self._anti_thrash_recovery_deadline = 0.0
+        self._proactive_prune_rearm_tokens = 0
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
+        self._load_proactive_prune_rearm_tokens()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
@@ -1703,6 +1765,41 @@ class ContextCompressor(ContextEngine):
         except Exception as exc:
             logger.debug("compression fallback streak lookup failed (non-sqlite): %s", exc)
 
+    def _load_proactive_prune_rearm_tokens(self) -> None:
+        """Restore the cache-boundary runway for a resumed durable session."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        getter = getattr(session_db, "get_session_model_config_value", None)
+        if not session_id or not callable(getter):
+            return
+        try:
+            value = getter(session_id, PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0)
+            self._proactive_prune_rearm_tokens = max(
+                0,
+                int(value) if isinstance(value, (int, float, str)) else 0,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+            logger.debug("proactive prune runway lookup failed: %s", exc)
+        except Exception as exc:
+            logger.debug("proactive prune runway lookup failed (non-sqlite): %s", exc)
+
+    def _clear_durable_proactive_prune_rearm(self) -> None:
+        """Remove the persisted runway key without touching the transcript.
+
+        Best-effort companion to zeroing the in-memory mirror at sites that
+        void the runway (model switch): without it a restart would reload a
+        runway computed under thresholds that no longer apply.
+        """
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        patcher = getattr(session_db, "patch_session_model_config", None)
+        if not session_id or not callable(patcher):
+            return
+        try:
+            patcher(session_id, {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None})
+        except Exception as exc:
+            logger.debug("proactive prune runway clear failed: %s", exc)
+
     def _persist_fallback_compression_streak(self) -> None:
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
@@ -1769,9 +1866,34 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count = count
         self._persist_ineffective_compression_count()
 
-    def record_completed_compaction(self, *, used_fallback: bool = False) -> None:
-        """Record one completed boundary and its summary quality."""
+    def record_completed_compaction(
+        self, *, used_fallback: bool = False, feasibility_skip: bool = False,
+    ) -> None:
+        """Record one completed boundary and its summary quality.
+
+        ``feasibility_skip=True`` marks a deliberate pre-LLM skip (#60451):
+        the boundary is streak-NEUTRAL for ``_fallback_compression_streak``
+        (neither incremented nor reset). It still arms the real-usage
+        effectiveness verdict (``_verify_compaction_cleared_threshold``) on
+        purpose — a skipped-summary drop that fails to clear the threshold is
+        exactly the incompressible-transcript case the ineffective-strike
+        breaker exists for, and its recovery probe bounds the block.
+        """
         self._verify_compaction_cleared_threshold = True
+        if feasibility_skip:
+            # A deliberate pre-LLM feasibility skip (#60451) is not a
+            # summary-quality verdict: it must neither extend a fallback
+            # streak (two skips would otherwise latch the >= 2 breaker and
+            # disable compression entirely — including the cheap deterministic
+            # dropping the skip exists to reach) nor reset one (a skip proves
+            # nothing about the summary model's health).
+            if not self.quiet_mode:
+                logger.info(
+                    "Compaction completed via pre-LLM feasibility skip; "
+                    "fallback_compression_streak unchanged (%d)",
+                    self._fallback_compression_streak,
+                )
+            return
         if used_fallback:
             self._fallback_compression_streak += 1
             if not self.quiet_mode:
@@ -1790,6 +1912,11 @@ class ContextCompressor(ContextEngine):
         refresh: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Return the live compression-failure cooldown for the bound session."""
+        if refresh:
+            # Transaction rollback must distinguish an authoritative empty row
+            # from a failed/unavailable durable read. The public return value
+            # cannot do so because it deliberately falls back to local state.
+            self._last_cooldown_refresh_was_authoritative = None
         now_mono = time.monotonic()
         local_state = None
         if self._summary_failure_cooldown_until > now_mono:
@@ -1814,10 +1941,16 @@ class ContextCompressor(ContextEngine):
         try:
             state = getter(session_id)
         except sqlite3.Error as exc:
+            if refresh:
+                self._last_cooldown_refresh_was_authoritative = False
             logger.debug("compression failure cooldown lookup failed: %s", exc)
             return local_state
         except Exception:
+            if refresh:
+                self._last_cooldown_refresh_was_authoritative = False
             return local_state
+        if refresh:
+            self._last_cooldown_refresh_was_authoritative = True
         if not state:
             if refresh:
                 if local_state is not None and self._cooldown_persist_failed:
@@ -1878,7 +2011,43 @@ class ContextCompressor(ContextEngine):
             self._cooldown_persist_failed = True
             logger.debug("compression failure cooldown persist failed (non-sqlite): %s", exc)
 
+    def record_timeout_failure(self, error: str) -> None:
+        """Record a consecutive timeout failure using the shared cooldown ladder.
+
+        Used by both the summary-LLM exception handler (inline at line ~3714)
+        and the host-level ``compress_context`` timeout wrapper in
+        ``run_compress_context_with_progress_timeout``. Avoids re-implementing
+        the ladder at each call site (#62452).
+        """
+        _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
+        self._consecutive_timeout_failures = (
+            getattr(self, "_consecutive_timeout_failures", 0) + 1
+        )
+        cooldown = _TIMEOUT_COOLDOWN_LADDER[
+            min(self._consecutive_timeout_failures,
+                len(_TIMEOUT_COOLDOWN_LADDER)) - 1
+        ]
+        self._record_compression_failure_cooldown(float(cooldown), error)
+
     def _clear_compression_failure_cooldown(self) -> None:
+        # #76354 review F4: fence check BEFORE cooldown-clear. A late worker
+        # whose host already timed out (and recorded a timeout cooldown) must
+        # not undo that cooldown when its summary eventually succeeds. The
+        # hook is installed by compress_context for the duration of the
+        # fenced call; when it reports cancellation, keep the host's cooldown.
+        cancelled_check = getattr(self, "_compression_cancelled_check", None)
+        if callable(cancelled_check):
+            try:
+                if cancelled_check():
+                    logger.info(
+                        "Skipping compression cooldown clear: host already "
+                        "cancelled this compression attempt"
+                    )
+                    return
+            except Exception:
+                logger.debug(
+                    "compression cancellation check failed", exc_info=True
+                )
         self._summary_failure_cooldown_until = 0.0
         self._last_summary_error = None
         self._consecutive_timeout_failures = 0
@@ -1976,11 +2145,13 @@ class ContextCompressor(ContextEngine):
         self.last_real_prompt_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.last_compression_rough_tokens = 0
+        self._pending_request_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
         # Strikes were judged against the PREVIOUS threshold; a recomputed
         # trigger invalidates them. Keep the durable copy in sync so a
         # restart doesn't resurrect strikes this recalibration just voided.
         self._record_ineffective_compression_verdict(0)
+        self._prellm_skip_count = 0
         if runtime_changed:
             self._fallback_compression_streak = 0
             self._persist_fallback_compression_streak()
@@ -1989,6 +2160,12 @@ class ContextCompressor(ContextEngine):
             self._clear_compression_failure_cooldown()
         self._verify_compaction_cleared_threshold = False
         self._last_compression_made_progress = False
+        # The prune runway was computed against the PREVIOUS model's trigger
+        # sizes. Same durable-sync discipline as the strike reset above: clear
+        # the model_config copy too, so a restart doesn't resurrect a runway
+        # this recalibration just voided.
+        self._proactive_prune_rearm_tokens = 0
+        self._clear_durable_proactive_prune_rearm()
 
     # When the MINIMUM_CONTEXT_LENGTH floor meets/exceeds a small context
     # window, compacting at the percentage (50% → 32K of a 64K window) wastes
@@ -2181,12 +2358,15 @@ class ContextCompressor(ContextEngine):
         # message forward. Without this gate a busy tool loop would re-fire
         # the prune nearly every iteration (each new tool pair ages an old one
         # out of the protected tail), breaking the cache per turn. Requiring a
-        # meaningful batch of reclaimable tokens makes fires episodic and
-        # amortized — the same way full compression is the one sanctioned
-        # cache break. 0 disables the gate (commit any non-zero prune).
+        # meaningful batch of reclaimable tokens, then requiring a full
+        # trigger-sized growth interval before rearming, makes fires episodic
+        # and amortized. 0 disables only the minimum-savings gate.
         self.proactive_prune_min_reclaim_tokens = max(
             0, int(proactive_prune_min_reclaim_tokens or 0)
         )
+        # A committed prune is a prompt-cache boundary. Do not permit the next
+        # one until the prompt has regrown the tokens just reclaimed.
+        self._proactive_prune_rearm_tokens: int = 0
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
@@ -2257,6 +2437,7 @@ class ContextCompressor(ContextEngine):
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
+        self._pending_request_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
 
         self.summary_model = summary_model_override or ""
@@ -2278,6 +2459,9 @@ class ContextCompressor(ContextEngine):
         # restart with a persisted tripped counter (#69872) waits a full fresh
         # window before probing (#54923: restart must never disarm a guard).
         self._anti_thrash_recovery_deadline: float = 0.0
+        # Pre-LLM feasibility skips (#60451). Observability only; NEVER feeds
+        # the ineffectiveness strike latch or the fallback streak breaker.
+        self._prellm_skip_count: int = 0
         # Consecutive completed deterministic-fallback boundaries. Unlike the
         # real-usage effectiveness counter, ordinary fitting responses must not
         # reset this breaker; only a healthy completed summary does.
@@ -2299,6 +2483,7 @@ class ContextCompressor(ContextEngine):
         # (gateway hygiene, /compress) can surface a visible warning.
         self._last_summary_dropped_count: int = 0
         self._last_summary_fallback_used: bool = False
+        self._last_feasibility_skip: bool = False
         # When summary generation fails we now ABORT compression entirely
         # and return the original messages unchanged instead of dropping
         # the middle window with a static placeholder.  Callers inspect
@@ -2341,6 +2526,17 @@ class ContextCompressor(ContextEngine):
             if self.last_prompt_tokens < self.threshold_tokens:
                 if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
                     self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
+                elif self._pending_request_rough_tokens > 0:
+                    # Pair the provider's real prompt count with the rough
+                    # estimate of the request that produced it (recorded via
+                    # note_request_rough_estimate just before the call). This
+                    # keeps the defer baseline synchronized with real usage on
+                    # EVERY fitting response, not only right after a
+                    # compaction — without it, sessions that never compressed
+                    # have no baseline and preflight fires on the raw rough
+                    # estimate alone, which overcounts CJK text and provider
+                    # replay blobs severalfold.
+                    self.last_rough_tokens_when_real_prompt_fit = self._pending_request_rough_tokens
                 # Any real provider reading below the trigger proves the prompt
                 # fits again. Clear the real-usage effectiveness latch even
                 # when this response was not immediately after compaction. The
@@ -2349,6 +2545,7 @@ class ContextCompressor(ContextEngine):
                 self._record_ineffective_compression_verdict(0)
             else:
                 self.last_rough_tokens_when_real_prompt_fit = 0
+            self._pending_request_rough_tokens = 0
 
             # Anti-thrashing verdict, judged HERE because this is the only place
             # that sees the provider's real prompt count for the just-compacted
@@ -2399,16 +2596,59 @@ class ContextCompressor(ContextEngine):
             return
         self.last_prompt_tokens = snapshot
 
+    def note_request_rough_estimate(self, rough_tokens: int) -> None:
+        """Record the rough estimate of the request about to be sent.
+
+        ``update_from_response()`` pairs this with the provider's real
+        ``prompt_tokens`` for the same request, giving
+        ``should_defer_preflight_to_real_usage()`` a synchronized
+        (rough, real) anchor to project real usage from rough growth.
+        Usage-less responses do not consume the pending value, so a
+        transport that reports usage separately still pairs correctly.
+        """
+        try:
+            self._pending_request_rough_tokens = max(0, int(rough_tokens))
+        except (TypeError, ValueError):
+            self._pending_request_rough_tokens = 0
+
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         """Return True when a high rough preflight estimate is known-noisy.
 
         ``estimate_request_tokens_rough(..., tools=...)`` intentionally
-        overestimates schema-heavy requests so Hermes compresses before a
-        provider rejects the payload. After a successful compressed API call,
-        though, provider ``prompt_tokens`` are a better signal than repeating
-        compaction from the same rough schema overhead. Defer only while the
-        rough estimate has grown modestly since a request the provider proved
-        fit under the threshold.
+        overestimates so Hermes compresses before a provider rejects the
+        payload — but the margin is not a fixed percentage: CJK text is
+        counted at ~1.7x its o200k cost and Responses-mode reasoning replay
+        blobs at several times their billed cost, so heavy sessions can show
+        a rough estimate 2-3x real usage and compact at 35-55% of the real
+        window (churn: each pass stalls the turn for minutes and discards
+        detail).
+
+        Instead of tolerating a fixed rough-growth allowance, project real
+        usage from the last synchronized (rough, real) pair::
+
+            projected_real = last_real + (rough_now - rough_at_last_real)
+
+        For ASCII and CJK-dense scripts rough growth over-counts real growth,
+        making the projection an upper bound. Other non-ASCII scripts
+        (Cyrillic, Greek, Thai, Arabic — chars/4 but ~2-3 chars/token on
+        o200k-family tokenizers) can under-count growth by up to ~2x
+        (#62605's direction), so the projection is NOT a strict upper bound
+        there. That residual risk is bounded by two backstops: any real
+        provider reading at/over the threshold clears the baseline (the
+        post-response should_compress gate then fires on real usage within
+        one API call), and the provider's context-overflow error handler
+        compacts reactively with the authoritative signal, as before.
+        Compression fires when the projection — not the raw estimate —
+        crosses the threshold.
+
+        Callers pass two different measurement bases: the turn prologue
+        estimates RAW messages (turn_context.py) while the baseline recorded
+        by note_request_rough_estimate covers the fully assembled request
+        (api_content/plugin injections, prefills, MoA context). The prologue's
+        smaller basis understates growth and can only OVER-defer there — and
+        the loop's own pre-API pressure check re-runs this projection with
+        the aligned basis before every provider call, so a prologue
+        over-defer never skips a needed compaction.
         """
         if rough_tokens < self.threshold_tokens:
             return False
@@ -2433,13 +2673,13 @@ class ContextCompressor(ContextEngine):
         if baseline <= 0:
             return False
 
+        # No baseline ratchet here: the (rough, real) pair is refreshed by
+        # update_from_response() on every fitting response. Advancing the
+        # rough baseline without a matching real reading would shrink
+        # apparent growth and defer on stale data — the unsafe direction.
         growth = max(0, rough_tokens - baseline)
-        tolerated_growth = max(4096, int(self.threshold_tokens * 0.05))
-        if growth > tolerated_growth:
-            return False
-
-        self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
-        return True
+        projected_real = self.last_real_prompt_tokens + growth
+        return projected_real < self.threshold_tokens
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
@@ -2952,12 +3192,11 @@ class ContextCompressor(ContextEngine):
         PROMPT-CACHE CONTRACT: a committed prune rewrites message bodies the
         provider has already seen, invalidating the cached prefix from the
         earliest rewritten message forward — exactly like a compression
-        boundary. To keep that break episodic rather than per-turn, the prune
-        only COMMITS when the estimated reclaim meets
-        ``proactive_prune_min_reclaim_tokens`` (measured on the actual pruned
-        output, not guessed up front). Below the gate the INPUT list object is
-        returned unchanged — the standard no-op caller contract (callers gate
-        bookkeeping on ``result is not input``).
+        boundary. A prune therefore commits only when it reclaims
+        ``proactive_prune_min_reclaim_tokens`` and disarms until message history
+        has regrown a full trigger-sized runway. Below either gate the INPUT list
+        object is returned unchanged — the standard no-op caller contract
+        (callers gate bookkeeping on ``result is not input``).
 
         Returns ``(messages, 0)`` — the input object — when disabled, below
         the trigger, or when the reclaim gate rejects the commit.
@@ -2968,6 +3207,21 @@ class ContextCompressor(ContextEngine):
             return messages, 0
         # Nothing to reclaim until there are messages outside the protected tail.
         if len(messages) <= self.protect_last_n + self._protect_head_size(messages) + 1:
+            return messages, 0
+        before = sum(_estimate_msg_budget_tokens(m) for m in messages)
+        if before < self._proactive_prune_rearm_tokens:
+            return messages, 0
+        # Capability gate BEFORE the expensive 3-pass scan: a bound store that
+        # can't persist the prune atomically (duck-typed/plugin session store
+        # without archive_and_compact) makes every prune a permanent no-op, so
+        # don't pay the scan for it on every eligible iteration.
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        if (
+            session_db
+            and session_id
+            and not callable(getattr(session_db, "archive_and_compact", None))
+        ):
             return messages, 0
         pruned_msgs, pruned_count = self._prune_old_tool_results(
             messages,
@@ -2982,11 +3236,41 @@ class ContextCompressor(ContextEngine):
         # Measured-savings gate (prompt-cache hysteresis): only commit when
         # the prune reclaims a meaningful batch of tokens. Estimated on the
         # real before/after messages so dedup + arg truncation count too.
-        if self.proactive_prune_min_reclaim_tokens > 0:
-            before = sum(_estimate_msg_budget_tokens(m) for m in messages)
-            after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
-            if (before - after) < self.proactive_prune_min_reclaim_tokens:
+        after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
+        reclaimed = max(0, before - after)
+        if reclaimed < self.proactive_prune_min_reclaim_tokens:
+            return messages, 0
+        # ``after`` includes the tool batch appended since the provider's last
+        # usage reading, so both the low-water mark and future gate use the
+        # same message-token estimate. Require a full trigger-sized growth
+        # interval before another cache-breaking rewrite.
+        runway = max(
+            reclaimed,
+            self.proactive_prune_tokens,
+            self.proactive_prune_min_reclaim_tokens,
+        )
+        next_rearm_tokens = after + runway
+        if session_db and session_id:
+            # The capability gate above guarantees archive_and_compact exists.
+            try:
+                session_db.archive_and_compact(
+                    session_id,
+                    pruned_msgs,
+                    model_config_patch={
+                        PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Proactive tool-result prune DB commit failed; keeping the "
+                    "original transcript: %s",
+                    exc,
+                )
                 return messages, 0
+            for msg in pruned_msgs:
+                if isinstance(msg, dict):
+                    msg[_DB_PERSISTED_MARKER] = True
+        self._proactive_prune_rearm_tokens = next_rearm_tokens
         return pruned_msgs, pruned_count
 
     # ------------------------------------------------------------------
@@ -4499,8 +4783,46 @@ This compaction should PRIORITISE preserving all information related to the focu
         #    when call_id != id (Codex Responses API format), re-exposing orphans.
         missing_results = surviving_call_ids - result_call_ids
         if missing_results:
+            # --- In-flight tool chain protection (issue #79278) -------------
+            # A strip here must distinguish a *pending* tool_call (the model's
+            # live request whose result the executor has not yet appended) from
+            # an *orphaned* call (one whose result was summarized/truncated away
+            # and can never come back).  Compression can fire mid-chain: the
+            # model emits `assistant(tool_calls)`, and tool_executor.py only
+            # appends the matching `role="tool"` result AFTER it runs the call.
+            # In that window `messages[-1]` is an assistant tool_call whose id
+            # is (not yet) in result_call_ids.  Any tool result would be
+            # appended *after* this message (tool_executor.py), so if it is the
+            # last non-tool message its calls are presumed still pending.
+            # Stripping it as an orphan would delete the live request; when the
+            # executor later appends the real result, repair_message_sequence
+            # would drop it as an unmatched orphan and the completed side
+            # effect — and the model's final synthesis built on it — would be
+            # lost.  We therefore preserve the trailing in-flight call verbatim;
+            # only genuinely orphaned calls in the *discarded* region are
+            # stripped.
+            trailing_inflight: Optional[Dict[str, Any]] = None
+            # Walk back over any trailing tool results first: with a
+            # multi-call batch the executor appends results one at a time, so
+            # a snapshot taken between appends looks like
+            # ``[..., assistant(c1,c2,c3), tool(c1)]`` — the chain is still
+            # in flight even though the last message is a tool result. The
+            # last NON-tool message is presumed the live request in both
+            # shapes; a genuinely unanswered call preserved here is stubbed
+            # pre-API by sanitize_api_messages step 2, so preserving is safe
+            # while stripping a live call silently loses its late result.
+            idx = len(messages) - 1
+            while idx >= 0 and messages[idx].get("role") == "tool":
+                idx -= 1
+            if idx >= 0 and messages[idx].get("role") == "assistant":
+                trailing_inflight = messages[idx]
+            # -----------------------------------------------------------------
             for msg in messages:
                 if msg.get("role") != "assistant":
+                    continue
+                if msg is trailing_inflight:
+                    # Live request, not an orphan — the executor appends its
+                    # result(s) after compress() returns.
                     continue
                 tcs = msg.get("tool_calls")
                 if not tcs:
@@ -5850,7 +6172,11 @@ This compaction should PRIORITISE preserving all information related to the focu
           1. Prune old tool results (cheap pre-pass, no LLM call)
           2. Protect head messages (system prompt + first exchange)
           3. Find tail boundary by token budget (~20K tokens of recent context)
-          4. Summarize middle turns with structured LLM prompt
+          4. Summarize middle turns with structured LLM prompt (skipped
+             pre-LLM when the middle is below
+             ``_FEASIBILITY_SKIP_MIDDLE_FRACTION`` of the threshold after a
+             prior real-usage ineffectiveness strike — the deterministic
+             fallback drop recovers the negligible savings instead)
           5. On re-compression, iteratively update the previous summary
 
         Blank platform-echo user rows trailing the latest actionable user
@@ -5870,7 +6196,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 everything else.  Inspired by Claude Code's ``/compact``.
             force: If True, clear any active summary-failure cooldown before
                 running so a manual ``/compress`` can retry immediately after
-                an auto-compression abort.  Auto-compress callers pass False.
+                an auto-compression abort, and bypass the pre-LLM feasibility
+                skip so an explicit user request always exercises the full
+                summary path.  Auto-compress callers pass False.
             memory_context: Optional provider-supplied context to preserve in
                 the summary prompt. Whitespace-only values are ignored.
         """
@@ -5878,6 +6206,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # after compress() returns to decide whether to surface a warning.
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
+        self._last_feasibility_skip = False
         self._last_summary_error = None
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
@@ -6006,6 +6335,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # — take the narrow rescan, miss a beyond-window fossil, and discard the
         # rehydrated state as cross-session leakage (#57835).
         _previous_summary_before_scan = self._previous_summary
+        _summary_has_user_turn_before_scan = getattr(self, "_summary_has_user_turn", None)
         # A persisted handoff summary can sit in the protected head after a
         # resume (commonly immediately after the system prompt). Search from
         # the first non-system message through the compression window. On the
@@ -6160,12 +6490,73 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
 
         # Phase 3: Generate structured summary
-        summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-        summary = self._generate_summary(
-            turns_to_summarize,
-            focus_topic=summary_focus_topic,
-            memory_context=memory_context,
-        )
+
+        # Pre-LLM feasibility check: if the middle section is too small to
+        # yield meaningful token savings, skip the expensive LLM summarization
+        # call and fall through to the deterministic message-dropping path
+        # (which is cheap and always applicable).  Without this guard a
+        # tool-heavy session where the protected tail already holds most of
+        # the tokens can burn 500+ seconds on a summary call that replaces a
+        # few lightweight messages, leaving the total token count essentially
+        # unchanged.
+        #
+        # Only fires after at least one prior real-usage ineffectiveness
+        # strike.  The check READS ``_ineffective_compression_count`` but
+        # never writes it: that strike counter is fed exclusively by real
+        # provider token counts (see the anti-thrashing verdict in
+        # _update_token_usage), and consumers latch at >= 2 to disable
+        # compression entirely.  Feasibility skips are tracked separately
+        # in ``_prellm_skip_count`` for observability.
+        #
+        # Skipped when ``force=True`` (manual /compress) so auth/error
+        # handling paths are always exercised on explicit user request.
+        feasibility_skip = False
+        if not force and self._ineffective_compression_count >= 1:
+            # _record_compression_regions already estimated this exact window
+            # into the telemetry dict above; reuse it so the log line and
+            # telemetry can never disagree. The regions helper no-ops when the
+            # telemetry attr isn't a dict, so fall back to a fresh estimate
+            # when the key is absent/None (0 is a legitimate value).
+            middle_tokens = telemetry.get("middle_window_tokens")
+            if middle_tokens is None:
+                middle_tokens = estimate_messages_tokens_rough(turns_to_summarize)
+            if middle_tokens < int(
+                self.threshold_tokens * _FEASIBILITY_SKIP_MIDDLE_FRACTION
+            ):
+                feasibility_skip = True
+                self._last_feasibility_skip = True
+                self._prellm_skip_count += 1
+                telemetry["prellm_skip_count"] = self._prellm_skip_count
+                if not self.quiet_mode:
+                    logger.warning(
+                        "Compression: middle section (%d tokens at indices "
+                        "%d-%d) is below %.0f%% of threshold (%d tokens) — "
+                        "skipping LLM summarization, proceeding with "
+                        "deterministic message dropping. prellm_skip_count=%d",
+                        middle_tokens, compress_start, compress_end,
+                        _FEASIBILITY_SKIP_MIDDLE_FRACTION * 100,
+                        self.threshold_tokens, self._prellm_skip_count,
+                    )
+
+        if feasibility_skip:
+            summary = None  # No LLM call; Phase 4 inserts the deterministic fallback
+        else:
+            # Deriving the auto focus topic scans recent user turns — only pay
+            # for it when a summary will actually be generated.
+            summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
+            try:
+                summary = self._generate_summary(
+                    turns_to_summarize,
+                    focus_topic=summary_focus_topic,
+                    memory_context=memory_context,
+                )
+            except AuxiliaryExplicitCancellation:
+                # Explicit cancellation is a true no-op. Restore state mutated by
+                # the resume/handoff self-heal scan before the exception escapes to
+                # the outer transaction, which restores the transcript and lease.
+                self._previous_summary = _previous_summary_before_scan
+                self._summary_has_user_turn = _summary_has_user_turn_before_scan
+                raise
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -6187,7 +6578,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # of these cases, rotating into a child session with a placeholder
         # summary degrades the conversation for zero benefit. Preserve it
         # unchanged until access is restored or connectivity recovers.
-        if not summary and (
+        if not summary and not feasibility_skip and (
             self.abort_on_summary_failure
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
@@ -6267,15 +6658,26 @@ This compaction should PRIORITISE preserving all information related to the focu
         # content-free "N messages were removed" marker.
         if not summary:
             if not self.quiet_mode:
-                logger.warning("Summary generation failed — inserting deterministic fallback context summary")
+                if feasibility_skip:
+                    logger.info("Feasibility skip — inserting deterministic fallback context summary")
+                else:
+                    logger.warning("Summary generation failed — inserting deterministic fallback context summary")
             n_dropped = compress_end - compress_start
             self._last_summary_dropped_count = n_dropped
             self._last_summary_fallback_used = True
             telemetry["fallback_used"] = True
-            telemetry["failure_class"] = telemetry.get("failure_class") or "summary_generation_failed"
+            if feasibility_skip:
+                # Deliberate optimization, not a summary failure — keep the
+                # telemetry class distinct so dashboards don't count skips
+                # as aux-model breakage.
+                telemetry["failure_class"] = telemetry.get("failure_class") or "feasibility_skip"
+            else:
+                telemetry["failure_class"] = telemetry.get("failure_class") or "summary_generation_failed"
             summary = self._build_static_fallback_summary(
                 turns_to_summarize,
-                reason=self._last_summary_error,
+                # A stale error from an earlier real failure must not be
+                # embedded into a deliberate feasibility skip's fallback.
+                reason=None if feasibility_skip else self._last_summary_error,
             )
 
         tail_messages: List[Dict[str, Any]] = []
@@ -6555,6 +6957,26 @@ This compaction should PRIORITISE preserving all information related to the focu
         _strip_persistence_markers(compressed)
         self._last_compression_made_progress = True
 
+        # A successful compaction just freed the largest allocation a long
+        # session ever drops (the compressed-away message dicts), which makes
+        # this the natural point to hand allocator pages back to the OS.
+        # #76905's trim lifecycle covers the gateway/TUI housekeeping loops but
+        # not the CLI compression path, so RSS keeps the pre-compaction
+        # high-water mark until exit. The helper is glibc-gated, config-gated
+        # and rate-limited, so this is a safe no-op elsewhere. (#70782)
+        try:
+            from hermes_cli.mem_trim import trim_memory
+
+            trim_memory(reason="post-compression")
+        except Exception as exc:
+            # debug, not warning: sibling trim sites all log failures at
+            # debug, and compression must never fail because of a trim.
+            logger.debug(
+                "post-compression memory trim failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+
         # Batch compaction invalidates micro-compaction state: the batch
         # marker now holds MORE history than the in-memory rolling summary
         # (it summarized everything in the window, including exchanges micro
@@ -6567,6 +6989,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._micro_compact_cursor = 0
         self._micro_compact_consecutive_failures = 0
         self._micro_compact_last_failure_cursor = -1
+        self._proactive_prune_rearm_tokens = 0
 
         return compressed
 
@@ -6592,3 +7015,95 @@ def is_compaction_summary_message(message: Any) -> bool:
     else:
         content = message
     return ContextCompressor._is_context_summary_content(content)
+
+
+def _handoff_carries_live_user_content(message: Any) -> bool:
+    """Return True when a summary-bearing row still carries a live user ask.
+
+    Merge-into-tail carriers preserve prior turn content before the summary.
+    Force-user-leading merges prepend the handoff + end marker to the real
+    ask, leaving a non-empty remainder after ``_SUMMARY_END_MARKER``. Either
+    shape must remain actionable (#80622 must not treat them as sole-handoff).
+
+    Delegates to ``_strip_context_summary_handoff_message`` — the canonical
+    "does anything survive once the handoff is removed" logic (it also
+    handles multimodal list content and returns ``None`` for a merged-shaped
+    row whose preserved prior tail is EMPTY, which a bare
+    ``classify_summary_content(...) == "merged"`` check would wrongly treat
+    as live). Callers must pre-filter with ``is_compaction_summary_message``:
+    for non-summary rows the strip helper returns the message unchanged,
+    which would read as "carries live content" here.
+    """
+    if not isinstance(message, dict):
+        return False
+    return (
+        ContextCompressor._strip_context_summary_handoff_message(message)
+        is not None
+    )
+
+
+def reference_handoff_would_drive_next_model_call(
+    messages: Optional[List[Dict[str, Any]]],
+) -> bool:
+    """Return True when the next model call would be driven only by a handoff.
+
+    A reference-only compaction handoff must never become the active user turn
+    by itself after an assistant response has already completed (#80622). Mid
+    tool-loop compression remains allowed: tool results / assistant tool_calls
+    after the handoff mean the loop is continuing an in-flight exchange, not
+    starting a fresh turn from the synthetic summary.
+    """
+    if not messages:
+        return False
+
+    last_driving_handoff = -1
+    for index, message in enumerate(messages):
+        if not is_compaction_summary_message(message):
+            continue
+        if _handoff_carries_live_user_content(message):
+            # Embedded live ask — this row is not a sole-handoff driver.
+            continue
+        last_driving_handoff = index
+
+    if last_driving_handoff < 0:
+        return False
+
+    for message in messages[last_driving_handoff + 1 :]:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "tool":
+            return False
+        if role == "assistant" and message.get("tool_calls"):
+            return False
+        if (
+            ContextCompressor._is_actionable_user_turn(message)
+            and not ContextCompressor._is_synthetic_compression_user_turn(message)
+        ):
+            return False
+        if is_compaction_summary_message(message) and _handoff_carries_live_user_content(
+            message
+        ):
+            return False
+    return True
+
+
+def is_user_originated_turn(message: Any) -> bool:
+    """Return True for human-authored user turns (not compaction scaffolding).
+
+    Gateway/session dispatchers (retry, undo, active-turn selection) must use
+    this instead of ``role == "user" and not display_kind`` — standalone
+    handoffs with ``_compressed_summary_has_user_turn`` were previously left
+    without ``display_kind=hidden`` and could be mistaken for real asks (#80622).
+    Summary-bearing rows are never user-originated, even when they embed a
+    live ask after the end marker (callers that need that text should unwrap).
+    """
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    if message.get("display_kind"):
+        return False
+    if is_compaction_summary_message(message):
+        return False
+    if ContextCompressor._is_synthetic_compression_user_turn(message):
+        return False
+    return ContextCompressor._is_actionable_user_turn(message)

@@ -90,7 +90,7 @@ def finalize_turn(
     Lifted verbatim from ``run_conversation`` (the region after the main agent
     loop). See module docstring.
     """
-    from agent.conversation_loop import logger
+    from agent.conversation_loop import logger, _strip_request_only_api_content
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -251,6 +251,11 @@ def finalize_turn(
     # are surfaced on the result dict via ``cleanup_errors`` rather than
     # killing the turn.
     _cleanup_errors = []
+
+    # Active-turn redirect replay text has served its only purpose once the
+    # provider loop exits. Remove both live and legacy sidecars before any
+    # trajectory/session persistence or continuation history is assembled.
+    _strip_request_only_api_content(messages)
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
@@ -419,6 +424,14 @@ def finalize_turn(
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+
+    # The gateway owns a separate in-memory history snapshot. Keep it current
+    # even when finalization reports a cleanup error: a later prompt must not be
+    # sent with the pre-turn snapshot while the durable DB already has this turn.
+    try:
+        agent._session_messages = messages
+    except Exception:
+        pass
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
@@ -721,7 +734,15 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    # Suppressed when skip_background_review=True (e.g. cron) — review forks
+    # spawn another AIAgent (~30K tokens / event) and cron sessions have no
+    # human-in-the-loop benefit from the review.
+    if (
+        final_response
+        and not interrupted
+        and not getattr(agent, "skip_background_review", False)
+        and (_should_review_memory or _should_review_skills)
+    ):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),

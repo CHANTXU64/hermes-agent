@@ -28,6 +28,8 @@ class _StubAgent:
 
     def __init__(self, *, raise_in):
         self._raise_in = set(raise_in)
+        self.trajectory_messages = None
+        self.persisted_messages = None
         self.max_iterations = 3
         self.iteration_budget = _StubBudget()
         self.context_compressor = _StubCompressor()
@@ -59,7 +61,8 @@ class _StubAgent:
         self.session_cost_source = "stub"
 
     # --- fallible cleanup surfaces -------------------------------------
-    def _save_trajectory(self, *a, **k):
+    def _save_trajectory(self, messages, *a, **k):
+        self.trajectory_messages = [dict(message) for message in messages]
         if "save_trajectory" in self._raise_in:
             raise RuntimeError("trajectory disk full")
 
@@ -70,7 +73,8 @@ class _StubAgent:
     def _drop_trailing_empty_response_scaffolding(self, *a, **k):
         pass
 
-    def _persist_session(self, *a, **k):
+    def _persist_session(self, messages, *a, **k):
+        self.persisted_messages = [dict(message) for message in messages]
         if "persist_session" in self._raise_in:
             raise RuntimeError("sqlite database is locked")
 
@@ -106,18 +110,20 @@ def _run(
     final_response=None,
     api_call_count=3,
     turn_exit_reason="unknown",
+    messages=None,
 ):
-    messages = [
-        {"role": "user", "content": "do a thing"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}
-            ],
-        },
-        {"role": "tool", "tool_call_id": "c1", "content": "file contents"},
-    ]
+    if messages is None:
+        messages = [
+            {"role": "user", "content": "do a thing"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "file contents"},
+        ]
     return finalize_turn(
         agent,
         final_response=final_response,
@@ -162,5 +168,38 @@ def test_clean_turn_has_no_cleanup_errors_key():
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     assert result["completed"] is False
     assert "cleanup_errors" not in result
+
+
+def test_request_only_sidecars_are_stripped_before_post_turn_surfaces():
+    agent = _StubAgent(raise_in=())
+    messages = [
+        {
+            "role": "user",
+            "content": "clean correction",
+            "api_content": "provider-only redirect scaffold",
+            "_request_only_api_content": True,
+        },
+        {"role": "assistant", "content": "done"},
+    ]
+
+    result = _run(
+        agent,
+        final_response="done",
+        api_call_count=1,
+        turn_exit_reason="text_response(stop)",
+        messages=messages,
+    )
+
+    for surface in (
+        messages,
+        result["messages"],
+        agent.trajectory_messages,
+        agent.persisted_messages,
+    ):
+        assert surface is not None
+        assert all("api_content" not in message for message in surface)
+        assert all(
+            "_request_only_api_content" not in message for message in surface
+        )
 
 
