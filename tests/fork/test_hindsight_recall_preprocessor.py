@@ -346,6 +346,27 @@ def test_hindsight_declares_full_prefetch_budget_from_stage_timeouts(
     assert hindsight.prefetch_timeout_seconds() == 51.0
 
 
+def test_hindsight_prefetch_budget_includes_configured_fallback_model(
+    provider_with_config,
+    monkeypatch,
+):
+    from agent import auxiliary_client as aux
+
+    hindsight = provider_with_config(recall_sync_timeout_seconds=10)
+    monkeypatch.setattr(aux, "_get_task_timeout", lambda task, default: 30.0)
+    monkeypatch.setattr(
+        aux,
+        "_get_auxiliary_task_config",
+        lambda task: {
+            "fallback_chain": [
+                {"provider": "deepseek", "model": "deepseek-v4-flash"}
+            ]
+        },
+    )
+
+    assert hindsight.prefetch_timeout_seconds() == 81.0
+
+
 def test_hindsight_budget_covers_rewrite_recall_and_current_query_fallback(
     provider_with_config,
     monkeypatch,
@@ -476,6 +497,210 @@ def test_recall_preprocessor_uses_default_luna_direct_path_without_generic_fallb
     assert build_kwargs["timeout"] == 30.0
     assert decision.drop_old_refs == (2,)
     assert decision.new_query == "具体配置修复步骤"
+
+
+def test_recall_preprocessor_uses_configured_fallback_after_primary_connection_failure(
+    monkeypatch,
+):
+    preprocessor = importlib.import_module(
+        "plugins.memory.hindsight.recall_preprocessor"
+    )
+    from agent import auxiliary_client as aux
+
+    task_config = {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+        "timeout": 30,
+        "extra_body": {"service_tier": "priority"},
+        "fallback_chain": [
+            {
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "timeout": 7,
+            }
+        ],
+    }
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: task_config)
+
+    class _PrimaryCompletions:
+        def create(self, **kwargs):
+            raise ConnectionError("primary route unavailable")
+
+    primary_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=_PrimaryCompletions()),
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+    fallback_client = SimpleNamespace(base_url="https://api.deepseek.com/v1")
+    fallback_response = SimpleNamespace(
+        model="deepseek-v4-flash",
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=(
+                        '{"drop_old_refs":[1],'
+                        '"new_query":"fallback generated query"}'
+                    )
+                )
+            )
+        ],
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        aux,
+        "_get_cached_client",
+        lambda provider, model, **kwargs: (primary_client, model),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_build_call_kwargs",
+        lambda provider, model, messages, **kwargs: {
+            "model": model,
+            "messages": messages,
+        },
+    )
+    monkeypatch.setattr(aux, "_validate_llm_response", lambda response, task: response)
+
+    def _try_configured_fallback_chain(
+        task,
+        failed_provider,
+        reason="error",
+        failed_model=None,
+    ):
+        captured["fallback_resolution"] = (
+            task,
+            failed_provider,
+            reason,
+            failed_model,
+        )
+        return fallback_client, "deepseek-v4-flash", "fallback_chain[0](deepseek)"
+
+    def _call_fallback_candidate_sync(client, model, label, **kwargs):
+        captured["fallback_call"] = (client, model, label, kwargs)
+        return fallback_response
+
+    monkeypatch.setattr(
+        aux,
+        "_try_configured_fallback_chain",
+        _try_configured_fallback_chain,
+    )
+    monkeypatch.setattr(
+        aux,
+        "_call_fallback_candidate_sync",
+        _call_fallback_candidate_sync,
+    )
+
+    decision = preprocessor.run_recall_preprocessor(
+        current_user_message="继续",
+        previous_assistant_message="上一轮回答",
+        previous_recall_query="old query",
+        previous_recall_results=["old memory"],
+    )
+
+    assert captured["fallback_resolution"] == (
+        "hindsight_recall_preprocessor",
+        "openai-codex",
+        "primary route unavailable",
+        "gpt-5.6-luna",
+    )
+    client, model, label, call_kwargs = captured["fallback_call"]
+    assert (client, model, label) == (
+        fallback_client,
+        "deepseek-v4-flash",
+        "fallback_chain[0](deepseek)",
+    )
+    assert call_kwargs["task"] == "hindsight_recall_preprocessor"
+    assert call_kwargs["temperature"] == 0
+    assert call_kwargs["max_tokens"] == 256
+    assert call_kwargs["effective_timeout"] == 7.0
+    assert call_kwargs["effective_extra_body"] == {}
+    assert decision.drop_old_refs == (1,)
+    assert decision.new_query == "fallback generated query"
+    assert preprocessor.get_recall_preprocessor_budget_seconds() == 37.0
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "base_url", "fallback_timeout"),
+    [
+        ("auto", "fallback-model", "", None),
+        ("main", "fallback-model", "", None),
+        ("custom:auto", "fallback-model", "", None),
+        ("custom:main", "fallback-model", "", None),
+        ("custom", "fallback-model", "", None),
+        ("deepseek", "auto", "", None),
+        ("deepseek", "", "", None),
+        ("deepseek", "fallback-model", "", float("inf")),
+        ("deepseek", "fallback-model", "", float("nan")),
+        ("deepseek", "fallback-model", "", 0),
+        ("deepseek", "fallback-model", "", -1),
+        ("deepseek", "fallback-model", "", True),
+    ],
+)
+def test_recall_preprocessor_rejects_non_explicit_fallback_routes(
+    monkeypatch,
+    provider,
+    model,
+    base_url,
+    fallback_timeout,
+):
+    preprocessor = importlib.import_module(
+        "plugins.memory.hindsight.recall_preprocessor"
+    )
+    from agent import auxiliary_client as aux
+
+    fallback_entry = {"provider": provider, "model": model}
+    if base_url:
+        fallback_entry["base_url"] = base_url
+    if fallback_timeout is not None:
+        fallback_entry["timeout"] = fallback_timeout
+    task_config = {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+        "timeout": 30,
+        "fallback_chain": [fallback_entry],
+    }
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: task_config)
+
+    primary_client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kwargs: (_ for _ in ()).throw(
+                    ConnectionError("primary route unavailable")
+                )
+            )
+        ),
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+    monkeypatch.setattr(
+        aux,
+        "_get_cached_client",
+        lambda provider, model, **kwargs: (primary_client, model),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_build_call_kwargs",
+        lambda provider, model, messages, **kwargs: {
+            "model": model,
+            "messages": messages,
+        },
+    )
+    monkeypatch.setattr(
+        aux,
+        "_try_configured_fallback_chain",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("non-explicit fallback must not reach generic resolver")
+        ),
+    )
+
+    with pytest.raises(ConnectionError, match="primary route unavailable"):
+        preprocessor.run_recall_preprocessor(
+            current_user_message="继续",
+            previous_assistant_message="上一轮回答",
+            previous_recall_query="old query",
+            previous_recall_results=["old memory"],
+        )
+
+    assert preprocessor.get_recall_preprocessor_budget_seconds() == 30.0
 
 
 def test_recall_preprocessor_rejects_provider_reported_model_mismatch(monkeypatch):

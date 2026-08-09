@@ -871,7 +871,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def prefetch_timeout_seconds(self) -> float:
         """Budget the complete bounded prefetch pipeline for MemoryManager."""
-        from .recall_preprocessor import get_recall_preprocessor_timeout_seconds
+        from .recall_preprocessor import get_recall_preprocessor_budget_seconds
 
         sync_recall_attempts = (
             _PREFETCH_MAX_SEQUENTIAL_SYNC_RECALLS
@@ -879,7 +879,7 @@ class HindsightMemoryProvider(MemoryProvider):
             else 1
         )
         return (
-            get_recall_preprocessor_timeout_seconds()
+            get_recall_preprocessor_budget_seconds()
             + (sync_recall_attempts * self._recall_sync_timeout_seconds)
             + _PREFETCH_OUTER_TIMEOUT_GRACE_SECONDS
         )

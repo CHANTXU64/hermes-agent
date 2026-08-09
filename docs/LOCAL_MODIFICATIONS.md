@@ -238,7 +238,7 @@ Upstream status: fork-only.
 
 ### 9. Hindsight P5 recall preprocessor
 
-Date: 2026-07-17; external-prefetch timeout compatibility fix 2026-07-19
+Date: 2026-07-17; external-prefetch timeout compatibility fix 2026-07-19; configured model fallback 2026-08-09
 
 Files:
 
@@ -269,14 +269,22 @@ What changed:
 - The current user message, latest completed non-tool assistant response, and
   previous real recall are evaluated by the frozen P5 prompt through the
   standard `auxiliary.hindsight_recall_preprocessor` task. Its configurable
-  provider/model/timeout defaults remain `openai-codex / gpt-5.6-luna / 30s`,
-  with no generic model/provider fallback. This task alone opts into OpenAI
-  Priority Processing through `extra_body.service_tier: priority`; the Codex
-  auxiliary adapter projects that explicit task-local value to the Responses
-  API's top-level `service_tier` field. Plugin-default `extra_body` remains
-  bound to its default provider: selecting a different provider without an
-  explicit `extra_body` drops the inherited request-body defaults, while an
-  explicit user `extra_body` still wins.
+  provider/model/timeout defaults remain `openai-codex / gpt-5.6-luna / 30s`.
+  A primary request, response-model validation, or strict-output parse failure
+  tries only this task's configured `fallback_chain`; every usable entry must
+  name an explicit provider and model, with dynamic, main-chat, and bare custom
+  routes rejected before generic resolution. Generic provider discovery and the
+  main chat model remain disabled. A fallback on another provider does not
+  inherit the primary route's provider-specific `extra_body`; its own positive
+  finite timeout is used when present, an omitted timeout inherits the primary
+  timeout, and an invalid timeout rejects the fallback chain before resolution.
+  This task alone opts into OpenAI Priority Processing through
+  `extra_body.service_tier: priority`; the Codex auxiliary adapter projects that
+  explicit task-local value to the Responses API's top-level `service_tier`
+  field. Plugin-default `extra_body` remains bound to its default provider:
+  selecting a different primary provider without an explicit `extra_body` drops
+  the inherited request-body defaults, while an explicit user `extra_body` still
+  wins.
 - Dynamic `main`/`auto` routes are rejected. Bare `custom` is rejected unless
   this task has its own `base_url`, preventing fallback through global custom or
   unrelated API-key providers. Non-Codex provider-reported `response.model`
@@ -313,12 +321,14 @@ What changed:
 - External memory providers may declare a complete synchronous prefetch budget.
   Providers without a declaration retain upstream's generic 8-second fail-open
   guard. Hindsight declares the sum of its bounded stages: the configured P5
-  auxiliary timeout, up to two sequential `recall_sync_timeout_seconds`
-  windows, and a 1-second outer-guard scheduling margin. The second recall
-  covers the branch where a P5-generated
-  query fails with no old results and the provider retries the current query.
-  With the current 30/10-second settings the outer guard is 51 seconds, so it no
-  longer truncates either recall stage at 8 seconds.
+  primary timeout, the largest valid timeout of any configured fallback model,
+  up to two sequential `recall_sync_timeout_seconds` windows, and a 1-second
+  outer-guard scheduling margin. A fallback entry without its own timeout uses
+  the primary P5 timeout. The second recall covers the branch where a
+  P5-generated query fails with no old results and the provider retries the
+  current query. With the current 30-second primary, 30-second fallback, and
+  10-second recall settings the outer guard is 81 seconds, so it no longer
+  truncates the fallback model or either recall stage.
 - If the outer guard still times out, `MemoryManager` invokes the provider's
   non-blocking timeout hook. Hindsight invalidates only the abandoned
   turn/generation, so its late result cannot become a future carried snapshot.
@@ -338,12 +348,14 @@ Merge protection:
 - Preserve P5 prompt SHA-256
   `b9b182478b41ab593398bb1649b8a318ab7f59464cd4abe5681a7add6481106f`
   unless the user explicitly approves and evaluates a successor.
-- Preserve the explicit configurable/no-fallback auxiliary task, its evaluated
-  Luna/30-second defaults, Codex provider-reported terminal-model validation,
-  non-Codex `response.model` validation, and strict schema validation. Continue
-  rejecting `auto`, `main`, bare `custom`, and their reserved `custom:*`
-  canonical equivalents. Do not treat the Codex adapter's requested-model
-  `.model` compatibility field as independent backend-model evidence.
+- Preserve the explicit configurable auxiliary task, its evaluated Luna/30-second
+  defaults, its task-local configured fallback chain, Codex provider-reported
+  terminal-model validation, non-Codex `response.model` validation, and strict
+  schema validation. Do not replace the task-local chain with generic provider
+  discovery or a main-chat-model fallback. Continue rejecting `auto`, `main`,
+  bare `custom`, and their reserved `custom:*` canonical equivalents. Do not
+  treat the Codex adapter's requested-model `.model` compatibility field as
+  independent backend-model evidence.
 - Keep query/result snapshots under the same generation, session-switch, and
   rewind lifecycle as `_prefetch_result`; do not preserve one cache
   representation without the other. Preserve the no-op post-turn hook and carry

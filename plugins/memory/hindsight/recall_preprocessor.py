@@ -90,6 +90,94 @@ def get_recall_preprocessor_timeout_seconds() -> float:
     return timeout_seconds
 
 
+def _fallback_entry_is_explicit(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    provider = str(entry.get("provider") or "").strip().lower()
+    model = str(entry.get("model") or "").strip().lower()
+    if not provider or not model or model == "auto":
+        return False
+    raw_timeout = entry.get("timeout")
+    if raw_timeout is not None and not (
+        isinstance(raw_timeout, (int, float))
+        and not isinstance(raw_timeout, bool)
+        and math.isfinite(float(raw_timeout))
+        and raw_timeout > 0
+    ):
+        return False
+    route_provider = provider
+    if route_provider.startswith("custom:"):
+        route_provider = route_provider.split(":", 1)[1].strip()
+    base_url = str(entry.get("base_url") or "").strip()
+    return route_provider not in {"auto", "main"} and not (
+        route_provider in {"", "custom"} and not base_url
+    )
+
+
+def _configured_fallback_chain_is_explicit(task_config: dict[str, Any]) -> bool:
+    chain = task_config.get("fallback_chain")
+    if not isinstance(chain, list):
+        return True
+    return all(
+        not isinstance(entry, dict)
+        or not str(entry.get("provider") or "").strip()
+        or _fallback_entry_is_explicit(entry)
+        for entry in chain
+    )
+
+
+def _fallback_entry_from_label(
+    task_config: dict[str, Any],
+    label: str,
+) -> dict[str, Any] | None:
+    prefix = "fallback_chain["
+    if not label.startswith(prefix):
+        return None
+    index_text, separator, _ = label[len(prefix) :].partition("]")
+    if not separator or not index_text.isdigit():
+        return None
+    chain = task_config.get("fallback_chain")
+    if not isinstance(chain, list):
+        return None
+    index = int(index_text)
+    if index >= len(chain) or not isinstance(chain[index], dict):
+        return None
+    return chain[index]
+
+
+def _fallback_timeout_seconds(
+    entry: dict[str, Any] | None,
+    primary_timeout: float,
+) -> float:
+    raw_timeout = entry.get("timeout") if entry is not None else None
+    if (
+        isinstance(raw_timeout, (int, float))
+        and not isinstance(raw_timeout, bool)
+        and math.isfinite(float(raw_timeout))
+        and raw_timeout > 0
+    ):
+        return float(raw_timeout)
+    return primary_timeout
+
+
+def get_recall_preprocessor_budget_seconds() -> float:
+    """Return the bounded primary-plus-fallback P5 execution budget."""
+    from agent import auxiliary_client as aux
+
+    primary_timeout = get_recall_preprocessor_timeout_seconds()
+    task_config = aux._get_auxiliary_task_config(_AUXILIARY_TASK)
+    chain = task_config.get("fallback_chain")
+    fallback_timeouts: list[float] = []
+    if isinstance(chain, list):
+        for entry in chain:
+            if not _fallback_entry_is_explicit(entry):
+                continue
+            fallback_timeouts.append(
+                _fallback_timeout_seconds(entry, primary_timeout)
+            )
+    return primary_timeout + max(fallback_timeouts, default=0.0)
+
+
 def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -153,6 +241,48 @@ def parse_recall_preprocessor_output(
     return RecallPreprocessDecision(tuple(refs), query)
 
 
+def _parse_validated_response(
+    aux: Any,
+    response: Any,
+    *,
+    provider: str,
+    model: str,
+    max_ref: int,
+) -> tuple[RecallPreprocessDecision, str]:
+    terminal_reported_model = str(
+        getattr(response, "provider_reported_model", "") or ""
+    )
+    response_reported_model = str(getattr(response, "model", "") or "")
+    require_terminal_model = aux._normalize_aux_provider(provider) == "openai-codex"
+    if require_terminal_model:
+        provider_reported_model = terminal_reported_model
+        model_mismatch = not terminal_reported_model or terminal_reported_model != model
+        returned_models = (terminal_reported_model,)
+    else:
+        returned_models = tuple(
+            dict.fromkeys(
+                reported_model
+                for reported_model in (
+                    terminal_reported_model,
+                    response_reported_model,
+                )
+                if reported_model
+            )
+        )
+        provider_reported_model = terminal_reported_model or response_reported_model
+        model_mismatch = any(
+            returned_model != model for returned_model in returned_models
+        )
+    if model_mismatch:
+        raise RuntimeError(
+            "recall-preprocessor provider-reported model mismatch: "
+            f"requested={model!r} returned={returned_models!r}"
+        )
+    raw_output = aux.extract_content_or_reasoning(response)
+    decision = parse_recall_preprocessor_output(raw_output, max_ref=max_ref)
+    return decision, provider_reported_model
+
+
 def run_recall_preprocessor(
     *,
     current_user_message: str,
@@ -160,7 +290,7 @@ def run_recall_preprocessor(
     previous_recall_query: str,
     previous_recall_results: Sequence[str],
 ) -> RecallPreprocessDecision:
-    """Run P5 through its configured auxiliary route without fallback."""
+    """Run P5 through its explicit route and configured task fallback chain."""
     from agent import auxiliary_client as aux
 
     task_config = aux._get_auxiliary_task_config(_AUXILIARY_TASK)
@@ -267,55 +397,78 @@ def run_recall_preprocessor(
     )
 
     started = time.monotonic()
-    response = aux._validate_llm_response(
-        client.chat.completions.create(**kwargs),
-        task="hindsight_recall_preprocessor",
-    )
-    elapsed = time.monotonic() - started
-    terminal_reported_model = str(
-        getattr(response, "provider_reported_model", "") or ""
-    )
-    response_reported_model = str(getattr(response, "model", "") or "")
-    require_terminal_model = (
-        aux._normalize_aux_provider(resolved_provider) == "openai-codex"
-    )
-    if require_terminal_model:
-        provider_reported_model = terminal_reported_model
-        model_mismatch = (
-            not terminal_reported_model
-            or terminal_reported_model != final_model
+    active_provider = resolved_provider
+    active_model = final_model
+    try:
+        response = aux._validate_llm_response(
+            client.chat.completions.create(**kwargs),
+            task=_AUXILIARY_TASK,
         )
-        returned_models = (terminal_reported_model,)
-    else:
-        returned_models = tuple(
-            dict.fromkeys(
-                model
-                for model in (
-                    terminal_reported_model,
-                    response_reported_model,
-                )
-                if model
+        decision, provider_reported_model = _parse_validated_response(
+            aux,
+            response,
+            provider=active_provider,
+            model=active_model,
+            max_ref=len(results),
+        )
+    except Exception as primary_error:
+        if not _configured_fallback_chain_is_explicit(task_config):
+            raise
+        fallback_client, fallback_model, fallback_label = (
+            aux._try_configured_fallback_chain(
+                _AUXILIARY_TASK,
+                resolved_provider,
+                reason=str(primary_error) or type(primary_error).__name__,
+                failed_model=final_model,
             )
         )
-        provider_reported_model = (
-            terminal_reported_model or response_reported_model
+        if fallback_client is None or not fallback_model:
+            raise
+
+        fallback_entry = _fallback_entry_from_label(task_config, fallback_label)
+        fallback_timeout = _fallback_timeout_seconds(
+            fallback_entry,
+            timeout_seconds,
         )
-        model_mismatch = any(
-            returned_model != final_model
-            for returned_model in returned_models
+        fallback_provider = aux._fallback_provider_from_label(fallback_label)
+        fallback_extra_body = {}
+        if (
+            aux._normalize_aux_provider(fallback_provider)
+            == aux._normalize_aux_provider(resolved_provider)
+        ):
+            fallback_extra_body = aux._get_task_extra_body(_AUXILIARY_TASK)
+
+        response = aux._call_fallback_candidate_sync(
+            fallback_client,
+            fallback_model,
+            fallback_label,
+            task=_AUXILIARY_TASK,
+            messages=messages,
+            temperature=0,
+            max_tokens=_MAX_OUTPUT_TOKENS,
+            tools=None,
+            effective_timeout=fallback_timeout,
+            effective_extra_body=fallback_extra_body,
+            reasoning_config=None,
         )
-    if model_mismatch:
-        raise RuntimeError(
-            "recall-preprocessor provider-reported model mismatch: "
-            f"requested={final_model!r} returned={returned_models!r}"
+        if response is None:
+            raise primary_error
+        active_provider = fallback_provider
+        active_model = fallback_model
+        decision, provider_reported_model = _parse_validated_response(
+            aux,
+            response,
+            provider=active_provider,
+            model=active_model,
+            max_ref=len(results),
         )
-    raw_output = aux.extract_content_or_reasoning(response)
-    decision = parse_recall_preprocessor_output(raw_output, max_ref=len(results))
+
+    elapsed = time.monotonic() - started
     logger.info(
         "Hindsight recall preprocessor: provider=%s model=%s latency=%.3fs "
         "old_results=%d dropped=%d new_query=%s",
-        resolved_provider,
-        provider_reported_model or final_model,
+        active_provider,
+        provider_reported_model or active_model,
         elapsed,
         len(results),
         len(decision.drop_old_refs),

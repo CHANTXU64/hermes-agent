@@ -57,19 +57,35 @@ auxiliary:
     provider: openai-codex
     model: gpt-5.6-luna
     timeout: 30
+    fallback_chain:
+      - provider: deepseek
+        model: deepseek-v4-flash
 ```
 
 The standard auxiliary-task fields are supported, including `provider`,
-`model`, `timeout`, `base_url`, `api_key`, `api_mode`, and `extra_body`.
-`provider` and `model` must both select an explicit route. `provider: auto`,
-`provider: main`, or an empty model is treated as unavailable. A bare
-`provider: custom` is also rejected unless this task supplies its own
-`base_url`; this prevents the generic client resolver from trying a global
-custom endpoint and then another API-key provider. Canonical-equivalent
-reserved forms such as `custom:`, `custom:auto`, `custom:main`, and
-`custom:custom` are evaluated by their suffix and cannot bypass those checks.
-These checks keep the task from silently falling back to the main chat model or
-another provider. Route, parse, or model failure uses the fail-open policy below.
+`model`, `timeout`, `base_url`, `api_key`, `api_mode`, `extra_body`, and a
+per-task `fallback_chain`. `provider` and `model` must both select an explicit
+primary route. `provider: auto`, `provider: main`, or an empty model is treated
+as unavailable. A bare `provider: custom` is also rejected unless this task
+supplies its own `base_url`; this prevents the generic client resolver from
+trying a global custom endpoint and then another API-key provider.
+Canonical-equivalent reserved forms such as `custom:`, `custom:auto`,
+`custom:main`, and `custom:custom` are evaluated by their suffix and cannot
+bypass those checks.
+
+When the primary request, provider-reported model validation, or strict output
+parse fails, P5 tries only the first viable model in this task's configured
+`fallback_chain`. Every usable fallback entry must also name an explicit
+provider and model; `auto`, `main`, their `custom:*` equivalents, a bare
+`custom` route without its own `base_url`, and an empty or `auto` model are
+rejected before the generic resolver can see them. It does not fall back through
+generic provider discovery or the main chat model. A fallback on another
+provider receives an empty `extra_body`, so OpenAI-only fields such as
+`service_tier` are not forwarded; a same-provider sibling model keeps the task's
+`extra_body`. A fallback entry's own positive finite `timeout` is used when
+present; an omitted value inherits the primary timeout, while an invalid value
+rejects the fallback chain before resolution. If no configured fallback
+succeeds, the fail-open recall-cache policy below applies.
 
 The auxiliary `timeout` controls only the P5 LLM decision. The subsequent
 read-only Hindsight recall has its own
@@ -80,17 +96,19 @@ external memory providers. Hindsight declares a provider-specific outer budget
 for its complete bounded pipeline:
 
 ```text
-configured auxiliary.hindsight_recall_preprocessor.timeout
+configured primary auxiliary.hindsight_recall_preprocessor.timeout
++ largest valid configured fallback timeout (or the primary timeout)
 + up to 2 × configured recall_sync_timeout_seconds
 + 1-second outer-guard scheduling margin
 ```
 
-With 30-second P5 and 10-second recall settings this outer budget is 51 seconds.
-Two recall windows are required for the bounded branch where a P5-generated
-query fails with no old results and Hindsight then retries the current query.
-Each recall still has its own 10-second deadline; the larger outer budget only
-prevents the generic guard from cutting either attempt off first. The 1-second
-margin covers thread startup, stage transitions, and timeout scheduling jitter.
+With a 30-second primary, one fallback without its own timeout, and 10-second
+recall settings this outer budget is 81 seconds. Two recall windows are required
+for the bounded branch where a P5-generated query fails with no old results and
+Hindsight then retries the current query. Each primary, fallback, and recall
+stage still has its own deadline; the larger outer budget only prevents the
+generic guard from cutting a later stage off first. The 1-second margin covers
+thread startup, stage transitions, and timeout scheduling jitter.
 An explicit `MemoryManager(external_prefetch_timeout=...)` test/application
 override still takes precedence, and providers without a valid declaration keep
 the generic 8-second behavior. If that outer guard abandons a still-running
@@ -99,7 +117,8 @@ so its late result cannot become the next turn's carried snapshot.
 
 - Default provider: `openai-codex`
 - Default model: `gpt-5.6-luna`
-- Generic provider/main-model fallback: disabled
+- Task-local configured fallback: enabled when `fallback_chain` is present
+- Generic provider discovery and main-chat-model fallback: disabled
 - Default P5 call timeout: 30 seconds
 - Caller requests a 256-token output limit, but the Codex adapter does not send
   `max_tokens` or `max_output_tokens` on the wire because this endpoint rejects
@@ -145,7 +164,9 @@ consume current-session state.
 
 The feature is deliberately fail-open toward memory availability:
 
-- P5 route unavailable, timeout, model mismatch, exception, or invalid JSON/schema: return the complete old recall cache.
+- P5 primary request, model validation, or strict-output parsing failure: try the
+  configured task-local fallback model; if it is unavailable or also fails,
+  return the complete old recall cache.
 - P5 requests a new query but that Hindsight recall raises: restore the complete old recall cache.
 - No old cache and P5 fails: use the existing bounded current-query synchronous recall.
 - A valid `new_query=null`: make no new recall, inject/carry the selected old
@@ -171,7 +192,7 @@ The preprocessor is skipped when Hindsight is in tools-only mode, `auto_recall` 
 - `hermes_cli/plugins.py` and `plugins/memory/__init__.py` — bridge auxiliary
   tasks declared by the active memory provider into the standard Hermes model
   configuration surfaces.
-- `plugins/memory/hindsight/recall_preprocessor.py` — frozen P5 prompt, strict parser, configured direct call.
+- `plugins/memory/hindsight/recall_preprocessor.py` — frozen P5 prompt, strict parser, configured primary call, and task-local configured fallback call.
 - `plugins/memory/hindsight/__init__.py` — structured snapshot, filtering/merge, recall, failure and lifecycle behavior.
 - `tests/fork/test_hindsight_recall_preprocessor.py` — prompt/schema,
   explicit-route/model-provenance, provider/failure, null lifecycle, carried
