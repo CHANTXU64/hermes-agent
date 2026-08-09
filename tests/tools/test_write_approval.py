@@ -72,7 +72,7 @@ def test_memory_gate_off_allows_write(hermes_home):
     from tools.memory_tool import memory_tool, MemoryStore
     from tools import write_approval as wa
     store = MemoryStore(); store.load_from_disk()
-    r = json.loads(memory_tool("add", "user", "save me", store=store))
+    r = json.loads(memory_tool("add", "user", "save me", reason="test write", evidence="test fixture", store=store))
     assert r["success"] is True
     assert r["entry_count"] == 1
     assert wa.pending_count("memory") == 0
@@ -90,7 +90,7 @@ def test_cli_memory_approve_without_live_agent_uses_fresh_store(hermes_home, cap
 
     _set_approval("memory", True)
     staging = MemoryStore(); staging.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "remember the launch date", store=staging))
+    r = json.loads(memory_tool("add", "memory", "remember the launch date", reason="test staged write", evidence="test fixture", store=staging))
     assert r.get("pending_id"), r
     assert wa.pending_count("memory") == 1
 
@@ -160,9 +160,9 @@ def test_handle_approve_all(hermes_home):
     from tools.memory_tool import MemoryStore
     from tools import write_approval as wa
     store = MemoryStore(); store.load_from_disk()
-    wa.stage_write("memory", {"action": "add", "target": "user", "content": "a"},
+    wa.stage_write("memory", {"action": "add", "target": "user", "content": "a", "reason": "test approval", "evidence": "test fixture"},
                    summary="a", origin="foreground")
-    wa.stage_write("memory", {"action": "add", "target": "user", "content": "b"},
+    wa.stage_write("memory", {"action": "add", "target": "user", "content": "b", "reason": "test approval", "evidence": "test fixture"},
                    summary="b", origin="foreground")
     out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
     assert "Approved 2" in out
@@ -220,7 +220,7 @@ def test_memory_inline_approve_writes(hermes_home, approval_callback_cleanup):
     set_approval_callback(approve_cb)
 
     store = MemoryStore(); store.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "approved fact", store=store))
+    r = json.loads(memory_tool("add", "memory", "approved fact", reason="test inline approval", evidence="test fixture", store=store))
     assert r["success"] is True
     assert r.get("staged") is None  # real write, not staged
     assert store.memory_entries == ["approved fact"]
@@ -238,7 +238,7 @@ def test_memory_inline_deny_blocks(hermes_home, approval_callback_cleanup):
     set_approval_callback(lambda command, description, **kw: "deny")
 
     store = MemoryStore(); store.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "denied fact", store=store))
+    r = json.loads(memory_tool("add", "memory", "denied fact", reason="test inline denial", evidence="test fixture", store=store))
     assert r["success"] is False
     assert "denied" in r["error"].lower()
     assert store.memory_entries == []

@@ -1640,6 +1640,47 @@ class TestExecuteToolCalls:
         assert metadata["tool_call_id"] == "mem-1"
         assert messages[-1]["tool_call_id"] == "mem-1"
 
+    @pytest.mark.parametrize(
+        "dispatch_method",
+        ["_execute_tool_calls_sequential", "_execute_tool_calls_concurrent"],
+    )
+    def test_memory_dispatch_forwards_single_operation_governance_metadata(
+        self, agent, dispatch_method
+    ):
+        governance = {
+            "reason": "retain the durable preference",
+            "evidence": "the user stated it directly",
+            "change_type": "add",
+            "deletion_type": "safe",
+            "loss_note": "none",
+            "related_skill": "example-skill",
+        }
+        tc = _mock_tool_call(
+            name="memory",
+            arguments=json.dumps(
+                {
+                    "action": "add",
+                    "target": "user",
+                    "content": "durable preference",
+                    **governance,
+                }
+            ),
+            call_id="mem-governance-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        agent._memory_manager = None
+        agent._memory_store = object()
+
+        with patch(
+            "tools.memory_tool.memory_tool",
+            return_value=json.dumps({"success": True}),
+        ) as mocked_memory:
+            getattr(agent, dispatch_method)(mock_msg, [], "task-1")
+
+        forwarded = mocked_memory.call_args.kwargs
+        for key, value in governance.items():
+            assert forwarded[key] == value
+
     def test_keyboard_interrupt_emits_cancelled_post_tool_hook(self, agent, monkeypatch):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])

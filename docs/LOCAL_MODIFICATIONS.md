@@ -1551,6 +1551,94 @@ Upstream status: fork-only; current upstream still contains the disconnect plus
 large-session context-overflow inference.
 
 
+### 23. Auditable autonomous built-in memory governance
+
+Status: fork-only; active after a process loads this version
+
+Date: 2026-08-08
+
+Files:
+
+- `tools/memory_tool.py`
+- `agent/background_review.py`
+- `agent/prompt_builder.py`
+- `agent/tool_executor.py`
+- `agent/agent_runtime_helpers.py`
+- `tests/agent/test_prompt_builder.py`
+- `tests/agent/test_memory_write_bridge.py`
+- `tests/fork/test_memory_changelog_governance.py`
+- `tests/tools/test_memory_tool.py`
+- `tests/tools/test_memory_tool_schema.py`
+- `tests/tools/test_write_approval.py`
+- `tests/run_agent/test_run_agent.py`
+- `docs/chantxu64/memory-change-governance/README.md`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- Keep autonomous `MEMORY.md` / `USER.md` maintenance while recording the
+  evidence and exact semantic loss behind every public mutation.
+
+What changed:
+
+- The public memory tool requires reason/evidence metadata, writes exact
+  before/after events to profile-scoped `MEMORY_CHANGELOG.jsonl`, classifies
+  removal as `safe`, `expired`, or `forced_capacity`, and groups batch operations
+  with a transaction ID. The target lock remains held through journaling, and a
+  checked disk snapshot is required before mutation. Journal failures roll back
+  the write; if a non-cooperating manual writer changed the file again, the newer
+  bytes are preserved instead of being erased by a stale rollback.
+- Sequential and concurrent live dispatch both forward single-operation
+  governance metadata.
+- Background memory review receives only the latest on-disk `MEMORY.md` and
+  `USER.md` in its uncached user message after per-entry threat scanning and JSON
+  data encoding. It never receives the full audit log. Pure adds skip history;
+  existing-entry changes use the read-only, 8,000-character-bound
+  `memory(action="history", ...)` lookup, which follows the newest producer
+  backward and includes only related JSONL lineage. A transaction ID records
+  atomic submission only: ordinary operations in the same batch do not become
+  each other's history; only operations explicitly marked `merge` share merge
+  lineage. The existing memory/Skill-only
+  runtime whitelist remains unchanged, and no SOUL files are appended to this
+  governance context.
+- Main-agent guidance, background review prompts, and the memory tool schema
+  distinguish actually observed incidents/user corrections from merely preventive
+  concerns. Unobserved risks cannot be recorded as lessons, and generic safety
+  precautions are not saved solely because they seem important. Repository
+  implementation designs, architecture notes, and fork-only behavior already
+  documented in repository docs are also excluded; only a short pre-load trigger
+  may remain when needed to select the correct Skill.
+- Prompts require actual `skill_view` inspection before treating a Skill as the
+  reliable carrier of a procedure; pre-load triggers may remain in memory.
+
+Why it matters:
+
+- Tight character limits previously encouraged untyped deletion of "stale or
+  less important" entries without retaining the original problem or known loss.
+- The user wants background review to continue managing memory itself, including
+  last-resort eviction, without silently erasing why an older lesson existed.
+
+Merge protection:
+
+- Preserve when: upstream still lacks equivalent per-change audit history,
+  deletion typing, sanitized live memory-review context, metadata-preserving
+  dispatch, and journal-failure rollback without stale-snapshot data loss.
+- Drop when: upstream provides an equivalent autonomous, evidence-backed memory
+  governance mechanism.
+- Ask user when: a replacement requires manual approval, broad file access, or
+  injection of SOUL/SOUL_CHANGELOG into background memory review.
+
+Verification:
+
+```bash
+./venv/bin/python -m pytest -q -o 'addopts=' tests/agent/test_prompt_builder.py tests/agent/test_memory_write_bridge.py tests/fork/test_memory_changelog_governance.py tests/tools/test_memory_tool.py tests/tools/test_memory_tool_schema.py tests/tools/test_write_approval.py tests/run_agent/test_run_agent.py::TestExecuteToolCalls tests/run_agent/test_background_review_cache_parity.py tests/run_agent/test_background_review_toolset_restriction.py tests/test_background_review_list_shapes.py tests/test_background_review_session_isolation.py
+```
+
+Feature docs: `docs/chantxu64/memory-change-governance/README.md`
+
+Upstream status: fork-only.
+
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -1635,6 +1723,21 @@ deltas are expected in these areas:
   - `tools/clarify_tool.py`
   - `tests/gateway/test_clarify_active_session_bypass.py`
   - `tests/tools/test_clarify_gateway.py`
+- Auditable autonomous built-in memory governance:
+  - `tools/memory_tool.py`
+  - `agent/background_review.py`
+  - `agent/prompt_builder.py`
+  - `agent/tool_executor.py`
+  - `agent/agent_runtime_helpers.py`
+  - `tests/agent/test_prompt_builder.py`
+  - `tests/agent/test_memory_write_bridge.py`
+  - `tests/fork/test_memory_changelog_governance.py`
+  - `tests/tools/test_memory_tool.py`
+  - `tests/tools/test_memory_tool_schema.py`
+  - `tests/tools/test_write_approval.py`
+  - `tests/run_agent/test_run_agent.py`
+  - `docs/chantxu64/memory-change-governance/README.md`
+  - `docs/LOCAL_MODIFICATIONS.md`
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
 - Multi Telegram bots (account_id session slots):
@@ -1673,9 +1776,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 22 major entries.
+Documented entries: 23 major entries.
 
-Active / current entries: 19.
+Active / current entries: 20.
 
 Historical reverted / abandoned areas: 3.
 

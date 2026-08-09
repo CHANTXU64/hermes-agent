@@ -38,3 +38,27 @@ def test_memory_schema_has_no_forbidden_top_level_combinators():
 
 def test_memory_schema_is_json_serializable():
     json.dumps(MEMORY_SCHEMA)
+
+
+def test_memory_schema_exposes_bounded_history_without_full_log_reads():
+    assert "history" in MEMORY_SCHEMA["parameters"]["properties"]["action"]["enum"]
+    description = MEMORY_SCHEMA["description"]
+    assert "For a pure add, do not read history" in description
+    assert "memory(action='history'" in description
+    assert "never load the full audit log" in description
+    assert "MEMORY_CHANGELOG.md" not in description
+
+
+def test_memory_schema_distinguishes_observed_lessons_from_precautions():
+    description = MEMORY_SCHEMA["description"]
+    assert "actually observed incident or user correction" in description
+    assert "merely preventive concern" in description
+    assert "Never label an unobserved concern as a lesson" in description
+    assert "generic safety precautions" in description
+
+
+def test_memory_schema_does_not_duplicate_repository_design_records():
+    description = MEMORY_SCHEMA["description"]
+    assert "implementation designs, architecture notes, or fork-only behavior" in description
+    assert "already documented in repository docs" in description
+    assert "short pre-load trigger" in description

@@ -51,6 +51,23 @@ class TestGuidanceConstants:
         assert "like a diary" not in MEMORY_GUIDANCE
         assert ">80%" not in MEMORY_GUIDANCE
 
+    def test_memory_guidance_reads_bounded_history_only_before_existing_changes(self):
+        assert "For a pure add, do not read history" in MEMORY_GUIDANCE
+        assert "memory(action='history'" in MEMORY_GUIDANCE
+        assert "never load the full audit log" in MEMORY_GUIDANCE
+        assert "MEMORY_CHANGELOG.md" not in MEMORY_GUIDANCE
+
+    def test_memory_guidance_distinguishes_observed_lessons_from_precautions(self):
+        assert "actually observed incident or user correction" in MEMORY_GUIDANCE
+        assert "merely preventive concern" in MEMORY_GUIDANCE
+        assert "Never label an unobserved concern as a lesson" in MEMORY_GUIDANCE
+        assert "generic safety precautions" in MEMORY_GUIDANCE
+
+    def test_memory_guidance_does_not_duplicate_repository_design_records(self):
+        assert "implementation designs, architecture notes, or fork-only behavior" in MEMORY_GUIDANCE
+        assert "already documented in repository docs" in MEMORY_GUIDANCE
+        assert "short pre-load trigger" in MEMORY_GUIDANCE
+
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE

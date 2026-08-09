@@ -69,8 +69,14 @@ def test_notifies_remove_with_old_text_after_success():
     ]
 
 
+def test_does_not_mirror_read_only_history_lookup():
+    mgr, provider = _manager_with_provider()
+    mgr.notify_memory_tool_write(
+        json.dumps({"success": True}),
+        {"action": "history", "target": "memory", "old_text": "preference"},
+    )
 
-
+    assert provider.calls == []
 
 
 @pytest.mark.parametrize("tool_result", [None, [], object(), "not-json"])

@@ -26,7 +26,9 @@ Design:
 import json
 import logging
 import time
-from contextlib import contextmanager
+import uuid
+from contextlib import contextmanager, nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
@@ -65,6 +67,176 @@ MEMORY_BLOCK_HEADERS = {
 }
 
 ENTRY_DELIMITER = "\n§\n"
+MEMORY_CHANGELOG_FILENAME = "MEMORY_CHANGELOG.jsonl"
+MEMORY_CHANGELOG_SCHEMA_VERSION = 1
+MEMORY_HISTORY_MAX_CHARS = 8000
+
+
+def get_memory_changelog_path() -> Path:
+    """Return the profile-scoped built-in memory JSONL path."""
+    return get_memory_dir() / MEMORY_CHANGELOG_FILENAME
+
+
+def _jsonl_text(records: List[Dict[str, Any]]) -> str:
+    """Serialize records as one compact JSON object per line."""
+    if not records:
+        return ""
+    return "\n".join(
+        json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        for record in records
+    ) + "\n"
+
+
+def _baseline_records() -> List[Dict[str, Any]]:
+    """Create an honest structured baseline for pre-governance entries."""
+    created = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    records: List[Dict[str, Any]] = []
+    for target, filename in (("memory", "MEMORY.md"), ("user", "USER.md")):
+        entries = MemoryStore._read_file(get_memory_dir() / filename)
+        for index, entry in enumerate(entries, 1):
+            records.append(
+                {
+                    "schema_version": MEMORY_CHANGELOG_SCHEMA_VERSION,
+                    "event_type": "baseline",
+                    "event_id": f"BASELINE-{target.upper()}-{index:03d}",
+                    "timestamp": created,
+                    "transaction_id": None,
+                    "target": target,
+                    "action": "baseline",
+                    "change_type": "baseline",
+                    "deletion_type": None,
+                    "reason": (
+                        "Legacy entry already existed when change-log governance was "
+                        "introduced; its original source was not reconstructed here."
+                    ),
+                    "evidence": "Current on-disk entry at baseline creation.",
+                    "related_skill": None,
+                    "loss_note": None,
+                    "before": None,
+                    "after": entry,
+                }
+            )
+    return records
+
+
+def initialize_memory_changelog() -> Path:
+    """Create the profile JSONL once, preserving existing entries as baseline."""
+    path = get_memory_changelog_path()
+    if path.exists():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, _jsonl_text(_baseline_records()), tmp_prefix=".memlog_")
+    return path
+
+
+def _normalize_governance_operation(op: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize and validate audit metadata for one public memory mutation."""
+    normalized = dict(op or {})
+    action = str(normalized.get("action") or "").strip()
+    reason = str(normalized.get("reason") or "").strip()
+    evidence = str(normalized.get("evidence") or "").strip()
+    if not reason:
+        raise ValueError(f"{action or 'memory'} requires reason: why this durable change is justified.")
+    if not evidence:
+        raise ValueError(f"{action or 'memory'} requires evidence: the user statement or verified fact supporting it.")
+
+    if action == "remove":
+        deletion_type = str(normalized.get("deletion_type") or "").strip()
+        if deletion_type not in {"safe", "expired", "forced_capacity"}:
+            raise ValueError(
+                "remove requires deletion_type: safe, expired, or forced_capacity."
+            )
+        if deletion_type == "forced_capacity" and not str(
+            normalized.get("loss_note") or ""
+        ).strip():
+            raise ValueError(
+                "forced_capacity removal requires loss_note describing useful meaning that may be lost."
+            )
+
+    default_type = {"add": "add", "replace": "replace", "remove": "delete"}.get(
+        action, action or "unknown"
+    )
+    normalized["change_type"] = str(
+        normalized.get("change_type") or default_type
+    ).strip()
+    if normalized["change_type"] not in {
+        "add",
+        "replace",
+        "merge",
+        "compress",
+        "migrate",
+        "delete",
+    }:
+        raise ValueError(
+            "change_type must be add, replace, merge, compress, migrate, or delete."
+        )
+    normalized["reason"] = reason
+    normalized["evidence"] = evidence
+    return normalized
+
+
+def _trace_governance_changes(
+    before_entries: List[str], operations: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Recover the exact before/after entry for each successful operation."""
+    working = list(before_entries)
+    traces: List[Dict[str, Any]] = []
+    for op in operations:
+        action = op.get("action")
+        content = (op.get("content") or "").strip()
+        old_text = (op.get("old_text") or "").strip()
+        before = None
+        after = None
+        if action == "add":
+            if content in working:
+                continue
+            working.append(content)
+            after = content
+        elif action in {"replace", "remove"}:
+            matches = [i for i, entry in enumerate(working) if old_text in entry]
+            if not matches:
+                continue
+            index = matches[0]
+            before = working[index]
+            if action == "replace":
+                working[index] = content
+                after = content
+            else:
+                working.pop(index)
+        traces.append({**op, "before": before, "after": after})
+    return traces
+
+
+def _format_change_records(
+    target: str, traces: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    transaction_id = f"TXN-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
+    records: List[Dict[str, Any]] = []
+    for trace in traces:
+        records.append(
+            {
+                "schema_version": MEMORY_CHANGELOG_SCHEMA_VERSION,
+                "event_type": "change",
+                "event_id": (
+                    f"MEM-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-"
+                    f"{uuid.uuid4().hex[:8]}"
+                ),
+                "timestamp": now,
+                "transaction_id": transaction_id,
+                "target": target,
+                "action": trace.get("action"),
+                "change_type": trace.get("change_type"),
+                "deletion_type": trace.get("deletion_type"),
+                "reason": trace.get("reason"),
+                "evidence": trace.get("evidence"),
+                "related_skill": trace.get("related_skill"),
+                "loss_note": trace.get("loss_note"),
+                "before": trace.get("before"),
+                "after": trace.get("after"),
+            }
+        )
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +559,9 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
+    def add(
+        self, target: str, content: str, *, _lock_held: bool = False
+    ) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
         if not content:
@@ -398,7 +572,8 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        with self._file_lock(self._path_for(target)):
+        lock = nullcontext() if _lock_held else self._file_lock(self._path_for(target))
+        with lock:
             # Re-read from disk under lock to pick up writes from other sessions.
             # For add (append-only), we skip the drift guard — appending never
             # clobbers existing content, so round-trip mismatches from prior
@@ -446,7 +621,14 @@ class MemoryStore:
 
         return self._success_response(target, "Entry added.")
 
-    def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
+    def replace(
+        self,
+        target: str,
+        old_text: str,
+        new_content: str,
+        *,
+        _lock_held: bool = False,
+    ) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
         old_text = old_text.strip()
         new_content = new_content.strip()
@@ -460,7 +642,8 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        with self._file_lock(self._path_for(target)):
+        lock = nullcontext() if _lock_held else self._file_lock(self._path_for(target))
+        with lock:
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -517,13 +700,16 @@ class MemoryStore:
 
         return self._success_response(target, "Entry replaced.")
 
-    def remove(self, target: str, old_text: str) -> Dict[str, Any]:
+    def remove(
+        self, target: str, old_text: str, *, _lock_held: bool = False
+    ) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
         old_text = old_text.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
 
-        with self._file_lock(self._path_for(target)):
+        lock = nullcontext() if _lock_held else self._file_lock(self._path_for(target))
+        with lock:
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -559,7 +745,13 @@ class MemoryStore:
 
         return self._success_response(target, "Entry removed.")
 
-    def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def apply_batch(
+        self,
+        target: str,
+        operations: List[Dict[str, Any]],
+        *,
+        _lock_held: bool = False,
+    ) -> Dict[str, Any]:
         """Apply a sequence of add/replace/remove ops to one target atomically.
 
         All operations are validated and applied against the FINAL budget --
@@ -585,7 +777,8 @@ class MemoryStore:
                 if scan_error:
                     return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
 
-        with self._file_lock(self._path_for(target)):
+        lock = nullcontext() if _lock_held else self._file_lock(self._path_for(target))
+        with lock:
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -908,8 +1101,330 @@ def load_on_disk_store() -> "MemoryStore":
     return store
 
 
+def _append_governance_records(
+    changelog_path: Path, target: str, traces: List[Dict[str, Any]]
+) -> None:
+    """Atomically append structured mutation records to the JSONL log."""
+    if not traces:
+        return
+    # Refuse to extend a structurally corrupt log; the caller will roll back
+    # the already-written memory transaction.
+    _load_changelog_records(changelog_path)
+    raw = changelog_path.read_text(encoding="utf-8")
+    if raw and not raw.endswith("\n"):
+        raw += "\n"
+    updated = raw + _jsonl_text(_format_change_records(target, traces))
+    atomic_write_text(changelog_path, updated, tmp_prefix=".memlog_")
+
+
+def _load_changelog_records(path: Path) -> List[Dict[str, Any]]:
+    """Parse the JSONL log without exposing unrelated records to the model."""
+    if not path.exists():
+        return []
+    raw = path.read_text(encoding="utf-8")
+    records: List[Dict[str, Any]] = []
+    for line_number, line in enumerate(raw.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Invalid memory changelog JSON on line {line_number}: {exc.msg}"
+            ) from exc
+        if not isinstance(record, dict):
+            raise ValueError(
+                f"Invalid memory changelog record on line {line_number}: expected an object."
+            )
+        records.append(record)
+    return records
+
+
+def _related_history_records(
+    records: List[Dict[str, Any]], target: str, current_entry: str
+) -> List[Dict[str, Any]]:
+    """Follow the current entry's producers backward without crossing reuse boundaries."""
+    selected: set[int] = set()
+    pending = [(current_entry, len(records))]
+    visited: set[tuple[str, int]] = set()
+    while pending:
+        text, upper_bound = pending.pop()
+        if (text, upper_bound) in visited:
+            continue
+        visited.add((text, upper_bound))
+
+        producer = None
+        for index in range(upper_bound - 1, -1, -1):
+            record = records[index]
+            if record.get("target") == target and record.get("after") == text:
+                producer = index
+                break
+        if producer is None:
+            continue
+
+        producer_record = records[producer]
+        transaction_id = producer_record.get("transaction_id")
+        if transaction_id and producer_record.get("change_type") == "merge":
+            group = [
+                index
+                for index in range(upper_bound)
+                if records[index].get("target") == target
+                and records[index].get("transaction_id") == transaction_id
+                and records[index].get("change_type") == "merge"
+            ]
+        else:
+            group = [producer]
+        selected.update(group)
+        earlier_than = min(group)
+        for index in group:
+            before = records[index].get("before")
+            if isinstance(before, str):
+                pending.append((before, earlier_than))
+    return [records[index] for index in sorted(selected)]
+
+
+def _history_record_for_model(record: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+    """Threat-scan and field-bound one history record before returning it."""
+    from tools.threat_patterns import scan_for_threats
+
+    findings = scan_for_threats(
+        json.dumps(record, ensure_ascii=False),
+        scope="strict",
+    )
+    if findings:
+        metadata: Dict[str, Any] = {}
+        for key in (
+            "schema_version",
+            "event_type",
+            "event_id",
+            "timestamp",
+            "target",
+            "action",
+            "change_type",
+        ):
+            value = record.get(key)
+            metadata[key] = value[:120] + "…[field truncated]" if (
+                isinstance(value, str) and len(value) > 120
+            ) else value
+        metadata["blocked"] = (
+            "Record contained threat pattern(s): " + ", ".join(findings)
+        )
+        return metadata, True
+
+    limits = {
+        "before": 800,
+        "after": 800,
+        "reason": 400,
+        "evidence": 400,
+        "loss_note": 400,
+        "related_skill": 200,
+    }
+    bounded: Dict[str, Any] = {}
+    truncated = False
+    for key, value in record.items():
+        limit = limits.get(key, 120)
+        if isinstance(value, str) and len(value) > limit:
+            bounded[key] = value[:limit] + "…[field truncated]"
+            truncated = True
+        else:
+            bounded[key] = value
+
+    if len(json.dumps([bounded], ensure_ascii=False)) > MEMORY_HISTORY_MAX_CHARS:
+        bounded = {
+            key: bounded.get(key)
+            for key in (
+                "schema_version",
+                "event_type",
+                "event_id",
+                "timestamp",
+                "target",
+                "action",
+                "change_type",
+            )
+        }
+        bounded["record_truncated"] = True
+        truncated = True
+    return bounded, truncated
+
+
+def _bounded_history(
+    records: List[Dict[str, Any]], max_chars: int = MEMORY_HISTORY_MAX_CHARS
+) -> tuple[List[Dict[str, Any]], bool]:
+    prepared: List[Dict[str, Any]] = []
+    truncated = False
+    for record in records:
+        safe_record, field_truncated = _history_record_for_model(record)
+        prepared.append(safe_record)
+        truncated = truncated or field_truncated
+
+    if len(json.dumps(prepared, ensure_ascii=False)) <= max_chars:
+        return prepared, truncated
+
+    # Preserve the origin plus as many newest changes as fit.
+    chosen_indices = [0] if prepared else []
+    for index in range(len(prepared) - 1, 0, -1):
+        candidate = [prepared[i] for i in sorted(chosen_indices + [index])]
+        if len(json.dumps(candidate, ensure_ascii=False)) <= max_chars:
+            chosen_indices.append(index)
+    bounded = [prepared[index] for index in sorted(set(chosen_indices))]
+    return bounded, True
+
+
+def _memory_history(store: "MemoryStore", target: str, old_text: str) -> Dict[str, Any]:
+    """Return only the bounded audit lineage for one current entry."""
+    old_text = old_text.strip()
+    if not old_text:
+        return {"success": False, "error": "old_text is required for history."}
+    entries, read_ok = MemoryStore._read_entries_checked(store._path_for(target))
+    if not read_ok:
+        return _read_failed_error(store._path_for(target))
+    matches = [entry for entry in entries if old_text in entry]
+    if not matches:
+        return {
+            "success": False,
+            "error": f"No current entry matched '{old_text}'.",
+            "current_entries": entries,
+        }
+    if len(set(matches)) > 1:
+        return {
+            "success": False,
+            "error": f"Multiple current entries matched '{old_text}'. Be more specific.",
+            "matches": store._previews(matches),
+        }
+    current_entry = matches[0]
+    try:
+        records = _load_changelog_records(get_memory_changelog_path())
+    except (OSError, IOError, UnicodeDecodeError, ValueError) as exc:
+        return {"success": False, "error": f"Could not read memory history: {exc}"}
+    related = _related_history_records(records, target, current_entry)
+    history, truncated = _bounded_history(related)
+    return {
+        "success": True,
+        "target": target,
+        "current_entry": current_entry,
+        "history": history,
+        "matched_records": len(related),
+        "returned_records": len(history),
+        "truncated": truncated,
+        "max_chars": MEMORY_HISTORY_MAX_CHARS,
+        "note": "Read-only result. Use this evidence before changing the existing entry.",
+    }
+
+
+def _apply_governed_mutation(
+    store: "MemoryStore", target: str, operations: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Apply one public memory transaction and journal its exact semantic delta.
+
+    The changelog lock serializes MEMORY and USER transactions through this
+    public tool path. If journaling fails after the memory write, restore the
+    before-state while still holding that governance lock rather than leaving an
+    untracked successful mutation.
+    """
+    try:
+        normalized = [_normalize_governance_operation(op) for op in operations]
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+
+    changelog_path = get_memory_changelog_path()
+    with store._file_lock(changelog_path):
+        try:
+            initialize_memory_changelog()
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": f"Memory unchanged because its change log could not be initialized: {exc}",
+            }
+
+        target_path = store._path_for(target)
+        with store._file_lock(target_path):
+            before, read_ok = MemoryStore._read_entries_checked(target_path)
+            if not read_ok:
+                return {
+                    "success": False,
+                    "error": (
+                        "Memory unchanged because its current contents could not be "
+                        "read safely for rollback."
+                    ),
+                }
+            if len(normalized) == 1:
+                op = normalized[0]
+                action = op.get("action")
+                if action == "add":
+                    result = store.add(
+                        target, op.get("content") or "", _lock_held=True
+                    )
+                elif action == "replace":
+                    result = store.replace(
+                        target,
+                        op.get("old_text") or "",
+                        op.get("content") or "",
+                        _lock_held=True,
+                    )
+                elif action == "remove":
+                    result = store.remove(
+                        target, op.get("old_text") or "", _lock_held=True
+                    )
+                else:
+                    return {
+                        "success": False,
+                        "error": f"Unknown action '{action}'. Use: add, replace, remove",
+                    }
+            else:
+                result = store.apply_batch(target, normalized, _lock_held=True)
+
+            if not result.get("success"):
+                return result
+
+            # The target lock stays held through journaling. This makes the
+            # before/write/log transaction indivisible for every in-process
+            # MemoryStore writer that honors the shared lock file.
+            after = list(store._entries_for(target))
+            if before == after:
+                return result
+            traces = _trace_governance_changes(before, normalized)
+            try:
+                _append_governance_records(changelog_path, target, traces)
+            except Exception as exc:
+                # Manual/non-cooperating writers can ignore the lock. Never
+                # restore a stale snapshot over newer bytes in that case.
+                current, read_ok = MemoryStore._read_entries_checked(target_path)
+                if not read_ok or current != after:
+                    if read_ok:
+                        store._set_entries(target, current)
+                    return {
+                        "success": False,
+                        "error": (
+                            "CRITICAL: the memory write succeeded and its change log "
+                            "failed, but the memory file changed again before rollback. "
+                            "The newer file was preserved and may contain an unlogged "
+                            f"mutation. Original log error: {exc}"
+                        ),
+                    }
+                try:
+                    store._write_file(target_path, before)
+                    store._set_entries(target, before)
+                except Exception as rollback_exc:
+                    return {
+                        "success": False,
+                        "error": (
+                            "CRITICAL: the memory write succeeded, its change log failed, "
+                            f"and rollback also failed ({rollback_exc}). The memory file may "
+                            f"have changed without an audit record. Original log error: {exc}"
+                        ),
+                    }
+                return {
+                    "success": False,
+                    "error": (
+                        "Memory write was rolled back because the change log could "
+                        f"not be updated: {exc}"
+                    ),
+                }
+            return result
+
+
 def _apply_write_gate(action: str, target: str, content: Optional[str],
-                      old_text: Optional[str]) -> Optional[str]:
+                      old_text: Optional[str], governance: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Evaluate the memory write gate. Returns a JSON tool-result string when
     the write should NOT proceed normally (blocked or staged), or None when the
     caller should perform the real write.
@@ -953,6 +1468,7 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         "content": content,
         "old_text": old_text,
     }
+    payload.update(governance or {})
     record = wa.stage_write(
         wa.MEMORY, payload,
         summary=f"{summary}: {detail[:120]}",
@@ -1045,10 +1561,16 @@ def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> s
 
 
 def memory_tool(
-    action: str = None,
+    action: Optional[str] = None,
     target: str = "memory",
-    content: str = None,
-    old_text: str = None,
+    content: Optional[str] = None,
+    old_text: Optional[str] = None,
+    reason: Optional[str] = None,
+    evidence: Optional[str] = None,
+    change_type: Optional[str] = None,
+    deletion_type: Optional[str] = None,
+    loss_note: Optional[str] = None,
+    related_skill: Optional[str] = None,
     operations: Optional[List[Dict[str, Any]]] = None,
     store: Optional[MemoryStore] = None,
 ) -> str:
@@ -1074,19 +1596,36 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    if action == "history":
+        return json.dumps(
+            _memory_history(store, target, old_text or ""),
+            ensure_ascii=False,
+        )
+
     # --- Batch path -------------------------------------------------------
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        gate_result = _apply_batch_write_gate(target, operations)
+        try:
+            governed_operations = [
+                _normalize_governance_operation(op or {}) for op in operations
+            ]
+        except ValueError as exc:
+            return tool_error(str(exc), success=False)
+        gate_result = _apply_batch_write_gate(target, governed_operations)
         if gate_result is not None:
             return gate_result
-        result = store.apply_batch(target, operations)
+        result = _apply_governed_mutation(store, target, governed_operations)
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
     # Validate required params BEFORE the gate so an invalid write is rejected
     # immediately instead of being staged and only failing at approve time.
+    if action not in {"add", "replace", "remove"}:
+        return tool_error(
+            f"Unknown action '{action}'. Use: add, replace, remove, history",
+            success=False,
+        )
     if action == "add" and not content:
         return tool_error("Content is required for 'add' action.", success=False)
     if action == "replace" and (not old_text or not content):
@@ -1101,24 +1640,41 @@ def memory_tool(
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
 
+    operation = {
+        "action": action,
+        "content": content,
+        "old_text": old_text,
+        "reason": reason,
+        "evidence": evidence,
+        "change_type": change_type,
+        "deletion_type": deletion_type,
+        "loss_note": loss_note,
+        "related_skill": related_skill,
+    }
+    try:
+        operation = _normalize_governance_operation(operation)
+    except ValueError as exc:
+        return tool_error(str(exc), success=False)
+
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
-    gate_result = _apply_write_gate(action, target, content, old_text)
+    governance = {
+        key: operation.get(key)
+        for key in (
+            "reason",
+            "evidence",
+            "change_type",
+            "deletion_type",
+            "loss_note",
+            "related_skill",
+        )
+        if operation.get(key)
+    }
+    gate_result = _apply_write_gate(action, target, content, old_text, governance)
     if gate_result is not None:
         return gate_result
 
-    if action == "add":
-        result = store.add(target, content)
-
-    elif action == "replace":
-        result = store.replace(target, old_text, content)
-
-    elif action == "remove":
-        result = store.remove(target, old_text)
-
-    else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
-
+    result = _apply_governed_mutation(store, target, [operation])
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1138,13 +1694,25 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
     if action == "batch":
-        return store.apply_batch(target, payload.get("operations") or [])
-    if action == "add":
-        return store.add(target, content)
-    if action == "replace":
-        return store.replace(target, old_text, content)
-    if action == "remove":
-        return store.remove(target, old_text)
+        return _apply_governed_mutation(
+            store, target, payload.get("operations") or []
+        )
+    if action in {"add", "replace", "remove"}:
+        operation = {
+            key: payload.get(key)
+            for key in (
+                "action",
+                "content",
+                "old_text",
+                "reason",
+                "evidence",
+                "change_type",
+                "deletion_type",
+                "loss_note",
+                "related_skill",
+            )
+        }
+        return _apply_governed_mutation(store, target, [operation])
     return {"success": False, "error": f"Unknown staged action '{action}'."}
 # OpenAI Function-Calling Schema
 # =============================================================================
@@ -1155,31 +1723,49 @@ MEMORY_SCHEMA = {
         "Save durable facts to persistent memory that survive across sessions. Memory is "
         "injected into every future turn, so keep entries compact and high-signal.\n\n"
         "HOW: make ALL your changes in ONE call via an 'operations' array (each item: "
-        "{action, content?, old_text?}). The batch applies atomically and the char limit is "
+        "{action, content?, old_text?, reason, evidence, ...}). Every operation needs a "
+        "specific reason and source evidence; the tool records the exact before/after content "
+        "in a structured JSONL audit log. The batch applies atomically and the char limit is "
         "checked only on the FINAL result — so a single call can remove/replace stale entries "
         "to free room AND add new ones, even when an add alone would overflow. The response "
         "reports current/limit chars and confirms completion; one batch call finishes the "
         "update, so don't repeat it. Use the bare action/content/old_text fields only for a "
         "single lone change.\n\n"
+        "HISTORY: For a pure add, do not read history. Before replacing, merging, compressing, "
+        "migrating, or removing an existing entry, call memory(action='history', target=..., "
+        "old_text=...) and inspect only its bounded related records; never load the full audit "
+        "log into model context.\n\n"
         "WHEN: save proactively when the user states a preference, correction, or personal "
         "detail, or you learn a stable fact about their environment, conventions, or workflow. "
         "Priority: user preferences & corrections > environment facts > procedures. The best "
         "memory stops the user repeating themselves.\n\n"
-        "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
-        "removes or shortens enough stale entries and adds the new one together.\n\n"
+        "EVIDENCE TYPE: distinguish an actually observed incident or user correction from a "
+        "merely preventive concern. Never label an unobserved concern as a lesson, and do not "
+        "save generic safety precautions solely because they seem important; normal model "
+        "safeguards do not need duplicate memory.\n\n"
+        "REPOSITORY RECORDS: do not save implementation designs, architecture notes, or "
+        "fork-only behavior already documented in repository docs. Keep only a short "
+        "pre-load trigger when it is needed to select the correct Skill before those docs "
+        "are read.\n\n"
+        "IF FULL: first merge or compress without losing distinct reasons. Then remove entries "
+        "that are demonstrably safe or expired. As a last resort, use deletion_type "
+        "'forced_capacity' only when the new durable fact is more valuable than every remaining "
+        "candidate; provide loss_note so the evicted meaning remains recoverable in the log.\n\n"
         "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
         "notes (environment, conventions, tool quirks, lessons).\n\n"
         "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
         "completed-work logs, temporary TODO state (use session_search for those). Reusable "
-        "procedures belong in a skill, not memory."
+        "procedures belong in a skill, not memory. Before deleting a possible duplicate, use "
+        "skill_view to verify the Skill's actual content and keep any trigger needed before that "
+        "Skill normally loads."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
-                "description": "The action to perform (single-op shape). Omit when using 'operations'."
+                "enum": ["add", "replace", "remove", "history"],
+                "description": "Mutation action, or read-only history lookup. Omit when using 'operations'."
             },
             "target": {
                 "type": "string",
@@ -1192,7 +1778,33 @@ MEMORY_SCHEMA = {
             },
             "old_text": {
                 "type": "string",
-                "description": "REQUIRED for 'replace' and 'remove' (single-op shape): a short unique substring identifying the existing entry to modify. Omit only for 'add'."
+                "description": "REQUIRED for 'replace', 'remove', and 'history': a short unique substring identifying the existing entry. Omit only for 'add'."
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why this durable change is justified. Required for every mutation."
+            },
+            "evidence": {
+                "type": "string",
+                "description": "The explicit user statement or verified fact supporting the change. Required for every mutation."
+            },
+            "change_type": {
+                "type": "string",
+                "enum": ["add", "replace", "merge", "compress", "migrate", "delete"],
+                "description": "Semantic change kind. Defaults from action; set merge/compress/migrate when applicable."
+            },
+            "deletion_type": {
+                "type": "string",
+                "enum": ["safe", "expired", "forced_capacity"],
+                "description": "Required for remove: safe, expired, or last-resort forced_capacity."
+            },
+            "loss_note": {
+                "type": "string",
+                "description": "Known useful meaning or risk lost. Required for forced_capacity removal."
+            },
+            "related_skill": {
+                "type": "string",
+                "description": "Skill actually inspected with skill_view when it carries or relates to this memory."
             },
             "operations": {
                 "type": "array",
@@ -1207,8 +1819,14 @@ MEMORY_SCHEMA = {
                         "action": {"type": "string", "enum": ["add", "replace", "remove"]},
                         "content": {"type": "string", "description": "Entry content for add/replace."},
                         "old_text": {"type": "string", "description": "Substring identifying the entry for replace/remove."},
+                        "reason": {"type": "string", "description": "Why this operation is justified."},
+                        "evidence": {"type": "string", "description": "User statement or verified fact supporting it."},
+                        "change_type": {"type": "string", "enum": ["add", "replace", "merge", "compress", "migrate", "delete"]},
+                        "deletion_type": {"type": "string", "enum": ["safe", "expired", "forced_capacity"]},
+                        "loss_note": {"type": "string", "description": "Required for forced_capacity removal."},
+                        "related_skill": {"type": "string", "description": "Skill verified with skill_view, if applicable."},
                     },
-                    "required": ["action"],
+                    "required": ["action", "reason", "evidence"],
                 },
             },
         },
@@ -1229,6 +1847,12 @@ registry.register(
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
+        reason=args.get("reason"),
+        evidence=args.get("evidence"),
+        change_type=args.get("change_type"),
+        deletion_type=args.get("deletion_type"),
+        loss_note=args.get("loss_note"),
+        related_skill=args.get("related_skill"),
         operations=args.get("operations"),
         store=kw.get("store")),
     check_fn=check_memory_requirements,

@@ -1781,6 +1781,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     content=next_args.get("content"),
                     old_text=next_args.get("old_text"),
                     operations=operations,
+                    reason=next_args.get("reason"),
+                    evidence=next_args.get("evidence"),
+                    change_type=next_args.get("change_type"),
+                    deletion_type=next_args.get("deletion_type"),
+                    loss_note=next_args.get("loss_note"),
+                    related_skill=next_args.get("related_skill"),
                     store=agent._memory_store,
                 )
                 # Mirror successful built-in memory writes to external
