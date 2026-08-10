@@ -4154,6 +4154,14 @@ def generate_launchd_plist() -> str:
         <string>{hermes_home}</string>
     </dict>
 
+    <!-- Raise the per-process open-file ceiling for the long-running gateway.
+         Scoped to this LaunchAgent; does not change the user's global launchd limit. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
+
     <key>LimitLoadToSessionType</key>
     <array>
         <string>Aqua</string>
