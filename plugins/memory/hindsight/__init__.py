@@ -3997,6 +3997,38 @@ class HindsightMemoryProvider(MemoryProvider):
         turns: list[str] = []
         try:
             with self._retain_store_connect() as conn:
+                # Standalone /new chats often still carry the previous chat as
+                # StateDB parent_session_id, while their provider-owned turns
+                # were written under the new session document. If this session
+                # already owns active turns under its own document id, retain
+                # that document instead of rewriting to the parent lineage.
+                if target_session_id:
+                    own_rows = conn.execute(
+                        """
+                        SELECT retain_document_id, turn_json
+                        FROM hindsight_retain_turns
+                        WHERE session_id = ?
+                          AND active = 1
+                        ORDER BY id ASC
+                        """,
+                        (target_session_id,),
+                    ).fetchall()
+                    own_docs = {
+                        str(doc or "").strip()
+                        for doc, _turn in own_rows
+                        if str(doc or "").strip()
+                    }
+                    if own_docs == {target_session_id}:
+                        lineage = [target_session_id]
+                        for _doc, turn_json in own_rows:
+                            if not turn_json:
+                                continue
+                            cleaned = self._sanitize_persisted_turn_json(str(turn_json))
+                            if cleaned:
+                                turns.append(cleaned)
+                        if turns:
+                            return turns, lineage, target_session_id
+
                 retain_document_id = self._resolve_retain_document_id(
                     conn, target_session_id, parent_session_id
                 )

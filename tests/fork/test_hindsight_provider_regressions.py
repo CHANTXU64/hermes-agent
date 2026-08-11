@@ -105,6 +105,100 @@ def test_retain_before_session_reset_drains_pending_memory_work(provider_with_co
     assert p._client.aretain_batch.call_count == 1
 
 
+def test_retain_before_session_reset_prefers_session_own_document_over_statedb_parent(
+    provider_with_config,
+    tmp_path,
+):
+    """/new can still carry previous session as StateDB parent_session_id.
+
+    Turns written under the new session id must be retained as that session's
+    document, not silently replaced by the previous chat's lineage document.
+    """
+    parent_session = "previous-chat-session"
+    new_session = "new-chat-after-reset"
+
+    parent = provider_with_config(
+        auto_retain=False,
+        retain_on_new=True,
+        session_id=parent_session,
+    )
+    parent.initialize(
+        session_id=parent_session,
+        hermes_home=str(tmp_path),
+        platform="telegram",
+    )
+    parent._client = _make_mock_client()
+    parent.sync_turn(
+        "old parent request about FIP popup",
+        "old parent answer",
+        session_id=parent_session,
+        messages=[
+            {"role": "user", "content": "old parent request about FIP popup", "timestamp": 1710003000.0},
+            {"role": "assistant", "content": "old parent answer", "timestamp": 1710003001.0},
+        ],
+    )
+    # Simulate many historical parent turns so a wrong retain is obvious.
+    for i in range(3):
+        parent.sync_turn(
+            f"parent filler {i}",
+            f"parent filler answer {i}",
+            session_id=parent_session,
+            messages=[
+                {"role": "user", "content": f"parent filler {i}", "timestamp": 1710003002.0 + i},
+                {"role": "assistant", "content": f"parent filler answer {i}", "timestamp": 1710003002.5 + i},
+            ],
+        )
+    parent.shutdown()
+
+    child = provider_with_config(
+        auto_retain=False,
+        retain_on_new=True,
+        session_id=new_session,
+    )
+    child.initialize(
+        session_id=new_session,
+        hermes_home=str(tmp_path),
+        platform="telegram",
+        # Provider starts without parent — matches production where /new
+        # session turns are stored under the new session document id.
+    )
+    child._client = _make_mock_client()
+    child.sync_turn(
+        "今天我用Codex一直报错Selected model is at capacity",
+        "checked hermes logs and retry policy",
+        session_id=new_session,
+        messages=[
+            {
+                "role": "user",
+                "content": "今天我用Codex一直报错Selected model is at capacity",
+                "timestamp": 1710004000.0,
+            },
+            {
+                "role": "assistant",
+                "content": "checked hermes logs and retry policy",
+                "timestamp": 1710004001.0,
+            },
+        ],
+    )
+
+    # Gateway /new passes StateDB parent_session_id of the previous chat.
+    result = child.retain_before_session_reset(
+        session_id=new_session,
+        parent_session_id=parent_session,
+        flush_pending=MagicMock(return_value=True),
+    )
+    child._retain_queue.join()
+
+    assert result["queued"] is True
+    assert result["turn_count"] == 1
+    assert result["document_id"] == new_session
+    content = child._client.aretain_batch.call_args.kwargs["items"][0]["content"]
+    assert "今天我用Codex一直报错" in content
+    assert "old parent request about FIP popup" not in content
+    assert "parent filler" not in content
+    child.shutdown()
+
+
 def test_retain_before_session_reset_uses_one_total_timeout(
     provider_with_config,
     monkeypatch,

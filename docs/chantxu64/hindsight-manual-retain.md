@@ -86,6 +86,7 @@ Gateway 可提供平台消息号时，user message 还会带内部
 - `retain_on_new` 默认 `false`；不会因为 `auto_retain=false` 而自动开启，也不会把每轮自动 Retain 打开。
 - `retain_on_new_timeout_seconds` 默认 `30` 秒、最小 `0.1` 秒，是 pending memory drain、persisted payload 重建、Hindsight API capability probe 与 Retain API 请求合计使用的一个总超时预算；capability probe 自身的网络 timeout 也不会超过当时的剩余预算。
 - 启用后，CLI、Gateway 聊天平台和 TUI 的显式 `/new` 及其 `/reset` 别名，都会先等待当前 persisted session lineage 的 Retain API 请求成功返回，再创建新会话。
+- 若当前会话的 active turns 已经全部写在自己的 `retain_document_id == session_id` 下，即使 StateDB 仍带着上一聊天的 `parent_session_id`，`/new` 也只 Retain 本会话 Document，不会改交上一会话的 lineage Document。
 - TUI 在 Retain 与新会话建立期间关闭 session boundary；此时输入的普通 prompt 只进入现有本地队列，不会提交到旧 session。Retain 失败时队列回到旧 session 继续处理，成功时由新 session 接续处理。
 - Retain 失败、超时、Provider 不可用或缺少同步门禁能力时，`/new` / `/reset` 失败关闭：旧会话不结束、不旋转、不清空，并向用户显示错误。
 - API 请求成功返回表示 Hindsight 已确认接收请求；当 Hindsight 配置为异步处理时，不把后续服务端提取完成冒充为同步完成。
