@@ -140,6 +140,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="<archive.tar.gz> [--name <name>]"),
     CommandDef("stop", "Kill all running background processes", "Session",
                busy_policy="interrupt_then_dispatch", busy_handler="stop"),
+    CommandDef("pause", "Pause new work globally (emergency stop); '/pause off' resumes", "Session",
+               gateway_only=True, args_hint="[reason | off]",
+               busy_policy="dispatch"),
     CommandDef("approve", "Approve a pending dangerous command", "Session",
                gateway_only=True, args_hint="[session|always]", busy_policy="dispatch"),
     CommandDef("deny", "Deny a pending dangerous command (optionally with a reason)", "Session",
@@ -299,9 +302,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("reload_mcp",)),
     CommandDef("reload-skills", "Re-scan ~/.hermes/skills/ for newly installed or removed skills",
                "Tools & Skills", aliases=("reload_skills",)),
-    CommandDef("browser", "Connect browser tools to your live Chromium-family browser via CDP", "Tools & Skills",
-               cli_only=True, args_hint="[connect|disconnect|status]",
-               subcommands=("connect", "disconnect", "status")),
+    CommandDef("browser", "Connect browser tools to your live Chromium-family browser via CDP, or switch to Browser Use mode", "Tools & Skills",
+               cli_only=True, args_hint="[connect|disconnect|status|use]",
+               subcommands=("connect", "disconnect", "status", "use")),
     CommandDef("plugins", "List installed plugins and their status",
                "Tools & Skills", cli_only=True),
 
@@ -1275,9 +1278,12 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     native slash.
 #   - blueprint, disk-cleanup/disk_cleanup, and lcm: fork low-frequency
 #     surfaces kept behind /hermes so fork-only /retain keeps a native slot.
+#   - pause: global emergency stop; reached via /hermes pause [off] on
+#     Slack. Added at the 50-cap — a native slot would clamp /platform.
 _SLACK_VIA_HERMES_ONLY = frozenset({
     "topup", "moa", "debug", "egress", "init", "version", "diff", "update",
     "heartbeat", "refine", "blueprint", "disk-cleanup", "disk_cleanup", "lcm",
+    "pause",
 })
 
 
@@ -2024,15 +2030,16 @@ class SlashCommandCompleter(Completer):
 
     @staticmethod
     def _personality_completions(sub_text: str, sub_lower: str):
-        """Yield completions for /personality from configured personalities."""
+        """Yield completions for /personality via hermes_cli.personality."""
         try:
-            # Resolve from the same source the runtime applies personalities —
-            # agent.personalities via the CLI config (which ships the built-ins).
-            # load_config()'s schema has no agent.personalities, so the completer
-            # used to come back empty even with personalities available.
+            # Single owner: built-ins + user overrides from agent.personalities.
             from cli import load_cli_config
+            from hermes_cli.personality import (
+                available_personalities,
+                describe_personality,
+            )
 
-            personalities = (load_cli_config().get("agent") or {}).get("personalities", {}) or {}
+            personalities = available_personalities(load_cli_config())
             if "none".startswith(sub_lower) and "none" != sub_lower:
                 yield Completion(
                     "none",
@@ -2042,15 +2049,11 @@ class SlashCommandCompleter(Completer):
                 )
             for name, prompt in personalities.items():
                 if name.startswith(sub_lower) and name != sub_lower:
-                    if isinstance(prompt, dict):
-                        meta = prompt.get("description") or prompt.get("system_prompt", "")[:50]
-                    else:
-                        meta = str(prompt)[:50]
                     yield Completion(
                         name,
                         start_position=-len(sub_text),
                         display=name,
-                        display_meta=meta,
+                        display_meta=describe_personality(prompt),
                     )
         except Exception:
             pass
