@@ -95,6 +95,7 @@ Gateway 可提供平台消息号时，user message 还会带内部
 ## 行为说明
 
 - 每个完成 turn 的 `sync_turn()` 都会先把同源 retain payload 写入 `hindsight/retain_turns.sqlite3`。
+- 上下文压缩前，Hindsight `on_pre_compress(messages)` 会用同一套 transcript 重建规则把当前可保留 turns 快照进本地 ledger。快照本身不单独抬高远端 flush 水位；`on_session_switch` 也不会把尾部仅 user 的 orphan 远程提交。压缩后的窗口即使只剩 `继续` + 最终答复，也会合并到该快照上，Document 从原始首句开始。orphan user 补全优先匹配 `_hermes_source_occurrence_id`（两侧都有且不同则不合并）；无 id 时允许同文 + 补全 assistant（可带 rehydrate 后的不同时间戳）。
 - 当 `sync_turn()` 收到 `messages` transcript 时，优先从完整 transcript 构建 retain turns，而不是只使用最终 `user_content` / `assistant_content` 标量对。这样 gateway 中一个长任务先收到用户 A、后被用户 B 打断并最终完成时，persisted document 仍从 A 开始。
 - Gateway 初始消息与排队 follow-up 都把各自的干净 user text、平台时间和平台消息号传到当前 Agent turn；StateDB 的 `platform_message_id` 与 persisted retain user occurrence 使用同一来源标识。重启、压缩或 replay 改变本地时间戳时，同一非空 occurrence id 仍只保留一次；不同 occurrence id 的相同文本不会合并。
 - 多模态同一消息的原生 image part 与 Gateway 简化文本只生成一个 retain occurrence；payload 不保存 `data:image/...;base64`、本地图片路径或像素数据，保留规范化的 `[Image attached]` 占位；原消息已有的安全 `http(s)` 图片 URL 作为回源引用保留。

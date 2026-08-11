@@ -2998,6 +2998,45 @@ class HindsightMemoryProvider(MemoryProvider):
                 return occurrence_id
         return ""
 
+    @classmethod
+    def _retain_closes_orphan_user(
+        cls,
+        old_turn_json: str,
+        old_identity: tuple,
+        incoming_turn_json: str,
+        incoming_identity: tuple,
+    ) -> bool:
+        """Whether *incoming* completes a persisted orphan user-only turn.
+
+        Compression/replay can rehydrate the same user event with a later
+        timestamp. Prefer stable source occurrence ids when both sides expose
+        one: equal ids close, unequal ids never close. Without ids, allow
+        same full identity, or same content when completing with an assistant
+        (needed for compressed windows that lost platform ids; replace still
+        matches sequentially). One-sided id + completing also allows same
+        content so a lost id on the compressed window can still finish the
+        orphan.
+        """
+        if not (
+            len(old_identity) == 1
+            and old_identity[0][0] == "user"
+            and incoming_identity
+            and incoming_identity[0][0] == "user"
+        ):
+            return False
+
+        old_occ = cls._retain_turn_source_occurrence_id(old_turn_json)
+        new_occ = cls._retain_turn_source_occurrence_id(incoming_turn_json)
+        if old_occ and new_occ:
+            return old_occ == new_occ
+
+        if incoming_identity[0] == old_identity[0]:
+            return True
+        if incoming_identity[0][1] != old_identity[0][1]:
+            return False
+        # Completing an orphan (user + assistant) with same content.
+        return len(incoming_identity) > 1
+
     @staticmethod
     def _retain_turn_canonical(turn_json: str) -> tuple:
         try:
@@ -3229,12 +3268,28 @@ class HindsightMemoryProvider(MemoryProvider):
                 incoming_identity = incoming_ids[incoming_index]
                 incoming_user = incoming_identity[0][:2]
                 if incoming_user[0] == "user":
-                    user_candidates = [
-                        existing_index
-                        for existing_index in range(existing_cursor, len(existing_ids))
-                        if existing_ids[existing_index]
-                        and existing_ids[existing_index][0][:2] == incoming_user
-                    ]
+                    incoming_occ = cls._retain_turn_source_occurrence_id(
+                        incoming_turns[incoming_index]
+                    )
+                    user_candidates = []
+                    for existing_index in range(existing_cursor, len(existing_ids)):
+                        if not (
+                            existing_ids[existing_index]
+                            and existing_ids[existing_index][0][:2] == incoming_user
+                        ):
+                            continue
+                        existing_occ = cls._retain_turn_source_occurrence_id(
+                            existing_turns[existing_index]
+                        )
+                        # Distinct platform occurrences of the same short text
+                        # (e.g. two later 「继续」) are different events.
+                        if (
+                            incoming_occ
+                            and existing_occ
+                            and incoming_occ != existing_occ
+                        ):
+                            continue
+                        user_candidates.append(existing_index)
                     incoming_user_count = sum(
                         1
                         for candidate_identity in incoming_ids[incoming_index:]
@@ -3689,13 +3744,14 @@ class HindsightMemoryProvider(MemoryProvider):
                 if not rows:
                     return False
 
-                old_entries: list[tuple[tuple, tuple[str, str, str]]] = []
+                old_entries: list[tuple[str, tuple, tuple[str, str, str]]] = []
                 for bank_id, row_session_id, row_parent_session_id, turn_json in rows:
                     cleaned = self._sanitize_persisted_turn_json(str(turn_json or ""))
                     if not cleaned:
                         continue
                     old_entries.append(
                         (
+                            cleaned,
                             self._retain_turn_replay_identity(cleaned),
                             (
                                 str(bank_id or self._bank_id),
@@ -3707,16 +3763,19 @@ class HindsightMemoryProvider(MemoryProvider):
                 if not old_entries:
                     return False
 
-                incoming = [(turn_json, self._retain_turn_replay_identity(turn_json)) for turn_json in turns]
+                incoming = [
+                    (turn_json, self._retain_turn_replay_identity(turn_json))
+                    for turn_json in turns
+                ]
                 owners: dict[int, tuple[str, str, str]] = {}
                 old_index = 0
-                for incoming_index, (_turn_json, identity) in enumerate(incoming):
-                    old_identity = old_entries[old_index][0]
-                    closes_orphan_user = bool(
-                        len(old_identity) == 1
-                        and old_identity[0][0] == "user"
-                        and identity
-                        and identity[0] == old_identity[0]
+                for incoming_index, (turn_json, identity) in enumerate(incoming):
+                    old_turn_json, old_identity, old_owner = old_entries[old_index]
+                    closes_orphan_user = self._retain_closes_orphan_user(
+                        old_turn_json,
+                        old_identity,
+                        turn_json,
+                        identity,
                     )
                     recovers_orphan_assistant = bool(
                         len(old_identity) == 1
@@ -3726,7 +3785,7 @@ class HindsightMemoryProvider(MemoryProvider):
                         and old_identity[0] in identity
                     )
                     if identity == old_identity or closes_orphan_user or recovers_orphan_assistant:
-                        owners[incoming_index] = old_entries[old_index][1]
+                        owners[incoming_index] = old_owner
                         old_index += 1
                         if old_index == len(old_entries):
                             break
@@ -4670,6 +4729,91 @@ class HindsightMemoryProvider(MemoryProvider):
             self._persist_retain_turn(turn)
         return len(new_turns), before_counter, self._turn_counter
 
+    def _snapshot_conversation_messages_to_retain(
+        self,
+        messages: List[Dict[str, Any]] | None,
+        *,
+        final_assistant_content: str = "",
+    ) -> tuple[int, int, int]:
+        """Persist newly retainable turns from a transcript without remote flush.
+
+        Returns ``(added, before_counter, after_counter)``. Used by both
+        completed-turn ``sync_turn`` and pre-compression snapshots so long
+        tool work that is later compressed still leaves the original real
+        user turn in the provider-owned ledger.
+        """
+        transcript_messages = [dict(message) for message in (messages or [])]
+        final_assistant = self._stringify_retain_content(final_assistant_content).strip()
+        if final_assistant:
+            for message in reversed(transcript_messages):
+                if str(message.get("role") or "").strip() != "assistant":
+                    continue
+                if message.get("tool_calls") or message.get("finish_reason") == "tool_calls":
+                    continue
+                content = self._stringify_retain_content(message.get("content")).strip()
+                if content != final_assistant:
+                    continue
+                if message.get("_timestamp", message.get("timestamp")) in (None, ""):
+                    # Only the response completing this sync is known to be new.
+                    # Historical replay messages with no source timestamp stay
+                    # unknown so overlap recovery cannot promote them via now().
+                    message["_timestamp"] = self._retain_message_timestamp()
+                break
+
+        transcript_turns = self._build_turns_from_conversation_messages(transcript_messages)
+        if not transcript_turns:
+            return 0, self._turn_counter, self._turn_counter
+        return self._append_session_turns(transcript_turns)
+
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Snapshot retainable turns before compression discards live context.
+
+        Context compression can drop a real first user request that never got a
+        final assistant answer yet (long tool work, recovery, then ``继续``).
+        Without this snapshot the later compressed window only contains the
+        continuation turn, so local retain and the Hindsight Document start at
+        the wrong message.
+
+        Writes the provider-owned local ledger. Newly snapshotted turns are not
+        made remote-flush-eligible on their own: if nothing was already pending
+        for automatic retain, the remote watermark advances with the snapshot so
+        ``on_session_switch`` does not publish an incomplete orphan Document.
+        A later completed ``sync_turn`` / replace still submits the full lineage.
+        """
+        if self._shutting_down.is_set():
+            return ""
+        try:
+            before_counter = self._turn_counter
+            pending_remote_before = False
+            with self._retain_flush_lock:
+                pending_remote_before = len(self._session_turns) > self._last_queued_flush_count
+            added, _, after_counter = self._snapshot_conversation_messages_to_retain(
+                messages or []
+            )
+            if added:
+                logger.debug(
+                    "on_pre_compress: buffered %d retain turn(s) before compression",
+                    added,
+                )
+                # Local ledger already has the rows. Only suppress remote
+                # eligibility for the newly snapshotted range when there was no
+                # prior unflushed auto-retain tail; otherwise leave the old
+                # watermark so completed-but-unflushed turns still flush.
+                if not pending_remote_before:
+                    with self._retain_flush_lock:
+                        if self._last_queued_flush_count <= before_counter:
+                            self._last_queued_flush_count = max(
+                                self._last_queued_flush_count,
+                                after_counter,
+                            )
+        except Exception as exc:
+            logger.warning(
+                "Hindsight on_pre_compress retain snapshot failed: %s",
+                exc,
+                exc_info=True,
+            )
+        return ""
+
     def sync_turn(
         self,
         user_content: str,
@@ -4703,47 +4847,48 @@ class HindsightMemoryProvider(MemoryProvider):
         if session_id:
             self._session_id = str(session_id).strip()
 
-        transcript_messages = [dict(message) for message in (messages or [])]
-        final_assistant = self._stringify_retain_content(assistant_content).strip()
-        if final_assistant:
-            for message in reversed(transcript_messages):
-                if str(message.get("role") or "").strip() != "assistant":
-                    continue
-                if message.get("tool_calls") or message.get("finish_reason") == "tool_calls":
-                    continue
-                content = self._stringify_retain_content(message.get("content")).strip()
-                if content != final_assistant:
-                    continue
-                if message.get("_timestamp", message.get("timestamp")) in (None, ""):
-                    # Only the response completing this sync is known to be new.
-                    # Historical replay messages with no source timestamp stay
-                    # unknown so overlap recovery cannot promote them via now().
-                    message["_timestamp"] = self._retain_message_timestamp()
-                break
-
-        transcript_turns = self._build_turns_from_conversation_messages(transcript_messages)
-        if transcript_turns:
-            added, before_counter, after_counter = self._append_session_turns(transcript_turns)
-            if added == 0:
-                logger.debug("sync_turn: transcript supplied no new retained turns")
-                return
-            if not self._auto_retain:
-                logger.debug("sync_turn: buffered %d transcript turn(s) (auto_retain disabled)", added)
-                return
-            if after_counter == before_counter:
-                logger.debug("sync_turn: retaining same-length replay correction")
+        if messages is not None:
+            transcript_turns = self._build_turns_from_conversation_messages(
+                [dict(message) for message in (messages or [])]
+            )
+            if transcript_turns:
+                added, before_counter, after_counter = self._snapshot_conversation_messages_to_retain(
+                    messages,
+                    final_assistant_content=assistant_content,
+                )
+                if added == 0:
+                    logger.debug("sync_turn: transcript supplied no new retained turns")
+                    return
+                if not self._auto_retain:
+                    logger.debug(
+                        "sync_turn: buffered %d transcript turn(s) (auto_retain disabled)",
+                        added,
+                    )
+                    return
+                if after_counter == before_counter:
+                    logger.debug("sync_turn: retaining same-length replay correction")
+                    self.flush_retained_turns()
+                    return
+                before_bucket = before_counter // self._retain_every_n_turns
+                after_bucket = after_counter // self._retain_every_n_turns
+                if after_bucket == before_bucket:
+                    next_turn = (before_bucket + 1) * self._retain_every_n_turns
+                    logger.debug(
+                        "sync_turn: buffered transcript through turn %d (will retain at turn %d)",
+                        after_counter,
+                        next_turn,
+                    )
+                    return
+                logger.debug(
+                    "sync_turn: retaining %d turns after transcript sync, total session content %d chars",
+                    len(self._session_turns),
+                    sum(len(t) for t in self._session_turns),
+                )
                 self.flush_retained_turns()
                 return
-            before_bucket = before_counter // self._retain_every_n_turns
-            after_bucket = after_counter // self._retain_every_n_turns
-            if after_bucket == before_bucket:
-                next_turn = (before_bucket + 1) * self._retain_every_n_turns
-                logger.debug("sync_turn: buffered transcript through turn %d (will retain at turn %d)", after_counter, next_turn)
-                return
-            logger.debug("sync_turn: retaining %d turns after transcript sync, total session content %d chars",
-                         len(self._session_turns), sum(len(t) for t in self._session_turns))
-            self.flush_retained_turns()
-            return
+            logger.debug("sync_turn: transcript supplied no retainable turns")
+            # Fall through to the scalar pair when the transcript rebuild could
+            # not produce turns (empty/noise-only window).
 
         clean_user = self._clean_retain_user_content(user_content)
         if clean_user:
@@ -4771,12 +4916,19 @@ class HindsightMemoryProvider(MemoryProvider):
             return
 
         if self._turn_counter % self._retain_every_n_turns != 0:
-            logger.debug("sync_turn: buffered turn %d (will retain at turn %d)",
-                         self._turn_counter, self._turn_counter + (self._retain_every_n_turns - self._turn_counter % self._retain_every_n_turns))
+            logger.debug(
+                "sync_turn: buffered turn %d (will retain at turn %d)",
+                self._turn_counter,
+                self._turn_counter
+                + (self._retain_every_n_turns - self._turn_counter % self._retain_every_n_turns),
+            )
             return
 
-        logger.debug("sync_turn: retaining %d turns, total session content %d chars",
-                     len(self._session_turns), sum(len(t) for t in self._session_turns))
+        logger.debug(
+            "sync_turn: retaining %d turns, total session content %d chars",
+            len(self._session_turns),
+            sum(len(t) for t in self._session_turns),
+        )
         self.flush_retained_turns()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -4937,70 +5089,85 @@ class HindsightMemoryProvider(MemoryProvider):
                 old_turns = list(self._session_turns[old_start_index:old_total_turns])
             else:
                 old_turns = list(self._session_turns[:old_total_turns])
-            old_metadata = self._build_metadata(
-                message_count=len(old_turns) * 2,
-                turn_index=old_turn_index,
-            )
-            old_lineage_tags: list[str] = []
-            if old_session_id:
-                old_lineage_tags.append(f"session:{old_session_id}")
-            if old_parent_session_id:
-                old_lineage_tags.append(f"parent:{old_parent_session_id}")
-            old_content = "[" + ",".join(old_turns) + "]"
-            submission_id: int | None = None
-
-            def _flush():
-                try:
-                    item = self._build_retain_kwargs(
-                        old_content,
-                        context=self._retain_context,
-                        metadata=old_metadata,
-                        tags=old_lineage_tags or None,
-                    )
-                    item.pop("bank_id", None)
-                    item.pop("retain_async", None)
-                    if old_update_mode is not None:
-                        item["update_mode"] = old_update_mode
-                    logger.debug(
-                        "Hindsight flush-on-switch: bank=%s, doc=%s, mode=%s, num_turns=%d",
-                        self._bank_id, old_document_id, old_update_mode, len(old_turns),
-                    )
-                    self._run_hindsight_operation(
-                        lambda client: client.aretain_batch(
-                            bank_id=self._bank_id,
-                            items=[item],
-                            document_id=old_document_id,
-                            retain_async=self._retain_async,
-                        )
-                    )
-                    if submission_id is not None:
-                        self._finish_retain_submission(submission_id)
-                except BaseException as e:
-                    if submission_id is not None:
-                        self._finish_retain_submission(submission_id, e)
-                    logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
-
-            # Route the flush through the same writer queue sync_turn
-            # uses. That serializes it behind any still-queued retains
-            # from the old session (FIFO by document_id), avoids racing
-            # two threads on aretain_batch against the same document, and
-            # keeps shutdown's drain semantics intact. Skip enqueue if
-            # shutdown has already fired — the writer is draining/gone.
-            if not self._shutting_down.is_set():
-                submission_id = self._begin_retain_submission(
-                    bank_id=self._bank_id,
-                    document_id=old_document_id,
-                    update_mode=old_update_mode,
-                    content=old_content,
-                )
-                try:
-                    self._ensure_writer()
-                    self._register_atexit()
-                    self._retain_queue.put(_flush)
-                except BaseException as exc:
-                    self._finish_retain_submission(submission_id, exc)
-                    raise
+            # Do not remote-publish trailing user-only orphans on switch.
+            # Pre-compress snapshots and interrupted turns stay in the local
+            # ledger; a later completed sync/replace submits the full document.
+            while old_turns:
+                trailing_identity = self._retain_turn_replay_identity(old_turns[-1])
+                if (
+                    len(trailing_identity) == 1
+                    and trailing_identity[0][0] == "user"
+                ):
+                    old_turns.pop()
+                    continue
+                break
+            if not old_turns:
                 self._last_queued_flush_count = old_total_turns
+            else:
+                old_metadata = self._build_metadata(
+                    message_count=len(old_turns) * 2,
+                    turn_index=old_turn_index,
+                )
+                old_lineage_tags: list[str] = []
+                if old_session_id:
+                    old_lineage_tags.append(f"session:{old_session_id}")
+                if old_parent_session_id:
+                    old_lineage_tags.append(f"parent:{old_parent_session_id}")
+                old_content = "[" + ",".join(old_turns) + "]"
+                submission_id: int | None = None
+
+                def _flush():
+                    try:
+                        item = self._build_retain_kwargs(
+                            old_content,
+                            context=self._retain_context,
+                            metadata=old_metadata,
+                            tags=old_lineage_tags or None,
+                        )
+                        item.pop("bank_id", None)
+                        item.pop("retain_async", None)
+                        if old_update_mode is not None:
+                            item["update_mode"] = old_update_mode
+                        logger.debug(
+                            "Hindsight flush-on-switch: bank=%s, doc=%s, mode=%s, num_turns=%d",
+                            self._bank_id, old_document_id, old_update_mode, len(old_turns),
+                        )
+                        self._run_hindsight_operation(
+                            lambda client: client.aretain_batch(
+                                bank_id=self._bank_id,
+                                items=[item],
+                                document_id=old_document_id,
+                                retain_async=self._retain_async,
+                            )
+                        )
+                        if submission_id is not None:
+                            self._finish_retain_submission(submission_id)
+                    except BaseException as e:
+                        if submission_id is not None:
+                            self._finish_retain_submission(submission_id, e)
+                        logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
+
+                # Route the flush through the same writer queue sync_turn
+                # uses. That serializes it behind any still-queued retains
+                # from the old session (FIFO by document_id), avoids racing
+                # two threads on aretain_batch against the same document, and
+                # keeps shutdown's drain semantics intact. Skip enqueue if
+                # shutdown has already fired — the writer is draining/gone.
+                if not self._shutting_down.is_set():
+                    submission_id = self._begin_retain_submission(
+                        bank_id=self._bank_id,
+                        document_id=old_document_id,
+                        update_mode=old_update_mode,
+                        content=old_content,
+                    )
+                    try:
+                        self._ensure_writer()
+                        self._register_atexit()
+                        self._retain_queue.put(_flush)
+                    except BaseException as exc:
+                        self._finish_retain_submission(submission_id, exc)
+                        raise
+                    self._last_queued_flush_count = old_total_turns
 
         # 2. Drop the carried recall so the new session cannot see stale memory.
         with self._prefetch_lock:

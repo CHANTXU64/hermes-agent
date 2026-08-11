@@ -2640,3 +2640,302 @@ async def test_gateway_retain_document_uses_sessionstore_sessiondb_lineage_and_c
             assert forbidden not in content
     finally:
         manager.shutdown_all()
+
+
+def test_hindsight_on_pre_compress_keeps_orphan_first_user_after_compressed_continuation(
+    tmp_path,
+    monkeypatch,
+):
+    """Long tool work + compression must not make retain start at later 继续.
+
+    Business acceptance for Document 20260810_212525_9c6decff-class failures:
+    when the real first user request never receives a final assistant answer
+    before context compression, the provider must snapshot that request during
+    on_pre_compress. A later compressed window that only contains the
+    continuation user + final answer must still produce a retained document
+    that starts at the original first user request.
+    """
+    session_id = "pre-compress-orphan-first-user"
+    real_first_user = (
+        "最近两三天，有两个任务问题很大，你先用子代理找准会话再分析，"
+        "一个是浏览器diff工具开发，一个是压缩转码工具项目的开发"
+    )
+    continuation_user = "继续"
+    final_answer = "## 总体裁决：不通过\n两个任务都没有形成可验收的完整交付。"
+    provider, client = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider2 = None
+
+    pre_compress_messages = [
+        {"role": "user", "content": real_first_user, "timestamp": 1710000000.0},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "session_search", "arguments": "{}"},
+                }
+            ],
+            "finish_reason": "tool_calls",
+            "timestamp": 1710000001.0,
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "TOOL OUTPUT THAT MUST NOT BE RETAINED",
+            "timestamp": 1710000002.0,
+        },
+        {
+            "role": "assistant",
+            "content": "会话已成功恢复，刚才未完成的工具调用不会重复执行。",
+            "timestamp": 1710000003.0,
+        },
+        {"role": "user", "content": continuation_user, "timestamp": 1710000004.0},
+    ]
+
+    try:
+        contribution = provider.on_pre_compress(pre_compress_messages)
+        assert contribution == ""
+
+        turns_after_snapshot, _lineage, document_id = provider._load_persisted_retain_turns(
+            session_id
+        )
+        assert document_id == session_id
+        assert len(turns_after_snapshot) >= 1
+        first_turn = json.loads(turns_after_snapshot[0])
+        assert first_turn[0]["role"] == "user"
+        assert first_turn[0]["content"] == f"User: {real_first_user}"
+
+        # Simulate a restarted/compressed provider that only sees the tail window.
+        provider2, client2 = _initialized_hindsight_provider(
+            tmp_path,
+            monkeypatch,
+            session_id=session_id,
+        )
+        compressed_window = [
+            {
+                "role": "user",
+                "content": (
+                    "[Session Arc Summary (d1, node 1)]\n"
+                    f"用户最新要求：\n> {real_first_user}"
+                ),
+                "timestamp": 1710000010.0,
+            },
+            {
+                "role": "user",
+                "content": (
+                    "[Your active task list was preserved across context compression]\n"
+                    "- [>] locate tasks"
+                ),
+                "timestamp": 1710000010.1,
+            },
+            {"role": "user", "content": continuation_user, "timestamp": 1710000011.0},
+            {"role": "assistant", "content": final_answer, "timestamp": 1710000012.0},
+        ]
+        provider2.sync_turn(
+            continuation_user,
+            final_answer,
+            session_id=session_id,
+            messages=compressed_window,
+        )
+
+        info = provider2.retain_persisted_session_lineage(session_id=session_id)
+        provider2._retain_queue.join()
+        assert info["queued"] is True
+
+        kwargs = client2.aretain_batch.call_args.kwargs
+        content = kwargs["items"][0]["content"]
+        turns = json.loads(content)
+        assert turns[0][0]["content"] == f"User: {real_first_user}", (
+            "retained document must start at the original first user request, "
+            f"not the later continuation. First message was: {turns[0][0].get('content')!r}"
+        )
+        assert any(
+            message.get("content") == f"User: {continuation_user}"
+            for turn in turns
+            for message in turn
+        )
+        assert any(
+            message.get("content") == f"Assistant: {final_answer}"
+            for turn in turns
+            for message in turn
+        )
+        for forbidden in (
+            "TOOL OUTPUT THAT MUST NOT BE RETAINED",
+            "Session Arc Summary",
+            "active task list was preserved",
+            "tool_calls",
+        ):
+            assert forbidden not in content
+    finally:
+        provider.shutdown()
+        if provider2 is not None:
+            provider2.shutdown()
+
+
+def test_hindsight_pre_compress_session_switch_rotation_keeps_first_user(
+    tmp_path,
+    monkeypatch,
+):
+    """Production path: pre_compress → session_switch(child,parent) → sync tail."""
+    root_session = "pre-compress-root-session"
+    child_session = "pre-compress-child-session"
+    real_first_user = "原始首句：请分析两个失败任务"
+    continuation_user = "继续"
+    final_answer = "## 总体裁决：不通过"
+
+    provider, client = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=root_session,
+        auto_retain=True,
+        retain_every_n_turns=10,
+    )
+    try:
+        pure_orphan_messages = [
+            {
+                "role": "user",
+                "content": real_first_user,
+                "timestamp": 1710001000.0,
+                "platform_message_id": "msg-first",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "session_search", "arguments": "{}"},
+                    }
+                ],
+                "finish_reason": "tool_calls",
+                "timestamp": 1710001001.0,
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "TOOL OUTPUT THAT MUST NOT BE RETAINED",
+                "timestamp": 1710001002.0,
+            },
+            {
+                "role": "user",
+                "content": continuation_user,
+                "timestamp": 1710001003.0,
+                "platform_message_id": "msg-cont-1",
+            },
+        ]
+        provider.on_pre_compress(pure_orphan_messages)
+        # auto_retain must not remote-publish incomplete pre-compress orphans.
+        assert client.aretain_batch.call_count == 0
+
+        provider.on_session_switch(child_session, parent_session_id=root_session)
+        provider._retain_queue.join()
+        assert client.aretain_batch.call_count == 0
+
+        compressed_window = [
+            {
+                "role": "user",
+                "content": f"[Session Arc Summary (d1, node 1)]\n> {real_first_user}",
+                "timestamp": 1710001010.0,
+            },
+            {
+                "role": "user",
+                "content": continuation_user,
+                "timestamp": 1710001011.0,
+                "platform_message_id": "msg-cont-1",
+            },
+            {
+                "role": "assistant",
+                "content": final_answer,
+                "timestamp": 1710001012.0,
+            },
+        ]
+        provider.sync_turn(
+            continuation_user,
+            final_answer,
+            session_id=child_session,
+            messages=compressed_window,
+        )
+        info = provider.retain_persisted_session_lineage(session_id=child_session)
+        provider._retain_queue.join()
+        assert info["queued"] is True
+
+        kwargs = client.aretain_batch.call_args.kwargs
+        content = kwargs["items"][0]["content"]
+        turns = json.loads(content)
+        assert turns[0][0]["content"] == f"User: {real_first_user}"
+        assert any(
+            message.get("content") == f"Assistant: {final_answer}"
+            for turn in turns
+            for message in turn
+        )
+        assert "TOOL OUTPUT THAT MUST NOT BE RETAINED" not in content
+    finally:
+        provider.shutdown()
+
+
+def test_hindsight_closes_orphan_user_respects_distinct_occurrence_ids(
+    tmp_path,
+    monkeypatch,
+):
+    """Different platform occurrence ids for the same short text must not merge."""
+    session_id = "orphan-occurrence-guard"
+    provider, client = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    try:
+        first_continue = [
+            {
+                "role": "user",
+                "content": "继续",
+                "timestamp": 1710002000.0,
+                "platform_message_id": "cont-a",
+            }
+        ]
+        second_continue_completed = [
+            {
+                "role": "user",
+                "content": "继续",
+                "timestamp": 1710002005.0,
+                "platform_message_id": "cont-b",
+            },
+            {
+                "role": "assistant",
+                "content": "second answer only",
+                "timestamp": 1710002006.0,
+            },
+        ]
+        provider.sync_turn(
+            "继续",
+            "",
+            session_id=session_id,
+            messages=first_continue,
+        )
+        provider.sync_turn(
+            "继续",
+            "second answer only",
+            session_id=session_id,
+            messages=second_continue_completed,
+        )
+        info = provider.retain_persisted_session_lineage(session_id=session_id)
+        provider._retain_queue.join()
+        assert info["queued"] is True
+        content = client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        turns = json.loads(content)
+        # First orphan 继续 stays; second becomes its own completed turn.
+        assert len(turns) >= 2
+        assert turns[0][0]["content"] == "User: 继续"
+        assert len(turns[0]) == 1
+        assert turns[1][0]["content"] == "User: 继续"
+        assert turns[1][1]["content"] == "Assistant: second answer only"
+        assert turns[1][1]["content"] != "Assistant: first answer"
+    finally:
+        provider.shutdown()
