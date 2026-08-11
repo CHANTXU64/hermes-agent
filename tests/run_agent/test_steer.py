@@ -239,9 +239,9 @@ class TestActiveTurnRedirectCheckpoint:
             "content": "clean malformed fallback",
         }
 
-        # The other redirect shape stores the scaffold on an assistant
-        # checkpoint before the clean user correction; it must use the same
-        # request-only consumption path.
+        # The other redirect shape uses a clean assistant placeholder for role
+        # alternation, then puts the interrupt scaffold only on the user
+        # correction's request-only api_content (#81841 + fork isolation).
         agent._current_streamed_assistant_text = "Tool-loop draft."
         tool_tail = [{"role": "user", "content": "start"}]
         _apply_active_turn_redirect(agent, tool_tail, "Change course.")
@@ -251,14 +251,18 @@ class TestActiveTurnRedirectCheckpoint:
             _consume_request_only_api_content(api_message)
             tool_tail_api.append(api_message)
 
-        assert "Tool-loop draft." in tool_tail_api[-2]["content"]
-        assert tool_tail_api[-1]["content"] == "Change course."
+        assert tool_tail_api[-2]["content"] == "Tool-loop draft."
+        assert "Change course." in tool_tail_api[-1]["content"]
+        assert "Tool-loop draft." in tool_tail_api[-1]["content"]
+        assert "[This response was interrupted by a user correction.]" in tool_tail_api[-1]["content"]
+        assert "[This response was interrupted by a user correction.]" not in tool_tail_api[-2]["content"]
         assert all("api_content" not in message for message in tool_tail_api)
         assert all(
             "_request_only_api_content" not in message for message in tool_tail_api
         )
 
         _strip_request_only_api_content(tool_tail)
+        assert tool_tail[-2]["content"] == "Tool-loop draft."
         assert tool_tail[-1]["content"] == "Change course."
         assert all("api_content" not in message for message in tool_tail)
         assert all(

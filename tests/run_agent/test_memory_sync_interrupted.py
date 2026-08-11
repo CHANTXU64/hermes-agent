@@ -95,13 +95,17 @@ class TestSyncExternalMemoryForTurn:
         manager = _LegacyMemoryManager()
         agent._memory_manager = manager
 
+        # Use non-trivial text: is_trivial_prompt("Continue") is True and skips
+        # queue_prefetch_all by design (upstream trivial-prompt gate).
         agent._sync_external_memory_for_turn(
-            original_user_message="Continue",
+            original_user_message="Continue the retain flow validation",
             final_response="Done",
             interrupted=False,
         )
 
-        assert manager.queued == [("Continue", "test_session_001")]
+        assert manager.queued == [
+            ("Continue the retain flow validation", "test_session_001")
+        ]
 
     def test_completed_turn_syncs_messages_when_present(self):
         agent = _bare_agent()

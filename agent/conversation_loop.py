@@ -271,16 +271,23 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         # never land here — the API replay path substitutes api_content back
         # into content, and a scaffold-as-assistant-reply is what the model
         # then echoes (#81841 / incomplete #73146 else branch).
+        # Fork: keep the scaffold only on the user correction's request-only
+        # sidecar so durable transcript stays clean and later turns never
+        # replay interrupt machinery.
         placeholder: Dict[str, Any] = {
             "role": "assistant",
-            "content": visible or checkpoint,
-            "api_content": checkpoint,
-            "_request_only_api_content": True,        }
+            "content": visible or "",
+        }
         if not visible:
             placeholder["display_kind"] = "hidden"
         messages.append(placeholder)
         messages.append(
-            {"role": "user", "content": text, "api_content": correction}
+            {
+                "role": "user",
+                "content": text,
+                "api_content": correction,
+                "_request_only_api_content": True,
+            }
         )
 
     agent._current_streamed_assistant_text = ""
