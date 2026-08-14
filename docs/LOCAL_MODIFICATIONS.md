@@ -1725,6 +1725,9 @@ What changed:
 - The `openai-api` image backend resolves the same API key and base URL as chat and posts Codex Responses `image_generation` calls there.
 - Auxiliary clients with no explicit `api_mode` now consult the provider-declared transport, so `openai-api` uses its Responses adapter instead of sending the generic/OpenRouter-shaped `reasoning.enabled` body to the configured endpoint.
 - OpenAI-compatible `/models` metadata now preserves `owned_by`; when the same response identifies itself as `codexmanager`, Hermes reads the current model's exact `slug/context_window` from that response's `models` extension.
+- Exact CodexManager context values are retained in `~/.hermes/endpoint_context_cache.json`, scoped by normalized endpoint, API-key SHA-256 fingerprint, and model. A newer exact value replaces the old one; a partial/failed catalog reuses the last valid value without resurrecting cached models in the live model list.
+- The five-minute in-memory endpoint catalog uses the same credential scope, so two API keys on one CodexManager URL cannot reuse each other's 272K/372K metadata.
+- For custom `openai-api` endpoints, the public context resolver consults live/credential-scoped metadata before the legacy `model@base_url` cache; official OpenAI URLs and other providers retain the prior cache order.
 
 Why it matters:
 
@@ -1732,9 +1735,9 @@ Why it matters:
 
 Merge protection:
 
-- Preserve when: an API-key Codex-compatible endpoint is still selected through `openai-api` and upstream lacks equivalent image registration, auxiliary transport inheritance, or live CodexManager context-catalog handling.
-- Drop when: upstream provides all three behaviors with equivalent tests.
-- Ask user when: upstream changes `openai-api` transport semantics, image generation routing, or the CodexManager enriched model catalog no longer provides authoritative context windows.
+- Preserve when: an API-key Codex-compatible endpoint is still selected through `openai-api` and upstream lacks equivalent image registration, auxiliary transport inheritance, live CodexManager context-catalog handling, or credential-scoped last-valid context retention.
+- Drop when: upstream provides all four behaviors with equivalent tests.
+- Ask user when: upstream changes `openai-api` transport semantics, image generation routing, the CodexManager enriched model catalog no longer provides authoritative context windows, or a durable endpoint cache adopts different deletion/expiry semantics.
 
 Verification:
 

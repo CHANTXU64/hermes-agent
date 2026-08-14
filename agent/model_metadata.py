@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -130,6 +131,19 @@ _MODEL_CACHE_TTL = 3600
 _endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _endpoint_model_metadata_cache_time: Dict[str, float] = {}
 _ENDPOINT_MODEL_CACHE_TTL = 300
+_endpoint_context_cache_lock = threading.RLock()
+
+
+def _credential_fingerprint(api_key: str) -> str:
+    """Return a non-secret stable identity for credential-scoped caches."""
+    if not api_key:
+        return "anonymous"
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+def _endpoint_metadata_cache_key(base_url: str, api_key: str) -> str:
+    """Keep in-memory endpoint catalogs isolated across API credentials."""
+    return f"{base_url}@sha256:{_credential_fingerprint(api_key)}"
 # Bounded-lifetime cache: after the first successful probe we remember the
 # server type so subsequent refreshes skip the full waterfall (no more 404
 # spam every 5 minutes on non-matching endpoints like /api/v1/models on vllm).
@@ -1218,10 +1232,11 @@ def fetch_endpoint_model_metadata(
     if not normalized or _is_openrouter_base_url(normalized):
         return {}
     _ensure_requests()
+    metadata_cache_key = _endpoint_metadata_cache_key(normalized, api_key)
 
     if not force_refresh:
-        cached = _endpoint_model_metadata_cache.get(normalized)
-        cached_at = _endpoint_model_metadata_cache_time.get(normalized, 0)
+        cached = _endpoint_model_metadata_cache.get(metadata_cache_key)
+        cached_at = _endpoint_model_metadata_cache_time.get(metadata_cache_key, 0)
         if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
             return cached
 
@@ -1288,8 +1303,8 @@ def fetch_endpoint_model_metadata(
                     if isinstance(alt_id, str) and alt_id and alt_id != model_id:
                         _add_model_aliases(cache, alt_id, entry)
 
-                _endpoint_model_metadata_cache[normalized] = cache
-                _endpoint_model_metadata_cache_time[normalized] = time.time()
+                _endpoint_model_metadata_cache[metadata_cache_key] = cache
+                _endpoint_model_metadata_cache_time[metadata_cache_key] = time.time()
                 return cache
         except Exception as exc:
             last_error = exc
@@ -1400,8 +1415,8 @@ def fetch_endpoint_model_metadata(
                 except Exception:
                     pass
 
-            _endpoint_model_metadata_cache[normalized] = cache
-            _endpoint_model_metadata_cache_time[normalized] = time.time()
+            _endpoint_model_metadata_cache[metadata_cache_key] = cache
+            _endpoint_model_metadata_cache_time[metadata_cache_key] = time.time()
             return cache
         except Exception as exc:
             last_error = exc
@@ -1413,9 +1428,129 @@ def fetch_endpoint_model_metadata(
 
     if last_error:
         logger.debug("Failed to fetch model metadata from %s/models: %s", normalized, last_error)
-    _endpoint_model_metadata_cache[normalized] = {}
-    _endpoint_model_metadata_cache_time[normalized] = time.time()
+    _endpoint_model_metadata_cache[metadata_cache_key] = {}
+    _endpoint_model_metadata_cache_time[metadata_cache_key] = time.time()
     return {}
+
+
+_ENDPOINT_CONTEXT_CACHE_VERSION = 1
+
+
+def _get_endpoint_context_cache_path() -> Path:
+    """Return the credential-scoped last-known endpoint context cache path."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "endpoint_context_cache.json"
+
+
+def _empty_endpoint_context_cache() -> Dict[str, Any]:
+    return {"version": _ENDPOINT_CONTEXT_CACHE_VERSION, "scopes": {}}
+
+
+def _load_endpoint_context_cache() -> Dict[str, Any]:
+    path = _get_endpoint_context_cache_path()
+    if not path.exists():
+        return _empty_endpoint_context_cache()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return _empty_endpoint_context_cache()
+        if data.get("version") != _ENDPOINT_CONTEXT_CACHE_VERSION:
+            return _empty_endpoint_context_cache()
+        if not isinstance(data.get("scopes"), dict):
+            return _empty_endpoint_context_cache()
+        return data
+    except Exception as exc:
+        logger.debug("Failed to load endpoint context cache: %s", exc)
+        return _empty_endpoint_context_cache()
+
+
+def _endpoint_context_scope(
+    base_url: str,
+    api_key: str,
+) -> Tuple[str, str, str]:
+    normalized = _normalize_base_url(base_url)
+    credential_fingerprint = _credential_fingerprint(api_key)
+    scope_id = hashlib.sha256(
+        f"{normalized}\0{credential_fingerprint}".encode("utf-8")
+    ).hexdigest()
+    return scope_id, normalized, credential_fingerprint
+
+
+def _save_endpoint_context_length(
+    model: str,
+    base_url: str,
+    api_key: str,
+    length: int,
+) -> None:
+    """Persist one exact live context value without storing the credential."""
+    if not isinstance(length, int) or length <= 0:
+        return
+    scope_id, normalized, credential_fingerprint = _endpoint_context_scope(
+        base_url, api_key
+    )
+    if not normalized or not model:
+        return
+
+    with _endpoint_context_cache_lock:
+        data = _load_endpoint_context_cache()
+        scopes = data.setdefault("scopes", {})
+        scope = scopes.get(scope_id)
+        if not isinstance(scope, dict):
+            scope = {
+                "base_url": normalized,
+                "credential_sha256": credential_fingerprint,
+                "models": {},
+            }
+            scopes[scope_id] = scope
+        models = scope.get("models")
+        if not isinstance(models, dict):
+            models = {}
+            scope["models"] = models
+        current = models.get(model)
+        if isinstance(current, dict) and current.get("context_length") == length:
+            return
+        models[model] = {
+            "context_length": length,
+            "updated_at": int(time.time()),
+        }
+        try:
+            atomic_json_write(
+                _get_endpoint_context_cache_path(),
+                data,
+                indent=2,
+                mode=0o600,
+                sort_keys=True,
+            )
+        except Exception as exc:
+            logger.debug("Failed to save endpoint context cache: %s", exc)
+
+
+def _get_endpoint_cached_context_length(
+    model: str,
+    base_url: str,
+    api_key: str,
+) -> Optional[int]:
+    """Return the last exact value for this URL and credential only."""
+    scope_id, normalized, _ = _endpoint_context_scope(base_url, api_key)
+    if not normalized or not model:
+        return None
+    with _endpoint_context_cache_lock:
+        data = _load_endpoint_context_cache()
+        scope = data.get("scopes", {}).get(scope_id)
+        if not isinstance(scope, dict):
+            return None
+        models = scope.get("models")
+        if not isinstance(models, dict):
+            return None
+        entry = models.get(model)
+        if not isinstance(entry, dict):
+            return None
+        length = entry.get("context_length")
+        if isinstance(length, int) and length > 0:
+            return length
+    return None
 
 
 def _resolve_endpoint_context_length(
@@ -1423,7 +1558,7 @@ def _resolve_endpoint_context_length(
     base_url: str,
     api_key: str = "",
 ) -> Optional[int]:
-    """Resolve context length from an endpoint's live ``/models`` metadata."""
+    """Resolve a live context length, then fall back to its last exact value."""
     endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
     matched = endpoint_metadata.get(model)
     is_codexmanager_catalog = any(
@@ -1442,7 +1577,17 @@ def _resolve_endpoint_context_length(
     if matched:
         context_length = matched.get("context_length")
         if isinstance(context_length, int):
+            if is_codexmanager_catalog:
+                _save_endpoint_context_length(
+                    model, base_url, api_key, context_length
+                )
             return context_length
+
+    # A partial CodexManager catalog or a failed/empty refresh must not erase a
+    # previously confirmed exact value. A non-CodexManager live catalog does
+    # not consume this private fallback, so a server swap stays visible.
+    if is_codexmanager_catalog or not endpoint_metadata:
+        return _get_endpoint_cached_context_length(model, base_url, api_key)
     return None
 
 
@@ -2526,6 +2671,7 @@ def get_model_context_length(
     Resolution order:
     0. Explicit config override (model.context_length or custom_providers per-model)
     0c. Endpoint-scoped metadata for models validated on one multiplexed endpoint
+    0d. Credential-scoped live/last-valid metadata for custom openai-api endpoints
     1. Persistent cache (previously discovered via probing).  Nous URLs,
        LM Studio, and Codex OAuth bypass the cache here so their provider
        metadata can be reconciled against the authoritative live source.
@@ -2626,6 +2772,23 @@ def get_model_context_length(
     if endpoint_context is not None:
         return endpoint_context
 
+    # ``openai-api`` custom gateways can expose different CodexManager catalogs
+    # for different credentials on the same URL. Resolve them before the legacy
+    # model@URL cache, which has no credential dimension and could otherwise
+    # mask both a newer live value and this credential's last-valid fallback.
+    uses_credential_scoped_endpoint_context = (
+        (provider or "").strip().lower() == "openai-api"
+        and bool(base_url)
+        and _is_custom_endpoint(base_url)
+        and not _is_known_provider_base_url(base_url)
+    )
+    if uses_credential_scoped_endpoint_context:
+        credential_context = _resolve_endpoint_context_length(
+            model, base_url, api_key=api_key
+        )
+        if credential_context is not None:
+            return credential_context
+
     is_bedrock_context = provider == "bedrock" or (
         base_url
         and base_url_hostname(base_url).startswith("bedrock-runtime.")
@@ -2638,7 +2801,11 @@ def get_model_context_length(
     # via /api/v1/models/load), so a stale cached value would mask reloads.
     # Codex OAuth is excluded because the authenticated /models catalogue is
     # account-specific and a fallback must never suppress later revalidation.
-    if base_url and not _skip_persistent_context_cache(base_url, provider):
+    if (
+        base_url
+        and not uses_credential_scoped_endpoint_context
+        and not _skip_persistent_context_cache(base_url, provider)
+    ):
         cached = get_cached_context_length(model, base_url)
         if cached is not None:
             # Invalidate stale 32k cache entries for Kimi-family models.
