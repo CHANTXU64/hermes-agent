@@ -6099,11 +6099,21 @@ def resolve_provider_client(
             return False
         if provider == "actual":
             return True
-        if api_mode == "codex_responses":
+        effective_api_mode = api_mode
+        if not effective_api_mode:
+            try:
+                from hermes_cli.providers import determine_api_mode
+
+                effective_api_mode = determine_api_mode(
+                    provider, base_url_str, model_str,
+                )
+            except Exception:
+                effective_api_mode = None
+        if effective_api_mode == "codex_responses":
             return True
         # Auto-detect: api.openai.com + codex model name pattern
-        if api_mode and api_mode != "codex_responses":
-            return False  # explicit non-codex mode
+        if effective_api_mode:
+            return False  # resolved non-codex mode
         if base_url_hostname(base_url_str) == "api.openai.com":
             model_lower = (model_str or "").lower()
             if "codex" in model_lower:

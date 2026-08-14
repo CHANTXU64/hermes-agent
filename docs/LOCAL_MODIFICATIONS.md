@@ -1699,6 +1699,65 @@ Verification:
 git diff --check
 ```
 
+### 25. OpenAI API Codex-compatible gateway integration
+
+Status: active
+
+Date: 2026-08-14
+
+Files:
+
+- `agent/auxiliary_client.py`
+- `agent/model_metadata.py`
+- `plugins/image_gen/openai-codex/__init__.py`
+- `tests/plugins/image_gen/test_openai_codex_provider.py`
+- `tests/fork/test_openai_api_codex_gateway.py`
+- `tests/fork/test_image_gen_openai_api.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- `openai-api` now works as one identity across chat, auxiliary tasks, context sizing, and image generation when `OPENAI_BASE_URL` targets a Codex-compatible API-key gateway.
+
+What changed:
+
+- The existing Codex image plugin still registers `openai-codex` for official OAuth and now also registers `openai-api`.
+- The `openai-api` image backend resolves the same API key and base URL as chat and posts Codex Responses `image_generation` calls there.
+- Auxiliary clients with no explicit `api_mode` now consult the provider-declared transport, so `openai-api` uses its Responses adapter instead of sending the generic/OpenRouter-shaped `reasoning.enabled` body to the configured endpoint.
+- OpenAI-compatible `/models` metadata now preserves `owned_by`; when the same response identifies itself as `codexmanager`, Hermes reads the current model's exact `slug/context_window` from that response's `models` extension.
+
+Why it matters:
+
+- The user selects `openai-api` across all configured surfaces. Before this change image generation could not resolve that name, auxiliary calls used an incomplete request-shaping path, and Hermes ignored the CodexManager API's own context-window catalog and misreported this route as 1.05M.
+
+Merge protection:
+
+- Preserve when: an API-key Codex-compatible endpoint is still selected through `openai-api` and upstream lacks equivalent image registration, auxiliary transport inheritance, or live CodexManager context-catalog handling.
+- Drop when: upstream provides all three behaviors with equivalent tests.
+- Ask user when: upstream changes `openai-api` transport semantics, image generation routing, or the CodexManager enriched model catalog no longer provides authoritative context windows.
+
+Verification:
+
+```bash
+./venv/bin/python -m pytest \
+  tests/fork/test_openai_api_codex_gateway.py \
+  tests/fork/test_image_gen_openai_api.py \
+  tests/plugins/image_gen/test_openai_codex_provider.py \
+  tests/agent/test_auxiliary_client.py \
+  tests/agent/test_model_metadata.py \
+  tests/hermes_cli/test_model_switch_openai_api_mode.py \
+  -q -o 'addopts='
+./venv/bin/python -m py_compile \
+  agent/auxiliary_client.py agent/model_metadata.py \
+  plugins/image_gen/openai-codex/__init__.py \
+  tests/fork/test_openai_api_codex_gateway.py \
+  tests/fork/test_image_gen_openai_api.py
+```
+
+Feature docs: none — one provider integration across existing generic seams, with focused regressions and full merge guidance here.
+
+Upstream status: fork-only.
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -1836,13 +1895,21 @@ deltas are expected in these areas:
   `runtime.nofile_soft_limit`; fork keeps emission regression only):
   - `tests/fork/test_launchd_open_file_limit.py`
   - `docs/LOCAL_MODIFICATIONS.md`
+- OpenAI API Codex-compatible gateway integration:
+  - `agent/auxiliary_client.py`
+  - `agent/model_metadata.py`
+  - `plugins/image_gen/openai-codex/__init__.py`
+  - `tests/plugins/image_gen/test_openai_codex_provider.py`
+  - `tests/fork/test_openai_api_codex_gateway.py`
+  - `tests/fork/test_image_gen_openai_api.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
 
 
 ## Summary statistics
 
-Documented entries: 24 major entries.
+Documented entries: 25 major entries.
 
-Active / current entries: 20.
+Active / current entries: 21.
 
 Historical reverted / abandoned / superseded areas: 4.
 

@@ -153,8 +153,8 @@ def _load_image_gen_config() -> Dict[str, Any]:
         return {}
 
 
-def _resolve_model() -> Tuple[str, Dict[str, Any]]:
-    """Decide which tier to use and return ``(model_id, meta)``."""
+def _resolve_model(section_key: str = "openai-codex") -> Tuple[str, Dict[str, Any]]:
+    """Resolve a tier from one provider section, then shared fallbacks."""
     import os
 
     env_override = os.environ.get("OPENAI_IMAGE_MODEL")
@@ -162,8 +162,8 @@ def _resolve_model() -> Tuple[str, Dict[str, Any]]:
         return env_override, _MODELS[env_override]
 
     cfg = _load_image_gen_config()
-    sub = cfg.get("openai-codex") if isinstance(cfg.get("openai-codex"), dict) else {}
     candidate: Optional[str] = None
+    sub = cfg.get(section_key) if isinstance(cfg.get(section_key), dict) else {}
     if isinstance(sub, dict):
         value = sub.get("model")
         if isinstance(value, str) and value in _MODELS:
@@ -297,13 +297,15 @@ def _build_responses_payload(
     size: str,
     quality: str,
     input_images: Optional[List[Dict[str, str]]] = None,
+    chat_model: str = _CODEX_CHAT_MODEL,
 ) -> Dict[str, Any]:
     """Build the Codex Responses request body for an image_generation call."""
     content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
     if input_images:
         content.extend(input_images)
+    host_model = (chat_model or "").strip() or _CODEX_CHAT_MODEL
     return {
-        "model": _CODEX_CHAT_MODEL,
+        "model": host_model,
         "store": False,
         "instructions": _CODEX_INSTRUCTIONS,
         "input": [{
@@ -410,28 +412,40 @@ def _collect_image_b64(
     size: str,
     quality: str,
     input_images: Optional[List[Dict[str, str]]] = None,
+    base_url: str = _CODEX_BASE_URL,
+    chat_model: str = _CODEX_CHAT_MODEL,
+    official_codex_headers: bool = True,
 ) -> Optional[str]:
     """Stream a Codex Responses image_generation call and return the b64 image."""
     import httpx
-    from agent.auxiliary_client import _codex_cloudflare_headers
 
-    headers = _codex_cloudflare_headers(token)
-    headers.update({
+    headers = {
         "Accept": "text/event-stream",
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-    })
+    }
+    if official_codex_headers:
+        from agent.auxiliary_client import _codex_cloudflare_headers
+
+        headers = _codex_cloudflare_headers(token)
+        headers.update({
+            "Accept": "text/event-stream",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        })
     payload = _build_responses_payload(
         prompt=prompt,
         size=size,
         quality=quality,
         input_images=input_images,
+        chat_model=chat_model,
     )
     timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
+    endpoint = f"{str(base_url or _CODEX_BASE_URL).rstrip('/')}/responses"
 
     image_b64: Optional[str] = None
     with httpx.Client(timeout=timeout, headers=headers) as http:
-        with http.stream("POST", f"{_CODEX_BASE_URL}/responses", json=payload) as response:
+        with http.stream("POST", endpoint, json=payload) as response:
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
@@ -446,6 +460,52 @@ def _collect_image_b64(
                     image_b64 = found
 
     return image_b64
+
+
+def _resolve_openai_api_runtime() -> Optional[Dict[str, str]]:
+    """Return openai-api key + base URL from the same runtime chat uses."""
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested="openai-api")
+    except Exception as exc:
+        logger.debug("Could not resolve openai-api runtime for image gen: %s", exc)
+        return None
+    if not isinstance(runtime, dict):
+        return None
+    api_key = str(runtime.get("api_key") or "").strip()
+    base_url = str(runtime.get("base_url") or "").strip().rstrip("/")
+    if not api_key or not base_url:
+        return None
+    return {"api_key": api_key, "base_url": base_url}
+
+
+def _resolve_host_chat_model() -> str:
+    """Host model that calls the image_generation tool on an openai-api endpoint."""
+    cfg = _load_image_gen_config()
+    sub = cfg.get("openai-api") if isinstance(cfg.get("openai-api"), dict) else {}
+    if isinstance(sub, dict):
+        for key in ("chat_model", "host_model"):
+            value = sub.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    try:
+        from hermes_cli.config import load_config
+
+        full = load_config()
+        model_cfg = full.get("model") if isinstance(full, dict) else None
+        if isinstance(model_cfg, dict):
+            provider = str(model_cfg.get("provider") or "").strip().lower()
+            default = model_cfg.get("default")
+            if (
+                provider == "openai-api"
+                and isinstance(default, str)
+                and default.strip()
+            ):
+                return default.strip()
+    except Exception as exc:
+        logger.debug("Could not read model.default for image host model: %s", exc)
+    return _CODEX_CHAT_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -629,11 +689,185 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         )
 
 
+class OpenAIApiImageGenProvider(ImageGenProvider):
+    """gpt-image-2 via Codex Responses, authenticated as openai-api."""
+
+    @property
+    def name(self) -> str:
+        return "openai-api"
+
+    @property
+    def display_name(self) -> str:
+        return "OpenAI API"
+
+    def is_available(self) -> bool:
+        if not _resolve_openai_api_runtime():
+            return False
+        try:
+            import httpx  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def list_models(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "id": model_id,
+                "display": meta["display"],
+                "speed": meta["speed"],
+                "strengths": meta["strengths"],
+                "price": "varies",
+            }
+            for model_id, meta in _MODELS.items()
+        ]
+
+    def default_model(self) -> Optional[str]:
+        return DEFAULT_MODEL
+
+    def get_setup_schema(self) -> Dict[str, Any]:
+        return {
+            "name": "OpenAI API",
+            "badge": "paid",
+            "tag": "gpt-image-2 via openai-api credentials and Codex Responses image_generation",
+            "env_vars": [
+                {
+                    "key": "OPENAI_API_KEY",
+                    "prompt": "OpenAI-compatible API key",
+                    "url": "https://platform.openai.com/api-keys",
+                },
+                {
+                    "key": "OPENAI_BASE_URL",
+                    "prompt": "OpenAI-compatible base URL",
+                    "url": "",
+                },
+            ],
+            "post_setup_hint": (
+                "Reuses the same OPENAI_API_KEY + OPENAI_BASE_URL as chat "
+                "when model.provider is openai-api."
+            ),
+        }
+
+    def capabilities(self) -> Dict[str, Any]:
+        return {"modalities": ["text", "image"], "max_reference_images": _MAX_REFERENCE_IMAGES}
+
+    def generate(
+        self,
+        prompt: str,
+        aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+        *,
+        image_url: Optional[str] = None,
+        reference_image_urls: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        prompt = (prompt or "").strip()
+        aspect = resolve_aspect_ratio(aspect_ratio)
+
+        if not prompt:
+            return error_response(
+                error="Prompt is required and must be a non-empty string",
+                error_type="invalid_argument",
+                provider="openai-api",
+                aspect_ratio=aspect,
+            )
+
+        runtime = _resolve_openai_api_runtime()
+        if not runtime:
+            return error_response(
+                error=(
+                    "openai-api credentials are missing. Set OPENAI_API_KEY and "
+                    "OPENAI_BASE_URL, then set image_gen.provider to openai-api."
+                ),
+                error_type="auth_required",
+                provider="openai-api",
+                aspect_ratio=aspect,
+            )
+
+        try:
+            import httpx  # noqa: F401
+        except ImportError:
+            return error_response(
+                error="httpx Python package not installed (pip install httpx)",
+                error_type="missing_dependency",
+                provider="openai-api",
+                aspect_ratio=aspect,
+            )
+
+        tier_id, meta = _resolve_model("openai-api")
+        size = _SIZES.get(aspect, _SIZES["square"])
+
+        try:
+            input_images = _normalize_input_images(image_url, reference_image_urls)
+        except Exception as exc:
+            return error_response(
+                error=f"Invalid image input for openai-api image editing: {exc}",
+                error_type="invalid_image_input",
+                provider="openai-api",
+                model=tier_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        try:
+            b64 = _collect_image_b64(
+                runtime["api_key"],
+                prompt=prompt,
+                size=size,
+                quality=meta["quality"],
+                input_images=input_images or None,
+                base_url=runtime["base_url"],
+                chat_model=_resolve_host_chat_model(),
+                official_codex_headers=False,
+            )
+        except Exception as exc:
+            logger.debug("openai-api image generation failed", exc_info=True)
+            return error_response(
+                error=f"OpenAI image generation via openai-api failed: {exc}",
+                error_type="api_error",
+                provider="openai-api",
+                model=tier_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        if not b64:
+            return error_response(
+                error="openai-api response contained no image_generation_call result",
+                error_type="empty_response",
+                provider="openai-api",
+                model=tier_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        try:
+            saved_path = save_b64_image(b64, prefix=f"openai_api_{tier_id}")
+        except Exception as exc:
+            return error_response(
+                error=f"Could not save image to cache: {exc}",
+                error_type="io_error",
+                provider="openai-api",
+                model=tier_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        return success_response(
+            image=str(saved_path),
+            model=tier_id,
+            prompt=prompt,
+            aspect_ratio=aspect,
+            provider="openai-api",
+            modality="image" if input_images else "text",
+            extra={"size": size, "quality": meta["quality"], "input_image_count": len(input_images)},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
 
 
 def register(ctx) -> None:
-    """Plugin entry point — register the Codex-backed image-gen provider."""
+    """Plugin entry point — register Codex OAuth and openai-api image backends."""
     ctx.register_image_gen_provider(OpenAICodexImageGenProvider())
+    ctx.register_image_gen_provider(OpenAIApiImageGenProvider())

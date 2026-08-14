@@ -351,5 +351,7 @@ class TestRegistration:
                 registered.append(prov)
 
         codex_plugin.register(_Ctx())
-        assert len(registered) == 1
-        assert registered[0].name == "openai-codex"
+        assert [provider.name for provider in registered] == [
+            "openai-codex",
+            "openai-api",
+        ]

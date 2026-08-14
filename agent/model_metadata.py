@@ -1333,6 +1333,9 @@ def fetch_endpoint_model_metadata(
                 if not model_id:
                     continue
                 entry: Dict[str, Any] = {"name": model.get("name", model_id)}
+                owned_by = model.get("owned_by")
+                if isinstance(owned_by, str) and owned_by.strip():
+                    entry["owned_by"] = owned_by.strip()
                 context_length = _extract_context_length(model)
                 if context_length is not None:
                     entry["context_length"] = context_length
@@ -1343,6 +1346,36 @@ def fetch_endpoint_model_metadata(
                 if pricing:
                     entry["pricing"] = pricing
                 _add_model_aliases(cache, model_id, entry)
+
+            is_codexmanager = any(
+                str(m.get("owned_by") or "").strip().lower() == "codexmanager"
+                for m in payload.get("data", []) if isinstance(m, dict)
+            )
+            if is_codexmanager:
+                for rich_model in payload.get("models", []):
+                    if not isinstance(rich_model, dict):
+                        continue
+                    rich_model_id = (
+                        rich_model.get("slug")
+                        or rich_model.get("id")
+                        or rich_model.get("model")
+                    )
+                    if not isinstance(rich_model_id, str) or not rich_model_id.strip():
+                        continue
+                    rich_model_id = rich_model_id.strip()
+                    rich_entry = cache.get(rich_model_id)
+                    if not isinstance(rich_entry, dict):
+                        rich_entry = {
+                            "name": rich_model.get("display_name", rich_model_id),
+                            "owned_by": "codexmanager",
+                        }
+                    rich_context_length = _extract_context_length(rich_model)
+                    if rich_context_length is not None:
+                        rich_entry["context_length"] = rich_context_length
+                    rich_max_completion = _extract_max_completion_tokens(rich_model)
+                    if rich_max_completion is not None:
+                        rich_entry["max_completion_tokens"] = rich_max_completion
+                    _add_model_aliases(cache, rich_model_id, rich_entry)
 
             # If this is a llama.cpp server, query /props for actual allocated context
             is_llamacpp = any(
@@ -1393,7 +1426,12 @@ def _resolve_endpoint_context_length(
     """Resolve context length from an endpoint's live ``/models`` metadata."""
     endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
     matched = endpoint_metadata.get(model)
-    if not matched:
+    is_codexmanager_catalog = any(
+        isinstance(entry, dict)
+        and str(entry.get("owned_by") or "").strip().lower() == "codexmanager"
+        for entry in endpoint_metadata.values()
+    )
+    if not matched and not is_codexmanager_catalog:
         if len(endpoint_metadata) == 1:
             matched = next(iter(endpoint_metadata.values()))
         else:
