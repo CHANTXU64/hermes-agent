@@ -257,6 +257,11 @@ class ResponsesApiTransport(ProviderTransport):
             base_url_hostname: str | None — hostname for backend detection
             is_github_responses: bool — Copilot/GitHub models backend
             is_codex_backend: bool — chatgpt.com/backend-api/codex
+            use_codex_cache_headers: bool — send Codex cache-routing headers
+                (session_id / thread-id / x-client-request-id) on a custom
+                Codex-compatible gateway without other official-backend
+                behavior (max_output_tokens stays sent; encrypted-reasoning
+                issuer stays endpoint-specific)
             is_xai_responses: bool — xAI/Grok backend
             github_reasoning_extra: dict | None — Copilot reasoning params
         """
@@ -278,6 +283,7 @@ class ResponsesApiTransport(ProviderTransport):
 
         is_github_responses = params.get("is_github_responses") is True
         is_codex_backend = params.get("is_codex_backend") is True
+        use_codex_cache_headers = params.get("use_codex_cache_headers") is True
         is_xai_responses = params.get("is_xai_responses") is True
         replay_encrypted_reasoning = bool(
             params.get("replay_encrypted_reasoning", True)
@@ -477,7 +483,7 @@ class ResponsesApiTransport(ProviderTransport):
         else:
             kwargs.pop("timeout", None)
 
-        if is_codex_backend:
+        if is_codex_backend or use_codex_cache_headers:
             # The Codex backend rejects body-level ``extra_headers`` with
             # HTTP 400, but the OpenAI SDK's ``extra_headers`` kwarg maps
             # to actual HTTP request headers (not body fields). ``session_id``

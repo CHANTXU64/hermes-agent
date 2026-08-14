@@ -216,3 +216,35 @@ def test_max_iteration_summary_keeps_codex_recall_after_clean_user(monkeypatch):
     assert "CODEX-SUMMARY-RECALL-SENTINEL" in developer["content"]
     assert messages[0] == {"role": "user", "content": "current question"}
     assert "CODEX-SUMMARY-RECALL-SENTINEL" not in json.dumps(messages)
+
+
+def test_openai_api_gateway_provider_uses_developer_after_user(monkeypatch):
+    """openai-api provider against a Codex Responses gateway must still get
+    the trailing developer memory item (not a user-content suffix)."""
+    agent = _build_agent(monkeypatch)
+    captured = {}
+    prompt = "List the deployment steps"
+
+    def _api_call(api_kwargs):
+        captured.update(api_kwargs)
+        return _final_response("ok")
+
+    _configure(agent, _api_call)
+    agent.provider = "openai-api"
+    agent.base_url = "https://codex.example.com/v1"
+    agent._base_url_lower = agent.base_url.lower()
+    agent._base_url_hostname = "codex.example.com"
+    result = agent.run_conversation(prompt)
+
+    assert result["completed"] is True
+    assert "remembered fact" not in captured["instructions"]
+    input_items = captured["input"]
+    user_index = next(
+        i for i, item in enumerate(input_items)
+        if item.get("role") == "user" and item.get("content") == prompt
+    )
+    developer = input_items[user_index + 1]
+    assert developer["role"] == "developer"
+    assert developer["content"].startswith("<memory-context>")
+    assert f"remembered fact for {prompt}" in developer["content"]
+    assert "remembered fact" not in input_items[user_index]["content"]

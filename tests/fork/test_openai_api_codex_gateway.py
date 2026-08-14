@@ -709,3 +709,100 @@ def test_codexmanager_context_cache_malformed_models_is_a_safe_miss(
     assert metadata._get_endpoint_cached_context_length(
         "gpt-5.6-sol", base_url, api_key
     ) is None
+
+
+class _FakeAgent:
+    """Minimal stand-in for the parts of AIAgent that build_api_kwargs touches."""
+
+    def __init__(self, *, provider, base_url, api_mode="codex_responses"):
+        self.provider = provider
+        self.base_url = base_url
+        self._base_url_hostname = base_url.split("//")[1].split("/")[0]
+        self._base_url_lower = base_url.lower()
+        self.api_mode = api_mode
+        self.model = "gpt-5.6-sol"
+        self.session_id = "physical-session-id"
+        self._gateway_session_key = "agent:main:telegram:dm:424242"
+        self.reasoning_config = {"enabled": True, "effort": "medium"}
+        self.max_tokens = 32000
+        self.tools = []
+        self.request_overrides = {}
+        self._codex_reasoning_replay_enabled = True
+        self._session_db = None
+        # Native server-side compaction is ENABLED on purpose: the custom
+        # gateway tests must prove the isolation gate still omits
+        # ``context_management`` even when every other eligibility check
+        # (model family, compression toggle) passes.
+        self.codex_responses_native_compaction = True
+        self.compression_enabled = True
+
+    def _get_transport(self, api_mode=None):
+        from agent.transports import get_transport
+
+        return get_transport(self.api_mode)
+
+    def _prepare_messages_for_non_vision_model(self, messages):
+        return messages
+
+    def _resolved_api_call_timeout(self):
+        return None
+
+
+def test_openai_api_gateway_sends_cache_routing_headers(monkeypatch):
+    """openai-api on a Codex-compatible gateway must send the same three
+    cache-routing headers as the official openai-codex backend, without
+    enabling native server-side compaction for the custom gateway."""
+    from agent.chat_completion_helpers import build_api_kwargs
+
+    agent = _FakeAgent(
+        provider="openai-api",
+        base_url="https://codex.example.com/v1",
+    )
+    kwargs = build_api_kwargs(
+        agent,
+        [{"role": "system", "content": "You are Hermes."}, {"role": "user", "content": "hi"}],
+        [],
+    )
+
+    assert kwargs["prompt_cache_key"] == "agent:main:telegram:dm:424242"
+    assert kwargs["extra_headers"] == {
+        "session_id": "physical-session-id",
+        "thread-id": "agent:main:telegram:dm:424242",
+        "x-client-request-id": "agent:main:telegram:dm:424242",
+    }
+    # Native compaction stays limited to official OpenAI/ChatGPT routes; a
+    # custom gateway must not receive the context_management field — even
+    # with native compaction enabled and a gpt-5.6 model (both set on the
+    # fake agent above).
+    assert "context_management" not in kwargs
+    # The custom gateway is NOT the official Codex backend: max_output_tokens
+    # must still be sent (the official backend skips it via is_codex_backend).
+    assert kwargs.get("max_output_tokens") == 32000
+
+
+def test_openai_api_gateway_headers_match_official_codex_backend(monkeypatch):
+    """The header set for openai-api must be identical to openai-codex so the
+    gateway cannot distinguish the two transport identities."""
+    from agent.chat_completion_helpers import build_api_kwargs
+
+    openai_api = _FakeAgent(
+        provider="openai-api",
+        base_url="https://codex.example.com/v1",
+    )
+    official = _FakeAgent(
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+
+    api_kwargs = build_api_kwargs(
+        openai_api,
+        [{"role": "user", "content": "hi"}],
+        [],
+    )
+    official_kwargs = build_api_kwargs(
+        official,
+        [{"role": "user", "content": "hi"}],
+        [],
+    )
+
+    assert api_kwargs["extra_headers"] == official_kwargs["extra_headers"]

@@ -1424,16 +1424,36 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
                 and "/backend-api/codex" in agent._base_url_lower
             )
         )
+        # ``openai-api`` on a custom Codex-compatible gateway speaks the same
+        # Responses wire shape and needs the same cache-routing headers, but is
+        # NOT the official Codex backend: it must keep sending
+        # ``max_output_tokens`` and must keep its endpoint-specific encrypted-
+        # reasoning issuer (sealing reasoning blobs to the shared ``codex_backend``
+        # domain would let a gateway-switch replay foreign blobs → HTTP 400
+        # ``invalid_encrypted_content``).
+        use_codex_cache_headers = is_codex_backend or agent.provider == "openai-api"
         is_xai_responses = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
         _msgs_for_codex = agent._prepare_messages_for_non_vision_model(api_messages)
 
         # Native server-side compaction (gpt-5.6 on direct OpenAI API /
         # ChatGPT Codex routes only) — None on every other route/model, in
         # which case the request is unchanged from pre-feature behavior.
+        # ``openai-api`` on a custom Codex-compatible gateway gets the cache
+        # routing headers (it is a Codex Responses backend) but is NOT a
+        # direct OpenAI route: sending ``context_management`` there could be
+        # rejected by the gateway, so compaction eligibility stays limited to
+        # the official OpenAI/ChatGPT surfaces.
         from agent.native_compaction import native_compaction_context_management
+        _official_codex_backend = (
+            agent.provider == "openai-codex"
+            or (
+                agent._base_url_hostname == "chatgpt.com"
+                and "/backend-api/codex" in agent._base_url_lower
+            )
+        )
         _context_management = native_compaction_context_management(
             agent,
-            is_codex_backend=is_codex_backend,
+            is_codex_backend=_official_codex_backend,
             is_xai_responses=is_xai_responses,
             is_github_responses=is_github_responses,
         )
@@ -1485,6 +1505,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             provider=getattr(agent, "provider", None),
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
+            use_codex_cache_headers=use_codex_cache_headers,
             is_xai_responses=is_xai_responses,
             github_reasoning_extra=agent._github_models_reasoning_extra_body() if is_github_responses else None,
             replay_encrypted_reasoning=bool(

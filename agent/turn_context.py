@@ -160,7 +160,7 @@ def uses_openai_memory_developer_after_user(agent: Any) -> bool:
     host = str(getattr(agent, "_base_url_hostname", "") or "").strip().lower()
     base = str(getattr(agent, "_base_url_lower", "") or "").strip().lower()
     return (
-        provider in {"openai", "openai-codex"}
+        provider in {"openai", "openai-codex", "openai-api"}
         or host == "api.openai.com"
         or (host == "chatgpt.com" and "/backend-api/codex" in base)
     )

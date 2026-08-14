@@ -1709,9 +1709,13 @@ Files:
 
 - `agent/auxiliary_client.py`
 - `agent/model_metadata.py`
+- `agent/chat_completion_helpers.py`
+- `agent/transports/codex.py`
+- `agent/turn_context.py`
 - `plugins/image_gen/openai-codex/__init__.py`
 - `tests/plugins/image_gen/test_openai_codex_provider.py`
 - `tests/fork/test_openai_api_codex_gateway.py`
+- `tests/fork/test_codex_request_only_memory_context.py`
 - `tests/fork/test_image_gen_openai_api.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
@@ -1728,6 +1732,8 @@ What changed:
 - Exact CodexManager context values are retained in `~/.hermes/endpoint_context_cache.json`, scoped by normalized endpoint, API-key SHA-256 fingerprint, and model. A newer exact value replaces the old one; a partial/failed catalog reuses the last valid value without resurrecting cached models in the live model list.
 - The five-minute in-memory endpoint catalog uses the same credential scope, so two API keys on one CodexManager URL cannot reuse each other's 272K/372K metadata.
 - For custom `openai-api` endpoints, the public context resolver consults live/credential-scoped metadata before the legacy `model@base_url` cache; official OpenAI URLs and other providers retain the prior cache order.
+- Main-session Codex transport sends the same three cache-routing headers (`session_id` / `thread-id` / `x-client-request-id`) to a custom `openai-api` Codex-compatible gateway as it sends on `openai-codex` (upstream only sends two of them), via a dedicated `use_codex_cache_headers` flag. Unlike the official backend, the custom gateway still receives `max_output_tokens` and keeps its endpoint-specific encrypted-reasoning issuer (reasoning blobs are sealed per endpoint; stamping a custom gateway as the shared `codex_backend` issuer would let a gateway switch replay foreign blobs → HTTP 400 `invalid_encrypted_content`). Native server-side compaction (`context_management`) stays limited to official OpenAI/ChatGPT routes so a custom gateway never receives that field.
+- Request-only memory recall on `openai-api` Codex Responses routes is injected as a trailing `role=developer` input item after the current user message (same shape as `openai-codex`), instead of being appended into the user content.
 
 Why it matters:
 
@@ -1744,6 +1750,7 @@ Verification:
 ```bash
 ./venv/bin/python -m pytest \
   tests/fork/test_openai_api_codex_gateway.py \
+  tests/fork/test_codex_request_only_memory_context.py \
   tests/fork/test_image_gen_openai_api.py \
   tests/plugins/image_gen/test_openai_codex_provider.py \
   tests/agent/test_auxiliary_client.py \
@@ -1752,8 +1759,11 @@ Verification:
   -q -o 'addopts='
 ./venv/bin/python -m py_compile \
   agent/auxiliary_client.py agent/model_metadata.py \
+  agent/chat_completion_helpers.py agent/transports/codex.py \
+  agent/turn_context.py \
   plugins/image_gen/openai-codex/__init__.py \
   tests/fork/test_openai_api_codex_gateway.py \
+  tests/fork/test_codex_request_only_memory_context.py \
   tests/fork/test_image_gen_openai_api.py
 ```
 
@@ -1901,9 +1911,13 @@ deltas are expected in these areas:
 - OpenAI API Codex-compatible gateway integration:
   - `agent/auxiliary_client.py`
   - `agent/model_metadata.py`
+  - `agent/chat_completion_helpers.py`
+  - `agent/transports/codex.py`
+  - `agent/turn_context.py`
   - `plugins/image_gen/openai-codex/__init__.py`
   - `tests/plugins/image_gen/test_openai_codex_provider.py`
   - `tests/fork/test_openai_api_codex_gateway.py`
+  - `tests/fork/test_codex_request_only_memory_context.py`
   - `tests/fork/test_image_gen_openai_api.py`
   - `docs/LOCAL_MODIFICATIONS.md`
 
