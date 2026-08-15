@@ -7945,6 +7945,9 @@ class AIAgent:
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
+            provider=function_args.get("provider"),
+            model=function_args.get("model"),
+            reasoning_effort=function_args.get("reasoning_effort"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),

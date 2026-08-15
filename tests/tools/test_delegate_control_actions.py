@@ -253,6 +253,21 @@ def test_delegate_task_routes_control_action_before_spawn_machinery():
     assert out["action"] == "list"
 
 
+def test_delegate_task_control_action_rejects_spawn_route_fields():
+    out = json.loads(
+        delegate_task(
+            action="list",
+            model="deepseek-v4-pro",
+            reasoning_effort="high",
+            parent_agent=_StubParent(),
+        )
+    )
+    assert "error" in out
+    assert "action='list'" in out["error"]
+    assert "model" in out["error"]
+    assert "reasoning_effort" in out["error"]
+
+
 def test_delegate_task_control_action_bypasses_spawn_pause():
     from tools.delegate_tool import set_spawn_paused
 

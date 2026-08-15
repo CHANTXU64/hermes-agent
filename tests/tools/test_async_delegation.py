@@ -153,6 +153,59 @@ def test_async_executor_workers_are_daemon_threads():
     assert _drain_one() is not None
 
 
+def test_async_batch_persists_and_emits_per_task_routes():
+    gate = threading.Event()
+    routes = [
+        {
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "reasoning_effort": "high",
+        },
+        {
+            "provider": "opencode-go",
+            "model": "glm-5",
+            "reasoning_effort": "medium",
+        },
+    ]
+
+    def runner():
+        gate.wait(timeout=60)
+        return {
+            "results": [
+                {"task_index": 0, "status": "completed", "summary": "one"},
+                {"task_index": 1, "status": "completed", "summary": "two"},
+            ],
+            "total_duration_seconds": 0.1,
+        }
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["Investigate first route", "Investigate second route"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        routes=routes,
+        session_key="route-owner",
+        runner=runner,
+        max_async_children=3,
+    )
+    assert result["status"] == "dispatched"
+    current = next(
+        item
+        for item in ad.list_async_delegations()
+        if item["delegation_id"] == result["delegation_id"]
+    )
+    assert current["routes"] == routes
+    durable = ad.get_durable_delegation(result["delegation_id"])
+    assert durable is not None
+    assert durable["task"]["routes"] == routes
+
+    gate.set()
+    event = _drain_one()
+    assert event is not None
+    assert event["routes"] == routes
+
+
 def test_completion_event_lands_on_shared_queue_with_session_key():
     def runner():
         return {"status": "completed", "summary": "the result",

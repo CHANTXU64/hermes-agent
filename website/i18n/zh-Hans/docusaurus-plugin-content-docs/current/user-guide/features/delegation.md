@@ -157,9 +157,57 @@ delegation:
   provider: "openrouter"             # 可选：将子智能体路由到不同的提供商
 ```
 
-解析顺序：`delegation.base_url`（直连端点）优先，其次是 `delegation.provider`（通过运行时提供商系统解析完整凭证包）；两者都未设置时，子智能体继承父智能体的提供商和凭证。`delegation.model` 在所有情况下生效，为空时子智能体继承父智能体的模型。
+已配置默认值的解析顺序保持不变：`delegation.base_url`（直连端点）优先，其次是 `delegation.provider`（通过运行时 provider 系统解析完整凭据）；两者都未设置时，子智能体继承父智能体的 provider 和凭据。`delegation.model` 应用于该默认 route；为空时继承父智能体模型。
 
-注意此固定是全局的：`delegate_task` 没有按任务指定模型的参数，批处理中的每个子智能体都运行配置的委派模型。对于需要更强模型的质量敏感型子任务，可以在该会话中不设置 `delegation.model`，或者将任务交给[看板](kanban.md)——看板支持按任务覆盖模型。
+### 单次调用覆盖 provider、模型与推理强度
+
+`delegate_task` 可以只为当前一次委派覆盖默认 route：
+
+```python
+delegate_task(
+    goal="使用更强模型审查这个补丁",
+    provider="openai-api",
+    model="gpt-5.6-terra-pro",
+    reasoning_effort="high",
+)
+```
+
+三个字段彼此独立：
+
+- 三者都不传时，现有 `delegation.*` 配置与父智能体继承行为保持不变。
+- 只传 `reasoning_effort` 时保留继承的子智能体 route，只改变本次推理强度。
+- 只传 `model` 时，从已认证的模型选择器目录中查找 provider。恰好一个匹配才自动选择；零匹配或多个匹配会明确报错，不猜测。
+- 同时传 `provider` 和 `model` 时使用该精确 route。如果已认证 provider 有非空模型目录，而指定模型不在目录中，Hermes 会在启动子智能体前拒绝。没有目录的自定义/直连 provider 继续交给现有运行时解析。
+- 切换 route 但未显式指定强度时，会按**目标模型**重新解析 `agent.reasoning_overrides` / 全局推理设置，不复制父模型专属的强度。
+
+Hermes 会先检查显式推理强度能否由所选 provider/model 的请求构造路径原样发送。能够原样发送时，子智能体使用该值；如果传输层会钳制、映射或省略，Hermes 仍保留已经选定的 provider 和模型，但把本次强度视为未指定，改用目标模型正常的 `agent.reasoning_overrides`、全局推理配置或 provider 默认值。Hermes 不会声称不受支持的请求值已经生效，也不会为此切换模型。超出 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra` 的值仍会报错。
+
+批量调用中，顶层字段是所有任务的默认值，每个任务项可以覆盖任意子集：
+
+```python
+delegate_task(
+    reasoning_effort="medium",
+    tasks=[
+        {
+            "goal": "研究实现机制",
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "reasoning_effort": "high",
+        },
+        {
+            "goal": "独立反驳研究结论",
+            "provider": "opencode-go",
+            "model": "glm-5",
+        },
+    ],
+)
+```
+
+每项结果和后台委派记录都会包含安全的实际 route 元数据（已知时包含 `provider`、`model` 以及子智能体选定的 `reasoning_effort` 配置），不会包含 API key 或端点密钥。后台批量记录按任务持久化 route，因此混合 provider 批次在重启后仍可审计。本功能不新增、也不重设计模型 fallback。
+
+路由错误会把紧凑的 Markdown 表格直接放进错误正文，完整模型目录不会写入常驻工具 schema。模型不存在或不属于指定 provider 时，Hermes 最多显示 10 个**常用且当前可用的模型**和 10 个**名称相似且当前可用的模型**，按 `(provider, model)` 去重，表格总预算为 1,800 字符。常用模型来自当前 profile 的本地 `state.db` 最近 30 天记录，依次按实际 API 调用量、会话数、token 用量和最近使用时间排序，再与当前已认证的精选模型目录取交集，因此历史上常用但现在已不可用的 route 不会被推荐。相似模型只来自同一当前目录，模型名相似度至少为 0.55。显式指定 provider 后，两组都只显示该 provider 下的模型。
+
+以上查询只读本地数据：不会调用 LLM、启动子智能体、强制刷新 provider 目录或自动替换模型。模型名有歧义时会直接列出当前精确匹配的 provider/model route。若无法生成安全的当前候选表，错误才退回到本机可用的发现入口：`hermes model --refresh`、`hermes auth list` 或 `hermes auth list <provider>`。
 
 ## 继承的工具访问权限
 

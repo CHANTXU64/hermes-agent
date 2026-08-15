@@ -166,9 +166,57 @@ delegation:
   provider: "openrouter"             # optional: route children to a different provider
 ```
 
-Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model.
+Resolution order for the configured default remains: `delegation.base_url` (direct endpoint), then `delegation.provider` (full credential bundle resolved through the runtime provider system), otherwise the child inherits the parent's provider and credentials. `delegation.model` applies to that configured route; when empty, the child inherits the parent's model.
 
-Note that the pin is global: `delegate_task` has no per-task model parameter, so every child in a batch runs on the configured delegation model. For quality-sensitive subtasks that need a stronger model, either leave `delegation.model` unset for that session or hand the task to the [kanban board](kanban.md#per-task-model-override), which does support a per-task model override.
+### Per-invocation provider, model, and reasoning
+
+`delegate_task` can override the configured/default child route for one invocation:
+
+```python
+delegate_task(
+    goal="Review this patch with a stronger model",
+    provider="openai-api",
+    model="gpt-5.6-terra-pro",
+    reasoning_effort="high",
+)
+```
+
+The three fields are independent:
+
+- With none of them, existing `delegation.*` configuration and parent inheritance remain unchanged.
+- `reasoning_effort` alone keeps the inherited child route and changes only the requested reasoning strength.
+- `model` alone searches the authenticated model picker inventory. Exactly one provider match is selected; zero or multiple matches fail with guidance instead of guessing.
+- `provider` plus `model` selects that exact route. When the authenticated provider has a non-empty model catalog, Hermes rejects a model that is absent from it. Providers without a catalog (for example some custom/direct endpoints) continue through normal runtime-provider resolution.
+- A routed model with no explicit effort resolves the normal `agent.reasoning_overrides` / global reasoning setting for the **target** model rather than copying a parent-model-specific effort.
+
+Hermes first checks whether an explicit reasoning value can be sent unchanged by the selected provider/model request builder. When it can, the child receives that exact value. When it would be clamped, mapped, or omitted, Hermes keeps the selected provider and model but treats the per-call value as unspecified: the child uses the target model's normal `agent.reasoning_overrides`, global reasoning configuration, or provider default. Hermes does not claim that the unsupported requested value took effect and does not switch models. Values outside `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra` remain an error.
+
+Top-level fields are defaults for every item in a batch, and each item can override any subset:
+
+```python
+delegate_task(
+    reasoning_effort="medium",
+    tasks=[
+        {
+            "goal": "Research the implementation",
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "reasoning_effort": "high",
+        },
+        {
+            "goal": "Critique the result independently",
+            "provider": "opencode-go",
+            "model": "glm-5",
+        },
+    ],
+)
+```
+
+Each result and background delegation record includes safe effective route metadata (`provider`, `model`, and the selected child `reasoning_effort` configuration when known). Credentials and endpoint secrets are never included. Background batch records persist a route entry per task, so mixed-provider batches remain auditable after restart. This feature does not add or redesign model fallback behavior.
+
+Routing errors put compact Markdown tables directly in the error text; the full catalog is never embedded in the persistent tool schema. For missing or provider-mismatched models, Hermes can show up to 10 **frequently used available models** and 10 **similar available models**, deduplicated by `(provider, model)` under a 1,800-character table budget. Frequent routes come from the current profile's local `state.db` usage over the last 30 days, ranked by actual API calls, sessions, token use, and recency, then intersected with the current authenticated curated inventory. Historical routes that are no longer available are therefore excluded. Similar routes come only from that same current inventory and require a model-name similarity score of at least 0.55. An explicitly requested provider constrains both groups to that provider.
+
+This lookup is local and read-only: it does not invoke an LLM, start a subagent, force a provider catalog refresh, or substitute a model automatically. Ambiguous model names list the exact currently matching provider/model routes. If no safe current table can be built, the error falls back to the installed discovery commands: `hermes model --refresh`, `hermes auth list`, or `hermes auth list <provider>`.
 
 ## Inherited Tool Access
 

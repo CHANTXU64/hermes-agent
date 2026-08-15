@@ -131,6 +131,18 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("up to 7", overrides["description"])
         self.assertNotIn("max_spawn_depth", overrides["description"])
 
+    @patch(
+        "hermes_cli.inventory.build_models_payload",
+        side_effect=AssertionError("model catalog must not enter persistent tool schema"),
+    )
+    def test_dynamic_schema_never_loads_model_catalog(self, _mock_payload):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        schema = _build_dynamic_schema_overrides()
+        serialized = json.dumps(schema, ensure_ascii=False)
+        self.assertNotIn("gpt-5.6-terra-pro", serialized)
+        self.assertNotIn("deepseek-v4-pro", serialized)
+
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
         prompt = _build_child_system_prompt("Fix the tests")
@@ -701,8 +713,12 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         cfg = {"model": "some-model", "provider": "openrouter"}
         with self.assertRaises(ValueError) as ctx:
             _resolve_delegation_credentials(cfg, parent)
-        self.assertIn("openrouter", str(ctx.exception).lower())
-        self.assertIn("Cannot resolve", str(ctx.exception))
+        message = str(ctx.exception)
+        self.assertIn("openrouter", message.lower())
+        self.assertIn("Cannot resolve", message)
+        self.assertIn("hermes auth list openrouter", message)
+        self.assertIn("hermes model --refresh", message)
+        self.assertNotIn("Available providers:", message)
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolves_but_no_api_key_raises(self, mock_resolve):
@@ -717,7 +733,9 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         cfg = {"model": "some-model", "provider": "openrouter"}
         with self.assertRaises(ValueError) as ctx:
             _resolve_delegation_credentials(cfg, parent)
-        self.assertIn("no API key", str(ctx.exception))
+        message = str(ctx.exception)
+        self.assertIn("no API key", message)
+        self.assertIn("hermes auth list openrouter", message)
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_named_custom_provider_preserves_provider_name(self, mock_resolve):
@@ -869,6 +887,856 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("Cannot resolve", result["error"])
         self.assertIn("nonexistent", result["error"])
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch("hermes_cli.inventory.load_picker_context")
+    @patch("hermes_cli.inventory.build_models_payload")
+    def test_model_only_ambiguous_catalog_match_requires_provider(
+        self, mock_payload, _mock_context, _mock_cfg
+    ):
+        mock_payload.return_value = {
+            "providers": [
+                {"slug": "deepseek", "models": ["deepseek-v4-pro"]},
+                {"slug": "opencode-go", "models": ["deepseek-v4-pro"]},
+            ]
+        }
+        result = json.loads(
+            delegate_task(
+                goal="Use one unambiguous route",
+                model="deepseek-v4-pro",
+                parent_agent=_make_mock_parent(depth=0),
+            )
+        )
+        self.assertIn("error", result)
+        self.assertIn("multiple configured providers", result["error"])
+        self.assertIn("deepseek", result["error"])
+        self.assertIn("opencode-go", result["error"])
+        self.assertIn("'provider'", result["error"])
+        self.assertEqual(result["error_code"], "ambiguous_model")
+        self.assertIn("**Available routes**", result["error"])
+        self.assertIn("| deepseek | deepseek-v4-pro |", result["error"])
+        self.assertIn("| opencode-go | deepseek-v4-pro |", result["error"])
+        self.assertNotIn("candidates", result)
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch(
+        "tools.delegate_tool._recent_delegation_route_usage",
+        create=True,
+        return_value=[
+            {
+                "provider": "openai-codex",
+                "model": "gpt-5.5",
+                "api_calls": 9000,
+                "sessions": 100,
+                "total_tokens": 1000000,
+                "last_used_at": 999,
+            },
+            {
+                "provider": "opencode-go",
+                "model": "glm-5",
+                "api_calls": 800,
+                "sessions": 20,
+                "total_tokens": 80000,
+                "last_used_at": 800,
+            },
+            {
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro",
+                "api_calls": 700,
+                "sessions": 15,
+                "total_tokens": 70000,
+                "last_used_at": 700,
+            },
+        ],
+    )
+    @patch("hermes_cli.inventory.load_picker_context")
+    @patch("hermes_cli.inventory.build_models_payload")
+    def test_model_only_missing_catalog_match_returns_available_markdown_suggestions(
+        self, mock_payload, _mock_context, _mock_usage, _mock_cfg
+    ):
+        mock_payload.return_value = {
+            "providers": [
+                {
+                    "slug": "deepseek",
+                    "models": [
+                        "missing-model-v2",
+                        "deepseek-v4-pro",
+                        "deepseek-v4-flash",
+                        "other-a",
+                    ],
+                },
+                {
+                    "slug": "opencode-go",
+                    "models": [
+                        "missing-model-mini",
+                        "glm-5",
+                        "other-b",
+                        "other-c",
+                    ],
+                },
+            ]
+        }
+        result = json.loads(
+            delegate_task(
+                goal="Reject a model that is not available",
+                model="missing-model",
+                parent_agent=_make_mock_parent(depth=0),
+            )
+        )
+        self.assertEqual(result["error_code"], "model_not_found")
+        message = result["error"]
+        self.assertIn("Model 'missing-model'", message)
+        self.assertIn("**Frequently used available models**", message)
+        self.assertIn("**Similar available models**", message)
+        self.assertIn("| Provider | Model |", message)
+        self.assertIn("| opencode-go | glm-5 |", message)
+        self.assertIn("| deepseek | deepseek-v4-pro |", message)
+        self.assertIn("| deepseek | missing-model-v2 |", message)
+        self.assertIn("| opencode-go | missing-model-mini |", message)
+        self.assertNotIn("openai-codex", message)
+        self.assertNotIn("gpt-5.5", message)
+        self.assertNotIn("candidates", result)
+        self.assertLessEqual(len(message), 2400)
+
+    def test_recent_route_usage_reads_profile_db_and_ranks_actual_calls(self):
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+
+        import tools.delegate_tool as delegate_module
+
+        now = time.time()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            conn = sqlite3.connect(home / "state.db")
+            conn.executescript(
+                """
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    started_at REAL,
+                    billing_provider TEXT,
+                    model TEXT,
+                    api_call_count INTEGER,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER
+                );
+                CREATE TABLE session_model_usage (
+                    session_id TEXT,
+                    model TEXT,
+                    billing_provider TEXT,
+                    api_call_count INTEGER,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER
+                );
+                """
+            )
+            sessions = [
+                ("a", now - 100, "deepseek", "deepseek-v4-pro", 0, 0, 0, 0, 0),
+                ("b", now - 50, "opencode-go", "glm-5", 0, 0, 0, 0, 0),
+                ("old", now - 40 * 86400, "openai-codex", "gpt-5.5", 0, 0, 0, 0, 0),
+            ]
+            conn.executemany(
+                "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                sessions,
+            )
+            conn.executemany(
+                "INSERT INTO session_model_usage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    ("a", "deepseek-v4-pro", "deepseek", 20, 100, 20, 0, 0, 0),
+                    ("b", "glm-5", "opencode-go", 50, 50, 10, 0, 0, 0),
+                    ("old", "gpt-5.5", "openai-codex", 999, 999, 999, 0, 0, 0),
+                ],
+            )
+            conn.commit()
+            conn.close()
+
+            with patch("hermes_constants.get_hermes_home", return_value=home):
+                usage = delegate_module._recent_delegation_route_usage(days=30)
+
+        self.assertEqual(
+            [(row["provider"], row["model"]) for row in usage],
+            [("opencode-go", "glm-5"), ("deepseek", "deepseek-v4-pro")],
+        )
+        self.assertEqual([row["api_calls"] for row in usage], [50, 20])
+
+    def test_markdown_route_suggestions_are_deduplicated_and_bounded(self):
+        import tools.delegate_tool as delegate_module
+
+        models = [f"wanted-model-{index:02d}" for index in range(25)]
+        payload = {
+            "providers": [
+                {"slug": "deepseek", "models": models[:15]},
+                {"slug": "opencode-go", "models": models[10:]},
+            ]
+        }
+        usage = [
+            {
+                "provider": "deepseek",
+                "model": model,
+                "api_calls": 100 - index,
+            }
+            for index, model in enumerate(models[:15])
+        ]
+        usage.insert(
+            0,
+            {
+                "provider": "openai-codex",
+                "model": "gpt-5.5",
+                "api_calls": 9999,
+            },
+        )
+
+        with patch(
+            "tools.delegate_tool._recent_delegation_route_usage",
+            return_value=usage,
+        ):
+            markdown = delegate_module._route_suggestion_markdown(
+                payload, requested_model="wanted-model"
+            )
+
+        data_rows = [
+            line
+            for line in markdown.splitlines()
+            if line.startswith("| ") and line != "| Provider | Model |"
+        ]
+        self.assertLessEqual(len(data_rows), 20)
+        self.assertEqual(len(data_rows), len(set(data_rows)))
+        self.assertLessEqual(len(markdown), 1800)
+        self.assertNotIn("openai-codex", markdown)
+        self.assertNotIn("gpt-5.5", markdown)
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch("hermes_cli.inventory.load_picker_context")
+    @patch("hermes_cli.inventory.build_models_payload")
+    def test_batch_routing_error_keeps_structured_candidates_and_task_index(
+        self, mock_payload, _mock_context, _mock_cfg
+    ):
+        mock_payload.return_value = {
+            "providers": [
+                {"slug": "deepseek", "models": ["deepseek-v4-pro"]},
+                {"slug": "opencode-go", "models": ["deepseek-v4-pro"]},
+            ]
+        }
+        result = json.loads(
+            delegate_task(
+                tasks=[
+                    {
+                        "goal": "Reject ambiguous task route before spawning",
+                        "model": "deepseek-v4-pro",
+                    },
+                    {"goal": "This task must not spawn after routing validation fails"},
+                ],
+                parent_agent=_make_mock_parent(depth=0),
+            )
+        )
+        self.assertEqual(result["error_code"], "ambiguous_model")
+        self.assertEqual(result["task_index"], 0)
+        self.assertIn("Task 0 routing invalid", result["error"])
+        self.assertIn("**Available routes**", result["error"])
+        self.assertNotIn("candidates", result)
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch("hermes_cli.inventory.load_picker_context")
+    @patch("hermes_cli.inventory.build_models_payload")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_model_only_unique_catalog_match_routes_child_provider(
+        self, mock_runtime, mock_payload, mock_context, _mock_cfg
+    ):
+        """A model-only invocation infers the one authenticated provider that
+        exposes the model, then resolves that provider with the target model.
+        """
+        mock_payload.return_value = {
+            "providers": [
+                {"slug": "deepseek", "models": ["deepseek-v4-flash"]},
+                {"slug": "opencode-go", "models": ["glm-5"]},
+            ]
+        }
+        mock_runtime.return_value = {
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "deepseek-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "deepseek-v4-flash"
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Use the requested model",
+                    model="deepseek-v4-flash",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertNotIn("error", result)
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["provider"], "deepseek")
+        self.assertEqual(kwargs["model"], "deepseek-v4-flash")
+        self.assertEqual(kwargs["base_url"], "https://api.deepseek.com/v1")
+        mock_runtime.assert_called_once_with(
+            requested="deepseek", target_model="deepseek-v4-flash"
+        )
+
+    @patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {"deepseek-v4-flash": "low"},
+            }
+        },
+    )
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch("hermes_cli.inventory.load_picker_context")
+    @patch("hermes_cli.inventory.build_models_payload")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_model_only_uses_target_model_reasoning_override_not_parent(
+        self,
+        mock_runtime,
+        mock_payload,
+        mock_context,
+        _mock_cfg,
+        _mock_full_cfg,
+    ):
+        mock_payload.return_value = {
+            "providers": [{"slug": "deepseek", "models": ["deepseek-v4-flash"]}]
+        }
+        mock_runtime.return_value = {
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "deepseek-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "deepseek-v4-flash"
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Use target defaults",
+                    model="deepseek-v4-flash",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertNotIn("error", result)
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(
+            kwargs["reasoning_config"], {"enabled": True, "effort": "low"}
+        )
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch("tools.delegate_tool._explicit_reasoning_effort_is_exact", return_value=True)
+    @patch("hermes_cli.inventory.load_picker_context")
+    @patch("hermes_cli.inventory.build_models_payload")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_batch_tasks_route_independently(
+        self,
+        mock_runtime,
+        mock_payload,
+        _mock_context,
+        _mock_reasoning,
+        _mock_cfg,
+    ):
+        mock_payload.return_value = {
+            "providers": [
+                {
+                    "slug": "deepseek",
+                    "models": ["shared-model", "deepseek-v4-pro"],
+                },
+                {
+                    "slug": "opencode-go",
+                    "models": ["shared-model", "glm-5"],
+                },
+            ]
+        }
+        def resolve_route(*, requested, target_model):
+            base_urls = {
+                "deepseek": "https://api.deepseek.com/v1",
+                "opencode-go": "https://opencode.ai/zen/go/v1",
+            }
+            return {
+                "provider": requested,
+                "model": target_model,
+                "base_url": base_urls[requested],
+                "api_key": f"{requested}-key",
+                "api_mode": "chat_completions",
+            }
+
+        mock_runtime.side_effect = resolve_route
+        parent = _make_mock_parent(depth=0)
+        built = []
+
+        def build_child(**kwargs):
+            built.append(kwargs)
+            child = MagicMock()
+            child._delegate_saved_tool_names = []
+            child._credential_pool = None
+            child.session_prompt_tokens = 0
+            child.session_completion_tokens = 0
+            child.model = kwargs["model"]
+            return child
+
+        with (
+            patch(
+                "tools.delegate_tool._build_child_preserving_parent_tools",
+                side_effect=build_child,
+            ),
+            patch("tools.delegate_tool._run_single_child") as mock_run,
+        ):
+            mock_run.side_effect = [
+                {
+                    "task_index": 0,
+                    "status": "completed",
+                    "summary": "first",
+                    "api_calls": 1,
+                    "duration_seconds": 0.1,
+                },
+                {
+                    "task_index": 1,
+                    "status": "completed",
+                    "summary": "second",
+                    "api_calls": 1,
+                    "duration_seconds": 0.1,
+                },
+            ]
+            result = json.loads(
+                delegate_task(
+                    model="shared-model",
+                    tasks=[
+                        {
+                            "goal": "Investigate DeepSeek route",
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-pro",
+                            "reasoning_effort": "high",
+                        },
+                        {
+                            "goal": "Investigate OpenCode route",
+                            "provider": "opencode-go",
+                            "model": "glm-5",
+                            "reasoning_effort": "medium",
+                        },
+                    ],
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertNotIn("error", result)
+        self.assertEqual(
+            [item["override_provider"] for item in built],
+            ["deepseek", "opencode-go"],
+        )
+        self.assertEqual(
+            [item["model"] for item in built], ["deepseek-v4-pro", "glm-5"]
+        )
+        self.assertEqual(
+            [item["override_reasoning_config"] for item in built],
+            [
+                {"enabled": True, "effort": "high"},
+                {"enabled": True, "effort": "medium"},
+            ],
+        )
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch(
+        "tools.delegate_tool._recent_delegation_route_usage",
+        return_value=[
+            {"provider": "deepseek", "model": "deepseek-v4-pro", "api_calls": 20},
+            {"provider": "opencode-go", "model": "glm-5", "api_calls": 10},
+        ],
+    )
+    @patch("hermes_cli.inventory.load_picker_context")
+    @patch("hermes_cli.inventory.build_models_payload")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_provider_resolution_failure_has_bounded_safe_route_candidates(
+        self, mock_runtime, mock_payload, _mock_context, _mock_usage, _mock_cfg
+    ):
+        mock_runtime.side_effect = RuntimeError("credential unavailable")
+        mock_payload.return_value = {
+            "providers": [
+                {"slug": "deepseek", "models": ["deepseek-v4-pro"]},
+                {"slug": "opencode-go", "models": ["glm-5"]},
+            ]
+        }
+        result = json.loads(
+            delegate_task(
+                goal="Reject an unavailable provider before spawning",
+                provider="missing-provider",
+                model="wanted-model",
+                parent_agent=_make_mock_parent(depth=0),
+            )
+        )
+        self.assertEqual(result["error_code"], "provider_unavailable")
+        self.assertIn("**Frequently used available models**", result["error"])
+        self.assertIn("| deepseek | deepseek-v4-pro |", result["error"])
+        self.assertIn("| opencode-go | glm-5 |", result["error"])
+        self.assertNotIn("candidates", result)
+        serialized = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("api_key", serialized)
+        self.assertNotIn("base_url", serialized)
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch(
+        "tools.delegate_tool._recent_delegation_route_usage",
+        return_value=[
+            {"provider": "opencode-go", "model": "glm-5", "api_calls": 10},
+            {"provider": "deepseek", "model": "deepseek-v4-pro", "api_calls": 20},
+        ],
+    )
+    @patch("hermes_cli.inventory.load_picker_context")
+    @patch("hermes_cli.inventory.build_models_payload")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_explicit_provider_rejects_model_missing_from_known_catalog(
+        self, mock_runtime, mock_payload, _mock_context, _mock_usage, _mock_cfg
+    ):
+        mock_payload.return_value = {
+            "providers": [{"slug": "opencode-go", "models": ["glm-5"]}]
+        }
+        mock_runtime.return_value = {
+            "provider": "opencode-go",
+            "model": "missing-model",
+            "base_url": "https://opencode.ai/zen/go/v1",
+            "api_key": "opencode-key",
+            "api_mode": "chat_completions",
+        }
+        with patch("run_agent.AIAgent") as mock_agent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "unexpected execution",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "missing-model"
+            mock_agent.return_value = mock_child
+            result = json.loads(
+                delegate_task(
+                    goal="Reject unavailable explicit route",
+                    provider="opencode-go",
+                    model="missing-model",
+                    parent_agent=_make_mock_parent(depth=0),
+                )
+            )
+        self.assertIn("error", result)
+        self.assertIn("missing-model", result["error"])
+        self.assertIn("opencode-go", result["error"])
+        self.assertEqual(result["error_code"], "model_not_on_provider")
+        self.assertIn("**Frequently used available models**", result["error"])
+        self.assertIn("| opencode-go | glm-5 |", result["error"])
+        self.assertNotIn("deepseek-v4-pro", result["error"])
+        self.assertNotIn("candidates", result)
+        mock_agent.assert_not_called()
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch("hermes_cli.inventory.build_models_payload")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_explicit_provider_and_model_use_exact_route_without_inference(
+        self, mock_runtime, mock_payload, _mock_cfg
+    ):
+        mock_payload.return_value = {
+            "providers": [
+                {"slug": "opencode-go", "models": ["deepseek-v4-flash"]}
+            ]
+        }
+        mock_runtime.return_value = {
+            "provider": "opencode-go",
+            "model": "deepseek-v4-flash",
+            "base_url": "https://opencode.ai/zen/go/v1",
+            "api_key": "opencode-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "deepseek-v4-flash"
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Use the exact requested route",
+                    provider="opencode-go",
+                    model="deepseek-v4-flash",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertNotIn("error", result)
+        mock_payload.assert_called_once()
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["provider"], "opencode-go")
+        self.assertEqual(kwargs["model"], "deepseek-v4-flash")
+        self.assertEqual(kwargs["base_url"], "https://opencode.ai/zen/go/v1")
+        mock_runtime.assert_called_once_with(
+            requested="opencode-go", target_model="deepseek-v4-flash"
+        )
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_explicit_reasoning_effort_reaches_target_child(
+        self, mock_runtime, _mock_cfg
+    ):
+        mock_runtime.return_value = {
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "deepseek-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "deepseek-v4-pro"
+            mock_child.provider = "deepseek"
+            mock_child.reasoning_config = {"enabled": True, "effort": "high"}
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Reason at the requested level",
+                    provider="deepseek",
+                    model="deepseek-v4-pro",
+                    reasoning_effort="high",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertNotIn("error", result)
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(
+            kwargs["reasoning_config"], {"enabled": True, "effort": "high"}
+        )
+        self.assertEqual(result["results"][0]["provider"], "deepseek")
+        self.assertEqual(result["results"][0]["model"], "deepseek-v4-pro")
+        self.assertEqual(result["results"][0]["reasoning_effort"], "high")
+
+    @patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={
+            "agent": {
+                "reasoning_effort": "medium",
+                "reasoning_overrides": {"deepseek-v4-pro": "low"},
+            }
+        },
+    )
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_reasoning_effort_unsupported_uses_target_auto_config(
+        self, mock_runtime, _mock_cfg, _mock_full_cfg
+    ):
+        mock_runtime.return_value = {
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "deepseek-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "deepseek-v4-pro"
+            mock_child.provider = "deepseek"
+            mock_child.reasoning_config = {"enabled": True, "effort": "low"}
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Use automatic reasoning when minimal is unsupported",
+                    provider="deepseek",
+                    model="deepseek-v4-pro",
+                    reasoning_effort="minimal",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertNotIn("error", result)
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(
+            kwargs["reasoning_config"], {"enabled": True, "effort": "low"}
+        )
+
+    @patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"agent": {"reasoning_effort": "medium"}},
+    )
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch("tools.delegate_tool._exact_reasoning_efforts_for_route", return_value=[])
+    @patch("hermes_cli.inventory.load_picker_context")
+    @patch("hermes_cli.inventory.build_models_payload")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_reasoning_fallback_does_not_scan_or_switch_models(
+        self,
+        mock_runtime,
+        mock_payload,
+        _mock_context,
+        mock_exact,
+        _mock_cfg,
+        _mock_full_cfg,
+    ):
+        mock_payload.return_value = {
+            "providers": [
+                {
+                    "slug": "deepseek",
+                    "models": [
+                        "no-dial-model",
+                        "reasoning-high-model",
+                        "reasoning-high-model-2",
+                    ],
+                }
+            ]
+        }
+        mock_runtime.return_value = {
+            "provider": "deepseek",
+            "model": "no-dial-model",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "deepseek-key",
+            "api_mode": "chat_completions",
+        }
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "no-dial-model"
+            mock_child.provider = "deepseek"
+            mock_child.reasoning_config = {"enabled": True, "effort": "medium"}
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Keep the selected model and use its default reasoning",
+                    provider="deepseek",
+                    model="no-dial-model",
+                    reasoning_effort="high",
+                    parent_agent=_make_mock_parent(depth=0),
+                )
+            )
+
+        self.assertNotIn("error", result)
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["model"], "no-dial-model")
+        self.assertEqual(
+            kwargs["reasoning_config"], {"enabled": True, "effort": "medium"}
+        )
+        mock_runtime.assert_called_once_with(
+            requested="deepseek", target_model="no-dial-model"
+        )
+        mock_exact.assert_called_once()
+        # One inventory read validates the explicit provider/model route; there
+        # must be no second read to search for a different model.
+        self.assertEqual(mock_payload.call_count, 1)
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    def test_invalid_reasoning_effort_lists_valid_values(self, _mock_cfg):
+        with patch("run_agent.AIAgent") as mock_agent:
+            result = json.loads(
+                delegate_task(
+                    goal="Reject an invalid reasoning value",
+                    reasoning_effort="maximum-ish",
+                    parent_agent=_make_mock_parent(depth=0),
+                )
+            )
+        self.assertIn("error", result)
+        self.assertIn("reasoning_effort", result["error"])
+        self.assertIn("maximum-ish", result["error"])
+        self.assertIn(
+            "minimal, low, medium, high, xhigh, max, ultra", result["error"]
+        )
+        self.assertEqual(result["error_code"], "invalid_reasoning_effort")
+        self.assertEqual(
+            result["supported_reasoning_efforts"],
+            [
+                "none",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultra",
+            ],
+        )
+        mock_agent.assert_not_called()
+
 
 class TestChildCredentialPoolResolution(unittest.TestCase):
     def test_same_provider_shares_parent_pool(self):
@@ -1223,6 +2091,44 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
+
+    def test_model_facing_single_route_fields_are_exposed_and_forwarded(self):
+        import run_agent
+
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertIn("provider", props)
+        self.assertIn("model", props)
+        self.assertIn("reasoning_effort", props)
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("provider", task_props)
+        self.assertIn("model", task_props)
+        self.assertIn("reasoning_effort", task_props)
+        self.assertIn("automatic/default", props["reasoning_effort"]["description"])
+        self.assertIn(
+            "automatic/default", task_props["reasoning_effort"]["description"]
+        )
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "cross-provider task",
+                    "provider": "deepseek",
+                    "model": "deepseek-v4-flash",
+                    "reasoning_effort": "high",
+                },
+            )
+
+        self.assertEqual(captured["provider"], "deepseek")
+        self.assertEqual(captured["model"], "deepseek-v4-flash")
+        self.assertEqual(captured["reasoning_effort"], "high")
 
     def test_model_acp_args_not_forwarded(self):
         """The live model dispatch path strips hidden ACP transport args."""

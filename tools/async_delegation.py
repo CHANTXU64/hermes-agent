@@ -243,7 +243,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     task_payload = {
         key: record.get(key)
         for key in (
-            "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
+            "goal", "goals", "context", "toolsets", "role", "model", "routes", "is_batch",
             # Routing origin (scope_id/user_id/user_name): persisted so a
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
@@ -367,7 +367,8 @@ def recover_abandoned_delegations() -> int:
                 "parent_session_id": parent_id, "goal": task.get("goal", ""),
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
-                "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
+                "model": task.get("model"), "routes": task.get("routes"),
+                "is_batch": bool(task.get("is_batch")),
                 "status": "unknown", "summary": None,
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
@@ -575,7 +576,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id
+                      origin_session_id, task_json
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -586,6 +587,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
+        "task": json.loads(row[8]) if row[8] else {},
     }
 
 
@@ -1022,6 +1024,7 @@ def dispatch_async_delegation_batch(
     session_key: str,
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
+    routes: Optional[List[Dict[str, Any]]] = None,
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
@@ -1064,6 +1067,7 @@ def dispatch_async_delegation_batch(
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
         "model": model,
+        "routes": list(routes) if routes else None,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
@@ -1187,6 +1191,7 @@ def _push_batch_completion_event(
         "toolsets": event_record.get("toolsets"),
         "role": event_record.get("role"),
         "model": event_record.get("model"),
+        "routes": event_record.get("routes"),
         "status": status,
         "is_batch": True,
         # The full per-task results list — the formatter renders a

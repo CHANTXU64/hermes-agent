@@ -1854,6 +1854,78 @@ Feature docs: none — this is a small message-enrichment compatibility rule ful
 
 Upstream status: fork-only.
 
+### 27. Per-invocation delegation provider/model/reasoning routing
+
+Status: active
+
+Date: 2026-08-15
+
+Files:
+
+- `tools/delegate_tool.py`
+- `tools/async_delegation.py`
+- `run_agent.py`
+- `tests/tools/test_delegate.py`
+- `tests/tools/test_delegate_control_actions.py`
+- `tests/tools/test_async_delegation.py`
+- `website/docs/user-guide/features/delegation.md`
+- `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features/delegation.md`
+- `docs/chantxu64/delegate-per-call-routing/README.md`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- Each `delegate_task` invocation or batch item can select a provider, model, and reasoning effort, with cross-provider credentials/API-mode resolution, truthful same-model reasoning fallback, durable safe route metadata, and bounded Markdown retry suggestions.
+
+What changed:
+
+- Top-level and per-task `provider`, `model`, and `reasoning_effort` fields are exposed and forwarded through both model dispatch paths.
+- Model-only calls infer a provider only when the authenticated curated inventory has one unique match; explicit provider/model calls resolve the target-model runtime route and reject known catalog mismatches before spawning.
+- Routed children resolve reasoning configuration against the target model. An explicit effort is used only when the production request builder preserves it exactly; otherwise Hermes keeps the selected provider/model and applies that target model's normal override/global/provider reasoning configuration without claiming that the requested value took effect.
+- Every batch task is route-validated before any child starts. Safe effective route metadata is present in child results, async status, SQLite task payloads, restart recovery, and completion events; secrets and raw request overrides are excluded.
+- Model-route errors keep structured error codes and render bounded Markdown suggestions in the error text. They combine up to 10 recent frequently used routes with up to 10 name-similar routes, deduplicate by `(provider, model)`, and stay within 1,800 characters. Recent usage is read from the active profile's local `state.db` and intersected with the current authenticated curated inventory, so stale historical routes are excluded. No LLM, child launch, forced catalog refresh, reasoning-model scan, or automatic model substitution is involved; the full catalog is never inserted into the persistent tool schema.
+
+Why it matters:
+
+- The parent can deliberately use a different provider/model for one subtask without changing global configuration, while model-only calls remain convenient and ambiguous routes fail closed. Errors contain enough bounded current information to retry without a separate model-directory tool call or permanent prompt bloat.
+
+Merge protection:
+
+- Preserve when upstream does not provide the combined contract of per-invocation/per-task cross-provider routing, target-model reasoning resolution, truthful same-model automatic/default fallback for unsupported explicit effort, all-task prevalidation, durable safe route metadata, and bounded current-availability Markdown suggestions.
+- Drop when upstream provides an equivalent public schema, routing precedence, validation behavior, persistence/recovery metadata, and error-result budget with matching regressions.
+- Ask user when upstream offers a similar interface but silently chooses ambiguous providers, claims a clamped/mapped reasoning value was honored, switches models for reasoning, omits durable per-task routes, injects a full catalog into the schema, or uses materially different precedence/fallback semantics.
+
+Verification:
+
+- 2026-08-16 revised-contract validation: core delegate/control/async tests reported `125 passed in 16.72s`; adjacent DeepSeek/OpenCode Go/Codex request-builder tests reported `158 passed in 1.82s`; restoration, API Server, Gateway binding, CLI delivery, TUI lifecycle, batch/output-schema, and FD-leak tests reported `65 passed in 7.77s` with seven pre-existing third-party deprecation warnings. Ruff, `py_compile`, and `git diff --check` passed. A read-only live-profile candidate render excluded stale historical `openai-codex` routes and returned only current authenticated picker-inventory routes.
+
+```bash
+./venv/bin/python -m pytest \
+  tests/tools/test_delegate.py \
+  tests/tools/test_delegate_control_actions.py \
+  tests/tools/test_async_delegation.py \
+  -q -o 'addopts='
+./venv/bin/python -m pytest \
+  tests/plugins/model_providers/test_deepseek_profile.py \
+  tests/plugins/model_providers/test_opencode_go_profile.py \
+  tests/agent/transports/test_codex_transport.py \
+  tests/agent/test_codex_request_transport_diagnostics.py \
+  -q -o 'addopts='
+./venv/bin/ruff check tools/delegate_tool.py tools/async_delegation.py \
+  run_agent.py tests/tools/test_delegate.py \
+  tests/tools/test_delegate_control_actions.py \
+  tests/tools/test_async_delegation.py
+./venv/bin/python -m py_compile tools/delegate_tool.py \
+  tools/async_delegation.py run_agent.py tests/tools/test_delegate.py \
+  tests/tools/test_delegate_control_actions.py \
+  tests/tools/test_async_delegation.py
+git diff --check
+```
+
+Feature docs: `docs/chantxu64/delegate-per-call-routing/README.md`
+
+Upstream status: fork-only.
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -1892,6 +1964,17 @@ deltas are expected in these areas:
   - `tests/gateway/test_stt_config.py`
   - `tests/gateway/test_telegram_audio_vs_voice.py`
   - `tests/gateway/test_telegram_voice_v0_regressions.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
+- Per-invocation delegation provider/model/reasoning routing:
+  - `tools/delegate_tool.py`
+  - `tools/async_delegation.py`
+  - `run_agent.py`
+  - `tests/tools/test_delegate.py`
+  - `tests/tools/test_delegate_control_actions.py`
+  - `tests/tools/test_async_delegation.py`
+  - `website/docs/user-guide/features/delegation.md`
+  - `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features/delegation.md`
+  - `docs/chantxu64/delegate-per-call-routing/README.md`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Safe command rewrite:
   - `tools/safe_cmd_rewrite.py`
@@ -2015,9 +2098,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 26 major entries.
+Documented entries: 27 major entries.
 
-Active / current entries: 22.
+Active / current entries: 23.
 
 Historical reverted / abandoned / superseded areas: 4.
 
