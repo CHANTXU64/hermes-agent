@@ -3802,12 +3802,14 @@ class TestRunConversation:
         agent.reasoning_callback = lambda _text: None
         entered = threading.Event()
         results = {}
+        requests = []
         calls = 0
         final = _mock_response(content="Corrected answer.", finish_reason="stop")
 
-        def _fake_api_call(_api_kwargs):
+        def _fake_api_call(api_kwargs):
             nonlocal calls
             calls += 1
+            requests.append(api_kwargs)
             if calls == 1:
                 agent._fire_reasoning_delta("Following the original approach.")
                 entered.set()
@@ -3837,21 +3839,23 @@ class TestRunConversation:
         assert calls == 2
         assert results["result"]["completed"] is True
         assert results["result"]["final_response"] == "Corrected answer."
+
+        request_correction = requests[1]["messages"][-1]
+        assert request_correction["role"] == "user"
+        assert "interrupted by a user correction" in request_correction["content"]
+        # Displayed reasoning is display-only — replaying it as assistant
+        # content trips Anthropic's output classifier (July 2026 brickings).
+        assert "Following the original approach." not in request_correction["content"]
+
         placeholder = results["result"]["messages"][-3]
         correction = results["result"]["messages"][-2]
         assert placeholder["role"] == "assistant"
         assert "interrupted by a user correction" not in (
             placeholder.get("content") or ""
         )
-        assert "interrupted by a user correction" in (
-            correction.get("api_content") or ""
-        )
-        # Displayed reasoning is display-only — replaying it as assistant
-        # content trips Anthropic's output classifier (July 2026 brickings).
-        assert "Following the original approach." not in (
-            correction.get("api_content") or ""
-        )
         assert correction["content"] == "Use the corrected approach."
+        assert "api_content" not in correction
+        assert "_request_only_api_content" not in correction
 
     def test_legacy_interrupt_scaffold_ghost_dropped_from_api_replay(self, agent):
         """Pre-#81841 hidden assistant rows with the interrupt scaffold must
