@@ -50,6 +50,10 @@ _MODEL_SWITCH_NOTICE = (
     "[Note: model was just switched from gpt-5.6-terra to gpt-5.6-sol via OpenAI Codex. "
     "Adjust your self-identification accordingly.]"
 )
+_EMPTY_TOOL_RESPONSE_NUDGE = (
+    "You just executed tool calls but returned an empty response. "
+    "Please process the tool results above and continue with the task."
+)
 
 
 def _local_seconds(value):
@@ -156,6 +160,50 @@ def test_hindsight_filters_tool_budget_notice_without_losing_visible_assistant_o
     assert turns[0][1]["content"] == "Assistant: final answer for the fix request"
     assert turns[2][0]["content"] == "Assistant: visible post-limit status"
     assert "maximum number of tool-calling iterations" not in json.dumps(turns)
+
+
+@pytest.mark.parametrize("with_runtime_flags", [False, True])
+def test_hindsight_empty_response_recovery_scaffolding_is_transparent(with_runtime_flags):
+    """The fixed recovery pair must not split or enter the visible retained turn."""
+    provider = HindsightMemoryProvider()
+    synthetic = {"_empty_recovery_synthetic": True} if with_runtime_flags else {}
+    messages = [
+        {
+            "role": "user",
+            "content": "finish the retain repair",
+            "message_id": "telegram-update-3986",
+            "timestamp": 1710000000.0,
+        },
+        {
+            "role": "assistant",
+            "content": "(empty)",
+            "timestamp": 1710000001.0,
+            **synthetic,
+        },
+        {
+            "role": "user",
+            "content": _EMPTY_TOOL_RESPONSE_NUDGE,
+            "timestamp": 1710000002.0,
+            **synthetic,
+        },
+        {
+            "role": "assistant",
+            "content": "repair verification completed",
+            "timestamp": 1710000003.0,
+        },
+    ]
+
+    turns = [json.loads(turn) for turn in provider._build_turns_from_conversation_messages(messages)]
+
+    assert [[message["role"] for message in turn] for turn in turns] == [
+        ["user", "assistant"],
+    ]
+    assert turns[0][0]["content"] == "User: finish the retain repair"
+    assert turns[0][0]["_hermes_source_occurrence_id"] == "message_id:telegram-update-3986"
+    assert turns[0][1]["content"] == "Assistant: repair verification completed"
+    serialized = json.dumps(turns, ensure_ascii=False)
+    assert "(empty)" not in serialized
+    assert _EMPTY_TOOL_RESPONSE_NUDGE not in serialized
 
 
 @pytest.mark.parametrize(
@@ -2937,5 +2985,139 @@ def test_hindsight_closes_orphan_user_respects_distinct_occurrence_ids(
         assert turns[1][0]["content"] == "User: 继续"
         assert turns[1][1]["content"] == "Assistant: second answer only"
         assert turns[1][1]["content"] != "Assistant: first answer"
+    finally:
+        provider.shutdown()
+
+
+def test_hindsight_replay_drops_leading_orphan_projection_of_persisted_assistant(
+    tmp_path,
+    monkeypatch,
+):
+    """A no-timestamp orphan replay must not duplicate the persisted completed reply."""
+    session_id = "restart-leading-orphan-assistant-projection"
+    completed_reply = "completed and verified"
+    provider1, _client1 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    provider1.sync_turn(
+        user_content="merge the verified fork changes",
+        assistant_content=completed_reply,
+        session_id=session_id,
+        messages=[
+            {
+                "role": "user",
+                "content": "merge the verified fork changes",
+                "message_id": "telegram-update-4100",
+                "timestamp": 1710000200.0,
+            },
+            {"role": "assistant", "content": completed_reply, "timestamp": 1710000201.0},
+        ],
+    )
+    provider1.shutdown()
+
+    provider2, client2 = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    try:
+        incoming_turns = [
+            json.dumps(
+                [{"role": "assistant", "content": f"Assistant: {completed_reply}", "timestamp": ""}],
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                [
+                    {
+                        "role": "assistant",
+                        "content": "Assistant: delayed review found no new issue",
+                        "timestamp": _local_seconds(1710000203.0),
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+        ]
+        provider2._append_session_turns(incoming_turns)
+        info = provider2.retain_persisted_session_lineage(session_id=session_id)
+        provider2._retain_queue.join()
+
+        assert info["turn_count"] == 2
+        content = client2.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert content.count(f"Assistant: {completed_reply}") == 1
+        assert content.count("Assistant: delayed review found no new issue") == 1
+    finally:
+        provider2.shutdown()
+
+
+def test_hindsight_persisted_empty_recovery_replay_is_sanitized_without_duplicates(
+    tmp_path,
+    monkeypatch,
+):
+    """Historical recovery projections must submit one real request and completion."""
+    session_id = "persisted-empty-recovery-projection"
+    provider, client = _initialized_hindsight_provider(
+        tmp_path,
+        monkeypatch,
+        session_id=session_id,
+    )
+    user_content = "User: 好"
+    assistant_content = "Assistant: 验证全部完成"
+    provider._persist_retain_turn(
+        json.dumps(
+            [
+                {
+                    "role": "user",
+                    "content": user_content,
+                    "timestamp": _local_seconds(1710000300.0),
+                    "_hermes_source_occurrence_id": "message_id:3986",
+                },
+                {
+                    "role": "assistant",
+                    "content": "Assistant: (empty)",
+                    "timestamp": _local_seconds(1710000301.0),
+                },
+            ],
+            ensure_ascii=False,
+        )
+    )
+    provider._persist_retain_turn(
+        json.dumps(
+            [
+                {"role": "user", "content": user_content, "timestamp": _local_seconds(1710000300.0)},
+                {"role": "assistant", "content": assistant_content, "timestamp": ""},
+            ],
+            ensure_ascii=False,
+        )
+    )
+    provider._persist_retain_turn(
+        json.dumps(
+            [
+                {
+                    "role": "user",
+                    "content": f"User: {_EMPTY_TOOL_RESPONSE_NUDGE}",
+                    "timestamp": _local_seconds(1710000302.0),
+                },
+                {
+                    "role": "assistant",
+                    "content": assistant_content,
+                    "timestamp": _local_seconds(1710000303.0),
+                },
+            ],
+            ensure_ascii=False,
+        )
+    )
+
+    try:
+        info = provider.retain_persisted_session_lineage(session_id=session_id)
+        provider._retain_queue.join()
+
+        content = client.aretain_batch.call_args.kwargs["items"][0]["content"]
+        assert info["turn_count"] == 1
+        assert content.count(user_content) == 1
+        assert content.count(assistant_content) == 1
+        assert "(empty)" not in content
+        assert _EMPTY_TOOL_RESPONSE_NUDGE not in content
     finally:
         provider.shutdown()

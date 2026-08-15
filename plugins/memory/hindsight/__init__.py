@@ -2075,6 +2075,10 @@ class HindsightMemoryProvider(MemoryProvider):
         "Please provide a final response summarizing what you've found and accomplished so far, "
         "without calling any more tools."
     )
+    _RETAIN_EMPTY_TOOL_RESPONSE_NUDGE = (
+        "You just executed tool calls but returned an empty response. "
+        "Please process the tool results above and continue with the task."
+    )
     _RETAIN_LCM_SUMMARY_HEADER_RE = re.compile(
         r"(?:\[(?:Recent|Session Arc|Durable) Summary \(d\d+(?:,\s*node\s+\d+)?\)\]"
         r"|\[Depth-\d+ Summary \(d\d+(?:,\s*node\s+\d+)?\)\])"
@@ -2126,6 +2130,11 @@ class HindsightMemoryProvider(MemoryProvider):
     def _is_tool_budget_exhausted_notice(cls, content: Any) -> bool:
         text = cls._stringify_retain_content(content).replace("\r\n", "\n").strip()
         return text == cls._RETAIN_TOOL_BUDGET_EXHAUSTED_NOTICE
+
+    @classmethod
+    def _is_empty_tool_response_nudge(cls, content: Any) -> bool:
+        text = cls._stringify_retain_content(content).replace("\r\n", "\n").strip()
+        return text == cls._RETAIN_EMPTY_TOOL_RESPONSE_NUDGE
 
     @classmethod
     def _strip_leading_retain_runtime_injections(cls, content: str) -> str:
@@ -2262,6 +2271,7 @@ class HindsightMemoryProvider(MemoryProvider):
         text = cls._stringify_retain_content(content).lstrip()
         return (
             cls._is_tool_budget_exhausted_notice(text)
+            or cls._is_empty_tool_response_nudge(text)
             or cls._starts_with_recent_summary_block(text)
             or cls._is_assistant_producing_runtime_event(text)
             or any(text.startswith(marker) for marker in cls._RETAIN_ASYNC_COMPLETION_MARKERS)
@@ -2432,7 +2442,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 return ""
             text = cls._strip_leading_retain_runtime_injections(text)
 
-        if cls._is_tool_budget_exhausted_notice(text):
+        if cls._is_tool_budget_exhausted_notice(text) or cls._is_empty_tool_response_nudge(text):
             return ""
 
         if cls._is_skill_invocation_runtime_event(text):
@@ -2472,6 +2482,8 @@ class HindsightMemoryProvider(MemoryProvider):
     def _is_retain_noise_assistant_content(cls, content: Any) -> bool:
         text = cls._stringify_retain_content(content).strip()
         if not text:
+            return True
+        if text == "(empty)":
             return True
         if text.startswith("Operation interrupted"):
             return True
@@ -2625,6 +2637,7 @@ class HindsightMemoryProvider(MemoryProvider):
         cleaned_msgs: List[Dict[str, Any]] = []
         kept_user = False
         kept_assistant = False
+        recovery_projection = False
 
         for msg in payload:
             if not isinstance(msg, dict):
@@ -2635,6 +2648,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 body = content[len(user_prefix):] if content.startswith(user_prefix) else content
                 cleaned_body = self._clean_retain_user_content(body)
                 if not cleaned_body:
+                    if self._is_empty_tool_response_nudge(body):
+                        recovery_projection = True
                     if self._is_orphan_assistant_trigger_user_content(body):
                         # Drop the internal trigger payload but keep scanning:
                         # its final assistant response was visible to the user.
@@ -2651,7 +2666,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 if self._is_retain_noise_assistant_content(body):
                     continue
                 kept_assistant = True
-                cleaned_msgs.append(msg)
+                new_msg = dict(msg)
+                if recovery_projection:
+                    new_msg["_hermes_empty_recovery_projection"] = True
+                cleaned_msgs.append(new_msg)
                 continue
             # Non user/assistant roles are not part of Hindsight turn payloads.
             continue
@@ -2759,6 +2777,15 @@ class HindsightMemoryProvider(MemoryProvider):
             content = self._stringify_retain_content(msg.get("content")).strip()
             if not role or not content:
                 continue
+            if role == "assistant" and any(
+                bool(msg.get(marker))
+                for marker in (
+                    "_empty_recovery_synthetic",
+                    "_empty_terminal_sentinel",
+                    "_thinking_prefill",
+                )
+            ):
+                continue
             if role == "tool":
                 clarify_exchange = self._extract_retain_clarify_exchange(msg)
                 out_of_band_users = self._extract_retain_out_of_band_user_messages(msg)
@@ -2807,6 +2834,11 @@ class HindsightMemoryProvider(MemoryProvider):
                     # assistant-producing runtime triggers form an independent
                     # assistant-only event instead of borrowing an earlier user.
                     tool_budget_notice = self._is_tool_budget_exhausted_notice(content)
+                    empty_recovery_nudge = bool(msg.get("_empty_recovery_synthetic")) or (
+                        self._is_empty_tool_response_nudge(content)
+                    )
+                    if empty_recovery_nudge:
+                        continue
                     preserves_visible_assistant = self._is_orphan_assistant_trigger_user_content(content)
                     if tool_budget_notice and pending_user and not pending_assistant:
                         _flush_pending_async_assistant()
@@ -2879,6 +2911,70 @@ class HindsightMemoryProvider(MemoryProvider):
             if not collapsed:
                 collapsed.append(turn_json)
                 continue
+            previous_identity = cls._retain_turn_replay_identity(collapsed[-1])
+            current_identity = cls._retain_turn_replay_identity(turn_json)
+            if cls._retain_closes_orphan_user(
+                collapsed[-1],
+                previous_identity,
+                turn_json,
+                current_identity,
+            ):
+                try:
+                    previous_payload = json.loads(collapsed[-1])
+                    current_payload = json.loads(turn_json)
+                except Exception:
+                    previous_payload = []
+                    current_payload = []
+                if (
+                    isinstance(previous_payload, list)
+                    and len(previous_payload) == 1
+                    and isinstance(previous_payload[0], dict)
+                    and isinstance(current_payload, list)
+                    and len(current_payload) > 1
+                    and isinstance(current_payload[0], dict)
+                ):
+                    old_user = previous_payload[0]
+                    merged_user = dict(current_payload[0])
+                    old_occurrence = str(
+                        old_user.get("_hermes_source_occurrence_id") or ""
+                    ).strip()
+                    if old_occurrence:
+                        merged_user["_hermes_source_occurrence_id"] = old_occurrence
+                        if old_user.get("timestamp"):
+                            merged_user["timestamp"] = old_user["timestamp"]
+                    current_payload[0] = merged_user
+                    collapsed[-1] = json.dumps(current_payload, ensure_ascii=False)
+                    continue
+
+            try:
+                previous_payload = json.loads(collapsed[-1])
+                current_payload = json.loads(turn_json)
+            except Exception:
+                previous_payload = []
+                current_payload = []
+            if (
+                isinstance(previous_payload, list)
+                and previous_payload
+                and isinstance(previous_payload[-1], dict)
+                and isinstance(current_payload, list)
+                and len(current_payload) == 1
+                and isinstance(current_payload[0], dict)
+                and current_payload[0].get("_hermes_empty_recovery_projection")
+                and previous_payload[-1].get("role") == "assistant"
+                and current_payload[0].get("role") == "assistant"
+                and str(previous_payload[-1].get("content") or "")
+                == str(current_payload[0].get("content") or "")
+            ):
+                merged_assistant = dict(previous_payload[-1])
+                merged_assistant["timestamp"] = str(
+                    previous_payload[-1].get("timestamp")
+                    or current_payload[0].get("timestamp")
+                    or ""
+                )
+                merged_assistant.pop("_hermes_empty_recovery_projection", None)
+                previous_payload[-1] = merged_assistant
+                collapsed[-1] = json.dumps(previous_payload, ensure_ascii=False)
+                continue
             exact_match = (
                 cls._retain_turn_canonical(collapsed[-1])
                 == cls._retain_turn_canonical(turn_json)
@@ -2933,7 +3029,21 @@ class HindsightMemoryProvider(MemoryProvider):
                 collapsed.append(turn_json)
                 continue
             collapsed[-1] = json.dumps(merged, ensure_ascii=False)
-        return collapsed
+        cleaned: List[str] = []
+        for turn_json in collapsed:
+            try:
+                payload = json.loads(turn_json)
+            except Exception:
+                cleaned.append(turn_json)
+                continue
+            changed = False
+            if isinstance(payload, list):
+                for message in payload:
+                    if isinstance(message, dict) and "_hermes_empty_recovery_projection" in message:
+                        message.pop("_hermes_empty_recovery_projection", None)
+                        changed = True
+            cleaned.append(json.dumps(payload, ensure_ascii=False) if changed else turn_json)
+        return cleaned
 
     @staticmethod
     def _retain_safe_image_urls_from_text(text: str) -> tuple[str, ...]:
@@ -4027,7 +4137,11 @@ class HindsightMemoryProvider(MemoryProvider):
                             if cleaned:
                                 turns.append(cleaned)
                         if turns:
-                            return turns, lineage, target_session_id
+                            return (
+                                self._collapse_adjacent_replay_representations(turns),
+                                lineage,
+                                target_session_id,
+                            )
 
                 retain_document_id = self._resolve_retain_document_id(
                     conn, target_session_id, parent_session_id
@@ -4055,7 +4169,11 @@ class HindsightMemoryProvider(MemoryProvider):
                                 cleaned = self._sanitize_persisted_turn_json(str(turn_json))
                                 if cleaned:
                                     turns.append(cleaned)
-                        return turns, lineage, retain_document_id
+                        return (
+                            self._collapse_adjacent_replay_representations(turns),
+                            lineage,
+                            retain_document_id,
+                        )
         except Exception as e:
             logger.warning("Hindsight retain document lookup failed: %s", e, exc_info=True)
 
@@ -4084,7 +4202,11 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("Hindsight retain store read failed: %s", e, exc_info=True)
             return [], lineage, ""
-        return turns, lineage, target_session_id
+        return (
+            self._collapse_adjacent_replay_representations(turns),
+            lineage,
+            target_session_id,
+        )
 
     def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
         metadata: Dict[str, str] = {
@@ -4567,6 +4689,64 @@ class HindsightMemoryProvider(MemoryProvider):
             "start_index": start_index,
         }
 
+    @classmethod
+    def _drop_leading_replayed_assistant_projection(
+        cls,
+        existing_turns: List[str],
+        incoming_turns: List[str],
+    ) -> List[str]:
+        """Drop a timestamp-less leading projection of the persisted final assistant.
+
+        This is deliberately bounded to a replay window that also contains a
+        timestamped event after the persisted cutoff.  Same-content assistant
+        events outside that source/order overlap remain distinct.
+        """
+        if not existing_turns or len(incoming_turns) < 2:
+            return incoming_turns
+        try:
+            existing_payload = json.loads(existing_turns[-1])
+            projection_payload = json.loads(incoming_turns[0])
+        except Exception:
+            return incoming_turns
+        if not (
+            isinstance(existing_payload, list)
+            and existing_payload
+            and isinstance(existing_payload[-1], dict)
+            and isinstance(projection_payload, list)
+            and len(projection_payload) == 1
+            and isinstance(projection_payload[0], dict)
+        ):
+            return incoming_turns
+        persisted_assistant = existing_payload[-1]
+        projected_assistant = projection_payload[0]
+        if not (
+            persisted_assistant.get("role") == "assistant"
+            and projected_assistant.get("role") == "assistant"
+            and str(persisted_assistant.get("content") or "")
+            == str(projected_assistant.get("content") or "")
+            and str(persisted_assistant.get("timestamp") or "")
+            and not str(projected_assistant.get("timestamp") or "")
+        ):
+            return incoming_turns
+
+        existing_times = [
+            cls._retain_timestamp_order_value(timestamp)
+            for turn in existing_turns
+            for _role, _content, timestamp in cls._retain_turn_replay_identity(turn)
+            if timestamp
+        ]
+        later_times = [
+            cls._retain_timestamp_order_value(timestamp)
+            for turn in incoming_turns[1:]
+            for _role, _content, timestamp in cls._retain_turn_replay_identity(turn)
+            if timestamp
+        ]
+        existing_times = [value for value in existing_times if value is not None]
+        later_times = [value for value in later_times if value is not None]
+        if not existing_times or not later_times or min(later_times) <= max(existing_times):
+            return incoming_turns
+        return incoming_turns[1:]
+
     def _append_session_turns(self, turns: List[str]) -> tuple[int, int, int]:
         """Append transcript-derived turn JSONs that are not already buffered.
 
@@ -4600,6 +4780,12 @@ class HindsightMemoryProvider(MemoryProvider):
         before_counter = self._turn_counter
         start_index = 0
         if self._session_turns:
+            turns = self._drop_leading_replayed_assistant_projection(
+                self._session_turns,
+                turns,
+            )
+            if not turns:
+                return 0, before_counter, before_counter
             existing = [self._retain_turn_canonical(turn) for turn in self._session_turns]
             incoming = [self._retain_turn_canonical(turn) for turn in turns]
             existing_occurrences = [
