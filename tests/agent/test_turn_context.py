@@ -333,12 +333,6 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
     assert agent._pending_cli_user_message is None
 
 
-
-
-
-
-
-
 def test_ensure_db_session_runs_after_system_prompt_restore():
     """Regression for #45499.
 
