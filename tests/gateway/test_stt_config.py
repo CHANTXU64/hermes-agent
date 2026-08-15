@@ -33,6 +33,35 @@ def test_load_gateway_config_bridges_stt_enabled_from_config_yaml(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_successful_transcription_keeps_voice_origin_marker():
+    """A successful STT result must remain identifiable as voice transcription."""
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    runner._has_setup_skill = lambda: False
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "帮我查一下今天天气",
+            "provider": "local_command",
+        },
+    ):
+        result, transcripts = await runner._enrich_message_with_transcription(
+            "",
+            ["/tmp/voice.ogg"],
+        )
+
+    assert result == (
+        "[The user sent a voice message~ Here's what they said: "
+        '"帮我查一下今天天气"]'
+    )
+    assert transcripts == ["帮我查一下今天天气"]
+
+
+@pytest.mark.asyncio
 async def test_enrich_message_with_transcription_returns_tuple_for_empty_content_placeholder():
     """A successful transcription whose caption is the empty-content placeholder
     must still return the ``(text, transcripts)`` tuple.

@@ -24004,12 +24004,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         continue
                     successful_transcripts.append(transcript)
-                    # Pass the transcript through as a plain quoted line. The
-                    # earlier wording ("The user sent a voice message~ Here's
-                    # what they said: ...") read as a meta-instruction and made
-                    # the LLM volunteer commentary about voice mode rather than
-                    # reply to the content.
-                    enriched_parts.append(f'"{transcript}"')
+                    # Preserve an explicit voice-origin marker so the model can
+                    # account for speech-recognition errors instead of treating
+                    # the transcript as deliberately authored text.
+                    enriched_parts.append(
+                        "[The user sent a voice message~ Here's what they said: "
+                        f'"{transcript}"]'
+                    )
                 else:
                     error = result.get("error", "unknown error")
                     # All failure branches: a single, minimal, neutral marker.

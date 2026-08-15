@@ -75,9 +75,10 @@ async def test_voice_message_still_transcribed():
         )
 
     mock_transcribe.assert_called_once_with("/tmp/voice.ogg", None, "gateway")
-    # The transcript passes through as a plain quoted line — no "voice message"
-    # meta-commentary in the LLM-visible prompt.
-    assert "hello world" in result
+    assert result == (
+        "[The user sent a voice message~ Here's what they said: "
+        '"hello world"]'
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1795,6 +1795,65 @@ Feature docs: none — one provider integration across existing generic seams, w
 
 Upstream status: fork-only.
 
+### 26. Successful STT keeps an explicit voice-origin marker
+
+Status: active
+
+Date: 2026-08-15
+
+Files:
+
+- `gateway/run.py`
+- `tests/gateway/test_stt_config.py`
+- `tests/gateway/test_telegram_audio_vs_voice.py`
+- `tests/gateway/test_telegram_voice_v0_regressions.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- Successful Gateway STT enrichment identifies the quoted transcript as content from a user voice message.
+
+What changed:
+
+- Successful non-empty transcripts are injected as `[The user sent a voice message~ Here's what they said: "<transcript>"]` instead of a bare quoted line.
+- The raw `successful_transcripts` list remains unchanged, so transcript echo formatting, ordering, and deduplication retain their existing behavior.
+- Empty/inaudible results, STT failures, disabled-STT notes, providers, downloads, and message routing are unchanged.
+
+Why it matters:
+
+- The model must know that the text came through speech recognition so it can account for possible recognition errors rather than treating every word as deliberately typed by the user.
+
+Merge protection:
+
+- Preserve the explicit voice-origin marker unless upstream provides equivalent source semantics for successful STT enrichment.
+- Do not revive the prefix by changing transcript echo text or platform-specific adapters; the protected behavior belongs to the common Gateway enrichment path.
+- Keep empty and failed transcription markers neutral and singular.
+
+Verification:
+
+- 2026-08-15: the three focused regression files reported `10 passed`; the broader Gateway voice/STT selection reported `124 passed, 1 skipped`. Ruff, `py_compile`, and `git diff --check` passed. Warnings were existing third-party deprecations plus two pre-existing unawaited-`AsyncMock` warnings in voice-channel tests.
+
+```bash
+./venv/bin/python -m pytest \
+  tests/gateway/test_stt_config.py \
+  tests/gateway/test_telegram_audio_vs_voice.py \
+  tests/gateway/test_telegram_voice_v0_regressions.py \
+  -q -o 'addopts='
+./venv/bin/python -m py_compile gateway/run.py \
+  tests/gateway/test_stt_config.py \
+  tests/gateway/test_telegram_audio_vs_voice.py \
+  tests/gateway/test_telegram_voice_v0_regressions.py
+./venv/bin/ruff check gateway/run.py \
+  tests/gateway/test_stt_config.py \
+  tests/gateway/test_telegram_audio_vs_voice.py \
+  tests/gateway/test_telegram_voice_v0_regressions.py
+git diff --check
+```
+
+Feature docs: none — this is a small message-enrichment compatibility rule fully described here and protected by focused regressions.
+
+Upstream status: fork-only.
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -1828,6 +1887,12 @@ deltas are expected in these areas:
   - `tests/tools/test_transcription.py`
   - `tests/tools/test_transcription_dotenv_fallback.py`
   - `tests/fork/test_custom_qwen_tts.py`
+- Successful STT voice-origin enrichment:
+  - `gateway/run.py`
+  - `tests/gateway/test_stt_config.py`
+  - `tests/gateway/test_telegram_audio_vs_voice.py`
+  - `tests/gateway/test_telegram_voice_v0_regressions.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
 - Safe command rewrite:
   - `tools/safe_cmd_rewrite.py`
   - `tools/terminal_tool.py`
@@ -1950,9 +2015,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 25 major entries.
+Documented entries: 26 major entries.
 
-Active / current entries: 21.
+Active / current entries: 22.
 
 Historical reverted / abandoned / superseded areas: 4.
 
