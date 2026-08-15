@@ -76,10 +76,76 @@ def test_current_recall_uses_developer_after_clean_user(monkeypatch):
     assert "<memory-context>" not in json.dumps(result["messages"])
 
 
+def test_lcm_request_context_precedes_memory_in_one_developer_after_clean_user(
+    monkeypatch,
+):
+    agent = _build_agent(monkeypatch)
+    captured = {}
+    prompt = "Explain the database migration plan"
+    lcm_policy = "HERMES-LCM-POLICY-SENTINEL"
+
+    def _api_call(api_kwargs):
+        captured.update(api_kwargs)
+        return _final_response("ok")
+
+    def _invoke_hook(name, **_kwargs):
+        if name == "pre_llm_call":
+            return [{"context": lcm_policy, "target": "request_context"}]
+        return []
+
+    _configure(agent, _api_call)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _invoke_hook)
+    result = agent.run_conversation(prompt)
+
+    assert result["completed"] is True
+    input_items = captured["input"]
+    user_index = next(i for i, item in enumerate(input_items) if item.get("role") == "user")
+    assert input_items[user_index]["content"] == prompt
+    developer_items = [item for item in input_items if item.get("role") == "developer"]
+    assert len(developer_items) == 1
+    developer = input_items[user_index + 1]
+    assert developer["role"] == "developer"
+    assert developer["content"].index(lcm_policy) < developer["content"].index(
+        "<memory-context>"
+    )
+    assert f"remembered fact for {prompt}" in developer["content"]
+    assert lcm_policy not in json.dumps(result["messages"])
+
+
+def test_ordinary_plugin_context_stays_on_openai_user_request_copy(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    captured = {}
+    prompt = "Explain the database migration plan"
+    plugin_context = "ORDINARY-PLUGIN-CONTEXT-SENTINEL"
+
+    def _api_call(api_kwargs):
+        captured.update(api_kwargs)
+        return _final_response("ok")
+
+    def _invoke_hook(name, **_kwargs):
+        if name == "pre_llm_call":
+            return [{"context": plugin_context}]
+        return []
+
+    _configure(agent, _api_call)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _invoke_hook)
+    result = agent.run_conversation(prompt)
+
+    assert result["completed"] is True
+    input_items = captured["input"]
+    user_index = next(i for i, item in enumerate(input_items) if item.get("role") == "user")
+    assert input_items[user_index]["content"] == prompt + "\n\n" + plugin_context
+    developer = input_items[user_index + 1]
+    assert developer["role"] == "developer"
+    assert plugin_context not in developer["content"]
+    assert plugin_context not in json.dumps(result["messages"])
+
+
 def test_current_recall_developer_position_is_stable_across_tool_loop(monkeypatch):
     agent = _build_agent(monkeypatch)
     captured = []
     prompt = "Review the database migration plan"
+    lcm_policy = "LCM-TOOL-LOOP-POLICY"
 
     def _api_call(api_kwargs):
         captured.append(api_kwargs)
@@ -109,7 +175,13 @@ def test_current_recall_developer_position_is_stable_across_tool_loop(monkeypatc
             }
         )
 
+    def _invoke_hook(name, **_kwargs):
+        if name == "pre_llm_call":
+            return [{"context": lcm_policy, "target": "request_context"}]
+        return []
+
     _configure(agent, _api_call)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _invoke_hook)
     setattr(agent, "_execute_tool_calls", _execute_tool_calls)
     getattr(agent, "valid_tool_names").add("read_file")
     result = agent.run_conversation(prompt)
@@ -127,6 +199,10 @@ def test_current_recall_developer_position_is_stable_across_tool_loop(monkeypatc
     )
     assert developer_index == user_index + 1
     assert developer_index < function_call_index < function_output_index
+    assert second_input[user_index]["content"] == prompt
+    assert second_input[developer_index]["content"].index(lcm_policy) < second_input[
+        developer_index
+    ]["content"].index("<memory-context>")
     assert f"remembered fact for {prompt}" in second_input[developer_index]["content"]
     assert second_input[-1].get("role") != "developer"
 
@@ -139,7 +215,18 @@ def test_next_turn_drops_prior_recall_and_keeps_only_current_developer(monkeypat
         captured.append(api_kwargs)
         return _final_response(f"done-{len(captured)}")
 
+    def _invoke_hook(name, **kwargs):
+        if name == "pre_llm_call":
+            return [
+                {
+                    "context": f"LCM-POLICY-{kwargs['user_message']}",
+                    "target": "request_context",
+                }
+            ]
+        return []
+
     _configure(agent, _api_call)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _invoke_hook)
     first = agent.run_conversation("first turn")
     second = agent.run_conversation(
         "second turn",
@@ -156,11 +243,13 @@ def test_next_turn_drops_prior_recall_and_keeps_only_current_developer(monkeypat
         if item.get("role") == "user" and item.get("content") == "first turn"
     )
     assert first_input[first_user_index + 1]["role"] == "developer"
+    assert "LCM-POLICY-first turn" in first_input[first_user_index + 1]["content"]
     assert "remembered fact for first turn" in first_input[first_user_index + 1]["content"]
 
     second_input = captured[1]["input"]
     serialized_second = json.dumps(second_input)
     assert "remembered fact for first turn" not in serialized_second
+    assert "LCM-POLICY-first turn" not in serialized_second
     developer_indices = [
         i for i, item in enumerate(second_input) if item.get("role") == "developer"
     ]
@@ -170,6 +259,7 @@ def test_next_turn_drops_prior_recall_and_keeps_only_current_developer(monkeypat
         if item.get("role") == "user" and item.get("content") == "second turn"
     )
     assert developer_indices[0] == second_user_index + 1
+    assert "LCM-POLICY-second turn" in second_input[developer_indices[0]]["content"]
     assert "remembered fact for second turn" in second_input[developer_indices[0]]["content"]
     assert "<memory-context>" not in json.dumps(second["messages"])
 
@@ -198,6 +288,7 @@ def test_max_iteration_summary_keeps_codex_recall_after_clean_user(monkeypatch):
         current_turn_user_idx=0,
         ext_prefetch_cache="CODEX-SUMMARY-RECALL-SENTINEL",
         plugin_user_context="CODEX-SUMMARY-PLUGIN-SENTINEL",
+        plugin_request_context="CODEX-SUMMARY-LCM-SENTINEL",
     )
 
     assert out == "summary"
@@ -210,9 +301,13 @@ def test_max_iteration_summary_keeps_codex_recall_after_clean_user(monkeypatch):
     )
     current_user = input_items[current_user_index]
     assert "CODEX-SUMMARY-PLUGIN-SENTINEL" in current_user["content"]
+    assert "CODEX-SUMMARY-LCM-SENTINEL" not in current_user["content"]
     assert "CODEX-SUMMARY-RECALL-SENTINEL" not in current_user["content"]
     developer = input_items[current_user_index + 1]
     assert developer["role"] == "developer"
+    assert developer["content"].index("CODEX-SUMMARY-LCM-SENTINEL") < developer[
+        "content"
+    ].index("<memory-context>")
     assert "CODEX-SUMMARY-RECALL-SENTINEL" in developer["content"]
     assert messages[0] == {"role": "user", "content": "current question"}
     assert "CODEX-SUMMARY-RECALL-SENTINEL" not in json.dumps(messages)

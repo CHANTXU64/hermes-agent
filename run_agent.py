@@ -8014,6 +8014,9 @@ class AIAgent:
             current_turn_user_idx=getattr(turn_context, "current_turn_user_idx", None),
             ext_prefetch_cache=getattr(turn_context, "ext_prefetch_cache", ""),
             plugin_user_context=getattr(turn_context, "plugin_user_context", ""),
+            plugin_request_context=getattr(
+                turn_context, "plugin_request_context", ""
+            ),
         )
 
     def _conversation_root_id(self) -> Optional[str]:

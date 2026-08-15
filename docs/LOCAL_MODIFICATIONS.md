@@ -798,32 +798,37 @@ Upstream status: fork-only.
 
 Status: active fork maintenance
 
-Date: 2026-06-16, restored 2026-07-22; upstream routing merged 2026-08-08
+Date: 2026-06-16, restored 2026-07-22; upstream routing merged 2026-08-08;
+LCM request-context placement 2026-08-15
 
 Decision and behavior:
 
-- Hindsight recall, `pre_llm_call` user-message context, plugin context, and
-  gateway turn notes are volatile additions for the current provider request.
-  Durable user history keeps the clean user-authored content only.
+- Hindsight recall, `pre_llm_call` user-message context, explicit plugin request
+  context, and gateway turn notes are volatile additions for the current
+  provider request. Durable user history keeps the clean user-authored content
+  only.
 - A later turn replays historical `content`; it never substitutes an older
   `messages.api_content` value. This intentionally accepts a prompt-cache
   boundary miss when volatile recall changes rather than replaying stale recall
   as if it were new user input.
-- OpenAI/Codex Responses places the current turn's recall in a request-only
-  `developer` item immediately after the clean current user item. That position
-  is rebuilt for every same-turn tool call, but the developer item is not
-  replayed on the next user turn. Other runtimes receive recall on a copy of the
-  current user content. Plugin and Gateway one-turn context remain on that
-  current-user request copy for all runtimes.
+- OpenAI/Codex Responses places explicit plugin request context followed by the
+  current turn's recall in one request-only `developer` item immediately after
+  the clean current user item. That position is rebuilt for every same-turn tool
+  call, but the developer item is not replayed on the next user turn. Other
+  runtimes receive both on a copy of the current user content in the same order.
+  Ordinary plugin context and Gateway one-turn context remain on the current-user
+  request copy for all runtimes; only a plugin that explicitly selects request
+  context can use the provider-aware route.
 - MoA reference fan-out and its aggregator receive a provider-neutral request
-  copy containing the current turn's recall plus plugin/Gateway context. The
-  acting model still receives its normal provider-specific shape; neither MoA
-  auxiliary path mutates durable history.
+  copy containing explicit request context, current recall, and ordinary
+  plugin/Gateway context. The acting model still receives its normal
+  provider-specific shape; neither MoA auxiliary path mutates durable history.
 - The max-iteration forced-summary request receives the same current
-  `TurnContext` as the preceding tool loop. Chat-completions keeps the context on
-  the current-user request copy; OpenAI/Codex Responses keeps recall in the
-  request-only developer item after that user. The synthetic summary request and
-  all volatile context remain absent from durable history.
+  `TurnContext` as the preceding tool loop. Chat-completions keeps explicit
+  request context followed by recall on the current-user request copy;
+  OpenAI/Codex Responses keeps both in that order in the request-only developer
+  item after the user. The synthetic summary request and all volatile context
+  remain absent from durable history.
 - String and multimodal composition never mutates the durable message object or
   its content list.
 - New normal CLI, Gateway, branch, compression, and session-flush paths do not
@@ -898,13 +903,14 @@ Merge protection:
   sidecar substitution is not.
 - Preserve current-turn must-deliver gateway notes while keeping them out of
   durable history, including multimodal turns.
-- Preserve the current-turn Codex `user → developer-recall` position across tool
-  calls and max-iteration summaries. Do not restore the historical cross-turn
-  replay of prior developer memory slots; that cache-affinity workaround
-  violates the current lifecycle contract.
-- Preserve current-turn recall/plugin/Gateway context in MoA reference and
-  aggregator requests; building MoA advice from the clean durable transcript
-  alone silently drops the current recall.
+- Preserve the current-turn Codex `user → developer(request-context → recall)`
+  position across tool calls and max-iteration summaries. Ordinary plugin and
+  Gateway context must remain on the user request copy. Do not restore the
+  historical cross-turn replay of prior developer memory slots; that
+  cache-affinity workaround violates the current lifecycle contract.
+- Preserve current-turn explicit request context, recall, and ordinary
+  plugin/Gateway context in MoA reference and aggregator requests; building MoA
+  advice from the clean durable transcript alone silently drops current context.
 - Preserve Hindsight P5/synchronous recall, `/retain`, `/undo`, multi-Telegram
   account routing, and upstream Gateway lifecycle improvements.
 - Do not merge delegate or branch cache scope merely because
@@ -924,6 +930,12 @@ Historical implementation references:
 
 Verification after the 2026-07-22 restoration:
 
+- The 2026-08-15 LCM request-context change was observed RED before production
+  edits: OpenAI/Codex Responses still put LCM guidance in user content, and the
+  host had no separate non-Responses fallback channel (`2 failed, 1 passed`).
+  After repair, the focused request-only, Codex/OpenAI-API, MoA, Gateway,
+  tool-loop, next-turn, max-summary, timeout-parity, and finalizer suite reported
+  `141 passed`. Ruff, `py_compile`, and `git diff --check` also passed.
 - Initial RED before production edits: `14 failed, 1 passed`, covering sidecar
   stamping, replay, multimodal mutation, summary replay, and Codex header
   separation.

@@ -2422,6 +2422,7 @@ def handle_max_iterations(
     current_turn_user_idx: int | None = None,
     ext_prefetch_cache: str = "",
     plugin_user_context: str = "",
+    plugin_request_context: str = "",
 ) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     agent._safe_print(
@@ -2508,6 +2509,7 @@ def handle_max_iterations(
             current_turn_user_idx=current_turn_user_idx,
             ext_prefetch_cache=ext_prefetch_cache,
             plugin_user_context=plugin_user_context,
+            plugin_request_context=plugin_request_context,
         )
 
         effective_system = agent._cached_system_prompt or ""

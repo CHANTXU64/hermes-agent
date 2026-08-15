@@ -15,7 +15,9 @@ from unittest.mock import patch
 
 import pytest
 
+from agent.memory_manager import build_memory_context_block
 from agent.turn_context import (
+    apply_request_only_turn_context,
     build_turn_context,
     compose_user_api_content,
     consume_gateway_turn_context_notes,
@@ -143,6 +145,34 @@ class TestConsumeIsOneShot:
 
 
 class TestStringContentRequestOnlyDelivery:
+    def test_request_context_falls_back_to_user_suffix_for_non_openai_runtime(self):
+        agent = _FakeAgent()
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "LCM-POLICY", "target": "request_context"}],
+        ):
+            ctx = _build(agent)
+
+        assert ctx.plugin_user_context == ""
+        assert ctx.plugin_request_context == "LCM-POLICY"
+        api_messages = [{"role": "user", "content": "hello"}]
+        apply_request_only_turn_context(
+            agent,
+            api_messages,
+            current_turn_user_idx=0,
+            ext_prefetch_cache="MEMORY",
+            plugin_user_context="",
+            plugin_request_context=ctx.plugin_request_context,
+        )
+
+        assert api_messages == [
+            {
+                "role": "user",
+                "content": "hello\n\nLCM-POLICY\n\n"
+                + build_memory_context_block("MEMORY"),
+            }
+        ]
+
     def test_notes_stay_off_the_durable_message(self):
         agent = _FakeAgent()
         agent._gateway_turn_context_notes = RESET_NOTE

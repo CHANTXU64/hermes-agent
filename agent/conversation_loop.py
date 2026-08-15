@@ -1673,6 +1673,7 @@ def run_conversation(
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
+    _plugin_request_context = _ctx.plugin_request_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
     # Commentary deduplication spans all provider continuations and tool calls
@@ -1986,12 +1987,10 @@ def run_conversation(
             # transport strips underscore keys, so drop it centrally here.
             api_msg.pop("_row_id", None)
 
-            # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated beyond the api_content stamp, so nothing leaks
-            # into the clean transcript content.
+            # Attach ordinary plugin/Gateway context to the current user copy.
+            # Provider-aware request context and recall are added later by
+            # apply_request_only_turn_context(). All are API-call-time only;
+            # the original message in `messages` stays clean.
             if idx == current_turn_user_idx and msg.get("role") == "user":
                 api_msg["_current_turn_user"] = True
                 _composed = compose_user_api_content(
@@ -2089,6 +2088,7 @@ def run_conversation(
                     current_turn_user_idx=None,
                     ext_prefetch_cache=_ext_prefetch_cache,
                     plugin_user_context="",
+                    plugin_request_context=_plugin_request_context,
                     force_memory_user_suffix=True,
                 )
                 for _message in _moa_api_messages:
@@ -2249,6 +2249,7 @@ def run_conversation(
                 current_turn_user_idx=current_user_index,
                 ext_prefetch_cache=_ext_prefetch_cache,
                 plugin_user_context="",
+                plugin_request_context=_plugin_request_context,
             )
 
             _sanitize_messages_surrogates(request_messages)

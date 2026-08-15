@@ -125,10 +125,10 @@ def compose_user_api_content(
     target="user_message" (the default). Both are appended to the *API copy*
     of the user message only — the stored content stays clean.
 
-    This is the single source of request-only composition.  The returned value
-    is placed on the provider request copy; it is never stamped onto the live
-    message or persisted.  Historical turns therefore replay their clean user
-    text, not recall/plugin context from an older turn.
+    This is the single source of request-only user-suffix composition. The
+    returned value is placed on the provider request copy; it is never stamped
+    onto the live message or persisted. Historical turns therefore replay their
+    clean user text, not recall/plugin context from an older turn.
 
     String content gets a string suffix. OpenAI-style multimodal content gets a
     copied trailing text part, leaving the durable list untouched. Returns
@@ -173,15 +173,17 @@ def apply_request_only_turn_context(
     current_turn_user_idx: Optional[int],
     ext_prefetch_cache: str,
     plugin_user_context: str,
+    plugin_request_context: str = "",
     force_memory_user_suffix: bool = False,
 ) -> int:
     """Attach this turn's volatile context to an API-only message copy.
 
-    Plugin/Gateway context stays on the current user item. Recall uses the
-    OpenAI Responses developer-item shape when supported, except for MoA's
-    provider-neutral advisory view where a user suffix is required so both
-    reference and aggregator requests can consume it. Returns the resolved
-    current-user index, or ``-1`` when no user item exists.
+    Ordinary plugin/Gateway context stays on the current user item. Explicit
+    request context and recall use the OpenAI Responses developer-item shape
+    when supported, except for MoA's provider-neutral advisory view where a
+    user suffix is required so both reference and aggregator requests can
+    consume it. Returns the resolved current-user index, or ``-1`` when no user
+    item exists.
     """
     resolved_idx = current_turn_user_idx if isinstance(current_turn_user_idx, int) else -1
     if not (
@@ -220,17 +222,27 @@ def apply_request_only_turn_context(
         current_user["content"] = plugin_composed
 
     memory_block = build_memory_context_block(ext_prefetch_cache)
-    if not memory_block:
-        return resolved_idx
+    request_parts = [
+        part for part in (plugin_request_context, memory_block) if part
+    ]
     if (
-        uses_openai_memory_developer_after_user(agent)
+        request_parts
+        and uses_openai_memory_developer_after_user(agent)
         and not force_memory_user_suffix
     ):
         api_messages.insert(
             resolved_idx + 1,
-            {"role": "developer", "content": memory_block},
+            {"role": "developer", "content": "\n\n".join(request_parts)},
         )
         return resolved_idx
+
+    request_composed = compose_user_api_content(
+        current_user.get("content", ""),
+        "",
+        plugin_request_context,
+    )
+    if request_composed is not None:
+        current_user["content"] = request_composed
 
     memory_composed = compose_user_api_content(
         current_user.get("content", ""),
@@ -548,6 +560,9 @@ class TurnContext:
     should_review_memory: bool = False
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
     plugin_user_context: str = ""
+    # Explicit provider-aware request context. OpenAI/Codex Responses receives
+    # it before recall in one developer item; other runtimes use a user suffix.
+    plugin_request_context: str = ""
     # Raw external-memory prefetch text used for provider-specific request
     # injection; retained for diagnostics/backward-compatible tests.
     ext_prefetch_cache: str = ""
@@ -1282,8 +1297,11 @@ def build_turn_context(
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
-    # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
+    # Plugin hook: pre_llm_call. Ordinary context uses the request-only user
+    # suffix; an explicit request_context target opts into provider-aware
+    # placement without changing other plugins.
     plugin_user_context = ""
+    plugin_request_context = ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
@@ -1300,6 +1318,7 @@ def build_turn_context(
             sender_id=getattr(agent, "_user_id", None) or "",
         )
         _ctx_parts: list[str] = []
+        _request_ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin
         # can't inflate every subsequent turn's prompt. Ported from
         # openai/codex PR #21069 ("Spill large hook outputs from context").
@@ -1314,8 +1333,10 @@ def build_turn_context(
             _spill_config_cached = None
         for r in _pre_results:
             _piece: str = ""
+            _target = "user_message"
             if isinstance(r, dict) and r.get("context"):
                 _piece = str(r["context"])
+                _target = str(r.get("target") or "user_message").strip().lower()
             elif isinstance(r, str) and r.strip():
                 _piece = r
             else:
@@ -1330,9 +1351,14 @@ def build_turn_context(
                     )
                 except Exception as _spill_exc:
                     logger.warning("hook context spill failed: %s", _spill_exc)
-            _ctx_parts.append(_piece)
+            if _target == "request_context":
+                _request_ctx_parts.append(_piece)
+            else:
+                _ctx_parts.append(_piece)
         if _ctx_parts:
             plugin_user_context = "\n\n".join(_ctx_parts)
+        if _request_ctx_parts:
+            plugin_request_context = "\n\n".join(_request_ctx_parts)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
@@ -1451,6 +1477,7 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx,
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
+        plugin_request_context=plugin_request_context,
         ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=_preflight_compression_blocked,
     )

@@ -614,6 +614,19 @@ class TestWireInvariant:
             )
 
         with patch(
+            "hermes_cli.lifecycle.invoke_hook",
+            side_effect=lambda hook, **_kwargs: (
+                [
+                    {"context": "PLUGIN-CTX"},
+                    {
+                        "context": "MOA-LCM-POLICY-SENTINEL",
+                        "target": "request_context",
+                    },
+                ]
+                if hook == "pre_llm_call"
+                else []
+            ),
+        ), patch(
             "agent.moa_loop._run_references_parallel",
             side_effect=_run_references,
         ), patch("agent.moa_loop.call_llm", side_effect=_call_aggregator):
@@ -633,15 +646,21 @@ class TestWireInvariant:
         reference_wire = json.dumps(captured["reference_messages"])
         aggregator_wire = json.dumps(captured["aggregator_messages"])
         assert "MOA-RECALL-SENTINEL" in reference_wire
+        assert "MOA-LCM-POLICY-SENTINEL" in reference_wire
         assert "PLUGIN-CTX" in reference_wire
         assert "MOA-RECALL-SENTINEL" in aggregator_wire
+        assert "MOA-LCM-POLICY-SENTINEL" in aggregator_wire
         assert "PLUGIN-CTX" in aggregator_wire
 
         # The acting-model request also sees current recall, while durable
         # result/DB history remains the clean user-authored turn.
         acting_user = _user_messages(_chat_requests(handler)[0])[-1]
+        assert acting_user["content"].index("MOA-LCM-POLICY-SENTINEL") < acting_user[
+            "content"
+        ].index("MOA-RECALL-SENTINEL")
         assert "MOA-RECALL-SENTINEL" in acting_user["content"]
         assert result["messages"][0]["content"] == "question for advisors"
+        assert "MOA-LCM-POLICY-SENTINEL" not in json.dumps(result["messages"])
         assert "MOA-RECALL-SENTINEL" not in json.dumps(result["messages"])
         user_rows = [row for row in db.get_messages(sid) if row["role"] == "user"]
         assert user_rows[0]["content"] == "question for advisors"
