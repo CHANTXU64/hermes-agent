@@ -1718,13 +1718,14 @@ git diff --check
 
 Status: active
 
-Date: 2026-08-14
+Date: 2026-08-14; Codex watchdog parity 2026-08-15
 
 Files:
 
 - `agent/auxiliary_client.py`
 - `agent/model_metadata.py`
 - `agent/chat_completion_helpers.py`
+- `run_agent.py`
 - `agent/transports/codex.py`
 - `agent/turn_context.py`
 - `plugins/image_gen/openai-codex/__init__.py`
@@ -1732,6 +1733,7 @@ Files:
 - `tests/fork/test_openai_api_codex_gateway.py`
 - `tests/fork/test_codex_request_only_memory_context.py`
 - `tests/fork/test_image_gen_openai_api.py`
+- `tests/agent/test_non_stream_stale_timeout.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
 Summary:
@@ -1749,6 +1751,7 @@ What changed:
 - For custom `openai-api` endpoints, the public context resolver consults live/credential-scoped metadata before the legacy `model@base_url` cache; official OpenAI URLs and other providers retain the prior cache order.
 - Main-session Codex transport sends the same three cache-routing headers (`session_id` / `thread-id` / `x-client-request-id`) to a custom `openai-api` Codex-compatible gateway as it sends on `openai-codex` (upstream only sends two of them), via a dedicated `use_codex_cache_headers` flag. Unlike the official backend, the custom gateway still receives `max_output_tokens` and keeps its endpoint-specific encrypted-reasoning issuer (reasoning blobs are sealed per endpoint; stamping a custom gateway as the shared `codex_backend` issuer would let a gateway switch replay foreign blobs → HTTP 400 `invalid_encrypted_content`). Native server-side compaction (`context_management`) stays limited to official OpenAI/ChatGPT routes so a custom gateway never receives that field.
 - Request-only memory recall on `openai-api` Codex Responses routes is injected as a trailing `role=developer` input item after the current user message (same shape as `openai-codex`), instead of being appended into the user content.
+- The non-streaming stale-call policy treats `openai-api` Codex Responses routes as Codex backends. Large requests therefore receive the existing Codex context floors (900 seconds above 50K estimated tokens and 1200 seconds above 100K) in both interactive and direct Cron/subagent call paths instead of the generic 150/240-second ceilings.
 
 Why it matters:
 
@@ -1756,11 +1759,16 @@ Why it matters:
 
 Merge protection:
 
-- Preserve when: an API-key Codex-compatible endpoint is still selected through `openai-api` and upstream lacks equivalent image registration, auxiliary transport inheritance, live CodexManager context-catalog handling, or credential-scoped last-valid context retention.
-- Drop when: upstream provides all four behaviors with equivalent tests.
-- Ask user when: upstream changes `openai-api` transport semantics, image generation routing, the CodexManager enriched model catalog no longer provides authoritative context windows, or a durable endpoint cache adopts different deletion/expiry semantics.
+- Preserve when: an API-key Codex-compatible endpoint is still selected through `openai-api` and upstream lacks equivalent image registration, auxiliary transport inheritance, live CodexManager context-catalog handling, credential-scoped last-valid context retention, or Codex large-context watchdog parity across interactive and direct call paths.
+- Drop when: upstream provides all five behaviors with equivalent tests.
+- Ask user when: upstream changes `openai-api` transport or timeout semantics, image generation routing, the CodexManager enriched model catalog no longer provides authoritative context windows, or a durable endpoint cache adopts different deletion/expiry semantics.
 
 Verification:
+
+- 2026-08-15 watchdog-parity review: shared backend classification, the direct
+  Responses path, and the non-Codex Chat Completions boundary were checked;
+  adjacent timeout, TTFB, wait-state, `openai-api`, and Responses regressions
+  reported `92 passed`. Ruff, `py_compile`, and `git diff --check` also passed.
 
 ```bash
 ./venv/bin/python -m pytest \
@@ -1770,11 +1778,12 @@ Verification:
   tests/plugins/image_gen/test_openai_codex_provider.py \
   tests/agent/test_auxiliary_client.py \
   tests/agent/test_model_metadata.py \
+  tests/agent/test_non_stream_stale_timeout.py \
   tests/hermes_cli/test_model_switch_openai_api_mode.py \
   -q -o 'addopts='
 ./venv/bin/python -m py_compile \
   agent/auxiliary_client.py agent/model_metadata.py \
-  agent/chat_completion_helpers.py agent/transports/codex.py \
+  agent/chat_completion_helpers.py run_agent.py agent/transports/codex.py \
   agent/turn_context.py \
   plugins/image_gen/openai-codex/__init__.py \
   tests/fork/test_openai_api_codex_gateway.py \
@@ -1927,6 +1936,7 @@ deltas are expected in these areas:
   - `agent/auxiliary_client.py`
   - `agent/model_metadata.py`
   - `agent/chat_completion_helpers.py`
+  - `run_agent.py`
   - `agent/transports/codex.py`
   - `agent/turn_context.py`
   - `plugins/image_gen/openai-codex/__init__.py`
@@ -1934,6 +1944,7 @@ deltas are expected in these areas:
   - `tests/fork/test_openai_api_codex_gateway.py`
   - `tests/fork/test_codex_request_only_memory_context.py`
   - `tests/fork/test_image_gen_openai_api.py`
+  - `tests/agent/test_non_stream_stale_timeout.py`
   - `docs/LOCAL_MODIFICATIONS.md`
 
 

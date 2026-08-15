@@ -133,7 +133,7 @@ def _is_openai_codex_backend(agent) -> bool:
     base_url_lower = str(getattr(agent, "_base_url_lower", "") or "")
     base_url_hostname = str(getattr(agent, "_base_url_hostname", "") or "")
     return (
-        getattr(agent, "provider", None) == "openai-codex"
+        getattr(agent, "provider", None) in {"openai-codex", "openai-api"}
         or (
             base_url_hostname == "chatgpt.com"
             and "/backend-api/codex" in base_url_lower
@@ -142,14 +142,15 @@ def _is_openai_codex_backend(agent) -> bool:
 
 
 def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
-    """Minimum wall-clock stale timeout for openai-codex by estimated context.
+    """Minimum stale timeout for OpenAI/Codex Responses by estimated context.
 
-    Gateway/Telegram sessions routinely ship ~15–25k tokens of tools +
-    instructions before the first user message. Subscription-backed Codex can
-    legitimately spend several minutes in backend admission/prefill at that
-    size; the generic 90s non-stream stale default aborts healthy calls. The
-    floor engages above 10k estimated tokens so those gateway-scale payloads
-    are covered; smaller requests keep the generic default.
+    Gateway/Telegram sessions routinely ship ~15–25k tokens of tools and
+    instructions before the first user message. Subscription-backed and
+    API-key Codex-compatible routes can legitimately spend several minutes in
+    backend admission/prefill at that size; the generic 90s non-stream stale
+    default aborts healthy calls. The floor engages above 10k estimated tokens
+    so those gateway-scale payloads are covered; smaller requests keep the
+    generic default.
     """
     if est_tokens > 100_000:
         return 1200.0

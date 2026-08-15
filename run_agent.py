@@ -1448,8 +1448,20 @@ class AIAgent:
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
-        from agent.chat_completion_helpers import estimate_request_context_tokens
+        from agent.chat_completion_helpers import (
+            _is_openai_codex_backend,
+            estimate_request_context_tokens,
+            openai_codex_stale_timeout_floor,
+        )
         est_tokens = estimate_request_context_tokens(api_payload)
+        if (
+            getattr(self, "api_mode", None) == "codex_responses"
+            and _is_openai_codex_backend(self)
+        ):
+            stale_base = max(
+                stale_base,
+                openai_codex_stale_timeout_floor(est_tokens),
+            )
         if est_tokens > 100_000:
             return max(stale_base, 240.0)
         if est_tokens > 50_000:

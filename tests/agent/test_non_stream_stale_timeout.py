@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 
 
@@ -120,3 +121,62 @@ def test_openai_codex_stale_floor_tiers():
 
     assert openai_codex_stale_timeout_floor(55_000) == 900.0
     assert openai_codex_stale_timeout_floor(120_000) == 1200.0
+
+
+def test_openai_api_uses_shared_codex_backend_watchdog_classification():
+    from agent.chat_completion_helpers import _is_openai_codex_backend
+
+    assert _is_openai_codex_backend(
+        SimpleNamespace(
+            provider="openai-api",
+            _base_url_hostname="codex.chantx.top",
+            _base_url_lower="https://codex.chantx.top/v1",
+        )
+    )
+    assert not _is_openai_codex_backend(
+        SimpleNamespace(
+            provider="openrouter",
+            _base_url_hostname="openrouter.ai",
+            _base_url_lower="https://openrouter.ai/api/v1",
+        )
+    )
+
+
+def test_openai_api_codex_responses_large_context_uses_900s_floor(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, "")
+
+    agent = _make_agent(
+        tmp_path,
+        model="gpt-5.6-sol",
+        provider="openai-api",
+        base_url="https://codex.chantx.top/v1",
+    )
+    setattr(agent, "api_mode", "codex_responses")
+
+    payload = {"model": "gpt-5.6-sol", "input": "x" * 220_000}
+    assert agent._compute_non_stream_stale_timeout(payload) == 900.0
+
+
+def test_openai_api_chat_completions_keeps_generic_large_context_timeout(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, "")
+
+    agent = _make_agent(
+        tmp_path,
+        model="plain-model",
+        provider="openai-api",
+        base_url="https://api.example.test/v1",
+    )
+    setattr(agent, "api_mode", "chat_completions")
+
+    payload = {"model": "plain-model", "messages": [{"content": "x" * 220_000}]}
+    assert agent._compute_non_stream_stale_timeout(payload) == 150.0
