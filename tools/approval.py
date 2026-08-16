@@ -3237,19 +3237,23 @@ class SmartApprovalResult:
         return hash(self.decision)
 
 
-def _approval_context_prefers_chinese() -> bool:
-    context = get_smart_approval_context()
-    text_parts = [str(context.get("latest_user_message") or "")]
-    for clarification in context.get("clarifications") or []:
-        if isinstance(clarification, dict):
-            text_parts.extend(
-                str(clarification.get(key) or "") for key in ("question", "answer")
-            )
-    return bool(re.search(r"[\u3400-\u9fff]", "\n".join(text_parts)))
+def _approval_language() -> str:
+    """Return the configured Hermes interface language for approval output."""
+    from agent.i18n import get_language
+
+    return get_language()
+
+
+def _approval_language_prefers_chinese() -> bool:
+    return _approval_language() in {"zh", "zh-hant"}
+
+
+def _approval_text(english: str, chinese: str) -> str:
+    return chinese if _approval_language_prefers_chinese() else english
 
 
 def _format_smart_review_description(review: SmartApprovalResult) -> str:
-    if not _approval_context_prefers_chinese():
+    if not _approval_language_prefers_chinese():
         return (
             f"Smart review: risk={review.risk_level}, "
             f"authorization={review.authorization}. {review.reason}"
@@ -3275,7 +3279,7 @@ def _format_user_denial_message(
     breaker_addendum: str = "",
 ) -> str:
     timed_out = outcome == "timeout"
-    if _approval_context_prefers_chinese():
+    if _approval_language_prefers_chinese():
         lead = (
             "已阻止：等待用户审批超时。"
             if timed_out
@@ -3566,7 +3570,10 @@ def _parse_smart_approval_result(raw: str) -> SmartApprovalResult:
             decision=decision,
             risk_level="low" if decision == "approve" else "high",
             authorization="sufficient" if decision == "approve" else "unclear",
-            reason="Legacy smart-approval response.",
+            reason=_approval_text(
+                "Legacy smart-approval response.",
+                "智能审批模型返回了旧版响应。",
+            ),
         )
     try:
         payload = json.loads(text)
@@ -3585,7 +3592,13 @@ def _parse_smart_approval_result(raw: str) -> SmartApprovalResult:
         return SmartApprovalResult(decision, risk_level, authorization, reason[:500])
     except Exception:
         return SmartApprovalResult(
-            "escalate", "high", "unclear", "审批模型返回格式无效，需要用户判断。"
+            "escalate",
+            "high",
+            "unclear",
+            _approval_text(
+                "Smart approval returned an invalid response format; user review is required.",
+                "审批模型返回格式无效，需要用户判断。",
+            ),
         )
 
 
@@ -3605,7 +3618,10 @@ def _enforce_smart_approval_contract(
             "escalate",
             review.risk_level,
             review.authorization,
-            "直接执行脚本内容不可完整读取，需要用户判断。",
+            _approval_text(
+                "Directly executed script content could not be read completely; user review is required.",
+                "直接执行脚本内容不可完整读取，需要用户判断。",
+            ),
         )
     allowed_authorizations = (
         {"exact"} if review.risk_level == "high" else {"exact", "sufficient"}
@@ -3615,7 +3631,10 @@ def _enforce_smart_approval_contract(
             "escalate",
             review.risk_level,
             review.authorization,
-            "当前授权不足以覆盖该风险和范围，需要用户判断。",
+            _approval_text(
+                "Current authorization does not cover this risk and scope; user review is required.",
+                "当前授权不足以覆盖该风险和范围，需要用户判断。",
+            ),
         )
     return review
 
@@ -3645,6 +3664,7 @@ def _smart_approve(
             source_kind=source_kind,
             read_script=read_script,
         )
+        reason_language = _approval_language()
 
         system_prompt = (
             "You are the security approval reviewer for an AI agent. Evaluate the actual "
@@ -3687,9 +3707,9 @@ def _smart_approve(
             "- none: no approval exists for a risky action, or an explicit prohibition applies.\n"
             "For a baseline-safe action, use authorization=sufficient even when the user "
             "message does not mention it.\n\n"
-            "Write reason in the same natural language as the latest real user message. "
-            "If that message is empty or language-neutral, use the dominant natural language "
-            "in the authorization evidence; if still unclear, use English.\n\n"
+            f"Write reason in the configured Hermes interface language: {reason_language}. "
+            "The configured language is authoritative even when the latest real user message "
+            "uses another language.\n\n"
             "Return one compact JSON object with exactly these fields: decision "
             "(approve|deny|escalate), risk_level (low|medium|high|critical), authorization "
             "(exact|sufficient|unclear|none), reason (one short sentence)."
@@ -3729,7 +3749,13 @@ def _smart_approve(
     except Exception as e:
         logger.debug("Smart approvals: LLM call failed (%s), escalating", e)
         return SmartApprovalResult(
-            "escalate", "high", "unclear", "审批模型不可用，需要用户判断。"
+            "escalate",
+            "high",
+            "unclear",
+            _approval_text(
+                "The approval model is unavailable; user review is required.",
+                "审批模型不可用，需要用户判断。",
+            ),
         )
 
 
@@ -4792,7 +4818,7 @@ def check_all_command_guards(command: str, env_type: str,
         review_description = _format_smart_review_description(smart_review)
         combined_desc = (
             review_description
-            if _approval_context_prefers_chinese()
+            if _approval_language_prefers_chinese()
             else f"{combined_desc}; {review_description}"
         )
     primary_key = warnings[0][0]
@@ -5229,7 +5255,7 @@ def check_execute_code_guard(code: str, env_type: str,
         review_description = _format_smart_review_description(smart_review)
         description = (
             review_description
-            if _approval_context_prefers_chinese()
+            if _approval_language_prefers_chinese()
             else f"{description} {review_description}"
         )
 

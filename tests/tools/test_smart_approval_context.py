@@ -287,7 +287,7 @@ def test_standard_development_commands_bypass_smart_review_when_baseline_safe(
     smart_review.assert_not_called()
 
 
-def test_smart_review_display_uses_latest_user_language():
+def test_smart_review_display_uses_configured_language(monkeypatch):
     from tools.approval import _format_smart_review_description
 
     review = SmartApprovalResult(
@@ -296,16 +296,18 @@ def test_smart_review_display_uses_latest_user_language():
         authorization="unclear",
         reason="需要人工确认此测试脚本的写入范围。",
     )
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
     chinese_token = set_smart_approval_context(
-        {"latest_user_message": "运行测试并验证", "clarifications": []}
+        {"latest_user_message": "Run the tests", "clarifications": []}
     )
     try:
         chinese = _format_smart_review_description(review)
     finally:
         reset_smart_approval_context(chinese_token)
 
+    monkeypatch.setenv("HERMES_LANGUAGE", "en")
     english_token = set_smart_approval_context(
-        {"latest_user_message": "Run the tests", "clarifications": []}
+        {"latest_user_message": "运行测试并验证", "clarifications": []}
     )
     try:
         english = _format_smart_review_description(review)
@@ -322,19 +324,21 @@ def test_smart_review_display_uses_latest_user_language():
     )
 
 
-def test_user_denial_message_uses_latest_user_language():
+def test_user_denial_message_uses_configured_language(monkeypatch):
     from tools.approval import _format_user_denial_message
 
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
     chinese_token = set_smart_approval_context(
-        {"latest_user_message": "请先让我确认", "clarifications": []}
+        {"latest_user_message": "Ask me first", "clarifications": []}
     )
     try:
         chinese = _format_user_denial_message("denied", "范围不对")
     finally:
         reset_smart_approval_context(chinese_token)
 
+    monkeypatch.setenv("HERMES_LANGUAGE", "en")
     english_token = set_smart_approval_context(
-        {"latest_user_message": "Ask me first", "clarifications": []}
+        {"latest_user_message": "请先让我确认", "clarifications": []}
     )
     try:
         english = _format_user_denial_message("denied", "wrong scope")
@@ -347,25 +351,27 @@ def test_user_denial_message_uses_latest_user_language():
     assert english.startswith("BLOCKED: Command denied by user.")
 
 
-def test_terminal_auto_approval_note_uses_review_language():
+def test_terminal_auto_approval_note_uses_configured_language(monkeypatch):
     from tools.terminal_tool import _format_approval_note
 
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
     chinese = _format_approval_note(
-        {
-            "smart_approved": True,
-            "smart_review": {"reason": "这是常规开发测试。"},
-        },
-        "test command",
-    )
-    english = _format_approval_note(
         {
             "smart_approved": True,
             "smart_review": {"reason": "Routine development test."},
         },
         "test command",
     )
+    monkeypatch.setenv("HERMES_LANGUAGE", "en")
+    english = _format_approval_note(
+        {
+            "smart_approved": True,
+            "smart_review": {"reason": "这是常规开发测试。"},
+        },
+        "test command",
+    )
 
-    assert chinese == "命令曾触发安全检查，已由智能审批自动批准：这是常规开发测试。"
+    assert chinese == "命令曾触发安全检查，已由智能审批自动批准：Routine development test."
     assert english == (
         "Command was flagged (test command) and auto-approved by smart approval."
     )
@@ -597,20 +603,36 @@ def test_prompt_marks_baseline_safe_actions_as_sufficiently_authorized():
     ) in prompt
 
 
-def test_prompt_requires_reason_in_latest_user_language():
+def test_prompt_requires_reason_in_configured_language(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
     prompt = _smart_system_prompt_for(
         "perform a flagged operation",
-        "请检查这个操作是否安全",
+        "Check whether this operation is safe",
     )
 
     assert (
-        "Write reason in the same natural language as the latest real user message."
+        "Write reason in the configured Hermes interface language: zh."
         in prompt
     )
     assert (
-        "If that message is empty or language-neutral, use the dominant natural language "
-        "in the authorization evidence; if still unclear, use English."
+        "The configured language is authoritative even when the latest real user message "
+        "uses another language."
         in prompt
+    )
+
+
+def test_internal_smart_approval_reasons_use_configured_language(monkeypatch):
+    from tools.approval import _parse_smart_approval_result
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+    chinese = _parse_smart_approval_result("not valid json")
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "en")
+    english = _parse_smart_approval_result("not valid json")
+
+    assert chinese.reason == "审批模型返回格式无效，需要用户判断。"
+    assert english.reason == (
+        "Smart approval returned an invalid response format; user review is required."
     )
 
 

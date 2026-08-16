@@ -1990,10 +1990,13 @@ What changed:
   guards without invoking Smart Approval when Tirith and static checks find no
   risk. Directly launched source scripts remain bounded review evidence, and
   unreadable custom scripts still escalate.
-- Smart-review reasons are requested in the latest real user's natural
-  language. Chinese sessions also receive localized risk/authorization
-  summaries, denial and timeout safeguards, and terminal auto-approval notes;
-  structured decision/risk/authorization values remain stable machine enums.
+- Approval language selection reuses Hermes' interface-language resolver
+  (`HERMES_LANGUAGE` override, then `display.language`, then English). The
+  reviewer receives the resolved language code for `reason`; fixed smart-review
+  presentation uses Chinese for `zh`/`zh-hant` and otherwise retains its English
+  fallback. A Chinese interface therefore remains Chinese even when the latest
+  user message is English or language-neutral. Structured decision/risk/
+  authorization values remain stable machine enums.
 - The reviewer returns `decision`, `risk_level`, `authorization`, and a short
   semantic `reason`. Critical risk is denied; an approval whose risk and
   authorization fields conflict is downgraded to escalation; high-risk exact

@@ -9,7 +9,7 @@ It combines four related guarantees:
 1. authorization evidence comes only from the latest real user turn and subsequent completed Clarify exchanges;
 2. directly launched custom scripts are reviewed through bounded entry-script evidence;
 3. standard package-managed development tools are not misclassified as unreadable custom scripts;
-4. user-visible approval explanations follow the current user's language.
+4. user-visible approval explanations follow Hermes' configured interface language.
 
 It also validates the Tirith command-line protocol before trusting a same-named executable found on `PATH`.
 
@@ -72,13 +72,17 @@ Structured machine fields remain English enums:
 - `risk_level`: `low`, `medium`, `high`, `critical`;
 - `authorization`: `exact`, `sufficient`, `unclear`, `none`.
 
-The reviewer is instructed to write `reason` in the latest real user's natural language. Chinese contexts also localize:
+The reviewer receives Hermes' resolved interface-language code for `reason`.
+Fixed smart-review presentation uses Chinese for `zh`/`zh-hant` and otherwise
+retains its English fallback. Chinese interfaces localize:
 
 - risk and authorization summaries;
 - denial and timeout safeguards;
 - terminal smart-auto-approval notes.
 
-Language detection uses the same request-local trusted approval context, not historical summaries or system scaffolding.
+Language resolution reuses `agent.i18n.get_language()`: `HERMES_LANGUAGE` overrides
+`display.language`, which falls back to English. Message text, historical summaries,
+and system scaffolding are not used to guess the presentation language.
 
 ## Main implementation seams
 
@@ -137,7 +141,8 @@ python -m pytest -q -o 'addopts=' \
   tests/tools/test_terminal_tool.py \
   tests/tools/test_code_execution.py \
   tests/tools/test_code_execution_modes.py \
-  tests/tools/test_tirith_security.py
+  tests/tools/test_tirith_security.py \
+  tests/agent/test_i18n.py
 
 python -m pytest -q -o 'addopts=' \
   tests/agent/test_context_compressor_zero_user_provenance.py \

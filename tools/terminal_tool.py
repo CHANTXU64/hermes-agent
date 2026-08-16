@@ -62,9 +62,11 @@ def _redact_terminal_error_text(value: Any) -> str:
 
 
 def _format_approval_note(approval: dict[str, Any], description: str) -> str:
+    from agent.i18n import get_language
+
     review = approval.get("smart_review")
     reason = review.get("reason", "") if isinstance(review, dict) else ""
-    chinese = bool(re.search(r"[\u3400-\u9fff]", reason or description))
+    chinese = get_language() in {"zh", "zh-hant"}
     if approval.get("user_approved"):
         if chinese:
             return f"命令需要人工审批，用户已批准：{description}"
