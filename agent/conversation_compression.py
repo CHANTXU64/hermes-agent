@@ -1909,6 +1909,15 @@ _SYNTHETIC_USER_PREFIXES = (
     "[System: Your previous tool call",
     "[Your active task list was preserved across context compression]",
     "[IMPORTANT: Background process ",
+    "[IMPORTANT: Watch patterns disabled for process ",
+    "[Current user objective preserved from compacted history]",
+    "[Session Arc Summary (",
+    "[Recent Summary (",
+    "[Durable Summary (",
+    "[Depth-",
+    "[ASYNC DELEGATION BATCH COMPLETE",
+    "[ASYNC DELEGATION COMPLETE",
+    "[Session was just handed off from CLI (",
 )
 
 
@@ -1923,6 +1932,80 @@ def _message_text(message: Any) -> str:
             if isinstance(part, dict)
         )
     return ""
+
+
+_MODEL_SWITCH_NOTE_PREFIX = "[Note: model was just switched from "
+_MODEL_SWITCH_NOTE_SUFFIX = "Adjust your self-identification accordingly.]"
+_REPLY_CONTEXT_PREFIXES = (
+    "[Replying to: ",
+    "[Replying to your previous message: ",
+)
+_THREAD_CONTEXT_PREFIX = "[Thread context — prior messages in this thread "
+_THREAD_CONTEXT_END = "[End of thread context]"
+_CRON_DELIVERY_PREFIX = "[IMPORTANT: You are running as a scheduled cron job. DELIVERY: "
+_CRON_FENCED_CONTEXT_PREFIXES = (
+    "## Script Output\n",
+    "## Script Error\n",
+    "## Output from job '",
+)
+
+
+def _real_user_message_text(message: Any) -> str:
+    """Return only user-authored text from a runtime-enriched user turn."""
+    text = _message_text(message).replace("\r\n", "\n").strip()
+    while text:
+        if text.startswith(_CRON_DELIVERY_PREFIX):
+            end = text.find("]\n\n")
+            if end < 0:
+                break
+            text = text[end + 3 :].lstrip()
+            continue
+
+        if text.startswith(_CRON_FENCED_CONTEXT_PREFIXES):
+            fence_start = text.find("```\n")
+            fence_end = text.find("\n```\n\n", fence_start + 4)
+            if fence_start < 0 or fence_end < 0:
+                break
+            text = text[fence_end + len("\n```\n\n") :].lstrip()
+            continue
+
+        if text.startswith("[IMPORTANT: The user has invoked the "):
+            try:
+                from agent.skill_commands import (
+                    extract_user_instruction_from_skill_message,
+                )
+
+                instruction = extract_user_instruction_from_skill_message(text)
+            except Exception:
+                return ""
+            if not instruction:
+                return ""
+            text = instruction.strip()
+            continue
+
+        if text.startswith(_MODEL_SWITCH_NOTE_PREFIX):
+            end = text.find(_MODEL_SWITCH_NOTE_SUFFIX)
+            if end < 0:
+                break
+            text = text[end + len(_MODEL_SWITCH_NOTE_SUFFIX) :].lstrip()
+            continue
+
+        if text.startswith(_REPLY_CONTEXT_PREFIXES):
+            end = text.find("]\n\n")
+            if end < 0:
+                break
+            text = text[end + 3 :].lstrip()
+            continue
+
+        if text.startswith(_THREAD_CONTEXT_PREFIX):
+            end = text.find(_THREAD_CONTEXT_END)
+            if end < 0:
+                break
+            text = text[end + len(_THREAD_CONTEXT_END) :].lstrip()
+            continue
+
+        break
+    return text.strip()
 
 
 _SYNTHETIC_USER_FLAGS = (
@@ -1947,7 +2030,7 @@ def _is_real_user_message(message: Any) -> bool:
         return False
     if any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS):
         return False
-    text = _message_text(message).strip()
+    text = _real_user_message_text(message)
     if not text:
         return False
     if text.startswith(_SYNTHETIC_USER_PREFIXES):

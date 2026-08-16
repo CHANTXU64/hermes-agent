@@ -53,6 +53,92 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def build_smart_approval_context(messages: list) -> dict[str, Any]:
+    """Return the latest user message and completed clarify pairs after it.
+
+    Smart approval intentionally does not inherit the full conversation. The
+    most recent user turn is the authorization boundary; clarify answers are
+    paired with their exact question so short answers such as "yes" retain
+    their scope without granting anything broader.
+    """
+    if not isinstance(messages, list):
+        return {"latest_user_message": "", "clarifications": []}
+
+    latest_user_index = -1
+    latest_user_message = ""
+    # Reuse the compression subsystem's canonical human-vs-scaffolding
+    # predicate. Runtime notices intentionally use role="user" for model turn
+    # alternation, but they must never become approval authorization evidence.
+    from agent.conversation_compression import (
+        _is_real_user_message,
+        _real_user_message_text,
+        _strip_stale_todo_snapshot,
+    )
+
+    for index, message in enumerate(messages):
+        if not _is_real_user_message(message):
+            continue
+        latest_user_index = index
+        normalized = dict(message)
+        normalized["content"] = _strip_stale_todo_snapshot(
+            message.get("content", "")
+        )
+        latest_user_message = _real_user_message_text(normalized)
+
+    clarify_questions: dict[str, str] = {}
+    clarifications: list[dict[str, str]] = []
+    for message in messages[latest_user_index + 1 :]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for tool_call in message.get("tool_calls") or []:
+                try:
+                    if isinstance(tool_call, dict):
+                        call_id = str(tool_call.get("id") or "")
+                        function = tool_call.get("function") or {}
+                        name = function.get("name")
+                        raw_args = function.get("arguments")
+                    else:
+                        call_id = str(getattr(tool_call, "id", "") or "")
+                        function = getattr(tool_call, "function", None)
+                        name = getattr(function, "name", None)
+                        raw_args = getattr(function, "arguments", None)
+                    if name != "clarify" or not call_id:
+                        continue
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    if not isinstance(args, dict):
+                        continue
+                    question = args.get("question")
+                    if isinstance(question, str) and question.strip():
+                        clarify_questions[call_id] = question.strip()
+                except Exception:
+                    continue
+        elif message.get("role") == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            question = clarify_questions.get(call_id)
+            if not question:
+                continue
+            try:
+                payload = message.get("content", "")
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                if not isinstance(payload, dict) or "user_response" not in payload:
+                    continue
+                answer = payload.get("user_response")
+                if isinstance(answer, list):
+                    answer_text = json.dumps(answer, ensure_ascii=False)
+                else:
+                    answer_text = "" if answer is None else str(answer)
+                clarifications.append({"question": question, "answer": answer_text})
+            except Exception:
+                continue
+
+    return {
+        "latest_user_message": latest_user_message,
+        "clarifications": clarifications,
+    }
+
+
 def _ensure_file_checkpoint(
     agent,
     function_name: str,
@@ -2072,6 +2158,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         skip_tool_request_middleware=True,
                         skip_tool_execution_middleware=True,
                         tool_request_middleware_trace=list(middleware_trace),
+                        approval_context=build_smart_approval_context(messages),
                         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     )
@@ -2151,6 +2238,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         skip_tool_request_middleware=True,
                         skip_tool_execution_middleware=True,
                         tool_request_middleware_trace=list(middleware_trace),
+                        approval_context=build_smart_approval_context(messages),
                         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     )

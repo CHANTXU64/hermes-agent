@@ -215,6 +215,54 @@ class TestProgrammingErrors:
 # ---------------------------------------------------------------------------
 
 class TestEnsureInstalled:
+    @staticmethod
+    def _write_fake_tirith(path, *, compatible: bool) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if compatible:
+            body = (
+                "#!/bin/sh\n"
+                "if [ \"$1\" = check ] && [ \"$2\" = --help ]; then\n"
+                "  printf '%s\\n' 'Usage: tirith check --shell --json --non-interactive'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n"
+            )
+        else:
+            body = (
+                "#!/bin/sh\n"
+                "printf '%s\\n' 'usage: tirith [-policy-path PATH]' >&2\n"
+                "exit 1\n"
+            )
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_default_name_skips_incompatible_path_binary_for_hermes_binary(
+        self, mock_cfg, tmp_path
+    ):
+        mock_cfg.return_value = {
+            "tirith_enabled": True,
+            "tirith_path": "tirith",
+            "tirith_timeout": 5,
+            "tirith_fail_open": False,
+        }
+        path_binary = tmp_path / "path-bin" / "tirith"
+        hermes_binary = tmp_path / "hermes-bin" / "tirith"
+        self._write_fake_tirith(path_binary, compatible=False)
+        self._write_fake_tirith(hermes_binary, compatible=True)
+        _tirith_mod._resolved_path = None
+
+        with patch(
+            "tools.tirith_security.shutil.which", return_value=str(path_binary)
+        ), patch(
+            "tools.tirith_security._hermes_bin_dir",
+            return_value=str(hermes_binary.parent),
+        ), patch("tools.tirith_security._clear_install_failed"):
+            result = ensure_installed()
+
+        assert result == str(hermes_binary)
+        assert _tirith_mod._resolved_path == str(hermes_binary)
+
     @patch("tools.tirith_security._load_security_config")
     def test_disabled_returns_none(self, mock_cfg):
         mock_cfg.return_value = {"tirith_enabled": False, "tirith_path": "tirith",
@@ -222,9 +270,12 @@ class TestEnsureInstalled:
         _tirith_mod._resolved_path = None
         assert ensure_installed() is None
 
+    @patch("tools.tirith_security._supports_check_protocol", return_value=True)
     @patch("tools.tirith_security.shutil.which", return_value="/usr/local/bin/tirith")
     @patch("tools.tirith_security._load_security_config")
-    def test_found_on_path_returns_immediately(self, mock_cfg, mock_which):
+    def test_found_on_path_returns_immediately(
+        self, mock_cfg, mock_which, mock_supports_protocol
+    ):
         mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
                                  "tirith_timeout": 5, "tirith_fail_open": True}
         _tirith_mod._resolved_path = None
@@ -232,6 +283,7 @@ class TestEnsureInstalled:
              patch("os.access", return_value=True):
             result = ensure_installed()
         assert result == "/usr/local/bin/tirith"
+        mock_supports_protocol.assert_called_once_with("/usr/local/bin/tirith")
         _tirith_mod._resolved_path = None
 
 

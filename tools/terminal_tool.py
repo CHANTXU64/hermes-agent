@@ -47,7 +47,7 @@ import atexit
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 
 from utils import env_var_enabled
 
@@ -59,6 +59,20 @@ def _redact_terminal_error_text(value: Any) -> str:
     from agent.redact import redact_sensitive_text
 
     return redact_sensitive_text("" if value is None else str(value), force=True)
+
+
+def _format_approval_note(approval: dict[str, Any], description: str) -> str:
+    review = approval.get("smart_review")
+    reason = review.get("reason", "") if isinstance(review, dict) else ""
+    chinese = bool(re.search(r"[\u3400-\u9fff]", reason or description))
+    if approval.get("user_approved"):
+        if chinese:
+            return f"命令需要人工审批，用户已批准：{description}"
+        return f"Command required approval ({description}) and was approved by the user."
+    if chinese:
+        detail = reason or description
+        return f"命令曾触发安全检查，已由智能审批自动批准：{detail}"
+    return f"Command was flagged ({description}) and auto-approved by smart approval."
 
 
 # ---------------------------------------------------------------------------
@@ -377,11 +391,15 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
+                      has_host_access: bool = False,
+                      cwd: Optional[str] = None,
+                      read_script: Optional[Callable[[str], Optional[str]]] = None) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                                  has_host_access=has_host_access,
+                                  cwd=cwd,
+                                  read_script=read_script)
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -2933,9 +2951,43 @@ def terminal_tool(
         # the approval-wait (see clear_current_thread_interrupt).
         _approved_run = bool(force)
         if not force:
+            approval_cwd_base = get_session_cwd(session_key)
+            if approval_cwd_base is None:
+                approval_cwd_base = getattr(env, "cwd", None) or cwd
+            approval_cwd = _resolve_command_cwd(
+                workdir=workdir,
+                default_cwd=approval_cwd_base,
+                session_key=session_key,
+                env_type=env_type,
+            )
+
+            def _read_script_for_approval(script_path: str) -> Optional[str]:
+                # Local files are read directly by tools.approval. For remote
+                # backends, fetch a bounded prefix from the environment that
+                # will actually execute the script.
+                if env_type == "local" or env is None:
+                    return None
+                try:
+                    from tools.approval import _MAX_SMART_SCRIPT_BYTES
+                    result = env.execute(
+                        f"head -c {_MAX_SMART_SCRIPT_BYTES + 1} "
+                        f"< {shlex.quote(script_path)}"
+                    )
+                    if result.get("returncode", -1) == 0:
+                        output = result.get("output", "")
+                        if isinstance(output, str):
+                            return output
+                except Exception:
+                    pass
+                return None
+
             approval = _check_all_guards(
                 command, env_type,
                 has_host_access=_docker_has_host_access(config),
+                cwd=approval_cwd,
+                read_script=(
+                    _read_script_for_approval if env_type != "local" else None
+                ),
             )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
@@ -2967,11 +3019,11 @@ def terminal_tool(
             # Track whether approval was explicitly granted by the user
             if approval.get("user_approved"):
                 desc = approval.get("description", "flagged as dangerous")
-                approval_note = f"Command required approval ({desc}) and was approved by the user."
+                approval_note = _format_approval_note(approval, desc)
                 _approved_run = True
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
-                approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
+                approval_note = _format_approval_note(approval, desc)
 
         # Rewrite destructive file operations to safe alternatives
         # (rm → trash, mv → gmv -b, cp → gcp -b)

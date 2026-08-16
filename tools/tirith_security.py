@@ -490,6 +490,45 @@ def _is_explicit_path(configured_path: str) -> bool:
     return configured_path != "tirith"
 
 
+def _supports_check_protocol(path: str) -> bool:
+    """Return whether *path* is the Tirith scanner Hermes integrates with.
+
+    Multiple unrelated projects expose a ``tirith`` console command. Hermes
+    needs the sheeki03/tirith CLI whose ``check`` subcommand supports the JSON,
+    shell, and non-interactive flags used below. A same-named executable on
+    PATH must not be cached merely because it exists and is executable.
+    """
+    try:
+        result = subprocess.run(
+            [path, "check", "--help"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    help_text = f"{result.stdout}\n{result.stderr}"
+    return result.returncode == 0 and all(
+        flag in help_text for flag in ("--json", "--shell", "--non-interactive")
+    )
+
+
+def _compatible_path_candidate(path: str | None) -> str | None:
+    if not path:
+        return None
+    if _supports_check_protocol(path):
+        return path
+    _warn_once(
+        f"tirith_incompatible:{os.path.realpath(path)}",
+        "ignoring incompatible tirith executable on PATH: %s",
+        path,
+    )
+    return None
+
+
 def _resolve_tirith_path(configured_path: str) -> str:
     """Resolve the tirith binary path, auto-installing if necessary.
 
@@ -542,7 +581,7 @@ def _resolve_tirith_path(configured_path: str) -> str:
     # Default "tirith" — always re-run cheap local checks so a manual
     # install is picked up even after a previous network failure (P2 fix:
     # long-lived gateway/CLI recovers without restart).
-    found = shutil.which("tirith")
+    found = _compatible_path_candidate(shutil.which("tirith"))
     if found:
         _resolved_path = found
         _install_failure_reason = ""
@@ -607,7 +646,7 @@ def _background_install(*, log_failures: bool = True):
             return
 
         # Re-check local paths (may have been installed by another process)
-        found = shutil.which("tirith")
+        found = _compatible_path_candidate(shutil.which("tirith"))
         if found:
             _resolved_path = found
             _install_failure_reason = ""
@@ -676,7 +715,7 @@ def ensure_installed(*, log_failures: bool = True):
         return None
 
     # Default "tirith" — quick local checks first (no network)
-    found = shutil.which("tirith")
+    found = _compatible_path_candidate(shutil.which("tirith"))
     if found:
         _resolved_path = found
         _install_failure_reason = ""

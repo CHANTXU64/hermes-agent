@@ -1926,6 +1926,143 @@ Feature docs: `docs/chantxu64/delegate-per-call-routing/README.md`
 
 Upstream status: fork-only.
 
+### 28. Current-turn context-aware Smart Approval
+
+Status: active
+
+Date: 2026-08-16
+
+Files:
+
+- `agent/agent_runtime_helpers.py`
+- `agent/conversation_compression.py`
+- `agent/tool_executor.py`
+- `model_tools.py`
+- `tools/approval.py`
+- `tools/tirith_security.py`
+- `tools/terminal_tool.py`
+- `tools/code_execution_tool.py`
+- `tests/tools/test_smart_approval_context.py`
+- `tests/tools/test_smart_approval_injection.py`
+- `tests/tools/test_smart_approval_policy.py`
+- `tests/tools/test_execute_code_approval_cluster.py`
+- `tests/tools/test_tirith_security.py`
+- `docs/chantxu64/current-turn-smart-approval/README.md`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- Smart Approval now judges actual risk and current authorization separately,
+  using only the latest real user-authored turn, completed Clarify
+  question/answer pairs after that turn, the action about to run, and bounded
+  contents of directly executed entry scripts.
+
+What changed:
+
+- Both tool-dispatch paths derive the same narrow authorization context and bind
+  it per request, so concurrent tool calls cannot borrow another request's user
+  authorization.
+- Approval context reuses the conversation compressor's canonical real-user
+  classification. Compaction summaries, preserved ToDo snapshots, background
+  notifications, recovery notices, and bare Skill invocation scaffolding cannot
+  become authorization evidence. Runtime-enriched real turns retain only the
+  user instruction: Skill bodies, model-switch notices, reply/thread metadata,
+  Cron delivery guidance, and pre-run/context-job output are stripped before
+  review. A ToDo snapshot appended to a real turn is removed without discarding
+  that turn.
+- Terminal review receives the real command and resolved execution directory;
+  `execute_code` review receives the complete Python source. Direct entry scripts
+  such as `python cleanup.py`, `bash deploy.sh`, `./run-task`, and literal script
+  launches inside `execute_code` are read from the environment that will execute
+  them and sent as bounded evidence. Missing, unreadable, oversized, or excess
+  direct-script evidence escalates instead of being silently approved.
+- Interpreter stdin and shell here-doc forms such as `python - <<'PY'` are
+  treated as inline command content rather than nonexistent external script
+  paths. A genuine entry script before a here-doc, such as
+  `python reader.py <<'EOF'`, is still collected and reviewed.
+- Tirith resolution now validates the Hermes scanner protocol instead of
+  trusting any same-named executable found on `PATH`. A binary must support the
+  `check` interface and the `--json`, `--shell`, and `--non-interactive` flags;
+  incompatible programs are skipped in favor of the managed Hermes binary.
+- Package-managed virtual-environment console entry points are not treated as
+  opaque custom scripts merely because their executable path is explicit.
+  Ordinary test/lint/build commands can therefore pass the normal security
+  guards without invoking Smart Approval when Tirith and static checks find no
+  risk. Directly launched source scripts remain bounded review evidence, and
+  unreadable custom scripts still escalate.
+- Smart-review reasons are requested in the latest real user's natural
+  language. Chinese sessions also receive localized risk/authorization
+  summaries, denial and timeout safeguards, and terminal auto-approval notes;
+  structured decision/risk/authorization values remain stable machine enums.
+- The reviewer returns `decision`, `risk_level`, `authorization`, and a short
+  semantic `reason`. Critical risk is denied; an approval whose risk and
+  authorization fields conflict is downgraded to escalation; high-risk exact
+  authorization remains eligible for one-operation approval.
+- Existing integrations that compare the historical one-word smart decision
+  remain compatible. Smart approvals still do not create a permanent broad
+  allowlist entry.
+- The first version intentionally omits file hashes/version binding, recursive
+  dependency graphs, LSP integration, dynamic dependency analysis, and a new
+  side-effect fingerprint system.
+
+Why it matters:
+
+- A destructive-looking command can be the exact operation the user just
+  authorized, while an innocent-looking script launcher can hide broader side
+  effects. The reviewer needs the current scope and direct script contents to
+  distinguish those cases without inheriting unrelated history.
+
+Merge protection:
+
+- Preserve when upstream Smart Approval cannot consume the latest-turn/Clarify
+  authorization boundary, structured risk and authorization fields, bounded
+  direct-script evidence across terminal and `execute_code`, localized approval
+  presentation, or protocol-validated Tirith resolution.
+- Drop when upstream provides equivalent request isolation, direct-entry-script
+  review, package-managed development-tool handling, fail-closed evidence gaps,
+  structured outcomes, language-aware presentation, compatible-scanner
+  selection, and one-operation persistence behavior with matching regressions.
+- Ask the user when upstream uses broader conversation history, omits Clarify
+  question scope, treats all high risk as denial, or recursively analyzes a
+  materially larger dependency surface.
+
+Verification:
+
+- Approval, terminal, `execute_code`, and Tirith regression coverage:
+  `206 passed`, `7 subtests passed`.
+- Conversation-compression and real-user provenance coverage: `193 passed`.
+- A live local resolver probe skipped the incompatible pipx `py-tirith` 1.0.5
+  executable at `~/.local/bin/tirith`, selected the Hermes-managed 0.2.12
+  scanner at `~/.hermes/bin/tirith`, and returned `allow` for an ordinary
+  `python -m pytest` command.
+- Direct evidence probes returned no custom-script evidence for a verified
+  virtual-environment console entry point and retained an `unreadable` evidence
+  gap for a missing directly launched custom Python script.
+- A frozen 50-event historical replay completed serially through the configured
+  `openai-api / gpt-5.6-luna` approval route with `medium` reasoning and a
+  five-second inter-case delay. All 50 records matched their frozen event/action
+  identities and route contract with no model-call failures. The replay is an
+  evaluation set, not a claim that every model judgment is correct; manual
+  review retained five judgment findings: two unnecessary low-risk read-only
+  escalations and three unsafe approvals involving unknown interactive effects,
+  an omitted backup overwrite, and an ambiguous target/overwrite scope.
+- A separately authorized prompt-only experiment was rejected by its ratchet
+  gate. After the five focus findings were initially corrected, 7 of the 45
+  previously accepted anchor decisions changed. A final 12-case boundary pass
+  met only 8 expected decisions. The experimental prompt and its text-contract
+  tests were removed; the frozen R021 prompt hash again exactly matches the
+  original 50-event baseline. The code-layer context and here-doc fixes remain.
+- Ruff, `py_compile`, and `git diff --check` passed for the changed source and
+  tests. Pyright was not installed in this worktree environment.
+- This layered-fix validation used local tests only: no paid model replay,
+  configuration change, Gateway restart, commit, or push was performed. The
+  running Gateway must be restarted separately before these source changes can
+  affect live approval requests.
+
+Feature docs: `docs/chantxu64/current-turn-smart-approval/README.md`
+
+Upstream status: fork-only.
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -1975,6 +2112,22 @@ deltas are expected in these areas:
   - `website/docs/user-guide/features/delegation.md`
   - `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features/delegation.md`
   - `docs/chantxu64/delegate-per-call-routing/README.md`
+  - `docs/LOCAL_MODIFICATIONS.md`
+- Current-turn context-aware Smart Approval:
+  - `agent/agent_runtime_helpers.py`
+  - `agent/conversation_compression.py`
+  - `agent/tool_executor.py`
+  - `model_tools.py`
+  - `tools/approval.py`
+  - `tools/tirith_security.py`
+  - `tools/terminal_tool.py`
+  - `tools/code_execution_tool.py`
+  - `tests/tools/test_smart_approval_context.py`
+  - `tests/tools/test_smart_approval_injection.py`
+  - `tests/tools/test_smart_approval_policy.py`
+  - `tests/tools/test_execute_code_approval_cluster.py`
+  - `tests/tools/test_tirith_security.py`
+  - `docs/chantxu64/current-turn-smart-approval/README.md`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Safe command rewrite:
   - `tools/safe_cmd_rewrite.py`
@@ -2098,9 +2251,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 27 major entries.
+Documented entries: 28 major entries.
 
-Active / current entries: 23.
+Active / current entries: 24.
 
 Historical reverted / abandoned / superseded areas: 4.
 
