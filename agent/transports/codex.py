@@ -124,10 +124,16 @@ def _default_prompt_cache_retention_for_request(
     model: str,
     base_url: Any,
 ) -> Optional[str]:
-    """Return ``24h`` for supported models on Amazon Bedrock Mantle."""
+    """Return ``24h`` for supported hosts/models (Bedrock Mantle, Meta)."""
     from utils import base_url_hostname
 
-    hostname_parts = base_url_hostname(str(base_url or "")).split(".")
+    hostname = base_url_hostname(str(base_url or "")).lower()
+    # Meta Model API: prompt caching is opt-in via prompt_cache_retention.
+    # Measured 0% hits on /chat/completions vs 93-99% on /responses with 24h.
+    if hostname == "api.meta.ai":
+        return "24h"
+
+    hostname_parts = hostname.split(".")
     is_bedrock_mantle = (
         len(hostname_parts) == 4
         and hostname_parts[0] == "bedrock-mantle"
@@ -272,6 +278,21 @@ def _is_post_tool_replay(messages: Optional[List[Dict[str, Any]]]) -> bool:
     return False
 
 
+def _native_compaction_active(context_management: Any) -> bool:
+    """Is THIS request natively compacted?
+
+    True only when the caller's eligibility gate
+    (``native_compaction.native_compaction_context_management``) produced a
+    non-empty payload. Every native-compaction side effect on the wire —
+    sending ``context_management``, replaying a ``type: "compaction"``
+    checkpoint, restructuring the input around it — hangs off this one
+    predicate, so a checkpoint that outlives the gate (model swapped out of
+    the gpt-5.6 family, compression disabled, rejection kill switch, resumed
+    session) cannot keep reshaping requests on its own.
+    """
+    return isinstance(context_management, list) and bool(context_management)
+
+
 class ResponsesApiTransport(ProviderTransport):
     """Transport for api_mode='codex_responses'.
 
@@ -312,6 +333,9 @@ class ResponsesApiTransport(ProviderTransport):
                 kwargs.get("replay_encrypted_reasoning", True)
             ),
             current_issuer_kind=issuer,
+            native_compaction_eligible=_native_compaction_active(
+                kwargs.get("context_management")
+            ),
         )
 
     def convert_tools(self, tools: List[Dict[str, Any]]) -> Any:
@@ -339,6 +363,14 @@ class ResponsesApiTransport(ProviderTransport):
                 content-address
             prompt_cache_key: str | None — stable logical gateway/compression
                 cache scope; takes precedence over static content addressing
+            cache_scope_id: str | None — rotation-stable logical scope id
+                (compression-lineage root; see agent/prompt_cache_scope.py).
+                Preferred over session_id when deriving the content-addressed
+                prompt_cache_key when no explicit prompt_cache_key is supplied;
+                content hash and the xAI x-grok-conv-id header; the Codex
+                x-client-request-id header mirrors the resulting body key.
+                Keeps the cache warm across context-compression session
+                rotation (#79017)
             max_tokens: int | None — max_output_tokens
             timeout: float | None — per-request timeout forwarded to the SDK
             request_overrides: dict | None — extra kwargs merged in
@@ -394,6 +426,12 @@ class ResponsesApiTransport(ProviderTransport):
         # agent.native_compaction.native_compaction_context_management();
         # None means the field is never added to the request.
         context_management = params.get("context_management")
+        # Single source of truth for "this request is natively compacted":
+        # the same value decides whether the field goes out AND whether the
+        # converter may replay/prune around a compaction checkpoint. Keeping
+        # them derived from one expression is what stops a persisted
+        # checkpoint from restructuring the wire after the gate closes.
+        native_compaction_active = _native_compaction_active(context_management)
 
         # Resolve the issuing endpoint for this call. Stashed on the
         # transport so normalize_response can stamp it onto reasoning
@@ -420,11 +458,16 @@ class ResponsesApiTransport(ProviderTransport):
         if params.get("is_xai_responses", False):
             from agent.model_metadata import is_grok_46_family
 
-            # Grok 4.6 accepts xhigh as a wire value. Older Grok models top out
-            # at high, while max/ultra remain Hermes aliases for every xAI model.
-            if not is_grok_46_family(model):
+            # Grok 4.6 accepts xhigh as a wire value; older Grok models top
+            # out at high. max/ultra are Hermes ladder aliases for "this
+            # model's ceiling", so they clamp to the strongest level the
+            # model actually accepts — xhigh on grok-4.6, high elsewhere —
+            # never one rung below it (#87279).
+            if is_grok_46_family(model):
+                _effort_clamp.update({"max": "xhigh", "ultra": "xhigh"})
+            else:
                 _effort_clamp["xhigh"] = "high"
-            _effort_clamp.update({"max": "high", "ultra": "high"})
+                _effort_clamp.update({"max": "high", "ultra": "high"})
         if (params.get("provider") or "").strip().lower() == "actual":
             # Actual Computer relays to SGLang/vLLM backends that accept only
             # none/low/medium/high/max for reasoning effort — a forwarded
@@ -488,6 +531,7 @@ class ResponsesApiTransport(ProviderTransport):
                 is_github_responses=is_github_responses,
                 replay_encrypted_reasoning=replay_encrypted_reasoning,
                 current_issuer_kind=issuer_kind,
+                native_compaction_eligible=native_compaction_active,
             ),
             "store": False,
         }
@@ -495,17 +539,20 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["tools"] = response_tools
             kwargs["tool_choice"] = "auto"
             kwargs["parallel_tool_calls"] = True
-        if isinstance(context_management, list) and context_management:
+        if native_compaction_active:
             kwargs["context_management"] = context_management
 
         session_id = str(params.get("session_id") or "").strip()
         logical_cache_key = _bounded_prompt_cache_key(params.get("prompt_cache_key"))
-        # A caller-supplied logical key preserves affinity across Gateway or
-        # compression session rotation. Other callers use upstream's static,
-        # session-scoped content-addressed key. Cron's per-fire timestamp is
-        # removed from that scope so recurring runs share a stable bucket.
-        # The physical session id remains separate transcript identity.
-        _cache_scope = _cache_scope_from_session_id(session_id)
+        # A caller-supplied logical key preserves fork Gateway affinity and
+        # takes precedence. Otherwise use upstream's rotation-stable
+        # compression lineage scope before deriving the static,
+        # content-addressed key. The physical session id remains separate
+        # transcript identity, and cron timestamps are stripped by the shared
+        # scope normalizer.
+        _cache_scope = _cache_scope_from_session_id(
+            params.get("cache_scope_id") or session_id
+        )
         cache_key = (
             logical_cache_key
             or _content_cache_key(instructions, response_tools, _cache_scope)

@@ -878,6 +878,7 @@ Primary files:
 - `agent/codex_responses_adapter.py`
 - `agent/chat_completion_helpers.py`
 - `agent/model_metadata.py`
+- `agent/prompt_cache_scope.py`
 - `agent/turn_finalizer.py`
 - `agent/transports/codex.py`
 - `run_agent.py`

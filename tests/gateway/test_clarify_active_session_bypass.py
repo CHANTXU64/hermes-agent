@@ -1,7 +1,7 @@
 """Regression tests for clarify replies while a gateway session is busy."""
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -189,3 +189,106 @@ async def test_gateway_clarify_choice_with_document_keeps_canonical_choice():
     assert isinstance(answer, ClarifyResponsePayload)
     assert answer.user_response == "继续处理"
     assert agent_path in answer.response_context
+
+
+@pytest.mark.asyncio
+async def test_gateway_clarify_choice_with_document_only_stays_pending():
+    """A bare attachment cannot silently answer or cancel a choice prompt."""
+    _clear_clarify_state()
+    from gateway.run import GatewayRunner
+    from tools import clarify_gateway as cm
+
+    document_path = "/Users/robot/.hermes/cache/documents/doc_789_scope.pdf"
+    agent_path = "/root/.hermes/cache/documents/doc_789_scope.pdf"
+    event = _event(
+        "",
+        message_type=MessageType.DOCUMENT,
+        media_urls=[document_path],
+        media_types=["application/pdf"],
+    )
+    adapter = _ClarifyBypassAdapter()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized = lambda source, **_kwargs: True
+    runner._session_key_for_source = lambda source: "clarify-choice-document-session"
+    runner._adapter_for_source = lambda source: adapter
+    runner._update_prompt_pending = {}
+
+    entry = cm.register(
+        "clarify-choice-document",
+        "clarify-choice-document-session",
+        "请选择处理方式",
+        ["只查看", "继续处理"],
+    )
+
+    with (
+        patch(
+            "tools.credential_files.to_agent_visible_cache_path",
+            return_value=agent_path,
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = await runner._handle_message(event)
+
+    assert result == ""
+    assert entry.event.is_set() is False
+    assert cm.get_pending_for_session(
+        "clarify-choice-document-session",
+        include_choice_prompts=True,
+    ) is entry
+    _clear_clarify_state()
+
+
+@pytest.mark.asyncio
+async def test_active_session_bypass_uses_profile_namespaced_key_under_multiplex():
+    """Regression for issue #82975: under a named-profile multiplex, the
+    adapter's clarify bypass lookup must use the SAME profile-namespaced
+    session key that the runner registers pending clarifies under
+    (SessionStore._generate_session_key() includes
+    profile=self._resolve_profile_for_key(source)), not the legacy
+    unnamespaced key. Otherwise the lookup misses, and a user's answer to
+    a pending clarify is routed to the busy-session queue instead of
+    resolving it -- the turn then hangs until the clarify's 3600s timeout."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _ClarifyBypassAdapter()
+    adapter._message_handler = AsyncMock(return_value="")
+    adapter._busy_session_handler = AsyncMock(return_value=True)
+    event = _event("None of those are valid options")
+
+    # A session_store configured for profile multiplexing, matching what
+    # the runner's SessionStore._generate_session_key() actually produces.
+    session_store = MagicMock()
+    session_store._resolve_profile_for_key.return_value = "ops"
+    adapter._session_store = session_store
+
+    profile_namespaced_key = build_session_key(
+        event.source,
+        group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
+        thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
+        profile="ops",
+    )
+    # Sanity: the profile-namespaced key really is different from the
+    # legacy unnamespaced one -- otherwise this test wouldn't distinguish
+    # the fixed behavior from the bug.
+    legacy_key = build_session_key(
+        event.source,
+        group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
+        thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
+    )
+    assert profile_namespaced_key != legacy_key
+
+    adapter._active_sessions[profile_namespaced_key] = asyncio.Event()
+    # The runner registers the pending clarify under its own
+    # profile-namespaced key, exactly as it would in a real multiplexed
+    # deployment.
+    cm.register("clarify-1", profile_namespaced_key, "Pick one", ["A", "B"])
+
+    await adapter.handle_message(event)
+
+    adapter._message_handler.assert_awaited_once_with(event)
+    adapter._busy_session_handler.assert_not_awaited()
+    assert adapter._pending_messages == {}

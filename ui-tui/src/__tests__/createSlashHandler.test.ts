@@ -486,6 +486,38 @@ describe('createSlashHandler', () => {
     })
   })
 
+  it.each([
+    ['/new sprint planning', 'new session started', 'sprint planning'],
+    ['/clear', undefined, undefined]
+  ])('skips the confirmation for %s when config disables it', (command, message, title) => {
+    patchUiState({ destructiveSlashConfirm: false })
+    const ctx = buildCtx()
+
+    expect(createSlashHandler(ctx)(command)).toBe(true)
+
+    expect(getOverlayState().confirm).toBeNull()
+    expect(ctx.session.newSession).toHaveBeenCalledWith(message, title)
+  })
+
+  it('routes the /reset catalog alias through the local fresh-session lifecycle', () => {
+    const ctx = buildCtx({
+      local: {
+        catalog: {
+          canon: {
+            '/new': '/new',
+            '/reset': '/new'
+          }
+        }
+      }
+    })
+
+    createSlashHandler(ctx)('/reset')
+    getOverlayState().confirm?.onConfirm()
+
+    expect(ctx.session.newSession).toHaveBeenCalledWith('new session started', undefined)
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+  })
+
   it('keeps the TUI session boundary closed until retain and newSession both finish', async () => {
     patchUiState({ busyInputMode: 'interrupt', sid: 'sid-current' })
     let resolveRetain!: (value: { queued: boolean }) => void
@@ -544,6 +576,26 @@ describe('createSlashHandler', () => {
       )
     })
     expect(ctx.session.newSession).not.toHaveBeenCalled()
+  })
+
+  it('skips the confirmation for the /reset alias when config disables it', () => {
+    patchUiState({ destructiveSlashConfirm: false })
+
+    const ctx = buildCtx({
+      local: {
+        catalog: {
+          canon: {
+            '/new': '/new',
+            '/reset': '/new'
+          }
+        }
+      }
+    })
+
+    expect(createSlashHandler(ctx)('/reset')).toBe(true)
+
+    expect(getOverlayState().confirm).toBeNull()
+    expect(ctx.session.newSession).toHaveBeenCalledWith('new session started', undefined)
   })
 
   it('keeps visible scrollback when branching a TUI session', async () => {

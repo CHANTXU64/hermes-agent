@@ -62,7 +62,7 @@ class TestClarifyToolChoicesValidation:
             return "answer"
 
         clarify_tool("Pick", choices=[1, 2, 3], callback=mock_callback)  # type: ignore
-        assert choices_received == ["1", "2", "3"]
+        assert choices_received == ["1 (Recommended)", "2", "3"]
 
 
 class TestClarifyToolCallbackHandling:
@@ -129,7 +129,7 @@ class TestClarifyDictChoices:
             callback=cb,
         ))  # type: ignore
         assert seen == [
-            "Tight, covers all 3 points",
+            "Tight, covers all 3 points (Recommended)",
             "Loose layout",
             "A plain string choice",
         ]

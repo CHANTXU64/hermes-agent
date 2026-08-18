@@ -23,6 +23,11 @@ from typing import List, Optional, Callable
 # A 5th "Other (type your answer)" option is always appended by the UI.
 MAX_CHOICES = 4
 
+# Suffix appended to the first choice so the user can see, at a glance, which
+# option the agent actually recommends. Applied here rather than per-surface so
+# CLI, TUI, desktop, and messaging adapters all render the same label.
+RECOMMENDED_LABEL = "(Recommended)"
+
 
 @dataclass(frozen=True)
 class ClarifyResponsePayload:
@@ -63,6 +68,24 @@ def _flatten_choice(c) -> str:
     if isinstance(c, (list, tuple)):
         return " ".join(_flatten_choice(x) for x in c).strip()
     return str(c).strip()
+
+
+def mark_recommended(choices: List[str]) -> List[str]:
+    """Label the first choice as the agent's recommendation."""
+    if len(choices) < 2:
+        return choices
+    first = str(choices[0]).strip()
+    if first != strip_recommended(first):
+        return choices
+    return [f"{first} {RECOMMENDED_LABEL}"] + list(choices[1:])
+
+
+def strip_recommended(text: str) -> str:
+    """Remove the recommendation label from a resolved answer."""
+    stripped = str(text).strip()
+    if stripped.casefold().endswith(RECOMMENDED_LABEL.casefold()):
+        return stripped[: -len(RECOMMENDED_LABEL)].strip()
+    return stripped
 
 
 def _invoke_callback(callback, question, choices, multi_select):
@@ -168,6 +191,13 @@ def clarify_tool(
     if callback is None:
         return tool_error("Clarify tool is not available in this execution context.")
 
+    # The first choice is the agent's pick (the schema says order best-first),
+    # so every UI gets one consistent recommendation label. Keep the bare list
+    # for the tool result: the label is presentation only.
+    offered = choices
+    if choices is not None:
+        choices = mark_recommended(choices)
+
     try:
         raw_response = _invoke_callback(callback, question, choices, multi_select)
     except Exception as exc:
@@ -179,13 +209,15 @@ def clarify_tool(
         raw_response = raw_response.user_response
 
     if multi_select and choices is not None:
-        user_response = _parse_multi_select_response(raw_response)
+        user_response = [
+            strip_recommended(r) for r in _parse_multi_select_response(raw_response)
+        ]
     else:
-        user_response = str(raw_response).strip()
+        user_response = strip_recommended(raw_response)
 
     result = {
         "question": question,
-        "choices_offered": choices,
+        "choices_offered": offered,
         "user_response": user_response,
     }
     if response_context is not None:
@@ -208,7 +240,8 @@ CLARIFY_SCHEMA = {
         "Ask the user a question when you need clarification, feedback, or a "
         "decision before proceeding. Supports three modes:\n\n"
         "1. **Single-select multiple choice** — provide up to 4 choices. The user picks one "
-        "or types their own answer via a 5th 'Other' option.\n"
+        "or types their own answer via a 5th 'Other' option. List the choice you recommend "
+        "FIRST: the UI labels it '(Recommended)' and highlights it by default.\n"
         "2. **Multi-select multiple choice** — set multi_select=true. The user can select "
         "multiple options via checkboxes. user_response will be a list of selected choices.\n"
         "3. **Open-ended** — omit choices entirely. The user types a free-form "

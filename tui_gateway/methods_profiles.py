@@ -60,6 +60,74 @@ def _(rid, params: dict) -> dict:
             return text[:80] + "..."
         return text
 
+    def _preferred_session_row(profile_path, session_id):
+        """Precise summary for ONE caller-pinned session id, or None.
+
+        Complements ``last_session``: that field answers "what is the newest
+        conversation", this answers "what about THIS conversation". Callers
+        that open a specific session on click (e.g. a roster whose rows open
+        a pinned chat) pass their pins via ``preferred_session_ids`` so the
+        preview and the click target describe the same session
+        (hermes-agent#88200).
+
+        Exact-lookup semantics, deliberately different from the listing:
+        hidden rows still resolve (a hidden-from-sidebar session EXISTS),
+        compression lineages resolve to the live tip with the same resolver
+        ``session.resume`` uses, and denied internal sources (tool/kanban)
+        count as absent. The reported ``id`` stays the caller's durable pin
+        while ``resolved_id`` names the live tip. Best-effort: any failure
+        degrades to None rather than failing the whole profiles.list call.
+        """
+        try:
+            from pathlib import Path
+
+            db_path = Path(profile_path) / "state.db"
+            if not db_path.exists():
+                return None
+            from hermes_state import SessionDB
+
+            deny = frozenset({"kanban", "tool"})
+            db = SessionDB(db_path=db_path)
+            try:
+                row = db.get_session(session_id)
+                if not row:
+                    return None
+                if (row.get("source") or "").strip().lower() in deny:
+                    return None
+                if row.get("archived"):
+                    return None
+                try:
+                    tip = db.resolve_resume_session_id(session_id) or session_id
+                except Exception:
+                    tip = session_id
+                tip_row = db.get_session(tip) or row
+                preview = ""
+                try:
+                    preview = _latest_message_preview(db, tip)
+                except Exception:
+                    pass
+                return {
+                    "id": session_id,
+                    "resolved_id": tip,
+                    "title": tip_row.get("title") or "",
+                    "preview": preview,
+                    "started_at": tip_row.get("started_at") or row.get("started_at") or 0,
+                    "last_active": (
+                        tip_row.get("last_activity_at")
+                        or tip_row.get("started_at")
+                        or row.get("started_at")
+                        or 0
+                    ),
+                    "message_count": tip_row.get("message_count") or 0,
+                }
+            finally:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        except Exception:
+            return None
+
     def _latest_profile_session_row(profile_path):
         """Most recent human-facing session in a profile's state.db, or None.
 
@@ -116,6 +184,13 @@ def _(rid, params: dict) -> dict:
         from hermes_cli.profiles import list_profiles
 
         include_sessions = is_truthy_value(params.get("include_sessions", True))
+        # Optional precise lookups: {profile_name: session_id} from callers
+        # that open a specific session per row (pinned-chat rosters). Only
+        # resolved when include_sessions is on; each named profile row gains
+        # a ``preferred_session`` summary (None when the id is gone).
+        preferred_ids = params.get("preferred_session_ids")
+        if not isinstance(preferred_ids, dict):
+            preferred_ids = {}
         out = []
         for p in list_profiles():
             row = {
@@ -125,10 +200,14 @@ def _(rid, params: dict) -> dict:
                 "model": p.model,
                 "provider": p.provider,
                 "description": getattr(p, "description", "") or "",
+                "display_name": getattr(p, "display_name", "") or "",
                 "skill_count": getattr(p, "skill_count", 0) or 0,
             }
             if include_sessions:
                 row["last_session"] = _latest_profile_session_row(p.path)
+                pin = preferred_ids.get(p.name)
+                if isinstance(pin, str) and pin.strip():
+                    row["preferred_session"] = _preferred_session_row(p.path, pin.strip())
 
             # Client-agnostic UI metadata (avatars, accent colors, pinned
             # order, …) — stored server-side in profile.yaml so every
@@ -159,7 +238,12 @@ def _(rid, params: dict) -> dict:
             except Exception:
                 row["has_avatar"] = False
             out.append(row)
-        return _ok(rid, {"profiles": out})
+        # Capability flag: this backend's prompt builder injects the Bot Mode
+        # teammate-messaging protocol (tools/bot_mode_probe.py) into every
+        # session of Bot-Mode-managed installs. Clients that would otherwise
+        # append the protocol to SOUL.md (the desktop's hermes-bots plugin)
+        # must skip their SOUL writes when this is present.
+        return _ok(rid, {"profiles": out, "bot_mode_protocol": True})
     except Exception as e:
         return _err(rid, 5061, str(e))
 
@@ -357,20 +441,36 @@ def _(rid, params: dict) -> dict:
             model_set = True
         except Exception:
             pass
-    elif is_truthy_value(params.get("mirror_credentials", True)) and not (path / "config.yaml").exists():
-        # No explicit pin and no cloned config: inherit the launch profile's
-        # provider+model so the first turn resolves. Same writer as the pin.
+    elif is_truthy_value(params.get("mirror_credentials", True)):
+        # No explicit pin: inherit the launch profile's provider+model so the
+        # first turn resolves. Gate on the MODEL SECTION being absent, not on
+        # config.yaml existing — earlier mirroring steps (voice sections,
+        # #85755) legitimately create the file first, and a file-existence
+        # gate silently skipped inheritance for every non-clone bot
+        # ("No inference provider configured" on first message, tester
+        # report). Clones bring their own model section and stay untouched.
         try:
-            from hermes_cli.config import load_config_readonly
+            from hermes_cli.config import load_config_readonly, read_user_config_raw
             from hermes_cli.web_routers.profiles import _write_profile_model
+            from hermes_constants import (
+                reset_hermes_home_override,
+                set_hermes_home_override,
+            )
 
-            cfg = load_config_readonly() or {}
-            model_cfg = cfg.get("model") or {}
-            inherited_provider = str(model_cfg.get("provider") or "")
-            inherited_model = str(model_cfg.get("default") or "")
-            if inherited_provider and inherited_model:
-                _write_profile_model(path, inherited_provider, inherited_model)
-                mirrored["model_inherited"] = True
+            token = set_hermes_home_override(str(path))
+            try:
+                dst_model = (read_user_config_raw() or {}).get("model") or {}
+            finally:
+                reset_hermes_home_override(token)
+
+            if not (dst_model.get("provider") and dst_model.get("default")):
+                cfg = load_config_readonly() or {}
+                model_cfg = cfg.get("model") or {}
+                inherited_provider = str(model_cfg.get("provider") or "")
+                inherited_model = str(model_cfg.get("default") or "")
+                if inherited_provider and inherited_model:
+                    _write_profile_model(path, inherited_provider, inherited_model)
+                    mirrored["model_inherited"] = True
         except Exception:
             pass
 
@@ -430,7 +530,20 @@ def _(rid, params: dict) -> dict:
                         {"name": skill_name, "enabled": skill_name.lower() not in disabled}
                     )
 
-            from toolsets import get_all_toolsets, get_toolset_info
+            # Toolsets: the same filtered universe the `hermes tools`
+            # checklist offers — configurable toolsets (built-in + plugin),
+            # minus platform-restricted ones that don't apply here — with
+            # enablement resolved the way the runtime actually resolves it.
+            # The raw registry (get_all_toolsets) leaks internal platform
+            # composites (hermes-discord, feishu_drive, ...) and reports
+            # everything "enabled" whenever the profile has no pin, which a
+            # capabilities UI then faithfully mis-renders (tester report).
+            from hermes_cli.tools_config import (
+                _get_effective_configurable_toolsets,
+                _get_platform_tools,
+                _toolset_allowed_for_platform,
+            )
+            from toolsets import resolve_toolset
 
             tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
             pinned = tools_cfg.get("enabled_toolsets")
@@ -439,15 +552,44 @@ def _(rid, params: dict) -> dict:
                 if isinstance(pinned, list)
                 else None
             )
+            try:
+                platform_enabled = set(
+                    _get_platform_tools(cfg, "cli", include_default_mcp_servers=False)
+                )
+            except Exception:
+                platform_enabled = set()
+            try:
+                from hermes_cli.tools_config import _DEFAULT_OFF_TOOLSETS
+            except Exception:
+                _DEFAULT_OFF_TOOLSETS = set()
             toolsets_out = []
-            for ts_name in sorted(get_all_toolsets().keys()):
-                info = get_toolset_info(ts_name) or {}
+            for ts_name, ts_label, ts_desc in _get_effective_configurable_toolsets():
+                if not _toolset_allowed_for_platform(ts_name, "cli"):
+                    continue
+                enabled = (
+                    ts_name in pinned_set
+                    if pinned_set is not None
+                    else ts_name in platform_enabled
+                )
+                # Default-off integrations (a2a, yuanbao, spotify, ...) are
+                # opt-ins; when the profile hasn't opted in they're noise in
+                # a per-profile editor — `hermes tools` / Settings is where
+                # you turn them on globally first. Enabled ones still show.
+                # yuanbao rides the same rule: a region-specific integration
+                # that isn't in _DEFAULT_OFF_TOOLSETS but is equally opt-in.
+                if (ts_name in _DEFAULT_OFF_TOOLSETS or ts_name == "yuanbao") and not enabled:
+                    continue
+                try:
+                    tool_count = len(set(resolve_toolset(ts_name)))
+                except Exception:
+                    tool_count = 0
                 toolsets_out.append(
                     {
                         "name": ts_name,
-                        "description": info.get("description") or "",
-                        "tool_count": len(info.get("tools") or []),
-                        "enabled": True if pinned_set is None else ts_name in pinned_set,
+                        "label": ts_label,
+                        "description": ts_desc or "",
+                        "tool_count": tool_count,
+                        "enabled": enabled,
                     }
                 )
 
