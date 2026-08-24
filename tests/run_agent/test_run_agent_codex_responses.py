@@ -346,6 +346,28 @@ def test_build_api_kwargs_openai_codex_uses_gateway_key_for_cache_scope(monkeypa
     }
 
 
+def test_openai_api_responses_omits_official_codex_cache_headers(monkeypatch):
+    """Generic openai-api Responses calls must not inherit official Codex routing."""
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-5.6-sol",
+        provider="openai-api",
+        api_mode="codex_responses",
+        base_url="https://generic.example.test/v1",
+        api_key="test-token",
+        quiet_mode=True,
+        max_iterations=1,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent.session_id = "physical-session"
+    agent._gateway_session_key = "agent:main:telegram:dm:424242"
+
+    kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+    assert "extra_headers" not in kwargs
+
+
 def test_codex_prompt_cache_scope_uses_compression_root_only():
     from agent.chat_completion_helpers import _codex_prompt_cache_scope
 

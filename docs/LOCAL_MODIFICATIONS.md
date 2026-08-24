@@ -893,7 +893,7 @@ Primary files:
 - `tests/gateway/test_replay_entry_fields.py`
 - `tests/run_agent/test_run_agent_codex_responses.py`
 - `tests/run_agent/test_codex_app_server_integration.py`
-- `tests/fork/test_codex_request_only_memory_context.py`
+- `tests/agent/test_codex_request_only_memory_context.py`
 
 Merge protection:
 
@@ -1716,9 +1716,9 @@ git diff --check
 
 ### 25. OpenAI API Codex-compatible gateway integration
 
-Status: active
+Status: reverted / historical
 
-Date: 2026-08-14; Codex watchdog parity 2026-08-15
+Date: 2026-08-14; reverted 2026-08-24
 
 Files:
 
@@ -1730,70 +1730,65 @@ Files:
 - `agent/turn_context.py`
 - `plugins/image_gen/openai-codex/__init__.py`
 - `tests/plugins/image_gen/test_openai_codex_provider.py`
-- `tests/fork/test_openai_api_codex_gateway.py`
-- `tests/fork/test_codex_request_only_memory_context.py`
-- `tests/fork/test_image_gen_openai_api.py`
+- `tests/agent/test_openai_api_semantic_boundary.py`
+- `tests/agent/test_codex_request_only_memory_context.py`
 - `tests/agent/test_non_stream_stale_timeout.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
 Summary:
 
-- `openai-api` now works as one identity across chat, auxiliary tasks, context sizing, and image generation when `OPENAI_BASE_URL` targets a Codex-compatible API-key gateway.
+- The fork-only interpretation of ordinary `openai-api` as a Codex-compatible
+  API-key gateway was retired after runtime configuration moved to official
+  `openai-codex` OAuth.
 
-What changed:
+What was removed:
 
-- The existing Codex image plugin still registers `openai-codex` for official OAuth and now also registers `openai-api`.
-- The `openai-api` image backend resolves the same API key and base URL as chat and posts Codex Responses `image_generation` calls there.
-- Auxiliary clients with no explicit `api_mode` now consult the provider-declared transport, so `openai-api` uses its Responses adapter instead of sending the generic/OpenRouter-shaped `reasoning.enabled` body to the configured endpoint.
-- OpenAI-compatible `/models` metadata now preserves `owned_by`; when the same response identifies itself as `codexmanager`, Hermes reads the current model's exact `slug/context_window` from that response's `models` extension.
-- Exact CodexManager context values are retained in `~/.hermes/endpoint_context_cache.json`, scoped by normalized endpoint, API-key SHA-256 fingerprint, and model. A newer exact value replaces the old one; a partial/failed catalog reuses the last valid value without resurrecting cached models in the live model list.
-- The five-minute in-memory endpoint catalog uses the same credential scope, so two API keys on one CodexManager URL cannot reuse each other's 272K/372K metadata.
-- For custom `openai-api` endpoints, the public context resolver consults live/credential-scoped metadata before the legacy `model@base_url` cache; official OpenAI URLs and other providers retain the prior cache order.
-- Main-session Codex transport sends the same three cache-routing headers (`session_id` / `thread-id` / `x-client-request-id`) to a custom `openai-api` Codex-compatible gateway as it sends on `openai-codex` (upstream only sends two of them), via a dedicated `use_codex_cache_headers` flag. Unlike the official backend, the custom gateway still receives `max_output_tokens` and keeps its endpoint-specific encrypted-reasoning issuer (reasoning blobs are sealed per endpoint; stamping a custom gateway as the shared `codex_backend` issuer would let a gateway switch replay foreign blobs → HTTP 400 `invalid_encrypted_content`). Native server-side compaction (`context_management`) stays limited to official OpenAI/ChatGPT routes so a custom gateway never receives that field.
-- Request-only memory recall on `openai-api` Codex Responses routes is injected as a trailing `role=developer` input item after the current user message (same shape as `openai-codex`), instead of being appended into the user content.
-- The non-streaming stale-call policy treats `openai-api` Codex Responses routes as Codex backends. Large requests therefore receive the existing Codex context floors (900 seconds above 50K estimated tokens and 1200 seconds above 100K) in both interactive and direct Cron/subagent call paths instead of the generic 150/240-second ceilings.
+- All provider-declared auxiliary transport inheritance introduced by the
+  retired gateway change. Explicit `api_mode="codex_responses"` and the older
+  `api.openai.com` Codex-model heuristic remain; provider-specific inheritance
+  is left to upstream.
+- CodexManager private `models[]` metadata parsing, credential-scoped endpoint
+  metadata/cache files, and the `openai-api` cache-order exception.
+- Codex cache-routing headers and Codex stale-timeout classification for
+  `openai-api` Responses requests.
+- The fork-added direct non-stream Codex timeout-floor parity; direct requests
+  again use the upstream 150/240-second context ceilings.
+- The `openai-api` request-only developer-memory exception.
+- `OpenAIApiImageGenProvider` and the `openai-api` image-provider alias.
+- Fork-only positive tests for the retired gateway behavior.
 
-Why it matters:
+What remains:
 
-- The user selects `openai-api` across all configured surfaces. Before this change image generation could not resolve that name, auxiliary calls used an incomplete request-shaping path, and Hermes ignored the CodexManager API's own context-window catalog and misreported this route as 1.05M.
+- Official `openai-codex` OAuth Responses routing, cache headers, request-only
+  developer context, LCM/plugin request context, image provider, and the
+  pre-existing main-request Codex watchdog/timeout floor.
+- Generic callers may still select a supported Responses transport explicitly;
+  ordinary `openai-api` no longer gains official Codex identity or its private
+  exceptions automatically.
+- Provider-aware LCM/plugin request context and unrelated later fork fixes.
 
 Merge protection:
 
-- Preserve when: an API-key Codex-compatible endpoint is still selected through `openai-api` and upstream lacks equivalent image registration, auxiliary transport inheritance, live CodexManager context-catalog handling, credential-scoped last-valid context retention, or Codex large-context watchdog parity across interactive and direct call paths.
-- Drop when: upstream provides all five behaviors with equivalent tests.
-- Ask user when: upstream changes `openai-api` transport or timeout semantics, image generation routing, the CodexManager enriched model catalog no longer provides authoritative context windows, or a durable endpoint cache adopts different deletion/expiry semantics.
+- Do not reintroduce the retired `openai-api` Codex gateway behavior from this
+  historical entry during future upstream merges.
+- Preserve the official `openai-codex` behavior and the negative boundary tests.
+- Keep auxiliary provider-declared transport inheritance and direct non-stream
+  timeout behavior aligned with upstream; do not restore local parity shims.
+- A future API-key Codex gateway integration requires a new explicit user
+  decision and fresh tests; it must not be inferred from provider naming.
 
 Verification:
 
-- 2026-08-15 watchdog-parity review: shared backend classification, the direct
-  Responses path, and the non-Codex Chat Completions boundary were checked;
-  adjacent timeout, TTFB, wait-state, `openai-api`, and Responses regressions
-  reported `92 passed`. Ruff, `py_compile`, and `git diff --check` also passed.
+- 2026-08-24: focused migration/boundary suite reported `358 passed`; adjacent
+  official Codex transport, TTFB/watchdog, direct Cron execution-path, and
+  turn-context suites reported `138 passed`.
+- Per operator direction, no runtime type check, Priority-specific check, real
+  image generation, Gateway restart, or Cron execution was performed as part
+  of the semantic rollback.
 
-```bash
-./venv/bin/python -m pytest \
-  tests/fork/test_openai_api_codex_gateway.py \
-  tests/fork/test_codex_request_only_memory_context.py \
-  tests/fork/test_image_gen_openai_api.py \
-  tests/plugins/image_gen/test_openai_codex_provider.py \
-  tests/agent/test_auxiliary_client.py \
-  tests/agent/test_model_metadata.py \
-  tests/agent/test_non_stream_stale_timeout.py \
-  tests/hermes_cli/test_model_switch_openai_api_mode.py \
-  -q -o 'addopts='
-./venv/bin/python -m py_compile \
-  agent/auxiliary_client.py agent/model_metadata.py \
-  agent/chat_completion_helpers.py run_agent.py agent/transports/codex.py \
-  agent/turn_context.py \
-  plugins/image_gen/openai-codex/__init__.py \
-  tests/fork/test_openai_api_codex_gateway.py \
-  tests/fork/test_codex_request_only_memory_context.py \
-  tests/fork/test_image_gen_openai_api.py
-```
-
-Feature docs: none — one provider integration across existing generic seams, with focused regressions and full merge guidance here.
-
-Upstream status: fork-only.
+Upstream status: historical fork-only behavior; intentionally removed. The
+auxiliary and direct non-stream timeout paths were validated against
+`upstream/main` at `91e867631e9d2eb9fbd69edd4459475d38070979`.
 
 ### 26. Successful STT keeps an explicit voice-origin marker
 
@@ -2236,7 +2231,7 @@ deltas are expected in these areas:
   - `tests/gateway/test_replay_entry_fields.py`
   - `tests/run_agent/test_run_agent_codex_responses.py`
   - `tests/run_agent/test_codex_app_server_integration.py`
-  - `tests/fork/test_codex_request_only_memory_context.py`
+  - `tests/agent/test_codex_request_only_memory_context.py`
 - Credential cooldown intentional-clear persistence:
   - `agent/credential_pool.py`
   - `hermes_cli/auth.py`
@@ -2314,29 +2309,15 @@ deltas are expected in these areas:
   `runtime.nofile_soft_limit`; fork keeps emission regression only):
   - `tests/fork/test_launchd_open_file_limit.py`
   - `docs/LOCAL_MODIFICATIONS.md`
-- OpenAI API Codex-compatible gateway integration:
-  - `agent/auxiliary_client.py`
-  - `agent/model_metadata.py`
-  - `agent/chat_completion_helpers.py`
-  - `run_agent.py`
-  - `agent/transports/codex.py`
-  - `agent/turn_context.py`
-  - `plugins/image_gen/openai-codex/__init__.py`
-  - `tests/plugins/image_gen/test_openai_codex_provider.py`
-  - `tests/fork/test_openai_api_codex_gateway.py`
-  - `tests/fork/test_codex_request_only_memory_context.py`
-  - `tests/fork/test_image_gen_openai_api.py`
-  - `tests/agent/test_non_stream_stale_timeout.py`
-  - `docs/LOCAL_MODIFICATIONS.md`
 
 
 ## Summary statistics
 
 Documented entries: 28 major entries.
 
-Active / current entries: 24.
+Active / current entries: 23.
 
-Historical reverted / abandoned / superseded areas: 4.
+Historical reverted / abandoned / superseded areas: 5.
 
 Fork-only non-merge commits represented here: see
 `git log --no-merges upstream/main..HEAD`.

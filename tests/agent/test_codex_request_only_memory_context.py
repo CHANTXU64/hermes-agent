@@ -313,9 +313,8 @@ def test_max_iteration_summary_keeps_codex_recall_after_clean_user(monkeypatch):
     assert "CODEX-SUMMARY-RECALL-SENTINEL" not in json.dumps(messages)
 
 
-def test_openai_api_gateway_provider_uses_developer_after_user(monkeypatch):
-    """openai-api provider against a Codex Responses gateway must still get
-    the trailing developer memory item (not a user-content suffix)."""
+def test_openai_api_provider_uses_generic_user_suffix(monkeypatch):
+    """Ordinary openai-api routes keep request-only context in the user item."""
     agent = _build_agent(monkeypatch)
     captured = {}
     prompt = "List the deployment steps"
@@ -326,9 +325,9 @@ def test_openai_api_gateway_provider_uses_developer_after_user(monkeypatch):
 
     _configure(agent, _api_call)
     agent.provider = "openai-api"
-    agent.base_url = "https://codex.example.com/v1"
+    agent.base_url = "https://generic.example.test/v1"
     agent._base_url_lower = agent.base_url.lower()
-    agent._base_url_hostname = "codex.example.com"
+    agent._base_url_hostname = "generic.example.test"
     result = agent.run_conversation(prompt)
 
     assert result["completed"] is True
@@ -336,10 +335,12 @@ def test_openai_api_gateway_provider_uses_developer_after_user(monkeypatch):
     input_items = captured["input"]
     user_index = next(
         i for i, item in enumerate(input_items)
-        if item.get("role") == "user" and item.get("content") == prompt
+        if item.get("role") == "user"
+        and str(item.get("content", "")).startswith(prompt)
     )
-    developer = input_items[user_index + 1]
-    assert developer["role"] == "developer"
-    assert developer["content"].startswith("<memory-context>")
-    assert f"remembered fact for {prompt}" in developer["content"]
-    assert "remembered fact" not in input_items[user_index]["content"]
+    assert f"remembered fact for {prompt}" in input_items[user_index]["content"]
+    assert not any(
+        item.get("role") == "developer"
+        and "remembered fact" in str(item.get("content", ""))
+        for item in input_items[user_index + 1:]
+    )
