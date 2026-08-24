@@ -1,5 +1,7 @@
 """Behavior boundaries for direct-entry Smart Approval evidence."""
 
+import pytest
+
 from fork_features.approval.script_evidence import (
     MAX_SCRIPT_BYTES,
     collect_direct_script_evidence,
@@ -84,3 +86,74 @@ def test_execute_code_evidence_does_not_scan_unreferenced_files(tmp_path):
     )
 
     assert evidence == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -W ignore actual.py",
+        "python -X dev actual.py",
+        "sudo -u root python actual.py",
+        "env -u UNUSED python actual.py",
+    ],
+)
+def test_launcher_options_do_not_replace_the_direct_script(command, tmp_path):
+    actual = tmp_path / "actual.py"
+    actual.write_text("print('actual')\n", encoding="utf-8")
+
+    evidence = collect_direct_script_evidence(
+        command,
+        cwd=str(tmp_path),
+        source_kind="shell",
+    )
+
+    assert evidence == [
+        {"path": str(actual), "status": "read", "content": "print('actual')\n"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        'subprocess.run(["python", "-W", "ignore", "actual.py"])',
+        'subprocess.run(["sudo", "-u", "root", "python", "actual.py"])',
+    ],
+)
+def test_execute_code_launcher_options_keep_the_direct_script(code, tmp_path):
+    actual = tmp_path / "actual.py"
+    actual.write_text("print('actual')\n", encoding="utf-8")
+
+    evidence = collect_direct_script_evidence(
+        code,
+        cwd=str(tmp_path),
+        source_kind="python",
+    )
+
+    assert evidence == [
+        {"path": str(actual), "status": "read", "content": "print('actual')\n"}
+    ]
+
+
+def test_duplicate_paths_do_not_consume_the_unique_script_limit(tmp_path):
+    repeated = tmp_path / "repeated.py"
+    final = tmp_path / "final.py"
+    repeated.write_text("print('repeated')\n", encoding="utf-8")
+    final.write_text("print('final')\n", encoding="utf-8")
+    command = "; ".join(
+        ["python repeated.py"] * 4 + ["python final.py"]
+    )
+
+    evidence = collect_direct_script_evidence(
+        command,
+        cwd=str(tmp_path),
+        source_kind="shell",
+    )
+
+    assert evidence == [
+        {
+            "path": str(repeated),
+            "status": "read",
+            "content": "print('repeated')\n",
+        },
+        {"path": str(final), "status": "read", "content": "print('final')\n"},
+    ]

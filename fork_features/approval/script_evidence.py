@@ -57,7 +57,105 @@ def _looks_like_script_path(value: str) -> bool:
     )
 
 
-def _direct_interpreter_script_arg(args: list[str]) -> Optional[str]:
+_SUDO_OPTIONS_WITH_VALUE = {
+    "-C",
+    "--close-from",
+    "-D",
+    "--chdir",
+    "-g",
+    "--group",
+    "-h",
+    "--host",
+    "-p",
+    "--prompt",
+    "-R",
+    "--chroot",
+    "-r",
+    "--role",
+    "-T",
+    "--command-timeout",
+    "-t",
+    "--type",
+    "-u",
+    "--user",
+}
+_ENV_OPTIONS_WITH_VALUE = {
+    "-C",
+    "--chdir",
+    "-S",
+    "--split-string",
+    "-u",
+    "--unset",
+}
+_PYTHON_OPTIONS_WITH_VALUE = {"-W", "-X", "--check-hash-based-pycs"}
+_INTERPRETERS = {
+    "bash",
+    "sh",
+    "zsh",
+    "dash",
+    "fish",
+    "node",
+    "ruby",
+    "perl",
+    "pwsh",
+    "powershell",
+    "powershell.exe",
+}
+
+
+def _skip_launcher_options(
+    args: list[str],
+    *,
+    options_with_value: set[str],
+    allow_assignments: bool = False,
+) -> list[str]:
+    """Return argv after one known launcher without interpreting its command."""
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            return args[index + 1 :]
+        if allow_assignments and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", arg):
+            index += 1
+            continue
+        if arg == "-" or not arg.startswith("-"):
+            return args[index:]
+        if arg in options_with_value:
+            index += 2
+        else:
+            # Attached short values (`-uroot`) and long `--key=value` forms
+            # are already contained in this token.
+            index += 1
+    return []
+
+
+def _unwrap_known_launchers(argv: list[str]) -> list[str]:
+    """Remove finite sudo/env prefixes shared by shell and literal subprocess argv."""
+    remaining = list(argv)
+    while remaining:
+        executable = os.path.basename(remaining[0]).lower()
+        if executable == "sudo":
+            remaining = _skip_launcher_options(
+                remaining[1:],
+                options_with_value=_SUDO_OPTIONS_WITH_VALUE,
+            )
+            continue
+        if executable == "env":
+            remaining = _skip_launcher_options(
+                remaining[1:],
+                options_with_value=_ENV_OPTIONS_WITH_VALUE,
+                allow_assignments=True,
+            )
+            continue
+        break
+    return remaining
+
+
+def _direct_interpreter_script_arg(
+    args: list[str],
+    *,
+    options_with_value: Optional[set[str]] = None,
+) -> Optional[str]:
     """Return a directly executed script path, excluding inline/stdin code.
 
     Shell lexing keeps heredoc operators such as ``<<PY`` in the argv-like
@@ -67,9 +165,12 @@ def _direct_interpreter_script_arg(args: list[str]) -> Optional[str]:
     the command block.
     """
     options_ended = False
-    for index, arg in enumerate(args):
+    index = 0
+    while index < len(args):
+        arg = args[index]
         if not options_ended and arg == "--":
             options_ended = True
+            index += 1
             continue
         if arg == "-":
             return None
@@ -84,64 +185,53 @@ def _direct_interpreter_script_arg(args: list[str]) -> Optional[str]:
         if redirection.startswith((">", "&>")):
             return None
 
+        if not options_ended and options_with_value and arg in options_with_value:
+            index += 2
+            continue
         if not options_ended and arg.startswith("-"):
+            index += 1
             continue
         return arg
     return None
 
 
+def _direct_argv_script_path(argv: list[str]) -> Optional[str]:
+    """Return the direct script from one finite, literal launcher argv."""
+    segment = _unwrap_known_launchers(argv)
+    if not segment:
+        return None
+    executable = os.path.basename(segment[0]).lower()
+    args = segment[1:]
+    if executable in {"source", "."}:
+        return args[0] if args else None
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable):
+        if any(
+            arg in {"-c", "-m"} or arg.startswith(("-c=", "-m="))
+            for arg in args
+        ):
+            return None
+        return _direct_interpreter_script_arg(
+            args,
+            options_with_value=_PYTHON_OPTIONS_WITH_VALUE,
+        )
+    if executable in _INTERPRETERS:
+        if any(arg in {"-c", "-Command", "-EncodedCommand"} for arg in args):
+            return None
+        return _direct_interpreter_script_arg(args)
+    return segment[0] if _looks_like_script_path(segment[0]) else None
+
+
 def _direct_shell_script_paths(source: str) -> list[str]:
     paths: list[str] = []
-    interpreters = {
-        "bash",
-        "sh",
-        "zsh",
-        "dash",
-        "fish",
-        "node",
-        "ruby",
-        "perl",
-        "pwsh",
-        "powershell",
-        "powershell.exe",
-    }
     for raw_segment in _shell_segments(source):
         segment = list(raw_segment)
         while segment and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", segment[0]):
             segment.pop(0)
         if not segment:
             continue
-        if os.path.basename(segment[0]) == "sudo":
-            segment.pop(0)
-            while segment and segment[0].startswith("-"):
-                segment.pop(0)
-        if segment and os.path.basename(segment[0]) == "env":
-            segment.pop(0)
-            while segment and (segment[0].startswith("-") or "=" in segment[0]):
-                segment.pop(0)
-        if not segment:
-            continue
-        executable = os.path.basename(segment[0]).lower()
-        args = segment[1:]
-        if executable in {"source", "."} and args:
-            paths.append(args[0])
-            continue
-        if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable):
-            if any(arg in {"-c", "-m"} for arg in args):
-                continue
-            script = _direct_interpreter_script_arg(args)
-            if script:
-                paths.append(script)
-            continue
-        if executable in interpreters:
-            if any(arg in {"-c", "-Command", "-EncodedCommand"} for arg in args):
-                continue
-            script = _direct_interpreter_script_arg(args)
-            if script:
-                paths.append(script)
-            continue
-        if _looks_like_script_path(segment[0]):
-            paths.append(segment[0])
+        script = _direct_argv_script_path(segment)
+        if script:
+            paths.append(script)
     return paths
 
 
@@ -202,26 +292,15 @@ def _direct_python_script_paths(source: str) -> list[str]:
             continue
         if not isinstance(argv, list) or not argv:
             continue
-        first = argv[0]
-        first_base = os.path.basename(first or "").lower()
-        if first == "<python-executable>" or re.fullmatch(
-            r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", first_base
-        ):
-            if len(argv) > 1 and argv[1] and not argv[1].startswith("-"):
-                paths.append(argv[1])
-        elif first_base in {
-            "bash",
-            "sh",
-            "zsh",
-            "node",
-            "ruby",
-            "perl",
-            "pwsh",
-        }:
-            if len(argv) > 1 and argv[1] and not argv[1].startswith("-"):
-                paths.append(argv[1])
-        elif first and _looks_like_script_path(first):
-            paths.append(first)
+        if any(value is None for value in argv):
+            continue
+        literal_argv = [
+            "python" if value == "<python-executable>" else str(value)
+            for value in argv
+        ]
+        script = _direct_argv_script_path(literal_argv)
+        if script:
+            paths.append(script)
     return paths
 
 
@@ -268,16 +347,20 @@ def collect_direct_script_evidence(
     evidence: list[dict[str, str]] = []
     seen: set[str] = set()
     base = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
-    for raw_path in raw_paths[:MAX_SCRIPT_COUNT]:
+    has_additional_scripts = False
+    for raw_path in raw_paths:
         expanded = os.path.expanduser(raw_path)
         resolved = os.path.abspath(
             expanded if os.path.isabs(expanded) else os.path.join(base, expanded)
         )
         if resolved in seen:
             continue
-        seen.add(resolved)
         if _is_virtualenv_console_entrypoint(resolved):
             continue
+        seen.add(resolved)
+        if len(seen) > MAX_SCRIPT_COUNT:
+            has_additional_scripts = True
+            break
         content: Optional[str] = None
         try:
             path = os.path.realpath(resolved)
@@ -304,7 +387,7 @@ def collect_direct_script_evidence(
                 "content": content or "",
             }
         )
-    if len(raw_paths) > MAX_SCRIPT_COUNT:
+    if has_additional_scripts:
         evidence.append(
             {
                 "path": "<additional-direct-scripts>",

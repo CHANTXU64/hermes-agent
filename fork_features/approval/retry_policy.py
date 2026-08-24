@@ -84,6 +84,12 @@ def first_automated_denial_result(
             max_entries=max_entries,
         )
 
+    # Intentional UX contract: keep this instruction outcome-oriented for the
+    # main agent. It only needs to retry the same necessary operation once and
+    # must not be taught internal Smart/YOLO/allowlist routing. A legal release
+    # may execute before a user card; naming the user decision here is deliberate
+    # guidance against command rewriting and route-shopping, not a transition
+    # diagram that promises every internal branch will prompt the user.
     if prefers_chinese:
         reason = (description or "").strip().rstrip("。.!！?？,，;；")
         reason_clause = f"，{reason}" if reason else ""
