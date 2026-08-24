@@ -48,6 +48,8 @@ def breaker_session(monkeypatch):
 
     session_key = "breaker-test-session"
     token = A.set_current_session_key(session_key)
+    A.clear_session(session_key)
+    context_tokens = A.set_current_observability_context(turn_id="breaker-test-turn")
     A._reset_denials(session_key)
     with A._lock:
         A._permanent_approved.discard("breaker-test-danger")
@@ -59,6 +61,8 @@ def breaker_session(monkeypatch):
     try:
         yield session_key
     finally:
+        A.clear_session(session_key)
+        A.reset_current_observability_context(context_tokens)
         A.reset_current_session_key(token)
         A._reset_denials(session_key)
         with A._lock:
@@ -129,17 +133,17 @@ def test_approval_resets_tally(breaker_session, monkeypatch):
 
 
 def test_human_approval_resets_tally(breaker_session):
-    _register_resolver(breaker_session, "deny")
-    _denied_terminal("dangerous one")
-    _denied_terminal("dangerous two")
+    # The first automated denial creates the only legitimate repeat route.
+    first = _denied_terminal("dangerous reset")
+    assert first["outcome"] == "auto_denied"
 
-    # User overrides the smart DENY (one-operation approval) → tally resets.
+    # Repeating the same action may receive one-operation user approval, which
+    # resets the session's consecutive guardian-denial tally.
     _register_resolver(breaker_session, "once")
-    ok = _denied_terminal("dangerous but user says yes")
+    ok = _denied_terminal("dangerous reset")
     assert ok["approved"] is True and ok.get("user_approved") is True
 
-    _register_resolver(breaker_session, "deny")
-    after = _denied_terminal("dangerous again")
+    after = _denied_terminal("dangerous after reset")
     assert after["approved"] is False
     assert BREAKER_MARKER not in after["message"]
 

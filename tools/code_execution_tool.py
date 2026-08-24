@@ -1287,9 +1287,37 @@ def execute_code(
         )
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config, _docker_has_host_access
+    from tools.terminal_tool import (
+        _docker_has_host_access,
+        _get_env_config,
+        get_active_env,
+        get_session_cwd,
+    )
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
+    _approval_env = get_active_env(task_id or "default")
+    _approval_cwd = (
+        get_session_cwd(task_id or "default")
+        or getattr(_approval_env, "cwd", None)
+        or _env_config.get("cwd")
+        or os.getcwd()
+    )
+
+    def _read_execute_code_script(script_path: str) -> Optional[str]:
+        if env_type == "local" or _approval_env is None:
+            return None
+        try:
+            from tools.approval import _MAX_SMART_SCRIPT_BYTES
+            result = _approval_env.execute(
+                f"head -c {_MAX_SMART_SCRIPT_BYTES + 1} < {shlex.quote(script_path)}"
+            )
+            if result.get("returncode", -1) == 0:
+                output = result.get("output", "")
+                if isinstance(output, str):
+                    return output
+        except Exception:
+            pass
+        return None
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
     # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script
@@ -1301,6 +1329,10 @@ def execute_code(
     _guard = check_execute_code_guard(
         code, env_type,
         has_host_access=_docker_has_host_access(_env_config),
+        cwd=_approval_cwd,
+        read_script=(
+            _read_execute_code_script if env_type != "local" else None
+        ),
     )
     if not _guard.get("approved", False):
         return json.dumps({

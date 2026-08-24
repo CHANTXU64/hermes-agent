@@ -3150,6 +3150,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
+            from agent.tool_executor import build_smart_approval_context
+            dispatch_kwargs["approval_context"] = build_smart_approval_context(messages or [])
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
             return _ra().handle_function_call(

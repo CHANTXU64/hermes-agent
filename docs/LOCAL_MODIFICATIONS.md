@@ -1926,6 +1926,212 @@ Feature docs: `docs/chantxu64/delegate-per-call-routing/README.md`
 
 Upstream status: fork-only.
 
+### 28. Current-turn context-aware Smart Approval
+
+Status: active
+
+Date: 2026-08-16
+
+Files:
+
+- `pyproject.toml`
+- `fork_features/__init__.py`
+- `fork_features/approval/__init__.py`
+- `fork_features/approval/script_evidence.py`
+- `fork_features/approval/smart_review.py`
+- `fork_features/approval/retry_policy.py`
+- `agent/agent_runtime_helpers.py`
+- `agent/conversation_compression.py`
+- `agent/tool_executor.py`
+- `model_tools.py`
+- `tools/approval.py`
+- `tools/tirith_security.py`
+- `tools/terminal_tool.py`
+- `tools/code_execution_tool.py`
+- `tests/tools/test_smart_approval_context.py`
+- `tests/tools/test_denial_retry_escalation.py`
+- `tests/tools/test_denial_circuit_breaker.py`
+- `tests/tools/test_smart_approval_injection.py`
+- `tests/tools/test_smart_approval_policy.py`
+- `tests/tools/test_execute_code_approval_cluster.py`
+- `tests/tools/test_tirith_security.py`
+- `tests/fork_features/approval/test_script_evidence.py`
+- `tests/fork_features/approval/test_smart_review.py`
+- `tests/fork_features/approval/test_retry_policy.py`
+- `tests/hermes_cli/test_gateway_restart_loop.py`
+- `docs/chantxu64/current-turn-smart-approval/README.md`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- Smart Approval now judges actual risk and current authorization separately,
+  using only the latest real user-authored turn, completed Clarify
+  question/answer pairs after that turn, the action about to run, and bounded
+  best-effort contents of directly executed entry scripts. A first Smart Review
+  denial exposes one text-similar retry route. Existing legal release mechanisms
+  and a later Smart `approve` remain effective; only a second current `deny`
+  consumes the similar state and falls back to one-shot human approval. A denial
+  or timeout on that repeat card is final for similar repeat actions in the turn
+  without changing ordinary approval behavior.
+
+What changed:
+
+- Both tool-dispatch paths derive the same narrow authorization context and bind
+  it per request, so concurrent tool calls cannot borrow another request's user
+  authorization.
+- Approval context reuses the conversation compressor's canonical real-user
+  classification. Compaction summaries, preserved ToDo snapshots, background
+  notifications, recovery notices, and bare Skill invocation scaffolding cannot
+  become authorization evidence. Runtime-enriched real turns retain only the
+  user instruction: Skill bodies, model-switch notices, reply/thread metadata,
+  Cron delivery guidance, and pre-run/context-job output are stripped before
+  review. A ToDo snapshot appended to a real turn is removed without discarding
+  that turn.
+- Terminal review receives the real command and resolved execution directory;
+  `execute_code` review receives the complete Python source. Direct entry scripts
+  such as `python cleanup.py`, `bash deploy.sh`, `./run-task`, and literal script
+  launches inside `execute_code` are read from the environment that will execute
+  them and sent as bounded evidence. Missing, unreadable, oversized, or excess
+  direct-script evidence no longer forces manual review by itself. The reviewer
+  judges the visible action and operational consequences; imports and dependency
+  trees are not recursively inspected.
+- Interpreter stdin and shell here-doc forms such as `python - <<'PY'` are
+  treated as inline command content rather than nonexistent external script
+  paths. A genuine entry script before a here-doc, such as
+  `python reader.py <<'EOF'`, is still collected and reviewed.
+- Tirith resolution now validates the Hermes scanner protocol instead of
+  trusting any same-named executable found on `PATH`. A binary must support the
+  `check` interface and the `--json`, `--shell`, and `--non-interactive` flags;
+  incompatible programs are skipped in favor of the managed Hermes binary.
+- Package-managed virtual-environment console entry points are not treated as
+  opaque custom scripts merely because their executable path is explicit.
+  Ordinary test/lint/build commands can therefore pass the normal security
+  guards without invoking Smart Approval when Tirith and static checks find no
+  risk. Directly launched source scripts remain bounded review evidence, and
+  unreadable evidence remains visible without becoming a fail-closed condition.
+- Approval language selection reuses Hermes' interface-language resolver
+  (`HERMES_LANGUAGE` override, then `display.language`, then English). The
+  reviewer receives the resolved language code for `reason`; fixed smart-review
+  presentation uses Chinese for `zh`/`zh-hant` and otherwise retains its English
+  fallback. A Chinese interface therefore remains Chinese even when the latest
+  user message is English or language-neutral. Structured decision/risk/
+  authorization values remain stable machine enums.
+- The reviewer returns `decision`, `risk_level`, `authorization`, and a short
+  semantic `reason`. Critical risk is denied; an approval whose risk and
+  authorization fields conflict is downgraded to escalation; high-risk exact
+  authorization remains eligible for one-operation approval.
+- Existing integrations that compare the historical one-word smart decision
+  remain compatible. Smart approvals still do not create a permanent broad
+  allowlist entry.
+- Fork-owned policy bodies now live under `fork_features/approval`: direct-script
+  evidence, structured Smart Review, and denial-retry/final-denial state. These
+  modules do not import approval/Terminal hosts; request context, language,
+  script readers, LLM access, redaction, the shared lock, and human-approval
+  transport remain explicit host inputs. `tools/approval.py` keeps compatibility
+  wrappers and core authorization/transport integration.
+- On the first Smart denial, the agent is told it may submit the same or a
+  textually similar operation again only when it remains necessary. Candidates
+  are scoped to the same session, verified user turn, and tool kind. Exact
+  whitespace-normalized text matches; otherwise a bounded first/last 8,192
+  characters use `SequenceMatcher(autojunk=False)` with a `0.86` threshold.
+- The second actual action follows the current normal approval path. YOLO/
+  mode-off, existing valid allowlists/session approvals, and a current Smart
+  `approve` release it normally; a current `escalate` keeps ordinary manual
+  approval behavior. Only a second current Smart `deny` consumes a text-similar
+  first-denial state and routes the current command or complete Python source to
+  the fresh one-shot fallback. Similarity does not prove semantic equivalence,
+  reuse authorization, or inspect shell tokens, paths, targets, ASTs, here-doc
+  structure, indentation, or effects.
+- One-shot retry approval disables session/permanent capabilities on bound
+  Gateway callbacks. A client response of `session` or `always` cannot persist
+  this approval. Without a live notify callback the route fails closed with
+  `approval_unavailable`, queues no dead pending request, and retains the retry
+  state so a later same-action request can reach a newly registered callback.
+- Only a denial or timeout from the repeat one-shot card creates the same-turn
+  similar-action latch. Ordinary manual approval, an ordinary first Smart
+  `escalate`, and selected approval transports retain their prior denial and
+  timeout behavior. Both a real session identifier and a real turn identifier
+  are required, and the state is deliberately in-memory only.
+- Gateway restart/stop remains a deterministic hard block in the running
+  Gateway. Repeating it does not create an approval card and does not execute
+  the lifecycle action. Computer Use, Cron, cross-tool intent tracking, and
+  cross-process retry persistence are outside this behavior.
+- The feature intentionally omits file hashes/version binding, recursive
+  dependency graphs, LSP integration, dynamic dependency analysis, and
+  cross-tool semantic same-result tracking.
+
+Why it matters:
+
+- The approval flow should judge actual outcomes and current authorization, not
+  require complete static source visibility. At the same time, an automatic
+  denial must not trigger wasteful command rewrites or alternate-tool bypass
+  attempts: an existing valid release remains effective, while a repeat that is
+  still denied can reach the user once; a real user denial ends that fallback
+  scope for the turn.
+
+Merge protection:
+
+- Preserve when upstream Smart Approval cannot consume the latest-turn/Clarify
+  authorization boundary, structured risk and authorization fields, bounded
+  direct-script evidence across terminal and `execute_code`, localized approval
+  presentation, first-Smart-denial/legal-release priority/second-denial
+  text-similar one-shot fallback, repeat-card-only same-turn denial latching, the
+  unchanged Gateway lifecycle hard block, Fork policy separation, or
+  protocol-validated Tirith resolution.
+- Drop when upstream provides equivalent request isolation, direct-entry-script
+  context without fail-closed source gaps, package-managed development-tool
+  handling, structured outcomes, language-aware presentation, compatible-scanner
+  selection, text-only denial retry/repeat-card-denial semantics, and
+  one-operation persistence behavior with matching regressions.
+- Ask the user when upstream uses broader conversation history, omits Clarify
+  question scope, treats all high risk as denial, or recursively analyzes a
+  materially larger dependency surface.
+
+Verification:
+
+- 2026-08-24 post-correction route tests: 11 legal-release-versus-forced-one-shot tests failed before the withdrawal and passed afterward.
+- Focused Fork/retry/Terminal/`execute_code`/context regression: `113 passed`.
+- Broader approval/Gateway regression: `351 passed`, `2 failed`, `1 deselected`, with `7` third-party deprecation warnings. The two failures are existing order-dependent redaction tests and each passed in a fresh isolated process (`2 passed`); the deselected macOS `/tmp` alias case remains the unchanged platform baseline.
+- Adjacent Smart Approval policy, Terminal, code-execution, Tirith, approval-mode, and interface-language regression: `205 passed`, `7 subtests passed`.
+- `py_compile`, Ruff, and `git diff --check` passed.
+- All approval-model test paths were mocked. No paid model replay, production configuration/provider/endpoint/fallback change, Gateway restart, live-main copy, commit, or push was performed.
+- The following 2026-08-16 results remain historical evidence for the original
+  latest-turn context, Tirith, and language-aware implementation.
+- Approval, terminal, `execute_code`, and Tirith regression coverage:
+  `206 passed`, `7 subtests passed`.
+- Conversation-compression and real-user provenance coverage: `193 passed`.
+- A live local resolver probe skipped the incompatible pipx `py-tirith` 1.0.5
+  executable at `~/.local/bin/tirith`, selected the Hermes-managed 0.2.12
+  scanner at `~/.hermes/bin/tirith`, and returned `allow` for an ordinary
+  `python -m pytest` command.
+- Direct evidence probes returned no custom-script evidence for a verified
+  virtual-environment console entry point and retained an `unreadable` evidence
+  gap for a missing directly launched custom Python script.
+- A frozen 50-event historical replay completed serially through the configured
+  `openai-api / gpt-5.6-luna` approval route with `medium` reasoning and a
+  five-second inter-case delay. All 50 records matched their frozen event/action
+  identities and route contract with no model-call failures. The replay is an
+  evaluation set, not a claim that every model judgment is correct; manual
+  review retained five judgment findings: two unnecessary low-risk read-only
+  escalations and three unsafe approvals involving unknown interactive effects,
+  an omitted backup overwrite, and an ambiguous target/overwrite scope.
+- A separately authorized prompt-only experiment was rejected by its ratchet
+  gate. After the five focus findings were initially corrected, 7 of the 45
+  previously accepted anchor decisions changed. A final 12-case boundary pass
+  met only 8 expected decisions. The experimental prompt and its text-contract
+  tests were removed; the frozen R021 prompt hash again exactly matches the
+  original 50-event baseline. The code-layer context and here-doc fixes remain.
+- Ruff, `py_compile`, and `git diff --check` passed for the changed source and
+  tests. Pyright was not installed in this worktree environment.
+- This layered-fix validation used local tests only: no paid model replay,
+  configuration change, Gateway restart, commit, or push was performed. The
+  running Gateway must be restarted separately before these source changes can
+  affect live approval requests.
+
+Feature docs: `docs/chantxu64/current-turn-smart-approval/README.md`
+
+Upstream status: fork-only.
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -1975,6 +2181,34 @@ deltas are expected in these areas:
   - `website/docs/user-guide/features/delegation.md`
   - `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features/delegation.md`
   - `docs/chantxu64/delegate-per-call-routing/README.md`
+  - `docs/LOCAL_MODIFICATIONS.md`
+- Current-turn context-aware Smart Approval:
+  - `pyproject.toml`
+  - `fork_features/__init__.py`
+  - `fork_features/approval/__init__.py`
+  - `fork_features/approval/script_evidence.py`
+  - `fork_features/approval/smart_review.py`
+  - `fork_features/approval/retry_policy.py`
+  - `agent/agent_runtime_helpers.py`
+  - `agent/conversation_compression.py`
+  - `agent/tool_executor.py`
+  - `model_tools.py`
+  - `tools/approval.py`
+  - `tools/tirith_security.py`
+  - `tools/terminal_tool.py`
+  - `tools/code_execution_tool.py`
+  - `tests/tools/test_smart_approval_context.py`
+  - `tests/tools/test_denial_retry_escalation.py`
+  - `tests/tools/test_denial_circuit_breaker.py`
+  - `tests/tools/test_smart_approval_injection.py`
+  - `tests/tools/test_smart_approval_policy.py`
+  - `tests/tools/test_execute_code_approval_cluster.py`
+  - `tests/tools/test_tirith_security.py`
+  - `tests/fork_features/approval/test_script_evidence.py`
+  - `tests/fork_features/approval/test_smart_review.py`
+  - `tests/fork_features/approval/test_retry_policy.py`
+  - `tests/hermes_cli/test_gateway_restart_loop.py`
+  - `docs/chantxu64/current-turn-smart-approval/README.md`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Safe command rewrite:
   - `tools/safe_cmd_rewrite.py`
@@ -2098,9 +2332,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 27 major entries.
+Documented entries: 28 major entries.
 
-Active / current entries: 23.
+Active / current entries: 24.
 
 Historical reverted / abandoned / superseded areas: 4.
 

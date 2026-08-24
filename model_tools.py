@@ -1176,6 +1176,7 @@ def handle_function_call(
     turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None,
     user_task: Optional[str] = None,
+    approval_context: Optional[Dict[str, Any]] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
     skip_tool_request_middleware: bool = False,
@@ -1315,6 +1316,7 @@ def handle_function_call(
                 turn_id=turn_id,
                 api_request_id=api_request_id,
                 user_task=user_task,
+                approval_context=approval_context,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 skip_tool_request_middleware=skip_tool_request_middleware,
@@ -1453,18 +1455,23 @@ def handle_function_call(
         # unaffected by wall-clock adjustments during the call.
         _dispatch_start = time.monotonic()
         _approval_tokens = None
+        _smart_approval_token = None
         try:
             from tools.approval import (
                 reset_current_observability_context,
+                reset_smart_approval_context,
                 set_current_observability_context,
+                set_smart_approval_context,
             )
             _approval_tokens = set_current_observability_context(
                 turn_id=turn_id or "",
                 tool_call_id=tool_call_id or "",
                 session_id=session_id or "",
             )
+            _smart_approval_token = set_smart_approval_context(approval_context or {})
         except Exception:
             reset_current_observability_context = None
+            reset_smart_approval_context = None
         try:
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
@@ -1502,6 +1509,11 @@ def handle_function_call(
                     api_request_id=api_request_id or "",
                 )
         finally:
+            if _smart_approval_token is not None and reset_smart_approval_context is not None:
+                try:
+                    reset_smart_approval_context(_smart_approval_token)
+                except Exception:
+                    pass
             if _approval_tokens is not None and reset_current_observability_context is not None:
                 try:
                     reset_current_observability_context(_approval_tokens)

@@ -117,9 +117,22 @@ def gw_session(monkeypatch):
     # yolo inherited from the developer's live environment.
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
     monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(
+        A,
+        "_generate_repeat_manual_description",
+        lambda *args, **kwargs: (
+            "目的：测试一次性审批。\n"
+            "实际动作：仅执行当前测试操作一次。\n"
+            "预期影响：执行一次。\n"
+            "风险：测试风险。\n"
+            "转人工原因：第二次相同操作需要用户决定。"
+        ),
+    )
 
     session_key = "cluster-test-session"
     token = A.set_current_session_key(session_key)
+    context_tokens = A.set_current_observability_context(turn_id="cluster-test-turn")
+    A.clear_session(session_key)
     with A._lock:
         A._gateway_queues.pop(session_key, None)
         A._gateway_notify_cbs.pop(session_key, None)
@@ -128,6 +141,8 @@ def gw_session(monkeypatch):
     try:
         yield session_key
     finally:
+        A.clear_session(session_key)
+        A.reset_current_observability_context(context_tokens)
         A.reset_current_session_key(token)
         with A._lock:
             A._gateway_queues.pop(session_key, None)
@@ -262,11 +277,13 @@ def test_guard_smart_mode(gw_session, monkeypatch):
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is True and res.get("smart_approved") is True
 
-    # Smart DENY on an interactive surface now asks the owner. With no bound
-    # notifier it remains pending rather than being hard-denied.
+    # The first Smart DENY returns the sole legitimate retry route; it must not
+    # open a human approval card yet.
     monkeypatch.setattr(A, "_smart_approve", lambda c, d: "deny")
     res = A.check_execute_code_guard("import os", "local")
-    assert res["approved"] is False and res["status"] == "pending_approval"
+    assert res["approved"] is False
+    assert res["outcome"] == "auto_denied"
+    assert res["retry_escalation_available"] is True
 
     # escalate → falls through to manual gateway approval
     monkeypatch.setattr(A, "_smart_approve", lambda c, d: "escalate")
@@ -275,8 +292,8 @@ def test_guard_smart_mode(gw_session, monkeypatch):
     assert res["approved"] is True
 
 
-def test_terminal_smart_deny_owner_override_is_one_operation(gw_session, monkeypatch):
-    """A human may override DENY, but a broad UI choice must not be persisted."""
+def test_terminal_second_smart_deny_owner_override_is_one_operation(gw_session, monkeypatch):
+    """Only the second same action reaches a human; broad UI choices never persist."""
     with A._lock:
         A._permanent_approved.discard("owner-override-test-danger")
         A._session_approved.get(gw_session, set()).discard("owner-override-test-danger")
@@ -293,42 +310,50 @@ def test_terminal_smart_deny_owner_override_is_one_operation(gw_session, monkeyp
         raising=False,
     )
 
+    first = A.check_all_command_guards("dangerous /tmp/first", "local")
+    assert first["approved"] is False
+    assert first["outcome"] == "auto_denied"
+
     shown = _register_capturing_resolver(gw_session, "always")
     result = A.check_all_command_guards("dangerous /tmp/first", "local")
 
     assert result["approved"] is True
     assert result["user_approved"] is True
-    assert shown["approval_data"]["smart_denied"] is True
+    assert result["one_shot"] is True
     assert shown["approval_data"]["allow_permanent"] is False
+    assert shown["approval_data"]["allow_session"] is False
     assert A.is_approved(gw_session, "owner-override-test-danger") is False
 
-    _register_resolver(gw_session, "deny")
-    changed = A.check_all_command_guards("dangerous /tmp/second", "local")
-    assert changed["approved"] is False
-    assert changed["outcome"] == "denied"
+    repeated = A.check_all_command_guards("dangerous /tmp/first", "local")
+    assert repeated["approved"] is False
+    assert repeated["outcome"] == "auto_denied"
 
 
-def test_execute_code_smart_deny_owner_override_is_one_operation(gw_session, monkeypatch):
-    """Never persist the coarse execute_code key after overriding smart DENY."""
+def test_execute_code_second_smart_deny_owner_override_is_one_operation(gw_session, monkeypatch):
+    """Never persist the coarse execute_code key after the second-action override."""
     with A._lock:
         A._permanent_approved.discard("execute_code")
         A._session_approved.get(gw_session, set()).discard("execute_code")
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
 
+    first = A.check_execute_code_guard("print('first')", "local")
+    assert first["approved"] is False
+    assert first["outcome"] == "auto_denied"
+
     shown = _register_capturing_resolver(gw_session, "session")
     result = A.check_execute_code_guard("print('first')", "local")
 
     assert result["approved"] is True
     assert result["user_approved"] is True
-    assert shown["approval_data"]["smart_denied"] is True
+    assert result["one_shot"] is True
     assert shown["approval_data"]["allow_permanent"] is False
+    assert shown["approval_data"]["allow_session"] is False
     assert A.is_approved(gw_session, "execute_code") is False
 
-    _register_resolver(gw_session, "deny")
-    changed = A.check_execute_code_guard("print('second')", "local")
-    assert changed["approved"] is False
-    assert changed["outcome"] == "denied"
+    repeated = A.check_execute_code_guard("print('first')", "local")
+    assert repeated["approved"] is False
+    assert repeated["outcome"] == "auto_denied"
 
 
 def test_smart_escalate_still_persists_session_choice(gw_session, monkeypatch):
@@ -357,7 +382,7 @@ def test_smart_escalate_still_persists_session_choice(gw_session, monkeypatch):
     assert A.is_approved(gw_session, key) is True
 
 
-def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkeypatch):
+def test_terminal_smart_deny_without_notify_stays_retryable(gw_session, monkeypatch):
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
     monkeypatch.setattr(
@@ -370,30 +395,50 @@ def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkey
         raising=False,
     )
 
+    first = A.check_all_command_guards("dangerous pending", "local")
+    assert first["outcome"] == "auto_denied"
     result = A.check_all_command_guards("dangerous pending", "local")
 
-    assert result["status"] == "pending_approval"
-    assert result["smart_denied"] is True
+    assert result["status"] == "blocked"
+    assert result["outcome"] == "approval_unavailable"
     assert result["allow_permanent"] is False
+    assert result["allow_session"] is False
+    assert result["one_shot"] is True
     with A._lock:
-        pending = dict(A._pending[gw_session])
-    assert pending["smart_denied"] is True
-    assert pending["allow_permanent"] is False
+        assert gw_session not in A._pending
+
+    _register_resolver(gw_session, "once")
+    approved = A.check_all_command_guards("dangerous pending", "local")
+    assert approved["approved"] is True
+    assert approved["one_shot"] is True
 
 
-def test_execute_code_smart_deny_pending_payload_is_one_operation(gw_session, monkeypatch):
+def test_execute_code_smart_deny_without_notify_stays_retryable(gw_session, monkeypatch):
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
+    from agent import redact
 
-    result = A.check_execute_code_guard("print('pending')", "local")
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    fake_key = "sk-proj-" + "X" * 24
+    code = f"api_key = {fake_key!r}\nprint('pending')"
 
-    assert result["status"] == "pending_approval"
-    assert result["smart_denied"] is True
+    first = A.check_execute_code_guard(code, "local")
+    assert first["outcome"] == "auto_denied"
+    result = A.check_execute_code_guard(code, "local")
+
+    assert result["status"] == "blocked"
+    assert result["outcome"] == "approval_unavailable"
     assert result["allow_permanent"] is False
+    assert result["allow_session"] is False
+    assert result["one_shot"] is True
+    assert fake_key not in result["message"]
     with A._lock:
-        pending = dict(A._pending[gw_session])
-    assert pending["smart_denied"] is True
-    assert pending["allow_permanent"] is False
+        assert gw_session not in A._pending
+
+    _register_resolver(gw_session, "once")
+    approved = A.check_execute_code_guard(code, "local")
+    assert approved["approved"] is True
+    assert approved["one_shot"] is True
 
 
 def test_terminal_serializes_smart_deny_pending_capabilities(monkeypatch):
@@ -417,6 +462,48 @@ def test_terminal_serializes_smart_deny_pending_capabilities(monkeypatch):
 
     assert payload["smart_denied"] is True
     assert payload["allow_permanent"] is False
+
+
+def test_terminal_blocks_unavailable_one_shot_without_execution(monkeypatch):
+    from tools import terminal_tool as terminal_module
+
+    monkeypatch.setattr(
+        terminal_module,
+        "_check_all_guards",
+        lambda *_args, **_kwargs: {
+            "approved": False,
+            "status": "blocked",
+            "outcome": "approval_unavailable",
+            "message": "no live approval callback",
+        },
+    )
+
+    payload = json.loads(terminal_module.terminal_tool(command="printf unreachable"))
+
+    assert payload["status"] == "blocked"
+    assert "no live approval callback" in payload["error"]
+
+
+def test_execute_code_blocks_unavailable_one_shot_without_dispatch(monkeypatch):
+    from tools import approval
+    from tools import code_execution_tool
+
+    monkeypatch.setattr(
+        approval,
+        "check_execute_code_guard",
+        lambda *_args, **_kwargs: {
+            "approved": False,
+            "status": "blocked",
+            "outcome": "approval_unavailable",
+            "message": "no live approval callback",
+        },
+    )
+
+    payload = json.loads(code_execution_tool.execute_code("raise AssertionError('unreachable')"))
+
+    assert payload["status"] == "error"
+    assert payload["tool_calls_made"] == 0
+    assert "no live approval callback" in payload["error"]
 
 
 def test_guard_session_yolo_bypasses(gw_session):

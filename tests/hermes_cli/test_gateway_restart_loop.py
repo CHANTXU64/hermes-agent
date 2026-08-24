@@ -296,6 +296,58 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
 
+    def test_repeated_lifecycle_attempt_remains_hard_blocked(self, monkeypatch):
+        import tools.approval as approval
+        import tools.terminal_tool as tt
+
+        calls = []
+        captured = []
+
+        class _FakeEnv:
+            env = {}
+            cwd = "/tmp"
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "unexpected", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.setattr(
+            approval,
+            "_generate_repeat_manual_description",
+            lambda *args, **kwargs: "unreachable lifecycle approval",
+            raising=False,
+        )
+        session_key = "terminal-lifecycle-repeat"
+        session_token = approval.set_current_session_key(session_key)
+        context_tokens = approval.set_current_observability_context(
+            turn_id="terminal-lifecycle-turn"
+        )
+
+        def capture_approval(data):
+            captured.append(dict(data))
+            with approval._lock:
+                entry = approval._gateway_queues[session_key][-1]
+                entry.result = "once"
+                entry.event.set()
+
+        approval.register_gateway_notify(session_key, capture_approval)
+        try:
+            first = json.loads(tt.terminal_tool(command="hermes gateway restart"))
+            second = json.loads(tt.terminal_tool(command="hermes gateway restart"))
+        finally:
+            approval.clear_session(session_key)
+            approval.reset_current_observability_context(context_tokens)
+            approval.reset_current_session_key(session_token)
+
+        assert first["exit_code"] == 1
+        assert second["exit_code"] == 1
+        assert "Blocked" in first["error"]
+        assert "Blocked" in second["error"]
+        assert captured == []
+        assert calls == []
+
     def test_blocks_lifecycle_command_hidden_in_referenced_script(
         self, monkeypatch, tmp_path
     ):
