@@ -13,6 +13,7 @@ from tools.approval import (
     _collect_direct_script_evidence,
     _smart_approve,
     check_all_command_guards,
+    check_execute_code_guard,
     clear_session,
     get_smart_approval_context,
     reset_smart_approval_context,
@@ -427,6 +428,26 @@ subprocess.run([sys.executable, "cleanup.py"], check=True)
     ]
 
 
+def test_execute_code_literal_terminal_script_is_read(tmp_path: Path):
+    script = tmp_path / "audit_hard_standards.py"
+    script.write_text("print('audit')\n")
+    command = f"python {str(script)!r} --output-dir {str(tmp_path / 'audit')!r}"
+    code = f"""
+from hermes_tools import terminal
+result = terminal({command!r}, timeout=180, workdir={str(tmp_path)!r})
+"""
+
+    evidence = _collect_direct_script_evidence(
+        code,
+        cwd=str(tmp_path),
+        source_kind="python",
+    )
+
+    assert evidence == [
+        {"path": str(script), "status": "read", "content": "print('audit')\n"}
+    ]
+
+
 def test_external_script_reader_wins_over_same_named_local_file(tmp_path: Path):
     script = tmp_path / "deploy.sh"
     script.write_text("echo local\n")
@@ -457,7 +478,7 @@ def test_unreadable_direct_script_is_explicit_evidence_gap(tmp_path: Path):
     ]
 
 
-def test_direct_script_evidence_does_not_recurse_local_imports(tmp_path: Path):
+def test_direct_script_evidence_does_not_follow_local_imports(tmp_path: Path):
     entry = tmp_path / "entry.py"
     helper = tmp_path / "helper.py"
     entry.write_text("import helper\nprint(helper.VALUE)\n")
@@ -472,7 +493,6 @@ def test_direct_script_evidence_does_not_recurse_local_imports(tmp_path: Path):
     assert evidence == [
         {"path": str(entry), "status": "read", "content": entry.read_text()}
     ]
-    assert all(item["path"] != str(helper) for item in evidence)
 
 
 def test_oversized_direct_script_remains_optional_unreadable_evidence(tmp_path: Path):
@@ -566,6 +586,76 @@ def test_terminal_smart_review_reads_direct_script_once(monkeypatch, tmp_path: P
     assert result["approved"] is True
     assert reads == [str(script)]
     assert "print('current entry')" in llm_call["messages"][1]["content"]
+
+
+def test_execute_code_guard_passes_nested_terminal_evidence_to_smart_review(
+    monkeypatch, tmp_path: Path
+):
+    outer = tmp_path / "outer"
+    task_root = tmp_path / "hindsight-document-candidate-validation"
+    outer.mkdir()
+    task_root.mkdir()
+    script = task_root / "audit_hard_standards.py"
+    script.write_text("print('audit')\\n")
+    command = (
+        f"/opt/hermes/venv/bin/python {str(script)!r} "
+        f"--batch-dir {str(task_root / 'run')!r} "
+        f"--output-dir {str(task_root / 'hard-audit')!r}"
+    )
+    code = f"""
+from hermes_tools import terminal
+result = terminal({command!r}, timeout=180, workdir={str(outer)!r})
+"""
+    llm_call = {}
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "decision": "approve",
+                            "risk_level": "low",
+                            "authorization": "sufficient",
+                            "reason": "当前脚本可以执行。",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            )
+        ]
+    )
+
+    def call_llm(**kwargs):
+        llm_call.update(kwargs)
+        return response
+
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "smart")
+    monkeypatch.setattr("tools.approval._YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr("tools.approval.is_approved", lambda *args: False)
+    monkeypatch.setattr("tools.approval._call_approval_llm", call_llm)
+
+    result = check_execute_code_guard(
+        code,
+        "local",
+        cwd=str(outer),
+    )
+
+    assert result["approved"] is True
+    prompt = llm_call["messages"][1]["content"]
+    evidence_json = prompt.split(
+        "<direct_script_evidence>\n", 1
+    )[1].split("\n</direct_script_evidence>", 1)[0]
+    evidence = json.loads(evidence_json)
+    assert evidence == [
+        {
+            "path": str(script),
+            "status": "read",
+            "content": "print('audit')\\n",
+        }
+    ]
 
 
 def test_smart_approval_returns_structured_decision_and_receives_context(tmp_path: Path):

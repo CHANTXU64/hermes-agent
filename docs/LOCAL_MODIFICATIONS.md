@@ -1962,7 +1962,8 @@ Summary:
 - Smart Approval now judges actual risk and current authorization separately,
   using only the latest real user-authored turn, completed Clarify
   question/answer pairs after that turn, the action about to run, and bounded
-  best-effort contents of directly executed entry scripts. A first Smart Review
+  best-effort contents of directly executed entry scripts plus explicitly
+  named local Python files. A first Smart Review
   denial exposes one text-similar retry route. Existing legal release mechanisms
   and a later Smart `approve` remain effective; only a second current `deny`
   consumes the similar state and falls back to one-shot human approval. A denial
@@ -1986,10 +1987,17 @@ What changed:
   `execute_code` review receives the complete Python source. Direct entry scripts
   such as `python cleanup.py`, `bash deploy.sh`, `./run-task`, and literal script
   launches inside `execute_code` are read from the environment that will execute
-  them and sent as bounded evidence. Missing, unreadable, oversized, or excess
-  direct-script evidence no longer forces manual review by itself. The reviewer
-  judges the visible action and operational consequences; imports and dependency
-  trees are not recursively inspected.
+  them and sent as bounded evidence. A literal `hermes_tools.terminal(...)`
+  command can expose its directly invoked Python script path. Ordinary imports,
+  module-name-only dynamic imports, and non-literal terminal commands are not
+  expanded. Missing, unreadable, oversized, or excess script evidence no longer
+  forces manual review by itself. The reviewer judges the visible action and
+  operational consequences; external dependency trees are not inspected.
+- Source reads are gated before any reader call: paths under the execution
+  cwd/current Git worktree and recognized task roots named `hindsight-*` or
+  `hermes-task-*` may be read; standard-library, installed-package,
+  Hermes-source, symlink-to-protected, arbitrary temporary-root, and
+  other-Git-project paths remain bounded `unreadable` evidence.
 - Interpreter stdin and shell here-doc forms such as `python - <<'PY'` are
   treated as inline command content rather than nonexistent external script
   paths. A genuine entry script before a here-doc, such as
@@ -2019,7 +2027,8 @@ What changed:
   remain compatible. Smart approvals still do not create a permanent broad
   allowlist entry.
 - Fork-owned policy bodies now live under `fork_features/approval`: direct-script
-  evidence, structured Smart Review, and denial-retry/final-denial state. These
+  evidence (including explicitly named nested script paths), structured Smart Review,
+  and denial-retry/final-denial state. These
   modules do not import approval/Terminal hosts; request context, language,
   script readers, LLM access, redaction, the shared lock, and human-approval
   transport remain explicit host inputs. `tools/approval.py` keeps compatibility
@@ -2051,9 +2060,9 @@ What changed:
   Gateway. Repeating it does not create an approval card and does not execute
   the lifecycle action. Computer Use, Cron, cross-tool intent tracking, and
   cross-process retry persistence are outside this behavior.
-- The feature intentionally omits file hashes/version binding, recursive
-  dependency graphs, LSP integration, dynamic dependency analysis, and
-  cross-tool semantic same-result tracking.
+- The feature intentionally omits file hashes/version binding, external
+  dependency graphs, ordinary-import following, non-literal dynamic dependency
+  analysis, and cross-tool semantic same-result tracking.
 
 Why it matters:
 
@@ -2089,6 +2098,9 @@ Verification:
 - Broader approval/Gateway regression: `351 passed`, `2 failed`, `1 deselected`, with `7` third-party deprecation warnings. The two failures are existing order-dependent redaction tests and each passed in a fresh isolated process (`2 passed`); the deselected macOS `/tmp` alias case remains the unchanged platform baseline.
 - Adjacent Smart Approval policy, Terminal, code-execution, Tirith, approval-mode, and interface-language regression: `205 passed`, `7 subtests passed`.
 - `py_compile`, Ruff, and `git diff --check` passed.
+- 2026-08-25 boundary correction: bounded script-evidence/context `59 passed`; adjacent Smart Approval/`execute_code` wiring `52 passed`; Terminal/code-execution/Tirith/i18n `167 passed`, `7 subtests passed`; isolated approval-mode parity `7 passed`.
+- The standalone approval file remained `95 passed`, `1 failed` on the unchanged macOS `/tmp` verification-artifact baseline. Ruff, `py_compile`, and `git diff --check` passed for the boundary correction.
+- 2026-08-25 issue 1/2/3 and I1/I2 repair validation: bounded script-evidence and Smart Approval context coverage `127 passed`, including current-worktree versus other-Git-project boundaries, recognized/unrecognized task temporary roots, protected-source and outside-root symlinks, interpreter-option handling, literal nested `hermes_tools.terminal` evidence, `execute_code` approval wiring, and Terminal integration. Ruff, `py_compile`, and `git diff --check` passed; this was targeted local validation only.
 - All approval-model test paths were mocked. No paid model replay, production configuration/provider/endpoint/fallback change, Gateway restart, live-main copy, commit, or push was performed.
 - The following 2026-08-16 results remain historical evidence for the original
   latest-turn context, Tirith, and language-aware implementation.

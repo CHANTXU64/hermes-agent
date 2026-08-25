@@ -7,7 +7,7 @@ This fork keeps Smart Approval narrow and auditable while avoiding false manual 
 It combines six related guarantees:
 
 1. authorization evidence comes only from the latest real user turn and subsequent completed Clarify exchanges;
-2. directly launched custom scripts provide bounded, best-effort entry-script evidence without recursive dependency inspection;
+2. directly launched custom scripts and explicitly named local Python files provide bounded, best-effort source evidence without external dependency inspection;
 3. standard package-managed development tools are not misclassified as unreadable custom scripts;
 4. user-visible approval explanations follow Hermes' configured interface language;
 5. a first Smart Review denial exposes one legitimate text-similar retry route; an existing legal bypass or a later `approve` remains effective, while a second `deny` can fall back to one-shot human approval;
@@ -38,9 +38,10 @@ Instead:
 - standard module invocations such as `python -m pytest` pass directly when Tirith and static dangerous-command checks find no risk;
 - verified console entry points under a Python virtual environment's `bin` or `Scripts` directory are treated as package-managed tools rather than opaque custom scripts;
 - source-script paths such as `.py`, `.sh`, `.js`, and similar entries remain reviewable even inside a virtual-environment-like directory;
-- directly launched custom scripts are read with limits of four scripts and 32,000 bytes per script;
+- directly launched custom scripts and explicitly named local Python files share limits of four evidence files and 32,000 bytes per file;
+- source is read only when the resolved path is under the execution cwd/current Git worktree or under a recognized task temporary root (`hindsight-*` or `hermes-task-*`); standard-library, installed-package, Hermes-source, symlink-to-protected, and other-Git-project paths remain visible as bounded `unreadable` evidence without calling the reader;
 - missing, unreadable, oversized, or excess direct-script evidence remains visible as bounded context but does not force manual review by itself;
-- local imports and dependency trees are not followed recursively;
+- `execute_code` code that passes a literal command to `hermes_tools.terminal` can expose the directly invoked Python script path; ordinary imports, module-name-only dynamic imports, and non-literal terminal commands are not expanded;
 - here-doc and stdin forms are inline command content, while a real script named before the redirection remains evidence.
 
 The reviewer judges the visible operation, current authorization, and actual operational consequences. This is bounded entry-point context, not a source-code supply-chain audit.
@@ -112,7 +113,7 @@ Gateway restart/stop remains an independent deterministic hard block inside the 
 - `agent/agent_runtime_helpers.py`, `model_tools.py`
   - propagation across execution paths
 - `fork_features/approval/script_evidence.py`
-  - bounded direct-entry-script identification and collection; no recursive imports
+  - bounded direct-entry and explicit-path identification, including literal `terminal()` child commands; no import dependency traversal; protected-source and project-boundary reads are suppressed before the reader is called
 - `fork_features/approval/smart_review.py`
   - reviewer prompt, structured result parsing, and risk/authorization contract
 - `fork_features/approval/retry_policy.py`
@@ -151,7 +152,7 @@ Preserve this fork behavior unless upstream provides an equivalent contract cove
 
 - latest-real-turn and scoped Clarify authorization evidence;
 - per-request isolation across concurrent tool calls;
-- bounded, optional direct-entry-script evidence without recursive dependency traversal;
+- bounded, optional direct-entry and explicit-path evidence without external dependency traversal, including the local cwd/current-worktree/task-root read boundary and protected-source/other-project suppression;
 - here-doc/stdin distinction;
 - package-managed virtual-environment console-entry handling without test-name whitelists;
 - Tirith protocol validation before accepting a PATH candidate;
@@ -228,6 +229,19 @@ git diff --check
 - adjacent Smart Approval policy, Terminal, code-execution, Tirith, approval-mode, and interface-language regression: `205 passed`, `7 subtests passed`;
 - `py_compile`, Ruff, and `git diff --check` passed;
 - all approval-model paths in these tests were mocked. No paid model replay, production configuration/provider/endpoint/fallback change, Gateway restart, live-main copy, commit, or push was performed.
+
+2026-08-25 boundary correction validation:
+
+- bounded script-evidence and Smart Approval context coverage: `59 passed`, including literal `hermes_tools.terminal` child-script extraction, explicit-path dynamic loading, and no ordinary-import expansion;
+- adjacent Smart Approval / `execute_code` wiring coverage: `52 passed`;
+- Terminal, code-execution, Tirith, and interface-language coverage: `167 passed`, `7 subtests passed`;
+- approval-mode parity in an isolated process: `7 passed`; the standalone approval file remained `95 passed`, `1 failed` on the unchanged macOS `/tmp` verification-artifact baseline;
+- Ruff, `py_compile`, and `git diff --check` passed. No model replay, configuration change, Gateway restart, commit, or push was performed.
+
+2026-08-25 issue 1/2/3 and I1/I2 repair validation:
+
+- bounded script-evidence and Smart Approval context coverage: `127 passed`, including current-worktree versus other-Git-project boundaries, recognized/unrecognized task temporary roots, protected-source and outside-root symlinks, interpreter-option handling, literal nested `hermes_tools.terminal` evidence, `execute_code` approval wiring, and Terminal integration;
+- Ruff, `py_compile`, and `git diff --check` passed. This was a local targeted validation only; no model replay, configuration change, Gateway restart, commit, or push was performed.
 
 ## Runtime activation
 
