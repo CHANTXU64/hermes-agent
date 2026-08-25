@@ -144,43 +144,14 @@ class GatewaySlashCommandsMixin:
     async def _handle_reset_command(
         self,
         event: MessageEvent,
-        *,
-        retain_data: Optional[dict[str, Any]] = None,
     ) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
         
-        # Get existing session key and snapshot the old entry before any reset
-        # mutation. A configured retain-on-new gate must be able to fail closed
-        # while leaving the current session completely untouched.
+        # Get existing session key and snapshot the old entry before reset.
         session_key = self._session_key_for_source(source)
         session_store: Any = getattr(self, "session_store")
         old_entry = session_store._entries.get(session_key)
-        _retain_before_new = cast(
-            Optional[Callable[..., Awaitable[dict[str, Any]]]],
-            getattr(self, "_retain_hindsight_session", None),
-        )
-        preflight_complete = retain_data is not None
-        if retain_data is None:
-            retain_data = {"enabled": False, "queued": False}
-        if callable(_retain_before_new) and not preflight_complete:
-            try:
-                retain_data = await _retain_before_new(
-                    event,
-                    wait=True,
-                    only_if_retain_on_new=True,
-                )
-            except Exception as retain_exc:
-                logger.warning(
-                    "Hindsight retain-on-new failed for session %s; reset aborted: %s",
-                    session_key,
-                    retain_exc,
-                    exc_info=True,
-                )
-                return (
-                    "⚠️ Hindsight Retain 失败，未创建新会话；"
-                    f"当前会话仍保留。错误：{retain_exc}"
-                )
 
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped. The
@@ -367,13 +338,6 @@ class GatewaySlashCommandsMixin:
                 # sanitize_title returned empty (whitespace-only / unprintable)
                 _title_note = t("gateway.reset.title_empty_untitled")
         header = header + _title_note
-        if retain_data.get("queued"):
-            turn_count = int(retain_data.get("turn_count") or 0)
-            count_note = f"（{turn_count} turns）" if turn_count else ""
-            header += (
-                "\n✓ Hindsight 已确认接收上一会话的 Retain 请求"
-                f"{count_note}。"
-            )
 
         # When /new runs inside a Telegram DM topic lane, rewrite the
         # (chat_id, thread_id) → session_id binding so the next message
@@ -3090,7 +3054,6 @@ class GatewaySlashCommandsMixin:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
                     cached_agent = cached_entry[0] if isinstance(cached_entry, tuple) else cached_entry
-            notified = False
             if cached_agent is not None:
                 mm = getattr(cached_agent, "_memory_manager", None)
                 if mm is not None:
@@ -3108,41 +3071,8 @@ class GatewaySlashCommandsMixin:
                                 rewound=True,
                                 turns_undone=result["turns_undone"],
                             )
-                        notified = True
                     except Exception as e:
                         logger.debug("undo: memory rewind notification skipped: %s", e)
-            if not notified:
-                try:
-                    from hermes_cli.config import cfg_get, load_config
-                    from hermes_constants import get_hermes_home
-                    from plugins.memory import load_memory_provider
-
-                    config = load_config()
-                    if (cfg_get(config, "memory", "provider") or "").strip() == "hindsight":
-                        provider = load_memory_provider("hindsight")
-                        if provider and provider.is_available() and hasattr(provider, "on_session_rewind"):
-                            init_kwargs = {
-                                "session_id": rewind_session_id,
-                                "platform": source.platform.value if source and source.platform else "gateway",
-                                "hermes_home": str(get_hermes_home()),
-                                "agent_context": "primary",
-                                "gateway_session_key": session_key,
-                            }
-                            for attr in ("user_id", "user_name", "chat_id", "chat_name", "chat_type", "thread_id"):
-                                value = getattr(source, attr, "") if source is not None else ""
-                                if value:
-                                    init_kwargs[attr] = value
-                            provider.initialize(**init_kwargs)
-                            provider.on_session_rewind(
-                                rewind_session_id,
-                                turns_undone=result["turns_undone"],
-                            )
-                            try:
-                                provider.shutdown()
-                            except Exception:
-                                pass
-                except Exception as e:
-                    logger.debug("undo: fallback memory rewind notification skipped: %s", e)
             self._evict_cached_agent(session_key)
         except Exception as e:
             logger.debug("undo: cached-agent eviction skipped: %s", e)

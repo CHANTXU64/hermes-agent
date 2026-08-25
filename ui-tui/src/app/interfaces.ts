@@ -321,7 +321,6 @@ export interface UiState {
   bgTasks: Set<string>
   busy: boolean
   busyInputMode: BusyInputMode
-  sessionBoundaryPending: boolean
   compact: boolean
   detailsMode: DetailsMode
   detailsModeCommandOverride: boolean

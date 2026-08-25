@@ -116,7 +116,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("save", "Save the current conversation", "Session",
                cli_only=True),
-    CommandDef("retain", "Manually flush buffered Hindsight memory turns", "Session"),
     CommandDef("retry", "Retry the last message (resend to agent)", "Session"),
     CommandDef("prompt", "Compose your next prompt in $EDITOR (markdown), then send it", "Session",
                cli_only=True, args_hint="[initial text]", aliases=("compose",)),
@@ -1276,8 +1275,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - refine: on-demand memory/skill review; reached via /hermes refine on
 #     Slack. Added at the 50-cap — a native slot would clamp an existing
 #     native slash.
-#   - blueprint, disk-cleanup/disk_cleanup, and lcm: fork low-frequency
-#     surfaces kept behind /hermes so fork-only /retain keeps a native slot.
+#   - blueprint, disk-cleanup/disk_cleanup, and lcm: low-frequency surfaces
+#     kept behind /hermes to preserve higher-frequency native slots at Slack's
+#     50-command cap.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
 _SLACK_VIA_HERMES_ONLY = frozenset({
@@ -1346,8 +1346,7 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     # Priority pass: pin high-value aliases (e.g. /btw, /bg) ahead of
     # everything except /hermes, so a new canonical command can never silently
     # clamp them off the 50-slash cap. Each alias borrows its parent command's
-    # description and hint. Keep _SLACK_PRIORITY_ALIASES tight so Slack parity
-    # is preserved for canonical commands such as the fork-only /retain.
+    # description and hint. Keep _SLACK_PRIORITY_ALIASES tight.
     _alias_to_cmd = {
         alias: cmd
         for cmd in COMMAND_REGISTRY

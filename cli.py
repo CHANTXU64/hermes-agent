@@ -8716,59 +8716,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return None
         return history_snapshot
 
-    def _retain_hindsight_before_new(self) -> bool:
-        """Apply the opt-in Hindsight retain gate before explicit /new."""
-        if not self.agent or not self.session_id:
-            return True
-
-        memory_manager = getattr(self.agent, "_memory_manager", None)
-        provider = memory_manager.get_provider("hindsight") if memory_manager else None
-        if provider is None:
-            configured_provider = str(
-                (CLI_CONFIG.get("memory") or {}).get("provider") or ""
-            ).strip()
-            if configured_provider != "hindsight":
-                return True
-            from plugins.memory.hindsight import get_retain_on_new_settings
-
-            enabled, _ = get_retain_on_new_settings()
-            if not enabled:
-                return True
-            _cprint(
-                "  ⚠️ Hindsight Retain 失败，未创建新会话；"
-                "当前会话仍保留。错误：Hindsight memory provider is unavailable"
-            )
-            return False
-
-        if not bool(getattr(provider, "retain_on_new_enabled", False)):
-            return True
-        retain_before_reset = getattr(provider, "retain_before_session_reset", None)
-        if not callable(retain_before_reset):
-            _cprint(
-                "  ⚠️ Hindsight Retain 失败，未创建新会话；"
-                "当前会话仍保留。错误：Provider 不支持 retain-before-reset"
-            )
-            return False
-
-        parent_session_id = ""
-        if self._session_db and self.session_id:
-            row = self._session_db.get_session(self.session_id)
-            parent_session_id = str((row or {}).get("parent_session_id") or "")
-        try:
-            data = retain_before_reset(
-                session_id=self.session_id,
-                parent_session_id=parent_session_id,
-                flush_pending=getattr(memory_manager, "flush_pending", None),
-            )
-        except Exception as exc:
-            _cprint(
-                "  ⚠️ Hindsight Retain 失败，未创建新会话；"
-                f"当前会话仍保留。错误：{exc}"
-            )
-            return False
-        if isinstance(data, dict) and data.get("queued"):
-            _cprint("  ✓ Previous session retained before reset.")
-        return True
 
     def new_session(self, silent=False, title=None):
         """Start a fresh session with a new session ID and cleared agent state."""
@@ -9194,9 +9141,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 except Exception:
                     pass
             # Notify memory providers that /undo rewound this same session so
-            # provider-owned per-turn stores (for example Hindsight manual
-            # /retain rows) can exclude the undone turns without treating this
-            # as a session switch.
+            # provider-owned per-session caches can invalidate rewound state
+            # without treating this as a session switch.
             try:
                 _mm = getattr(self.agent, "_memory_manager", None)
                 if _mm is not None and self.session_id:
@@ -10764,8 +10710,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 cmd_original=cmd_original,
             ) is None:
                 return True  # confirmation cancelled — command handled, keep REPL alive
-            if not self._retain_hindsight_before_new():
-                return True
             self.new_session(title=title)
         elif canonical == "resume":
             self._handle_resume_command(cmd_original)
@@ -10819,27 +10763,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_branch_command(cmd_original)
         elif canonical == "save":
             self.save_conversation()
-        elif canonical == "retain":
-            memory_manager = getattr(self.agent, "_memory_manager", None) if self.agent else None
-            provider = memory_manager.get_provider("hindsight") if memory_manager else None
-            if not provider or not hasattr(provider, "retain_persisted_session_lineage"):
-                _cprint("  Hindsight memory provider is not active.")
-            else:
-                try:
-                    data = None
-                    row = self._session_db.get_session(self.session_id) if self._session_db and self.session_id else {}
-                    parent_session_id = str((row or {}).get("parent_session_id") or "")
-                    if self.session_id and hasattr(provider, "retain_persisted_session_lineage"):
-                        data = provider.retain_persisted_session_lineage(
-                            session_id=self.session_id,
-                            parent_session_id=parent_session_id,
-                        )
-                    if data is None:
-                        data = {"queued": False, "message": "No persisted turns to retain."}
-                    msg = data.get("message") if not data.get("queued") else "Buffered session turns queued for retain."
-                except Exception as e:
-                    msg = f"Failed to retain session: {e}"
-                _cprint(f"  {msg}")
         elif canonical == "cron":
             self._handle_cron_command(cmd_original)
         elif canonical == "suggestions":

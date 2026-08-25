@@ -15745,37 +15745,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return EphemeralReply(t("gateway.stop.stopped"))
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):
-        # Fail closed: persist the current Hindsight lineage before mutating
-        # any running-session state. A failed retain leaves the active run,
-        # generation, queues, cache, and session binding untouched.
-        try:
-            retain_data = await self._retain_hindsight_session(
-                event,
-                wait=True,
-                only_if_retain_on_new=True,
-            )
-        except Exception as retain_exc:
-            logger.warning(
-                "Hindsight retain-on-new failed for session %s; reset aborted: %s",
-                quick_key,
-                retain_exc,
-                exc_info=True,
-            )
-            return (
-                "⚠️ Hindsight Retain 失败，未创建新会话；"
-                f"当前会话仍保留。错误：{retain_exc}"
-            )
-
-        # Retain is acknowledged. Interrupt the old run and clear its pending
-        # queue before delegating to the ordinary reset path; pass retain_data
-        # so the reset handler does not submit the same lineage twice.
+        # /reset and /new must bypass the running-agent guard so they
+        # actually dispatch as commands instead of being queued as user
+        # text (which would be fed back to the agent with the same
+        # broken history — #2170).  Interrupt the agent first, then
+        # clear the adapter's pending queue so the stale "/reset" text
+        # doesn't get re-processed as a user message after the
+        # interrupt completes.
+        # Clear any pending messages so the old text doesn't replay
         await self._interrupt_and_clear_session(
             quick_key,
             source,
             interrupt_reason=_INTERRUPT_REASON_RESET,
             invalidation_reason="new_command",
         )
-        return await self._handle_reset_command(event, retain_data=retain_data)
+        # Clean up the running agent entry so the reset handler
+        # doesn't think an agent is still active.
+        return await self._handle_reset_command(event)
 
     async def _busy_queue_command(self, event: MessageEvent, quick_key: str, source):
         # /queue <prompt> — queue without interrupting.
@@ -16808,9 +16794,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "status":
             return await self._handle_status_command(event)
-
-        if canonical == "retain":
-            return await self._handle_retain_command(event)
 
         if canonical == "egress":
             from hermes_cli.proxy_cli import format_status_text
@@ -20491,170 +20474,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
 
-    async def _retain_hindsight_session(
-        self,
-        event: MessageEvent,
-        *,
-        wait: bool = False,
-        only_if_retain_on_new: bool = False,
-    ) -> dict:
-        """Retain the selected session through the active Hindsight provider.
 
-        ``/retain`` uses the historical non-blocking path. Explicit session
-        reset uses ``wait=True`` and fails closed when the opt-in switch is on.
-        """
-        source = event.source
-        session_store = getattr(self, "session_store", None)
-        session_entry = None
-        if session_store is not None:
-            try:
-                session_entry = session_store.get_or_create_session(source)
-            except Exception:
-                session_entry = None
-        session_key = (
-            getattr(session_entry, "session_key", "")
-            or self._session_key_for_source(source)
-        )
-        current_session_id = str(getattr(session_entry, "session_id", "") or "").strip()
-
-        agent = None
-        try:
-            running = getattr(self, "_running_agents", {}) or {}
-            agent = running.get(session_key)
-        except Exception:
-            agent = None
-        if agent is None:
-            cache_lock = getattr(self, "_agent_cache_lock", None)
-            cache = getattr(self, "_agent_cache", None)
-            if cache_lock is not None and cache is not None:
-                with cache_lock:
-                    cached = cache.get(session_key)
-                    agent = cached[0] if isinstance(cached, tuple) else cached if cached else None
-
-        memory_manager = getattr(agent, "_memory_manager", None) if agent is not None else None
-        provider = memory_manager.get_provider("hindsight") if memory_manager else None
-        owned_provider = False
-        if provider is None:
-            try:
-                from hermes_cli.config import cfg_get, load_config
-                from hermes_constants import get_hermes_home
-                from plugins.memory import load_memory_provider
-
-                config = load_config()
-                hindsight_configured = (
-                    (cfg_get(config, "memory", "provider") or "").strip()
-                    == "hindsight"
-                )
-                if only_if_retain_on_new:
-                    if not hindsight_configured:
-                        return {"enabled": False, "queued": False}
-                    from plugins.memory.hindsight import get_retain_on_new_settings
-
-                    enabled, _ = get_retain_on_new_settings()
-                    if not enabled:
-                        return {"enabled": False, "queued": False}
-                if hindsight_configured:
-                    candidate = load_memory_provider("hindsight")
-                    if candidate and candidate.is_available():
-                        init_kwargs = {
-                            "session_id": current_session_id,
-                            "platform": source.platform.value if source and source.platform else "gateway",
-                            "hermes_home": str(get_hermes_home()),
-                            "agent_context": "primary",
-                            "gateway_session_key": session_key,
-                        }
-                        for attr in ("user_id", "user_name", "chat_id", "chat_name", "chat_type", "thread_id"):
-                            value = getattr(source, attr, "") if source is not None else ""
-                            if value:
-                                init_kwargs[attr] = value
-                        db = getattr(session_store, "_db", None) if session_store is not None else None
-                        if db is not None and current_session_id:
-                            try:
-                                title = db.get_session_title(current_session_id)
-                                if title:
-                                    init_kwargs["session_title"] = title
-                            except Exception:
-                                pass
-                        candidate.initialize(**init_kwargs)
-                        provider = candidate
-                        owned_provider = True
-            except Exception as exc:
-                if only_if_retain_on_new:
-                    raise RuntimeError(
-                        f"Hindsight memory provider could not be initialized: {exc}"
-                    ) from exc
-                provider = None
-        if not provider or not hasattr(provider, "retain_persisted_session_lineage"):
-            if only_if_retain_on_new:
-                raise RuntimeError("Hindsight memory provider is unavailable")
-            return {
-                "available": False,
-                "queued": False,
-                "message": "当前会话没有可用的 Hindsight 记忆 Provider，无法执行 /retain。",
-            }
-
-        if only_if_retain_on_new and not bool(
-            getattr(provider, "retain_on_new_enabled", False)
-        ):
-            return {"enabled": False, "queued": False}
-
-        try:
-            session_id = str(
-                current_session_id
-                or getattr(agent, "session_id", "")
-                or getattr(provider, "_session_id", "")
-                or ""
-            ).strip()
-            parent_session_id = ""
-            db = getattr(session_store, "_db", None) if session_store is not None else None
-            if session_id and db is not None:
-                try:
-                    row = db.get_session(session_id)
-                    parent_session_id = str((row or {}).get("parent_session_id") or "")
-                except Exception:
-                    parent_session_id = ""
-            if not session_id:
-                return {"queued": False, "message": "No persisted turns to retain."}
-
-            retain_kwargs: dict[str, Any] = {
-                "session_id": session_id,
-                "parent_session_id": parent_session_id,
-            }
-            if wait:
-                retain_before_reset = getattr(
-                    provider,
-                    "retain_before_session_reset",
-                    None,
-                )
-                if not callable(retain_before_reset):
-                    raise RuntimeError(
-                        "Hindsight provider does not support retain-before-reset"
-                    )
-                data = await asyncio.to_thread(
-                    retain_before_reset,
-                    **retain_kwargs,
-                    flush_pending=getattr(memory_manager, "flush_pending", None),
-                )
-            else:
-                data = provider.retain_persisted_session_lineage(**retain_kwargs)
-            if data is None:
-                return {"queued": False, "message": "No persisted turns to retain."}
-            return cast(dict[str, Any], data)
-        finally:
-            if owned_provider and wait and hasattr(provider, "shutdown"):
-                await asyncio.to_thread(provider.shutdown)
-
-    async def _handle_retain_command(self, event: MessageEvent) -> str:
-        """Handle /retain — manually flush buffered Hindsight turns."""
-        try:
-            data = await self._retain_hindsight_session(event)
-            if not data.get("available", True):
-                return str(data.get("message"))
-            if not data.get("queued"):
-                return str(data.get("message") or "No buffered turns to retain.")
-            return "Buffered session turns queued for retain."
-        except Exception as e:
-            return f"Failed to retain session: {e}"
 
 
 

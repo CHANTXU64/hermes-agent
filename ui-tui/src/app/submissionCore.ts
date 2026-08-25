@@ -51,15 +51,7 @@ export function submitPrompt(
   showUserMessage = true,
   displayOverride?: string
 ): void {
-  const ui = getUiState()
-
-  if (ui.sessionBoundaryPending) {
-    deps.enqueue(text, displayOverride || text)
-
-    return
-  }
-
-  const sid = ui.sid
+  const sid = getUiState().sid
 
   if (!sid) {
     return deps.sys('session not ready yet')

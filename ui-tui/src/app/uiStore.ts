@@ -13,7 +13,6 @@ const buildUiState = (): UiState => ({
   bgTasks: new Set(),
   busy: false,
   busyInputMode: 'queue',
-  sessionBoundaryPending: false,
   compact: false,
   detailsMode: 'collapsed',
   detailsModeCommandOverride: false,
