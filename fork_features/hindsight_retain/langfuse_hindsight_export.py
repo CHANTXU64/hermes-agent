@@ -1,0 +1,1118 @@
+#!/usr/bin/env python3
+"""Read-only Langfuse/Hindsight export and comparison for one Hermes session."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sqlite3
+from collections import Counter
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+
+try:
+    from langfuse import Langfuse
+except ImportError:  # pragma: no cover - runtime dependency check
+    Langfuse = None
+
+
+# 安全边界：这两个地址是固定字面量，不允许由环境变量决定。
+LANGFUSE_BASE_URL = "https://langfuse.chantx.top"
+HINDSIGHT_BASE_URL = "https://hindsight-api.chantx.top"
+DEFAULT_ENV_FILE = Path.home() / ".hermes" / ".env"
+DEFAULT_HINDSIGHT_CONFIG_PATH = (
+    Path.home() / ".hermes" / "hindsight" / "config.json"
+)
+DEFAULT_SQLITE_PATH = (
+    Path.home() / ".hermes" / "hindsight" / "retain_turns.sqlite3"
+)
+DEFAULT_STATE_DB_PATH = Path.home() / ".hermes" / "state.db"
+
+
+@contextmanager
+def sqlite_query_only(path: Path):
+    connection = sqlite3.connect(f"{path.expanduser().resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        yield connection
+    finally:
+        connection.close()
+
+
+def safe_id(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+
+def load_dotenv(path: Path) -> dict[str, str]:
+    """Read only simple KEY=VALUE entries; never print the values."""
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def jsonable(value):
+    """Convert Langfuse SDK models to JSON without exposing credentials."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    if hasattr(value, "model_dump"):
+        try:
+            return jsonable(value.model_dump(mode="json"))
+        except TypeError:
+            return jsonable(value.model_dump())
+    if hasattr(value, "dict"):
+        return jsonable(value.dict())
+    if hasattr(value, "__dict__"):
+        return {
+            str(k): jsonable(v)
+            for k, v in vars(value).items()
+            if not str(k).startswith("_")
+        }
+    return str(value)
+
+
+def write_json(path: Path, payload) -> None:
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+
+
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def get_langfuse_credentials(env_file: Path) -> tuple[str, str]:
+    values = load_dotenv(env_file)
+    public_key = values.get("HERMES_LANGFUSE_PUBLIC_KEY") or values.get(
+        "LANGFUSE_PUBLIC_KEY"
+    )
+    secret_key = values.get("HERMES_LANGFUSE_SECRET_KEY") or values.get(
+        "LANGFUSE_SECRET_KEY"
+    )
+    if not public_key or not secret_key:
+        raise SystemExit(
+            f"{env_file} 中缺少 HERMES_LANGFUSE_PUBLIC_KEY / "
+            "HERMES_LANGFUSE_SECRET_KEY（或不带 HERMES_ 前缀的通用名称）；"
+            "脚本不会从环境变量拼接目标地址。"
+        )
+    return public_key, secret_key
+
+
+def load_hindsight_bank_id(config_path: Path) -> str:
+    try:
+        payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid Hindsight config") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid Hindsight config")
+    bank_id = payload.get("bank_id")
+    if not isinstance(bank_id, str):
+        raise ValueError("invalid Hindsight bank_id")
+    bank_id = bank_id.strip()
+    if not bank_id or any(
+        character
+        not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+        for character in bank_id
+    ):
+        raise ValueError("invalid Hindsight bank_id")
+    return bank_id
+
+
+def export_langfuse(session_id: str, env_file: Path) -> dict:
+    """List and fully fetch every Trace for one Hermes session."""
+    if Langfuse is None:
+        raise SystemExit(
+            "缺少 langfuse Python 包；请在 Hermes 使用的 Python 环境中运行。"
+        )
+    public_key, secret_key = get_langfuse_credentials(env_file)
+    client = Langfuse(
+        public_key=public_key,
+        secret_key=secret_key,
+        base_url=LANGFUSE_BASE_URL,
+        tracing_enabled=False,
+    )
+    listed = []
+    try:
+        # The SDK uses one-based pages. Stop when a short page is returned.
+        for page in range(1, 101):
+            response = client.api.trace.list(
+                page=page,
+                limit=100,
+                session_id=session_id,
+                order_by="timestamp.asc",
+            )
+            rows = list(getattr(response, "data", None) or [])
+            listed.extend(rows)
+            if len(rows) < 100:
+                break
+        trace_ids: list[str] = []
+        seen: set[str] = set()
+        for row in listed:
+            trace_id = getattr(row, "id", None)
+            if trace_id and trace_id not in seen:
+                seen.add(trace_id)
+                trace_ids.append(trace_id)
+        traces = [jsonable(client.api.trace.get(trace_id)) for trace_id in trace_ids]
+    finally:
+        client.shutdown()
+    return {
+        "session_id": session_id,
+        "trace_count": len(traces),
+        "traces": traces,
+    }
+
+
+def get_json(url: str) -> dict:
+    """Perform one HTTPS GET and preserve HTTP errors as JSON evidence."""
+    request = Request(url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8")
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                payload = {"raw_text": body}
+            return {"http_status": response.status, "url": url, "payload": payload}
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = {"raw_text": body}
+        return {"http_status": exc.code, "url": url, "payload": payload}
+    except (URLError, TimeoutError) as exc:
+        return {"http_status": None, "url": url, "error": str(exc)}
+
+
+def export_hindsight(session_id: str, bank: str) -> tuple[dict, dict, dict]:
+    bank_q = quote(bank, safe="")
+    document_q = quote(session_id, safe="")
+    document_url = (
+        f"{HINDSIGHT_BASE_URL}/v1/default/banks/{bank_q}/documents/{document_q}"
+    )
+    memories_url = (
+        f"{HINDSIGHT_BASE_URL}/v1/default/banks/{bank_q}/memories/list?"
+        + urlencode({"limit": 100, "offset": 0, "document_id": session_id})
+    )
+    health = get_json(f"{HINDSIGHT_BASE_URL}/health")
+    document = get_json(document_url)
+    memories = get_json(memories_url)
+    return health, document, memories
+
+
+def local_retain_summary(session_id: str, sqlite_path: Path) -> dict:
+    if not sqlite_path.exists():
+        return {"exists": False, "path": str(sqlite_path), "rows": []}
+    query = """
+        SELECT id, bank_id, document_id, update_mode, content_json,
+               status, queued_at, completed_at, error
+        FROM hindsight_retain_submissions
+        WHERE document_id = ?
+        ORDER BY id
+    """
+    try:
+        with sqlite_query_only(sqlite_path) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(query, (session_id,)).fetchall()
+    except sqlite3.Error as exc:
+        return {"exists": True, "path": str(sqlite_path), "error": str(exc)}
+
+    safe_rows = []
+    for row in rows:
+        content = row["content_json"] or ""
+        safe_rows.append(
+            {
+                "id": row["id"],
+                "bank_id": row["bank_id"],
+                "document_id": row["document_id"],
+                "update_mode": row["update_mode"],
+                "status": row["status"],
+                "queued_at": row["queued_at"],
+                "completed_at": row["completed_at"],
+                "error": row["error"],
+                "content_json_chars": len(content),
+                "content_json_sha256": sha256_text(content) if content else None,
+            }
+        )
+    return {
+        "exists": True,
+        "path": str(sqlite_path),
+        "row_count": len(safe_rows),
+        "rows": safe_rows,
+    }
+
+
+_MODEL_SWITCH_NOTE_RE = re.compile(
+    r"^\[Note: model was just switched[^\n]*\]\s*",
+    flags=re.IGNORECASE,
+)
+_NEW_MESSAGE_WRAPPER_RE = re.compile(
+    r"^\[System note: A new message has arrived\.[^\]]*\]\s*",
+    flags=re.IGNORECASE,
+)
+_INTERRUPTED_USER_PREFIX_RE = re.compile(
+    r"^(?:(?:\[Context from the interrupted assistant response\]"
+    r"|\[This response was interrupted by a user correction\.\])\s*)+",
+    flags=re.IGNORECASE,
+)
+_IMAGE_ATTACHMENT_RE = re.compile(
+    r"\[Image attached at:[^\]\n]+\]",
+    flags=re.IGNORECASE,
+)
+_IMAGE_SENT_MARKER = "[The user sent an image.]"
+_VOICE_MESSAGE_RE = re.compile(
+    r"\[The user sent a voice message~ Here's what they said:\s*"
+    r"(?:\".*?\"|“.*?”)\]",
+    flags=re.S,
+)
+_SYNTHETIC_USER_PREFIXES = (
+    "[ASYNC DELEGATION BATCH COMPLETE",
+    "[IMPORTANT:",
+    "You just executed tool calls but returned an empty response.",
+    "[user did not respond within",
+    "[Your active task list was preserved across context compression]",
+    "[Current user objective preserved from compacted history]",
+    "[Recent Summary",
+    "[Durable Summary",
+    "## Hermes-LCM Recall Policy",
+    "<memory-context>",
+)
+_USER_RUNTIME_SUFFIX_MARKERS = (
+    "\n\n[Your active task list was preserved across context compression]",
+    "\n\n[Current user objective preserved from compacted history]",
+    "\n\n[Recent Summary",
+    "\n\n[Durable Summary",
+    "\n\n## Hermes-LCM Recall Policy",
+    "\n\n<memory-context>",
+)
+
+
+def _trailing_voice_block(content: str) -> str:
+    matches = list(_VOICE_MESSAGE_RE.finditer(content))
+    if not matches or content[matches[-1].end() :].strip():
+        return ""
+    first_index = len(matches) - 1
+    while first_index > 0:
+        gap = content[matches[first_index - 1].end() : matches[first_index].start()]
+        if gap.strip():
+            break
+        first_index -= 1
+    return content[matches[first_index].start() : matches[-1].end()].strip()
+
+
+def _clean_user_content(value) -> str:
+    image_count = 0
+    if isinstance(value, str):
+        content = value
+    elif isinstance(value, list):
+        text_parts = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in {"input_text", "text"} and isinstance(
+                item.get("text"), str
+            ):
+                text_parts.append(item["text"])
+            elif item.get("type") == "input_image":
+                image_count += 1
+        content = "\n\n".join(text_parts)
+    else:
+        return ""
+    content = _IMAGE_ATTACHMENT_RE.sub(_IMAGE_SENT_MARKER, content)
+    content = _NEW_MESSAGE_WRAPPER_RE.sub("", content).strip()
+    content = _MODEL_SWITCH_NOTE_RE.sub("", content).strip()
+    content = _INTERRUPTED_USER_PREFIX_RE.sub("", content).strip()
+    if any(content.startswith(prefix) for prefix in _SYNTHETIC_USER_PREFIXES):
+        content = _trailing_voice_block(content)
+        if not content:
+            return ""
+    for marker in _USER_RUNTIME_SUFFIX_MARKERS:
+        marker_index = content.find(marker)
+        if marker_index >= 0:
+            content = content[:marker_index].rstrip()
+    missing_image_markers = max(0, image_count - content.count(_IMAGE_SENT_MARKER))
+    if missing_image_markers:
+        suffix = "\n\n".join([_IMAGE_SENT_MARKER] * missing_image_markers)
+        content = f"{content}\n\n{suffix}" if content else suffix
+    return content.strip()
+
+
+def _decode_state_content(value):
+    if not isinstance(value, str):
+        return value
+    content = value.strip()
+    if content.startswith(("[", "{")):
+        try:
+            return json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    return value
+
+
+def load_undo_filter(
+    session_id: str,
+    state_db_path: Path,
+    *,
+    cutoff_at: datetime | None = None,
+) -> dict:
+    """Read only the SessionDB evidence needed to exclude `/undo` content."""
+    result = {
+        "status": "unknown",
+        "reason": "not_checked",
+        "rewind_count": 0,
+        "rewound_users": [],
+        "active_same_text_users": [],
+    }
+    path = Path(state_db_path).expanduser()
+    if not path.exists():
+        result["reason"] = "state_db_missing"
+        return result
+    try:
+        with sqlite_query_only(path) as conn:
+            conn.row_factory = sqlite3.Row
+            session = conn.execute(
+                "SELECT COALESCE(rewind_count, 0) AS rewind_count "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                result["reason"] = "session_not_found"
+                return result
+            rewind_count = int(session["rewind_count"] or 0)
+            result["rewind_count"] = rewind_count
+            if rewind_count <= 0:
+                result["status"] = "not_applicable"
+                result["reason"] = "no_rewind_operations"
+                return result
+            rows = conn.execute(
+                """
+                SELECT id, content, timestamp, active
+                FROM messages
+                WHERE session_id = ?
+                  AND role = 'user'
+                  AND compacted = 0
+                ORDER BY id
+                """,
+                (session_id,),
+            ).fetchall()
+    except (sqlite3.Error, OSError) as exc:
+        result["reason"] = f"state_db_error:{type(exc).__name__}"
+        return result
+
+    cutoff_seconds = None
+    if cutoff_at is not None:
+        if cutoff_at.tzinfo is None:
+            cutoff_at = cutoff_at.replace(tzinfo=timezone.utc)
+        cutoff_at = cutoff_at.astimezone(timezone.utc)
+        cutoff_seconds = cutoff_at.timestamp()
+        result["cutoff_at"] = cutoff_at.isoformat()
+    normalized_users = []
+    for row in rows:
+        if cutoff_seconds is not None:
+            row_seconds = _timestamp_seconds(row["timestamp"])
+            if row_seconds is None or row_seconds > cutoff_seconds:
+                continue
+        content = _clean_user_content(_decode_state_content(row["content"]))
+        if not content:
+            continue
+        normalized_users.append(
+            {
+                "message_id": int(row["id"]),
+                "content": content,
+                "timestamp": row["timestamp"],
+                "active": int(row["active"]),
+            }
+        )
+    rewound_users = [row for row in normalized_users if row["active"] == 0]
+    if not rewound_users:
+        result["reason"] = "no_filterable_rewound_user_rows"
+        return result
+    rewound_contents = {row["content"] for row in rewound_users}
+    active_same_text_users = [
+        row
+        for row in normalized_users
+        if row["active"] == 1 and row["content"] in rewound_contents
+    ]
+    result["status"] = "checked"
+    result["reason"] = "rewound_user_rows_loaded"
+    result["rewound_users"] = rewound_users
+    result["active_same_text_users"] = active_same_text_users
+    return result
+
+
+def _timestamp_seconds(value) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _parse_cutoff_at(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("cutoff-at must be an ISO datetime") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _apply_cutoff(
+    turns: list[list[dict]],
+    cutoff_at: datetime | None,
+) -> tuple[list[list[dict]], dict]:
+    if cutoff_at is None:
+        return turns, {}
+    if cutoff_at.tzinfo is None:
+        cutoff_at = cutoff_at.replace(tzinfo=timezone.utc)
+    cutoff_at = cutoff_at.astimezone(timezone.utc)
+    cutoff_seconds = cutoff_at.timestamp()
+    filtered_count = 0
+    unknown_count = 0
+    kept_turns: list[list[dict]] = []
+    for turn in turns:
+        kept_messages = []
+        for message in turn:
+            message_seconds = _timestamp_seconds(message.get("timestamp"))
+            if message_seconds is None:
+                unknown_count += 1
+                filtered_count += 1
+                continue
+            if message_seconds > cutoff_seconds:
+                filtered_count += 1
+                continue
+            kept_messages.append(message)
+        if kept_messages:
+            kept_turns.append(kept_messages)
+    return kept_turns, {
+        "cutoff_at": cutoff_at.isoformat(),
+        "cutoff_filtered_message_count": filtered_count,
+        "cutoff_unknown_timestamp_count": unknown_count,
+    }
+
+
+def _document_message_body(message: dict) -> str:
+    content = str(message.get("content") or "").strip()
+    role = str(message.get("role") or "")
+    prefix = "User: " if role == "user" else "Assistant: "
+    if content.startswith(prefix):
+        return content[len(prefix) :].strip()
+    return content
+
+
+def _apply_undo_filter(turns: list[list[dict]], undo_filter: dict | None):
+    evidence = undo_filter if isinstance(undo_filter, dict) else {}
+    status = str(evidence.get("status") or "not_checked")
+    records = evidence.get("rewound_users")
+    if not isinstance(records, list):
+        records = []
+    active_records = evidence.get("active_same_text_users")
+    if not isinstance(active_records, list):
+        active_records = []
+    audit = {
+        "undo_filter_status": status,
+        "undo_filter_reason": str(evidence.get("reason") or "not_provided"),
+        "undo_rewind_count": evidence.get("rewind_count"),
+        "undo_rewound_user_count": len(records),
+        "undo_active_same_text_user_count": len(active_records),
+        "undo_matched_user_count": 0,
+        "undo_unmatched_user_count": len(records),
+        "undo_filtered_message_count": 0,
+        "undo_filtered_turn_count": 0,
+    }
+    if status != "checked" or not records:
+        return turns, audit
+
+    candidate_users = []
+    for turn_index, turn in enumerate(turns):
+        for message_index, message in enumerate(turn):
+            if message.get("role") != "user":
+                continue
+            candidate_users.append(
+                {
+                    "turn_index": turn_index,
+                    "message_index": message_index,
+                    "content": _document_message_body(message),
+                    "timestamp": _timestamp_seconds(message.get("timestamp")),
+                }
+            )
+
+    cuts: dict[int, int] = {}
+    matched = 0
+    all_state_records = []
+    for record in records:
+        if isinstance(record, dict):
+            all_state_records.append({**record, "rewound": True})
+    for record in active_records:
+        if isinstance(record, dict):
+            all_state_records.append({**record, "rewound": False})
+
+    contents = sorted(
+        {
+            str(record.get("content") or "").strip()
+            for record in all_state_records
+            if str(record.get("content") or "").strip()
+        }
+    )
+    for content in contents:
+        state_group = [
+            record
+            for record in all_state_records
+            if str(record.get("content") or "").strip() == content
+        ]
+        candidate_group = [
+            candidate for candidate in candidate_users if candidate["content"] == content
+        ]
+        if not state_group or not candidate_group:
+            continue
+        has_active_instance = any(not record["rewound"] for record in state_group)
+        if has_active_instance and (
+            any(_timestamp_seconds(record.get("timestamp")) is None for record in state_group)
+            or any(candidate["timestamp"] is None for candidate in candidate_group)
+        ):
+            continue
+
+        pairs = []
+        for state_index, record in enumerate(state_group):
+            record_time = _timestamp_seconds(record.get("timestamp"))
+            for candidate_index, candidate in enumerate(candidate_group):
+                candidate_time = candidate["timestamp"]
+                if record_time is None or candidate_time is None:
+                    delta = float("inf")
+                else:
+                    delta = abs(candidate_time - record_time)
+                pairs.append(
+                    (
+                        delta,
+                        candidate["turn_index"],
+                        candidate["message_index"],
+                        int(record.get("message_id") or 0),
+                        state_index,
+                        candidate_index,
+                    )
+                )
+
+        assigned_state = set()
+        assigned_candidates = set()
+        for _, _, _, _, state_index, candidate_index in sorted(pairs):
+            if state_index in assigned_state or candidate_index in assigned_candidates:
+                continue
+            assigned_state.add(state_index)
+            assigned_candidates.add(candidate_index)
+            record = state_group[state_index]
+            if not record["rewound"]:
+                continue
+            chosen = candidate_group[candidate_index]
+            matched += 1
+            cuts[chosen["turn_index"]] = min(
+                cuts.get(chosen["turn_index"], len(turns[chosen["turn_index"]])),
+                chosen["message_index"],
+            )
+
+    filtered_turns = []
+    filtered_messages = 0
+    filtered_whole_turns = 0
+    for turn_index, turn in enumerate(turns):
+        cut = cuts.get(turn_index)
+        if cut is None:
+            filtered_turns.append(turn)
+            continue
+        filtered_messages += len(turn) - cut
+        kept = turn[:cut]
+        if kept:
+            filtered_turns.append(kept)
+        else:
+            filtered_whole_turns += 1
+
+    audit["undo_matched_user_count"] = matched
+    audit["undo_unmatched_user_count"] = len(records) - matched
+    audit["undo_filtered_message_count"] = filtered_messages
+    audit["undo_filtered_turn_count"] = filtered_whole_turns
+    return filtered_turns, audit
+
+
+def _document_message(role: str, content: str, timestamp: str) -> dict:
+    label = "User" if role == "user" else "Assistant"
+    return {
+        "role": role,
+        "content": f"{label}: {content}",
+        "timestamp": timestamp or "",
+    }
+
+
+def _clarify_events(observation: dict) -> list[tuple[str, int, dict]]:
+    clarify_input = observation.get("input") or {}
+    clarify_output = observation.get("output") or {}
+    if not isinstance(clarify_input, dict):
+        clarify_input = {}
+    if not isinstance(clarify_output, dict):
+        clarify_output = {}
+    events: list[tuple[str, int, dict]] = []
+    question = clarify_output.get("question") or clarify_input.get("question")
+    choices = clarify_output.get("choices_offered") or clarify_input.get("choices")
+    if isinstance(question, str) and question.strip():
+        rendered_question = question.strip()
+        if isinstance(choices, list) and choices:
+            rendered_choices = [
+                str(choice).strip() for choice in choices if str(choice).strip()
+            ]
+            if rendered_choices:
+                rendered_question += "\n\nChoices offered:\n" + "\n".join(
+                    f"- {choice}" for choice in rendered_choices
+                )
+        timestamp = str(observation.get("startTime") or "")
+        events.append(
+            (
+                timestamp,
+                20,
+                _document_message("assistant", rendered_question, timestamp),
+            )
+        )
+    user_response = _clean_user_content(clarify_output.get("user_response"))
+    if user_response:
+        timestamp = str(observation.get("endTime") or "")
+        events.append(
+            (
+                timestamp,
+                30,
+                _document_message("user", user_response, timestamp),
+            )
+        )
+    return events
+
+
+def build_candidate_document(
+    langfuse_export: dict,
+    session_id: str,
+    *,
+    undo_filter: dict | None = None,
+    cutoff_at: datetime | None = None,
+) -> dict:
+    """Build a deterministic, read-only conversation document candidate."""
+    main_traces = [
+        trace
+        for trace in langfuse_export.get("traces", [])
+        if isinstance(trace, dict)
+        and str((trace.get("metadata") or {}).get("task_id") or "") == session_id
+    ]
+    observations_by_id: dict[str, dict] = {}
+    chains_by_id: dict[str, dict] = {}
+    for trace in main_traces:
+        for observation in trace.get("observations") or []:
+            if not isinstance(observation, dict):
+                continue
+            observation_id = str(observation.get("id") or "")
+            if observation_id:
+                observations_by_id[observation_id] = observation
+            if observation.get("type") != "CHAIN":
+                continue
+            if observation.get("name") != "Hermes turn":
+                continue
+            if observation_id:
+                chains_by_id[observation_id] = observation
+
+    children_by_parent: dict[str, list[dict]] = {}
+    for observation in observations_by_id.values():
+        parent_id = str(observation.get("parentObservationId") or "")
+        if parent_id:
+            children_by_parent.setdefault(parent_id, []).append(observation)
+
+    chains = sorted(
+        chains_by_id.values(),
+        key=lambda item: (str(item.get("startTime") or ""), str(item.get("id") or "")),
+    )
+    known_chain_user_contents = {
+        _clean_user_content((chain.get("input") or {}).get("content"))
+        for chain in chains
+        if isinstance(chain.get("input"), dict)
+        and (chain.get("input") or {}).get("role") == "user"
+    }
+    known_clarify_user_contents: set[str] = set()
+    for observation in observations_by_id.values():
+        if observation.get("type") != "TOOL" or observation.get("name") != "Tool: clarify":
+            continue
+        clarify_output = observation.get("output") or {}
+        if isinstance(clarify_output, dict):
+            response = _clean_user_content(clarify_output.get("user_response"))
+            if response:
+                known_clarify_user_contents.add(response)
+
+    oob_by_parent: dict[str, list[tuple[str, dict]]] = {}
+    seen_oob_contents: set[str] = set()
+    generations = sorted(
+        (
+            observation
+            for observation in observations_by_id.values()
+            if observation.get("type") == "GENERATION"
+        ),
+        key=lambda item: (
+            str(item.get("startTime") or ""),
+            str(item.get("id") or ""),
+        ),
+    )
+    for generation in generations:
+        parent_id = str(generation.get("parentObservationId") or "")
+        if parent_id not in chains_by_id:
+            continue
+        generation_input = generation.get("input")
+        if not isinstance(generation_input, list):
+            continue
+        for item in generation_input:
+            if not isinstance(item, dict) or item.get("role") != "user":
+                continue
+            content = _clean_user_content(item.get("content"))
+            if not content:
+                continue
+            if content in known_chain_user_contents:
+                continue
+            if content in known_clarify_user_contents:
+                continue
+            if content in seen_oob_contents:
+                continue
+            seen_oob_contents.add(content)
+            timestamp = str(generation.get("startTime") or "")
+            oob_by_parent.setdefault(parent_id, []).append(
+                (timestamp, _document_message("user", content, timestamp))
+            )
+
+    turn_entries: list[tuple[str, int, str, list[dict]]] = []
+    for chain in chains:
+        messages: list[dict] = []
+        intermediate_events: list[tuple[str, int, dict]] = []
+        chain_input = chain.get("input") or {}
+        if isinstance(chain_input, dict) and chain_input.get("role") == "user":
+            user_content = _clean_user_content(chain_input.get("content"))
+            if user_content:
+                messages.append(
+                    _document_message(
+                        "user", user_content, str(chain.get("startTime") or "")
+                    )
+                )
+        child_observations = sorted(
+            children_by_parent.get(str(chain.get("id") or ""), []),
+            key=lambda item: (
+                str(item.get("startTime") or ""),
+                str(item.get("id") or ""),
+            ),
+        )
+        for timestamp, message in oob_by_parent.get(str(chain.get("id") or ""), []):
+            intermediate_events.append((timestamp, 10, message))
+        for child in child_observations:
+            if child.get("type") != "TOOL" or child.get("name") != "Tool: clarify":
+                continue
+            intermediate_events.extend(_clarify_events(child))
+        for _, _, message in sorted(
+            intermediate_events,
+            key=lambda item: (item[0], item[1], item[2]["content"]),
+        ):
+            messages.append(message)
+        chain_output = chain.get("output") or {}
+        if isinstance(chain_output, dict):
+            assistant_content = chain_output.get("content")
+            if isinstance(assistant_content, str) and assistant_content.strip():
+                messages.append(
+                    _document_message(
+                        "assistant",
+                        assistant_content.strip(),
+                        str(chain.get("endTime") or ""),
+                    )
+                )
+        if messages:
+            turn_entries.append(
+                (
+                    str(chain.get("startTime") or ""),
+                    10,
+                    str(chain.get("id") or ""),
+                    messages,
+                )
+            )
+
+    for observation in observations_by_id.values():
+        if observation.get("type") != "TOOL" or observation.get("name") != "Tool: clarify":
+            continue
+        parent_id = str(observation.get("parentObservationId") or "")
+        if parent_id in chains_by_id:
+            continue
+        events = _clarify_events(observation)
+        messages = [
+            message
+            for _, _, message in sorted(
+                events,
+                key=lambda item: (item[0], item[1], item[2]["content"]),
+            )
+        ]
+        if messages:
+            turn_entries.append(
+                (
+                    str(observation.get("startTime") or ""),
+                    20,
+                    str(observation.get("id") or ""),
+                    messages,
+                )
+            )
+
+    turns = [
+        messages
+        for _, _, _, messages in sorted(
+            turn_entries,
+            key=lambda item: (item[0], item[1], item[2]),
+        )
+    ]
+    turns, cutoff_audit = _apply_cutoff(turns, cutoff_at)
+    turns, undo_audit = _apply_undo_filter(turns, undo_filter)
+
+    document_content = json.dumps(
+        turns,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    source_capture_modes = sorted(
+        {
+            str((trace.get("metadata") or {}).get("capture_mode"))
+            for trace in main_traces
+            if (trace.get("metadata") or {}).get("capture_mode")
+        }
+    )
+    if "sanitized" in source_capture_modes:
+        source_is_lossless = False
+        completeness_status = "not_guaranteed_sanitized_source"
+    else:
+        source_is_lossless = None
+        completeness_status = "not_assessed_unknown_capture_mode"
+    return {
+        "schema_version": "hindsight-conversation-document-v1",
+        "session_id": session_id,
+        "document_id": session_id,
+        "turns": turns,
+        "document_content": document_content,
+        "document_content_sha256": sha256_text(document_content),
+        "audit": {
+            "main_trace_count": len(main_traces),
+            "source_capture_modes": source_capture_modes,
+            "source_is_lossless": source_is_lossless,
+            "completeness_status": completeness_status,
+            "source_turn_count": len(chains),
+            "candidate_turn_count": len(turns),
+            "candidate_message_count": sum(len(turn) for turn in turns),
+            **cutoff_audit,
+            **undo_audit,
+        },
+    }
+
+
+def walk_strings(value, output: list[str]) -> None:
+    if isinstance(value, str):
+        if value:
+            output.append(value)
+    elif isinstance(value, dict):
+        for child in value.values():
+            walk_strings(child, output)
+    elif isinstance(value, list):
+        for child in value:
+            walk_strings(child, output)
+
+
+def langfuse_summary(export: dict, original_text: str | None) -> dict:
+    summaries = []
+    all_strings: list[str] = []
+    for trace in export.get("traces", []):
+        observations = trace.get("observations") or []
+        type_counts = Counter(str(o.get("type")) for o in observations)
+        metadata = trace.get("metadata") or {}
+        walk_strings(trace, all_strings)
+        summaries.append(
+            {
+                "trace_id": trace.get("id"),
+                "name": trace.get("name"),
+                "session_id": trace.get("sessionId"),
+                "observation_count": len(observations),
+                "observation_types": dict(sorted(type_counts.items())),
+                "has_root_input": trace.get("input") is not None,
+                "has_root_output": trace.get("output") is not None,
+                "task_id": metadata.get("task_id"),
+                "turn_id": metadata.get("turn_id"),
+                "capture_mode": metadata.get("capture_mode"),
+            }
+        )
+    return {
+        "trace_count": len(summaries),
+        "traces": summaries,
+        "full_hindsight_original_text_found_in_trace_string": bool(
+            original_text and any(original_text in text for text in all_strings)
+        ),
+    }
+
+
+def comparison_summary(
+    session_id: str,
+    langfuse_export: dict,
+    hindsight_document: dict,
+    local_retain: dict,
+) -> dict:
+    payload = hindsight_document.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    original_text = payload.get("original_text")
+    if not isinstance(original_text, str):
+        original_text = ""
+    original_hash = sha256_text(original_text) if original_text else None
+    local_hashes = {
+        row.get("content_json_sha256")
+        for row in local_retain.get("rows", [])
+        if row.get("content_json_sha256")
+    }
+    return {
+        "session_id": session_id,
+        "hindsight_document_http_status": hindsight_document.get("http_status"),
+        "hindsight_original_text_chars": len(original_text),
+        "hindsight_original_text_sha256": original_hash,
+        "local_submission_count": local_retain.get("row_count", 0),
+        "local_submission_statuses": sorted(
+            {row.get("status") for row in local_retain.get("rows", [])}
+        ),
+        "local_content_hash_equals_remote_original_text": bool(
+            original_hash and original_hash in local_hashes
+        ),
+        "langfuse": langfuse_summary(langfuse_export, original_text),
+        "interpretation": (
+            "原始 Langfuse Trace 是执行树；Hindsight document 是 retain 后的对话文本，"
+            "memory units 是进一步提炼的记忆，三者不应按字节相等验收。"
+        ),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--session-id", required=True)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="输出目录；默认当前目录下的 langfuse_hindsight_<session_id>",
+    )
+    parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
+    parser.add_argument(
+        "--hindsight-config",
+        type=Path,
+        default=DEFAULT_HINDSIGHT_CONFIG_PATH,
+    )
+    parser.add_argument("--sqlite-path", type=Path, default=DEFAULT_SQLITE_PATH)
+    parser.add_argument("--state-db-path", type=Path, default=DEFAULT_STATE_DB_PATH)
+    parser.add_argument("--cutoff-at", type=_parse_cutoff_at, default=None)
+    parser.add_argument("--skip-hindsight", action="store_true")
+    args = parser.parse_args()
+
+    sid = args.session_id
+    output_dir = args.output_dir or Path.cwd() / f"langfuse_hindsight_{safe_id(sid)}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    langfuse_export = export_langfuse(sid, args.env_file)
+    langfuse_path = output_dir / f"langfuse_export_{safe_id(sid)}.json"
+    write_json(langfuse_path, langfuse_export)
+
+    undo_filter = load_undo_filter(
+        sid,
+        args.state_db_path,
+        cutoff_at=args.cutoff_at,
+    )
+    candidate_document = build_candidate_document(
+        langfuse_export,
+        sid,
+        undo_filter=undo_filter,
+        cutoff_at=args.cutoff_at,
+    )
+    candidate_path = output_dir / f"candidate_document_{safe_id(sid)}.json"
+    write_json(candidate_path, candidate_document)
+
+    if args.skip_hindsight:
+        health = {"skipped": True}
+        hindsight_document = {"skipped": True}
+        hindsight_memories = {"skipped": True}
+    else:
+        bank_id = load_hindsight_bank_id(args.hindsight_config)
+        health, hindsight_document, hindsight_memories = export_hindsight(sid, bank_id)
+
+    health_path = output_dir / "hindsight_health.json"
+    document_path = output_dir / f"hindsight_document_{safe_id(sid)}.json"
+    memories_path = output_dir / f"hindsight_memories_{safe_id(sid)}.json"
+    write_json(health_path, health)
+    write_json(document_path, hindsight_document)
+    write_json(memories_path, hindsight_memories)
+
+    local_retain = local_retain_summary(sid, args.sqlite_path)
+    local_path = output_dir / f"local_retain_summary_{safe_id(sid)}.json"
+    write_json(local_path, local_retain)
+
+    comparison = comparison_summary(
+        sid, langfuse_export, hindsight_document, local_retain
+    )
+    comparison_path = output_dir / f"comparison_{safe_id(sid)}.json"
+    write_json(comparison_path, comparison)
+
+    manifest = {
+        "session_id": sid,
+        "read_only": True,
+        "fixed_targets": {
+            "langfuse": LANGFUSE_BASE_URL,
+            "hindsight": HINDSIGHT_BASE_URL,
+        },
+        "files": [
+            str(langfuse_path),
+            str(candidate_path),
+            str(health_path),
+            str(document_path),
+            str(memories_path),
+            str(local_path),
+            str(comparison_path),
+        ],
+        "summary": {
+            **comparison,
+            "candidate_document": {
+                "schema_version": candidate_document["schema_version"],
+                "document_content_sha256": candidate_document[
+                    "document_content_sha256"
+                ],
+                **candidate_document["audit"],
+            },
+        },
+    }
+    manifest_path = output_dir / "manifest.json"
+    write_json(manifest_path, manifest)
+    print(json.dumps(manifest, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

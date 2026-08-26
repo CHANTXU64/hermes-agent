@@ -515,7 +515,7 @@ Retirement decision:
 - Preserve the official automatic Retain implementation for upstream compatibility, but this installation keeps `auto_retain=false`; `/new`, `/reset`, and `/undo` no longer cause fork-owned Hindsight persistence.
 - Preserve Unicode-safe official turn serialization (`json.dumps(..., ensure_ascii=False)`), normal Bank selection, Recall/P5/cache behavior, generic `MemoryProvider` / `MemoryManager` rewind lifecycle, SessionDB active-only rewind, and normal session switching.
 - Preserve shared `messages=` support in the generic memory pipeline because providers other than Hindsight use it; Hindsight no longer consumes it for a private ledger.
-- The selected out-of-tree Langfuse candidate generator is stored at `~/code/scripts/hindsight/langfuse_hindsight_export.py`. Its existence does not authorize Hindsight writes, a replacement save command, an async worker, `/new` integration, or monitoring.
+- The active Langfuse candidate generator and delayed writer are Fork-owned under `fork_features/hindsight_retain/`. The separate config-defined Quick Command consumer below owns their Hindsight write/monitor contract and does not revive this retired provider-owned chain, the legacy SQLite ledger, `/new` integration, replay, or provider lifecycle hooks.
 
 Retirement verification:
 
@@ -534,6 +534,54 @@ Retirement verification:
   zero, and the post-review command/Slack/anti-resurrection set passed `225`.
 
 Upstream status: fork-only feature retired; official Hindsight tools and automatic Retain implementation retained.
+
+### 9a. Gateway session-aware exec Quick Commands
+
+- ID: `gateway-session-aware-quick-command`
+- Status: active
+- Depends on: none — reuses the existing Gateway `SessionStore` routing map
+- Source boundary: logical-only
+
+Files / touchpoints:
+
+- `gateway/run.py` — upstream Gateway Quick Command exec seam
+- `tests/fork/test_gateway_quick_command_session_env.py` — Fork-owned behavior and cross-route concurrency coverage
+- `fork_features/hindsight_retain/retain_integrity.py` — Fork-owned delayed Retain scheduler, writer, receipt scanner, and remote verifier
+- `fork_features/hindsight_retain/langfuse_hindsight_export.py` — Fork-owned Langfuse candidate exporter with request-time cutoff filtering
+- `tests/fork/test_hindsight_retain_integrity.py` and `tests/fork/test_langfuse_hindsight_export.py` — Fork-owned Retain/exporter regression coverage
+- Machine-local consumers outside this repository: `~/.hermes/config.yaml`, `~/.hermes/hindsight/config.json`, `~/.hermes/scripts/check-hermes-hindsight.py`, and `~/.hermes/scripts/hindsight_monitor_html.py`
+
+Intent / invariants:
+
+- A config-defined Gateway `type: exec` Quick Command can opt in only with the strict boolean `session_env: true`; only that command receives the active durable Hermes session ID as `HERMES_SESSION_ID`. Strings, numbers, false, null, and an absent key do not opt in.
+- Gateway resolves the current message's complete route key through the existing `SessionStore` map; it must not create a session, choose a recent session, or fall back across platform, chat/thread/topic, profile, or Telegram `account_id` boundaries.
+- Every Gateway Quick Command child env first drops any process-global `HERMES_SESSION_ID`; strict opt-in then adds the exact mapped session only to that child dictionary. The implementation must never mutate process-global `os.environ`, so concurrent channels and accounts cannot overwrite one another.
+- Commands without `session_env: true` receive no Hermes session ID and otherwise preserve upstream Quick Command behavior. A session-aware command with no current mapping fails before spawning its child process. CLI, TUI, and Desktop remain outside this Gateway-only unit and are not modified by it.
+- `/retain` calls the Fork-owned `schedule` command. It validates the configured Bank, records a lock-protected, append-only, fsynced `scheduled` receipt containing the exact triggering session, request-time cutoff, and `due_at=requested_at+1200s`, then starts a detached child with closed stdio and returns `status=scheduled` immediately. The CLI keeps JSON as its default machine-readable output; the profile-local Gateway Quick Command explicitly selects `--output-format text`, which turns schedule success or failure into a concise user-facing receipt instead of exposing raw JSON in chat. The user explicitly chose this simple non-durable worker: Gateway or machine shutdown can lose it; no Cron, replay, or restart recovery is added. The scanner reports a high alert when a scheduled attempt is past due plus grace and has no `started` receipt.
+- The detached child waits only until its fixed `due_at`, then records `started` and reads Langfuse. Candidate filtering is per message timestamp and includes only content at or before the request-time cutoff; waiting 20 minutes is solely for Langfuse synchronization and must not include later messages from the same session. Artifacts live under `<session_id>/<attempt_id>` with directory mode `0700` and file mode `0600`, so repeated calls cannot overwrite evidence for an earlier attempt. Before `export_succeeded`, one validator proves session/Document identity, canonical UUID, `turns == json.loads(document_content)`, recomputed counts and SHA-256, fsyncs every manifest artifact and the directory, and binds that immutable hash into later receipts.
+- The verified writer targets the literal URL `https://hindsight-api.chantx.top`; it reads `bank_id` and optional `retain_context` from `~/.hermes/hindsight/config.json` before any remote-write receipt or POST. Missing, empty, wrong-type, or URL-unsafe Bank values fail closed with no environment-variable or hard-coded fallback. A missing `retain_context` uses the retired provider's default `conversation between Hermes Agent and the User`; null/empty omits it. The Hindsight item otherwise matches the retired manual `/retain` contract: `content`, optional configured `context`, `document_id=session_id`, and `update_mode=replace`; it sends no Retain `tags`, `metadata`, `timestamp`, or `occurred_at`. Attempt/schema/hash/count facts stay only in the local candidate, manifest, and journal. Submission remains asynchronous with `operation_id=attempt_id`.
+- The remote receipt sequence is `remote_write_started` before POST, then `remote_write_accepted` only after a matching Bank/item/async/operation response. Definite 4xx rejection and transport/response uncertainty are distinct receipts. An uncertain POST is never retried; the monitor queries the original deterministic operation. The Quick Command returns `scheduled`; later receipts separately prove extraction, acceptance, operation completion, and exact Document content.
+- The daily Hindsight attempt monitor takes a shared journal lock, preserves earlier valid attempts after a torn final JSONL line while emitting a dedicated high alert, and distinguishes lost scheduled workers, local interruption, write-not-started/rejected/uncertain, operation missing/pending/stalled/failed/unavailable/identity or metadata mismatch, extraction errors, Document identity/missing/unavailable, severe content loss, and exact-hash mismatch. Remote success requires a completed `retain`/`batch_retain` operation with an explicit integer `extraction_errors_count=0`, matching operation and Document identities, and exact `Document.original_text` hash. A later `remote_write_started` generation supersedes older current-Document comparisons without claiming that the newer operation succeeded.
+- New writer Documents are owned by this attempt/operation/hash audit and are excluded from the retired provider-ledger/unmapped Document audit. Legacy StateDB and SQLite ledgers are opened with URI `mode=ro` plus `PRAGMA query_only=ON`; writer, remote Document audit, and legacy shared-bank audit all use the Bank loaded from the default profile's Hindsight config. StateDB is cross-evidence only and cannot substitute for the fsynced attempt intent.
+- The writer/exporter are managed Fork components. The machine-local daily monitor and deployment configuration remain profile-local; all stay outside the retired Hindsight provider chain, `/new`, generic `/undo`, and CLI/TUI/Desktop lifecycles.
+
+Merge decision:
+
+- Preserve when: a local exec Quick Command needs the exact current Hermes session identity without a dedicated built-in command.
+- Drop when: upstream provides an equivalent opt-in child-process context that passes the same isolation, no-fallback, and concurrency tests on Gateway.
+- Ask user when: changing the environment variable, Bank, stable ID mapping, or replace semantics; adding route fallback/session creation, automatic retry/replay, other surfaces, or coupling to `/new` or memory-provider lifecycles.
+
+Verification:
+
+```bash
+.venv/bin/python -m pytest -q -o 'addopts=' tests/fork/test_gateway_quick_command_session_env.py tests/fork/test_hindsight_retain_integrity.py tests/fork/test_langfuse_hindsight_export.py tests/cli/test_quick_commands.py
+python3 -m py_compile gateway/run.py fork_features/hindsight_retain/retain_integrity.py fork_features/hindsight_retain/langfuse_hindsight_export.py tests/fork/test_gateway_quick_command_session_env.py tests/fork/test_hindsight_retain_integrity.py tests/fork/test_langfuse_hindsight_export.py /Users/robot/.hermes/scripts/check-hermes-hindsight.py /Users/robot/.hermes/scripts/hindsight_monitor_html.py
+git diff --check
+```
+
+- Upstream status: fork-only
+- Last validated: upstream `64a6f42cb38def7ad6524bdfe640a16997c88760`; Fork working tree based on `4e00fb68f5fe583cb7c44a124fa59c91bf40aa0f` (uncommitted)
+- Feature docs: this maintenance entry; Fork-owned scripts expose `schedule`, internal `execute-scheduled`, legacy immediate `export`, and read-only `scan`
 
 ### 10. Custom hosted STT provider
 
@@ -777,7 +825,9 @@ Merge protection:
   advice from the clean durable transcript alone silently drops current context.
 - Preserve Hindsight P5/synchronous recall, the model-visible `hindsight_retain`
   tool, generic `/undo`, multi-Telegram account routing, and upstream Gateway
-  lifecycle improvements; do not revive the retired Hermes `/retain` command.
+  lifecycle improvements. Do not revive the retired built-in/provider-owned
+  `/retain` chain; the config-defined session-aware Quick Command is a separate
+  connector and must remain outside Hindsight, `/new`, and `/undo` lifecycles.
 - Do not merge delegate or branch cache scope merely because
   `parent_session_id` is present.
 - Do not remove upstream content-addressed key hardening while restoring the

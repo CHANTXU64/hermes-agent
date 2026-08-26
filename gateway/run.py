@@ -17130,6 +17130,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # has all API keys in os.environ.
                             from tools.environments.local import build_subprocess_env
                             sanitized_env = build_subprocess_env()
+                            # Quick Commands only receive a session identity via
+                            # the explicit boolean opt-in below. Never inherit a
+                            # stale process-global value.
+                            sanitized_env.pop("HERMES_SESSION_ID", None)
+                            if qcmd.get("session_env") is True:
+                                try:
+                                    quick_session_id = (
+                                        await self.async_session_store.peek_session_id(
+                                            _quick_key
+                                        )
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "Quick command /%s could not resolve session %s: %s",
+                                        command,
+                                        _quick_key,
+                                        exc,
+                                    )
+                                    quick_session_id = None
+                                if not quick_session_id:
+                                    return (
+                                        f"Quick command '/{command}' requires an active "
+                                        "Hermes session."
+                                    )
+                                # Per-subprocess only: concurrent chats/accounts
+                                # must never race through process-global os.environ.
+                                sanitized_env["HERMES_SESSION_ID"] = str(
+                                    quick_session_id
+                                )
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
