@@ -1192,6 +1192,163 @@ def test_directory_setup_failure_still_writes_terminal_failure(tmp_path: Path) -
     events = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
     assert [event["event"] for event in events] == ["started", "export_failed"]
     assert events[1]["failure_type"] == "FileExistsError"
+    assert events[1]["failure_stage"] == "prepare_output"
+
+
+def test_export_process_failure_records_safe_diagnostics(tmp_path: Path) -> None:
+    module = load_module()
+    session_id = "20260825_204500_aabbccdd"
+    attempt_id = "4bdb5e72-7d07-4f06-a6f6-1ecb0e5f4b77"
+    state_db = tmp_path / "state.db"
+    journal = tmp_path / "retain-attempts.jsonl"
+    output_root = tmp_path / "runs"
+    exporter = tmp_path / "failing_exporter.py"
+    create_state_db(state_db, session_id)
+    exporter.write_text(
+        """
+import sys
+print("trace page=1")
+print("HERMES_LANGFUSE_SECRET_KEY=test-secret", file=sys.stderr)
+print("Authorization: Bearer bearer-secret", file=sys.stderr)
+print("x" * 9000, file=sys.stderr)
+raise SystemExit(7)
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(module.ExportFailure):
+        module.run_export(
+            session_id=session_id,
+            output_root=output_root,
+            journal_path=journal,
+            state_db_path=state_db,
+            export_script=exporter,
+            python_executable=sys.executable,
+            attempt_id=attempt_id,
+            remote_expectation="expected",
+        )
+
+    events = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+    failure = events[-1]
+    assert failure["event"] == "export_failed"
+    assert failure["failure_stage"] == "export_process"
+    assert failure["failure_type"] == "ExportFailure"
+    assert failure["failure_message"] == "export process failed"
+    assert failure["exporter_returncode"] == 7
+    assert failure["exporter_stdout"] == "trace page=1\n"
+    assert "test-secret" not in failure["exporter_stderr"]
+    assert "bearer-secret" not in failure["exporter_stderr"]
+    assert "<redacted>" in failure["exporter_stderr"]
+    assert "[truncated]" in failure["exporter_stderr"]
+    assert len(failure["exporter_stderr"]) <= module.MAX_FAILURE_LOG_CHARS
+
+
+def test_failure_log_truncation_reports_original_length() -> None:
+    module = load_module()
+    source = "H" * 5000 + "T" * 5000
+
+    rendered = module._sanitize_failure_text(source)
+
+    assert len(rendered) == module.MAX_FAILURE_LOG_CHARS
+    assert rendered.startswith("H")
+    assert rendered.endswith("T")
+    assert "...[truncated]..." in rendered
+    assert f"original_chars={len(source)}" in rendered
+
+
+@pytest.mark.parametrize("length", [4000, 4001])
+def test_failure_log_truncation_limit_boundary(length: int) -> None:
+    module = load_module()
+    rendered = module._sanitize_failure_text("x" * length)
+
+    assert len(rendered) == min(length, module.MAX_FAILURE_LOG_CHARS)
+    if length == module.MAX_FAILURE_LOG_CHARS:
+        assert "...[truncated]..." not in rendered
+    else:
+        assert "...[truncated]..." in rendered
+        assert "original_chars=4001" in rendered
+
+
+def test_export_process_spawn_failure_records_stage_without_result_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_module()
+    session_id = "20260825_205000_eeff0011"
+    state_db = tmp_path / "state.db"
+    journal = tmp_path / "retain-attempts.jsonl"
+    exporter = tmp_path / "unused_exporter.py"
+    create_state_db(state_db, session_id)
+
+    def fail_spawn(*args, **kwargs):
+        raise OSError("could not start exporter")
+
+    monkeypatch.setattr(module.subprocess, "run", fail_spawn)
+
+    with pytest.raises(module.ExportFailure):
+        module.run_export(
+            session_id=session_id,
+            output_root=tmp_path / "runs",
+            journal_path=journal,
+            state_db_path=state_db,
+            export_script=exporter,
+            python_executable=sys.executable,
+            attempt_id="spawn-failure",
+        )
+
+    failure = json.loads(journal.read_text(encoding="utf-8").splitlines()[-1])
+    assert failure["failure_stage"] == "export_process"
+    assert failure["failure_type"] == "OSError"
+    assert failure["failure_message"] == "could not start exporter"
+    assert "exporter_returncode" not in failure
+    assert "exporter_stdout" not in failure
+    assert "exporter_stderr" not in failure
+
+
+@pytest.mark.parametrize(
+    ("stage", "hook_name"),
+    [
+        ("read_export_artifacts", "_read_export_artifacts"),
+        ("validate_candidate", "_validate_candidate"),
+        ("harden_artifacts", "_harden_and_sync_artifacts"),
+    ],
+)
+def test_post_export_failure_records_stage_and_process_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    hook_name: str,
+) -> None:
+    module = load_module()
+    session_id = "20260825_205500_11223344"
+    state_db = tmp_path / "state.db"
+    journal = tmp_path / "retain-attempts.jsonl"
+    exporter = tmp_path / "valid_exporter.py"
+    create_state_db(state_db, session_id)
+    write_valid_exporter(exporter)
+
+    def fail_hook(*args, **kwargs):
+        raise ValueError(f"forced {stage}")
+
+    monkeypatch.setattr(module, hook_name, fail_hook)
+
+    with pytest.raises(module.ExportFailure):
+        module.run_export(
+            session_id=session_id,
+            output_root=tmp_path / "runs",
+            journal_path=journal,
+            state_db_path=state_db,
+            export_script=exporter,
+            python_executable=sys.executable,
+            attempt_id="post-export-failure",
+        )
+
+    failure = json.loads(journal.read_text(encoding="utf-8").splitlines()[-1])
+    assert failure["failure_stage"] == stage
+    assert failure["failure_type"] == "ValueError"
+    assert failure["failure_message"] == f"forced {stage}"
+    assert failure["exporter_returncode"] == 0
+    assert session_id in failure["exporter_stdout"]
+    assert failure["exporter_stderr"] == ""
 
 
 def test_existing_checker_collects_retain_attempt_scan_json() -> None:

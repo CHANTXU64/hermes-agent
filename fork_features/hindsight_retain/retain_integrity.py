@@ -7,6 +7,7 @@ import hashlib
 import json
 import fcntl
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -34,6 +35,54 @@ REMOTE_EXPECTATIONS = {
 RETAIN_OPERATION_TYPES = {"retain", "batch_retain"}
 DocumentFetcher = Callable[[str], dict[str, Any]]
 OperationFetcher = Callable[[str], dict[str, Any]]
+
+MAX_FAILURE_LOG_CHARS = 4000
+_FAILURE_REDACTION = "<redacted>"
+_FAILURE_TRUNCATION_MARKER = "...[truncated]..."
+_FAILURE_URL_CREDENTIALS_RE = re.compile(
+    r"(?i)(https?://)[^/\s:@]+:[^@\s/]+@"
+)
+_FAILURE_AUTH_RE = re.compile(
+    r"(?i)(\b(?:proxy-)?authorization\s*:\s*(?:bearer|basic)\s+|\b(?:bearer|basic)\s+)[^\s,;]+"
+)
+_FAILURE_FLAG_RE = re.compile(
+    r"(?i)(\s--(?:api[-_]?key|secret(?:[-_]?key)?|token|password)(?:=|\s+))[^\s,;]+"
+)
+_FAILURE_ASSIGNMENT_RE = re.compile(
+    r"(?i)(\b(?:[a-z0-9_]*(?:api[-_]?key|secret|token|password|passwd|credential|authorization)[a-z0-9_]*|api[-_]?key|secret|token|password)\s*[:=]\s*)[^\s,;]+"
+)
+
+
+def _sanitize_failure_text(value: Any) -> str:
+    """Keep useful failure output while removing credentials and bounding size."""
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text:
+        return ""
+    text = _FAILURE_URL_CREDENTIALS_RE.sub(
+        lambda match: f"{match.group(1)}{_FAILURE_REDACTION}@",
+        text,
+    )
+    text = _FAILURE_AUTH_RE.sub(
+        lambda match: f"{match.group(1)}{_FAILURE_REDACTION}",
+        text,
+    )
+    text = _FAILURE_FLAG_RE.sub(
+        lambda match: f"{match.group(1)}{_FAILURE_REDACTION}",
+        text,
+    )
+    text = _FAILURE_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}{_FAILURE_REDACTION}",
+        text,
+    )
+    if len(text) <= MAX_FAILURE_LOG_CHARS:
+        return text
+    marker = f"\n{_FAILURE_TRUNCATION_MARKER} (original_chars={len(text)})\n"
+    if len(marker) >= MAX_FAILURE_LOG_CHARS:
+        return marker[:MAX_FAILURE_LOG_CHARS]
+    remaining = MAX_FAILURE_LOG_CHARS - len(marker)
+    head_chars = remaining // 2
+    tail_chars = remaining - head_chars
+    return f"{text[:head_chars]}{marker}{text[-tail_chars:]}"
 
 
 class ExportFailure(RuntimeError):
@@ -695,12 +744,16 @@ def run_export(
     ]
     if cutoff_iso is not None:
         command.extend(["--cutoff-at", cutoff_iso])
+    completed = None
+    failure_stage = "prepare_output"
     try:
         output_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(output_root, 0o700)
         output_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(output_dir.parent, 0o700)
         output_dir.mkdir(mode=0o700, exist_ok=False)
+
+        failure_stage = "export_process"
         completed = subprocess.run(
             command,
             capture_output=True,
@@ -709,9 +762,13 @@ def run_export(
         )
         if completed.returncode != 0:
             raise ExportFailure("export process failed")
+
+        failure_stage = "read_export_artifacts"
         manifest, manifest_path, candidate = _read_export_artifacts(output_dir, session_id)
+        failure_stage = "validate_candidate"
         material = _validate_candidate(candidate, session_id)
         candidate_path = output_dir / f"candidate_document_{session_id}.json"
+        failure_stage = "harden_artifacts"
         _harden_and_sync_artifacts(
             output_dir,
             manifest,
@@ -719,18 +776,26 @@ def run_export(
             candidate_path,
         )
     except Exception as exc:
-        append_event_durable(
-            Path(journal_path),
-            {
-                "schema_version": 1,
-                "attempt_id": attempt_id,
-                "event": "export_failed",
-                "recorded_at": (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
-                "session_id": session_id,
-                "document_id": session_id,
-                "failure_type": type(exc).__name__,
-            },
-        )
+        failure_event = {
+            "schema_version": 1,
+            "attempt_id": attempt_id,
+            "event": "export_failed",
+            "recorded_at": (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
+            "session_id": session_id,
+            "document_id": session_id,
+            "failure_stage": failure_stage,
+            "failure_type": type(exc).__name__,
+            "failure_message": _sanitize_failure_text(str(exc)),
+        }
+        if completed is not None:
+            failure_event.update(
+                {
+                    "exporter_returncode": int(completed.returncode),
+                    "exporter_stdout": _sanitize_failure_text(completed.stdout),
+                    "exporter_stderr": _sanitize_failure_text(completed.stderr),
+                }
+            )
+        append_event_durable(Path(journal_path), failure_event)
         if isinstance(exc, ExportFailure):
             raise
         raise ExportFailure("export could not be completed") from exc
