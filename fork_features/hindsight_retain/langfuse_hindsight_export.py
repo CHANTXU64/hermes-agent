@@ -123,6 +123,95 @@ def get_langfuse_credentials(env_file: Path) -> tuple[str, str]:
     return public_key, secret_key
 
 
+LEGACY_OBSERVATIONS_PAGE_SIZE = 100
+LEGACY_OBSERVATIONS_MAX_PAGES = 10_000
+
+
+def _pagination_total(response) -> int | None:
+    metadata = jsonable(getattr(response, "meta", None))
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("totalItems", "total_items", "total"):
+        value = metadata.get(key)
+        if type(value) is int and value >= 0:
+            return value
+    return None
+
+
+def _fetch_trace_observations(client, trace_id: str) -> list:
+    """Read observations through the paginated legacy API."""
+    observations = []
+    observation_ids: set[str] = set()
+    total_items = None
+    for page in range(1, LEGACY_OBSERVATIONS_MAX_PAGES + 1):
+        response = client.api.legacy.observations_v1.get_many(
+            page=page,
+            limit=LEGACY_OBSERVATIONS_PAGE_SIZE,
+            trace_id=trace_id,
+        )
+        page_total = _pagination_total(response)
+        if page_total is None:
+            raise RuntimeError(
+                f"Langfuse observations missing valid totalItems for trace {trace_id}"
+            )
+        if total_items is None:
+            total_items = page_total
+        elif page_total != total_items:
+            raise RuntimeError(
+                f"Langfuse observations totalItems changed for trace {trace_id}: "
+                f"{total_items} to {page_total}"
+            )
+
+        rows = list(getattr(response, "data", None) or [])
+        serialized_rows = jsonable(rows)
+        if not isinstance(serialized_rows, list):
+            raise RuntimeError(
+                f"Langfuse observations response is not a list for trace {trace_id}"
+            )
+        page_observations: list[dict] = []
+        for observation in serialized_rows:
+            if not isinstance(observation, dict):
+                raise RuntimeError(
+                    f"Langfuse observation row is not an object for trace {trace_id}"
+                )
+            observation_id = observation.get("id")
+            if not isinstance(observation_id, str) or not observation_id.strip():
+                raise RuntimeError(
+                    f"Langfuse observation has invalid ID for trace {trace_id}"
+                )
+            if observation_id in observation_ids:
+                raise RuntimeError(
+                    f"Langfuse observations contain duplicate observation ID "
+                    f"{observation_id} for trace {trace_id}"
+                )
+            observation_ids.add(observation_id)
+            page_observations.append(observation)
+        observations.extend(page_observations)
+
+        if len(observation_ids) > total_items:
+            raise RuntimeError(
+                f"Langfuse observations exceeded totalItems for trace {trace_id}: "
+                f"{len(observation_ids)} of {total_items}"
+            )
+        if len(observation_ids) == total_items:
+            break
+        if not rows:
+            break
+    else:
+        raise RuntimeError(
+            f"Langfuse observations exceeded {LEGACY_OBSERVATIONS_MAX_PAGES} pages"
+        )
+
+    if total_items is None or len(observation_ids) != total_items:
+        received = len(observation_ids)
+        expected = total_items if total_items is not None else "unknown"
+        raise RuntimeError(
+            f"Langfuse observations incomplete for trace {trace_id}: "
+            f"{received} of {expected} unique observations"
+        )
+    return observations
+
+
 def load_hindsight_bank_id(config_path: Path) -> str:
     try:
         payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
@@ -144,7 +233,7 @@ def load_hindsight_bank_id(config_path: Path) -> str:
 
 
 def export_langfuse(session_id: str, env_file: Path) -> dict:
-    """List and fully fetch every Trace for one Hermes session."""
+    """List traces and fetch each trace without exceeding the Trace size limit."""
     if Langfuse is None:
         raise SystemExit(
             "缺少 langfuse Python 包；请在 Hermes 使用的 Python 环境中运行。"
@@ -177,7 +266,16 @@ def export_langfuse(session_id: str, env_file: Path) -> dict:
             if trace_id and trace_id not in seen:
                 seen.add(trace_id)
                 trace_ids.append(trace_id)
-        traces = [jsonable(client.api.trace.get(trace_id)) for trace_id in trace_ids]
+
+        traces = []
+        for trace_id in trace_ids:
+            # Fetch only the root fields; the full observations payload can exceed
+            # Langfuse's 80 MB response limit and is read through the paginated v1 API.
+            trace = jsonable(client.api.trace.get(trace_id, fields="core,io"))
+            if not isinstance(trace, dict):
+                raise RuntimeError(f"Langfuse trace {trace_id} is not an object")
+            trace["observations"] = _fetch_trace_observations(client, trace_id)
+            traces.append(trace)
     finally:
         client.shutdown()
     return {

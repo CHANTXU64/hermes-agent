@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+
+import pytest
 import hashlib
 import json
 import re
@@ -1261,3 +1263,164 @@ def test_undo_filter_keeps_active_resend_when_rewound_trace_is_missing(tmp_path)
     assert candidate["audit"]["undo_matched_user_count"] == 0
     assert candidate["audit"]["undo_unmatched_user_count"] == 1
     assert candidate["audit"]["undo_filtered_message_count"] == 0
+
+
+def test_export_langfuse_fetches_core_trace_and_paginates_observations(
+    tmp_path, monkeypatch
+):
+    module = load_script_module(tmp_path)
+    session_id = "session-large-trace"
+    trace_get_calls = []
+    observation_calls = []
+    shutdown_calls = []
+
+    class Row:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    class TraceApi:
+        def list(self, **kwargs):
+            assert kwargs["session_id"] == session_id
+            return Row(data=[Row(id="trace-large")])
+
+        def get(self, trace_id, *, fields):
+            trace_get_calls.append((trace_id, fields))
+            return {
+                "id": trace_id,
+                "metadata": {"task_id": session_id},
+                "name": "Hermes trace",
+            }
+
+    class ObservationsApi:
+        def get_many(self, *, page, limit, trace_id):
+            observation_calls.append((page, limit, trace_id))
+            pages = {
+                1: [Row(id="observation-1", type="CHAIN")],
+                2: [Row(id="observation-2", type="GENERATION")],
+            }
+            return Row(
+                data=pages.get(page, []),
+                meta=Row(totalItems=2),
+            )
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.api = Row(
+                trace=TraceApi(),
+                legacy=Row(observations_v1=ObservationsApi()),
+            )
+
+        def shutdown(self):
+            shutdown_calls.append(True)
+
+    monkeypatch.setattr(module, "Langfuse", Client)
+    monkeypatch.setattr(
+        module,
+        "get_langfuse_credentials",
+        lambda env_file: ("public", "secret"),
+    )
+
+    exported = module.export_langfuse(session_id, tmp_path / "env")
+
+    assert trace_get_calls == [("trace-large", "core,io")]
+    assert observation_calls == [
+        (1, 100, "trace-large"),
+        (2, 100, "trace-large"),
+    ]
+    assert exported["traces"] == [
+        {
+            "id": "trace-large",
+            "metadata": {"task_id": session_id},
+            "name": "Hermes trace",
+            "observations": [
+                {"id": "observation-1", "type": "CHAIN"},
+                {"id": "observation-2", "type": "GENERATION"},
+            ],
+        }
+    ]
+    assert shutdown_calls == [True]
+
+
+def test_fetch_trace_observations_rejects_duplicate_ids(tmp_path):
+    module = load_script_module(tmp_path)
+
+    class Row:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    class ObservationsApi:
+        def get_many(self, *, page, limit, trace_id):
+            return Row(
+                data=[Row(id="observation-1", type="CHAIN")],
+                meta=Row(totalItems=2),
+            )
+
+    client = Row(api=Row(legacy=Row(observations_v1=ObservationsApi())))
+
+    with pytest.raises(RuntimeError, match="duplicate observation ID"):
+        module._fetch_trace_observations(client, "trace-duplicate")
+
+
+def test_fetch_trace_observations_rejects_missing_total_items(tmp_path):
+    module = load_script_module(tmp_path)
+
+    class Row:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    class ObservationsApi:
+        def get_many(self, *, page, limit, trace_id):
+            return Row(
+                data=[Row(id="observation-1", type="CHAIN")],
+                meta=Row(),
+            )
+
+    client = Row(api=Row(legacy=Row(observations_v1=ObservationsApi())))
+
+    with pytest.raises(RuntimeError, match="missing valid totalItems"):
+        module._fetch_trace_observations(client, "trace-missing-total")
+
+
+def test_fetch_trace_observations_rejects_non_integral_total_items(tmp_path):
+    module = load_script_module(tmp_path)
+
+    class Row:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    class ObservationsApi:
+        def get_many(self, *, page, limit, trace_id):
+            return Row(
+                data=[Row(id="observation-1", type="CHAIN")],
+                meta=Row(totalItems=2.5),
+            )
+
+    client = Row(api=Row(legacy=Row(observations_v1=ObservationsApi())))
+
+    with pytest.raises(RuntimeError, match="missing valid totalItems"):
+        module._fetch_trace_observations(client, "trace-non-integral-total")
+
+
+def test_fetch_trace_observations_rejects_total_items_changes(tmp_path):
+    module = load_script_module(tmp_path)
+
+    class Row:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    class ObservationsApi:
+        def get_many(self, *, page, limit, trace_id):
+            if page == 1:
+                return Row(
+                    data=[Row(id="observation-1", type="CHAIN")],
+                    meta=Row(totalItems=2),
+                )
+            return Row(
+                data=[Row(id="observation-2", type="GENERATION")],
+                meta=Row(totalItems=3),
+            )
+
+    client = Row(api=Row(legacy=Row(observations_v1=ObservationsApi())))
+
+    with pytest.raises(RuntimeError, match="totalItems changed"):
+        module._fetch_trace_observations(client, "trace-changing-total")
