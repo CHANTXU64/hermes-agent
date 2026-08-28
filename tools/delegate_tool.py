@@ -4777,6 +4777,34 @@ def _exact_reasoning_efforts_for_route(
                 exact.append(candidate)
         return exact
 
+    if normalized_mode == "anthropic_messages":
+        from agent.anthropic_adapter import build_anthropic_kwargs
+
+        for candidate in candidates:
+            config = parse_reasoning_effort(candidate)
+            try:
+                kwargs = build_anthropic_kwargs(
+                    model=model,
+                    messages=[{"role": "user", "content": "capability probe"}],
+                    tools=None,
+                    max_tokens=1024,
+                    reasoning_config=config,
+                    base_url=base_url,
+                )
+            except Exception:
+                continue
+            emitted_payload = {
+                "thinking": kwargs.get("thinking"),
+                "output_config": kwargs.get("output_config"),
+            }
+            if candidate == "none":
+                if _contains_explicit_reasoning_disable(emitted_payload):
+                    exact.append(candidate)
+                continue
+            if _extract_reasoning_wire_effort(emitted_payload) == candidate:
+                exact.append(candidate)
+        return exact
+
     if normalized_mode != "chat_completions":
         return exact
 

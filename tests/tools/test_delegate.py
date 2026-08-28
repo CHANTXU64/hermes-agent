@@ -1572,6 +1572,84 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
     @patch(
         "hermes_cli.config.load_config_readonly",
+        return_value={"agent": {"reasoning_effort": "high"}},
+    )
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
+    @patch("hermes_cli.inventory.load_picker_context")
+    @patch("hermes_cli.inventory.build_models_payload")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_anthropic_messages_explicit_low_reaches_target_child(
+        self,
+        mock_runtime,
+        mock_payload,
+        _mock_context,
+        _mock_cfg,
+        _mock_full_cfg,
+    ):
+        mock_payload.return_value = {
+            "providers": [
+                {
+                    "slug": "custom:cloudflare-claude",
+                    "models": ["claude-sonnet-5"],
+                }
+            ]
+        }
+        mock_runtime.return_value = {
+            "provider": "custom",
+            "model": "claude-sonnet-5",
+            "base_url": "https://gateway.example.com/anthropic",
+            "api_key": "cloudflare-key",
+            "api_mode": "anthropic_messages",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "claude-sonnet-5"
+            mock_child.provider = "custom:cloudflare-claude"
+            mock_child.reasoning_config = {"enabled": True, "effort": "low"}
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Use native Anthropic at the requested level",
+                    provider="custom:cloudflare-claude",
+                    model="claude-sonnet-5",
+                    reasoning_effort="low",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertNotIn("error", result)
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(
+            kwargs["reasoning_config"], {"enabled": True, "effort": "low"}
+        )
+
+    def test_anthropic_messages_reports_only_exact_wire_efforts(self):
+        from tools.delegate_tool import _exact_reasoning_efforts_for_route
+
+        exact = _exact_reasoning_efforts_for_route(
+            provider="custom:anthropic-proxy",
+            model="claude-sonnet-5",
+            api_mode="anthropic_messages",
+            base_url="https://gateway.example.com/anthropic",
+        )
+
+        self.assertEqual(exact, ["low", "medium", "high", "xhigh", "max"])
+
+    @patch(
+        "hermes_cli.config.load_config_readonly",
         return_value={
             "agent": {
                 "reasoning_effort": "medium",

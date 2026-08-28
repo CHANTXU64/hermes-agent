@@ -62,6 +62,8 @@ none, minimal, low, medium, high, xhigh, max, ultra
 
 The exactly usable subset is route-specific. Validation probes the existing production request builders/provider profiles and compares the requested value with the emitted wire value. Binary thinking toggles, silent omission, and level remapping do not count as the requested value taking effect. Instead of aborting or changing models, Hermes falls back to the target model's `agent.reasoning_overrides`, global reasoning configuration, or provider default. Invalid vocabulary still fails early.
 
+Native `anthropic_messages` routes use the same production Anthropic request builder for this probe. Its exact per-invocation subset is `low`, `medium`, `high`, `xhigh`, and `max`; `minimal` maps to `low`, `ultra` maps to `max`, and `none` currently omits reasoning fields rather than emitting an explicit disable marker, so those three values retain the same-model automatic/default fallback behavior instead of being reported as exact.
+
 ## Background metadata and observability
 
 Each child result exposes safe route metadata when available:

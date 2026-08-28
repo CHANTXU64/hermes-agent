@@ -1768,7 +1768,7 @@ Upstream status: fork-only.
 
 Status: active
 
-Date: 2026-08-15
+Date: 2026-08-15; native Anthropic reasoning probe fixed 2026-08-28
 
 Files:
 
@@ -1792,6 +1792,7 @@ What changed:
 - Top-level and per-task `provider`, `model`, and `reasoning_effort` fields are exposed and forwarded through both model dispatch paths.
 - Model-only calls infer a provider only when the authenticated curated inventory has one unique match; explicit provider/model calls resolve the target-model runtime route and reject known catalog mismatches before spawning.
 - Routed children resolve reasoning configuration against the target model. An explicit effort is used only when the production request builder preserves it exactly; otherwise Hermes keeps the selected provider/model and applies that target model's normal override/global/provider reasoning configuration without claiming that the requested value took effect.
+- Exact reasoning probes cover Chat Completions, Responses, and native Anthropic Messages routes. Anthropic Messages reuses the production request builder: `low`, `medium`, `high`, `xhigh`, and `max` are exact; `minimal -> low`, `ultra -> max`, and omission for `none` are not reported as exact and therefore keep the same-model automatic/default fallback contract.
 - Every batch task is route-validated before any child starts. Safe effective route metadata is present in child results, async status, SQLite task payloads, restart recovery, and completion events; secrets and raw request overrides are excluded.
 - Model-route errors keep structured error codes and render bounded Markdown suggestions in the error text. They combine up to 10 recent frequently used routes with up to 10 name-similar routes, deduplicate by `(provider, model)`, and stay within 1,800 characters. Recent usage is read from the active profile's local `state.db` and intersected with the current authenticated curated inventory, so stale historical routes are excluded. No LLM, child launch, forced catalog refresh, reasoning-model scan, or automatic model substitution is involved; the full catalog is never inserted into the persistent tool schema.
 
@@ -1808,6 +1809,7 @@ Merge protection:
 Verification:
 
 - 2026-08-16 revised-contract validation: core delegate/control/async tests reported `125 passed in 16.72s`; adjacent DeepSeek/OpenCode Go/Codex request-builder tests reported `158 passed in 1.82s`; restoration, API Server, Gateway binding, CLI delivery, TUI lifecycle, batch/output-schema, and FD-leak tests reported `65 passed in 7.77s` with seven pre-existing third-party deprecation warnings. Ruff, `py_compile`, and `git diff --check` passed. A read-only live-profile candidate render excluded stale historical `openai-codex` routes and returned only current authenticated picker-inventory routes.
+- 2026-08-28 native Anthropic regression validation: delegate/control/async tests reported `127 passed`; Anthropic adapter/sanitization tests reported `98 passed`; Ruff, `py_compile`, and `git diff --check` passed. After Gateway restart, a live `custom:cloudflare-claude` / `claude-fable-5` child completed one API call with the requested effective `low` effort instead of falling back to the model's `high` default.
 
 ```bash
 ./venv/bin/python -m pytest \
