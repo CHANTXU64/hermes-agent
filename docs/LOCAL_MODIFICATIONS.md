@@ -2056,6 +2056,147 @@ Feature docs: `docs/chantxu64/current-turn-smart-approval/README.md`
 
 Upstream status: fork-only.
 
+### 29. Provider-native long-task continuity Request Fork
+
+Status: active fork maintenance; source and standalone plugin implemented,
+locally verified, enabled, and live-verified in the default Gateway Profile
+
+Date: 2026-08-28
+
+Files:
+
+- `fork_features/request_fork/__init__.py`
+- `agent/conversation_loop.py`
+- `agent/conversation_compression.py`
+- `agent/turn_context.py`
+- `agent/turn_retry_state.py`
+- `run_agent.py`
+- `gateway/slash_commands.py`
+- `hermes_cli/plugins.py`
+- `fork_features/hindsight_retain/langfuse_hindsight_export.py`
+- `tests/fork_features/test_current_request_fork.py`
+- `tests/fork_features/test_long_task_continuity_hooks.py`
+- `tests/fork_features/test_long_task_continuity_recovery.py`
+- `tests/fork_features/test_plugin_state_cas.py`
+- `tests/agent/test_compression_adoption_preserves_live_tail.py`
+- `tests/agent/test_turn_retry_state.py`
+- `tests/run_agent/test_413_compression.py`
+- `tests/run_agent/test_compression_boundary_hook.py`
+- `tests/run_agent/test_run_agent_codex_responses.py`
+- `tests/gateway/test_compress_command.py`
+- `tests/fork/test_langfuse_hindsight_export.py`
+- user plugin `~/.hermes/plugins/long-task-continuity/`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+What changed:
+
+- A scoped `FrozenCodexRequest` carries a deep-copied, provider-native Codex
+  Responses request body and fidelity metadata. The private checkpoint Fork
+  clones that body, appends exactly one synthetic `role=user` checkpoint item,
+  and sends it with an explicitly owned client created from a frozen provider/
+  client-construction spec. It does not retain or reread the parent agent, nor
+  rerun chat conversion, request build, transport preflight,
+  plugin middleware, tools, transcript persistence, Memory, Retain, or normal
+  parent-request hooks.
+- Automatic Codex Responses compression defers only the continuity-aware pending
+  trigger until the parent request has completed normal request-only context,
+  cache decoration, request build, sanitization, transport preflight, and
+  one-shot request-header preparation. It captures `prepared_parent` before
+  plugin middleware; if compression runs instead of sending that parent, the
+  outer loop rebuilds the main request without consuming provider retry budget
+  or losing the one-shot user-initiated flag.
+- Provider 413/context-overflow recovery freezes the actual request after request
+  and execution middleware, Relay mutation, final preflight, and streaming flag
+  insertion at the physical provider-call boundary, and labels it `failed_wire`.
+  Responses function-call items, function-call outputs, flat tool
+  schemas, cache identity, and final headers therefore survive the Fork without
+  a second conversion.
+- A longer durable parent adopted under the compression lease invalidates the
+  earlier prepared request. A host-owned pure rematerializer preserves the frozen
+  request-only body and inserts only a proven concurrent durable append before
+  the complete live tail as `rematerialized_after_adopt`; it does not rerun
+  middleware, context selection, vision, or provider calls. Gateway `/compress`
+  has no observed parent wire request and truthfully uses
+  `reconstructed_out_of_turn`; multimodal history that cannot be reconstructed
+  without vision side effects makes the Fork unavailable. Outer transcript
+  persistence/session transition still decides committed versus aborted.
+- Recovery remains request-local synthetic user context. It is wrapped in a
+  generic `<hermes-runtime-context user-authored="false" ...>` provenance
+  envelope, and the Langfuse-to-Hindsight exporter excludes any runtime context
+  carrying that generic non-user provenance rather than matching continuity
+  business text.
+- The standalone plugin keeps pending deliveries in a CAS-updated per-session
+  map (with read migration for the previous single-slot shape). Different
+  sessions coexist; compression generations prevent a late older checkpoint
+  from overwriting a newer same-session pending state;
+  acknowledgement deletes only an exact session/compression/checkpoint identity.
+  A checkpoint whose base authority changed before join terminates as
+  `superseded`, clears its active record, and delivers the latest authoritative
+  state instead of exposing an unconsumed retry.
+- The private Request Fork reuses the host-parsed `agent.api_max_retries` ceiling
+  for retryable transport failures, creates a fresh independently owned client
+  for every attempt, and uses the host backoff policy. Checkpoint JSON correction
+  attempts remain separate from transport retries.
+- If all checkpoint attempts fail, diagnostic details remain in durable plugin
+  state and are not injected into the model. Recovery uses the last accepted
+  root, user messages, and next action when available; otherwise it gives only
+  brief guidance to continue from the compression summary and latest user
+  message, forbidding broad history search.
+
+Why it matters:
+
+- Long-running exploratory tasks must preserve their root goal, durable facts,
+  constraints, and causal plan across real context compression without asking a
+  weaker summarizer to invent the authoritative state.
+- A checkpoint derived from a lossy chat-shaped reconstruction can silently drop
+  tool schemas and function-call history; sharing the parent client or runtime
+  can also close or mutate the live request. Provider-native values and explicit
+  ownership make those boundaries testable.
+- Runtime recovery must guide the model without being retained or later quoted
+  as user-authored evidence. Profile-global delivery state must not let one
+  session overwrite or acknowledge another session's recovery.
+
+Merge protection:
+
+- Never feed Responses-native `input` or flat `tools` back through the
+  chat-to-Responses adapter. Tests must observe the final Fork transport body,
+  not only a snapshot passed into compression.
+- Preserve the distinction between `failed_wire`, `prepared_parent`,
+  `rematerialized_after_adopt`, and `reconstructed_out_of_turn`; only the first
+  represents a physically attempted provider request.
+- Keep the Fork client explicit and independently closed. Do not reintroduce
+  `copy.copy(agent)`, implicit primary-client lookup, parent transcript writes,
+  normal middleware, or tool execution in the private Fork.
+- Preserve compression/Fork parallelism: compression commit does not wait for
+  the checkpoint. Only committed compression may join before the next real
+  provider request; aborted/failed attempts discard their Fork result.
+- Preserve generic `user-authored=false` filtering and synthetic user role; do
+  not replace it with a continuity-specific Retain string rule or a developer
+  message.
+- Preserve per-session CAS mutation and exact acknowledgement identity. A stale
+  checkpoint result must not overwrite a newer same-session generation, and a
+  stale acknowledgement must not remove a newer same-session pending value or
+  another session's value.
+
+Validation:
+
+- Final post-review related Core, Gateway, lifecycle, transport, and exporter
+  regressions: `262 passed` with `7` third-party deprecation warnings.
+- After the transport-retry change, the directly affected host regressions:
+  `25 passed`.
+- Standalone plugin suite after retry and compact-fallback changes: `32 passed`.
+- Plugin Doctor: runtime discovery/import/registration passed, with `1 tool` and
+  `3 hooks`.
+- Ruff, `py_compile`, and `git diff --check` passed.
+- The default Gateway was manually restarted after the final code changes. A
+  real Codex checkpoint saved authoritative revision `1`, injected recovery on
+  the next request, received a successful delivery acknowledgement, and left no
+  failed checkpoint or pending delivery. This verifies the success path; the
+  retry and terminal-failure branches remain covered by deterministic tests.
+- No push was run.
+
+Upstream status: fork-only.
+
 ## Current fork delta checklist
 
 Compared with the upstream parent of the latest completed fork sync, active fork
@@ -2197,6 +2338,28 @@ deltas are expected in these areas:
   - `tests/run_agent/test_run_agent.py`
   - `docs/chantxu64/memory-change-governance/README.md`
   - `docs/LOCAL_MODIFICATIONS.md`
+- Provider-native long-task continuity Request Fork:
+  - `fork_features/request_fork/__init__.py`
+  - `agent/conversation_loop.py`
+  - `agent/conversation_compression.py`
+  - `agent/turn_context.py`
+  - `agent/turn_retry_state.py`
+  - `run_agent.py`
+  - `gateway/slash_commands.py`
+  - `hermes_cli/plugins.py`
+  - `fork_features/hindsight_retain/langfuse_hindsight_export.py`
+  - `tests/fork_features/test_current_request_fork.py`
+  - `tests/fork_features/test_long_task_continuity_hooks.py`
+  - `tests/fork_features/test_long_task_continuity_recovery.py`
+  - `tests/fork_features/test_plugin_state_cas.py`
+  - `tests/agent/test_compression_adoption_preserves_live_tail.py`
+  - `tests/agent/test_turn_retry_state.py`
+  - `tests/run_agent/test_413_compression.py`
+  - `tests/run_agent/test_compression_boundary_hook.py`
+  - `tests/run_agent/test_run_agent_codex_responses.py`
+  - `tests/gateway/test_compress_command.py`
+  - `tests/fork/test_langfuse_hindsight_export.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
 - Documentation:
   - `docs/LOCAL_MODIFICATIONS.md`
 - Multi Telegram bots (account_id session slots):
@@ -2239,9 +2402,9 @@ deltas are expected in these areas:
 
 ## Summary statistics
 
-Documented entries: 28 major entries.
+Documented entries: 29 major entries.
 
-Active / current entries: 23.
+Active / current entries: 24.
 
 Historical reverted / abandoned / superseded areas: 5.
 

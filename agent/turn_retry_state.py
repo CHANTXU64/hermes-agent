@@ -75,6 +75,10 @@ class TurnRetryState:
     auth_failover_attempted: bool = False
 
     # ── Restart signals (read by the outer loop after the attempt) ───────
+    # The provider-ready parent was intentionally not sent because automatic
+    # compression ran after request preparation. Rebuild the same logical
+    # attempt without charging the provider-retry budget.
+    restart_after_prepared_compression: bool = False
     restart_with_compressed_messages: bool = False
     restart_with_length_continuation: bool = False
     # Set when a content-filter stream stall (e.g. MiniMax "new_sensitive")

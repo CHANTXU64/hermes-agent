@@ -4144,6 +4144,7 @@ class GatewaySlashCommandsMixin:
             # "local" vs "cli" mismatch.
             from gateway.run import (
                 _GATEWAY_HYGIENE_PLATFORM,
+                _load_gateway_config,
                 _platform_config_key,
                 _seed_hygiene_system_prompt,
             )
@@ -4196,6 +4197,46 @@ class GatewaySlashCommandsMixin:
                 runtime_kwargs["platform"] = platform_key
             runtime_kwargs["gateway_session_key"] = session_key
 
+            # The compression helper itself needs no callable tools, but the
+            # private checkpoint Fork must preserve the same tool schemas a
+            # normal request for this source would carry. Resolve those
+            # toolsets through the regular gateway path instead of reusing the
+            # memory-only hygiene subset.
+            user_config = _load_gateway_config()
+            _toolset_resolver = getattr(
+                self,
+                "_resolve_enabled_toolsets_for_source",
+                None,
+            )
+            if callable(_toolset_resolver):
+                enabled_toolsets = _toolset_resolver(
+                    user_config,
+                    source,
+                    platform_key or "cli",
+                )
+            else:
+                from hermes_cli.tools_config import _get_platform_tools
+
+                enabled_toolsets = sorted(
+                    _get_platform_tools(user_config, platform_key or "cli")
+                )
+            enabled_toolsets = [
+                str(item)
+                for item in (
+                    enabled_toolsets
+                    if isinstance(enabled_toolsets, (list, tuple, set))
+                    else []
+                )
+            ]
+            disabled_toolsets = [
+                str(item)
+                for item in (
+                    ((user_config.get("agent") or {}).get("disabled_toolsets") or [])
+                    if isinstance(user_config, dict)
+                    else []
+                )
+            ]
+
             # The manual compression helper skips memory-provider initialization,
             # but _compress_context may persist its cached system prompt. Restore
             # the exact live-session prompt so provider blocks are retained.
@@ -4220,7 +4261,8 @@ class GatewaySlashCommandsMixin:
                 max_iterations=4,
                 quiet_mode=True,
                 skip_memory=True,
-                enabled_toolsets=["memory"],
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
                 session_id=session_entry.session_id,
                 session_db=getattr(self._session_db, "_db", self._session_db),
             )
@@ -4247,6 +4289,17 @@ class GatewaySlashCommandsMixin:
                     msgs, system_prompt=_sys_prompt, tools=_tools
                 )
 
+                from fork_features.request_fork import (
+                    build_out_of_turn_compression_request_snapshot,
+                )
+
+                request_fork = (
+                    build_out_of_turn_compression_request_snapshot(
+                        tmp_agent,
+                        msgs,
+                    )
+                )
+
                 compressor = tmp_agent.context_compressor
                 if not compressor.has_content_to_compress(head):
                     return t("gateway.compress.nothing_to_do")
@@ -4265,6 +4318,7 @@ class GatewaySlashCommandsMixin:
                         focus_topic=focus_topic,
                         force=True,
                         defer_context_engine_notification=True,
+                        request_fork=request_fork,
                     )
                 )
 

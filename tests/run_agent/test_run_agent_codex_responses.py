@@ -1526,6 +1526,280 @@ def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):
 
 
 
+def test_codex_413_compression_forks_actual_failed_wire_request(monkeypatch):
+    import copy
+
+    import agent.codex_runtime as codex_runtime
+    from fork_features.request_fork import (
+        FrozenCodexRequest,
+        RequestForkService,
+        current_request_fork_scope,
+    )
+    from hermes_cli.middleware import RequestMiddlewareResult
+
+    class _HTTP413(Exception):
+        status_code = 413
+
+    agent = _build_agent(monkeypatch)
+    setattr(agent, "_disable_streaming", True)
+    error = _HTTP413("Request entity too large")
+    wire_requests = []
+    responses = [error, _codex_message_response("Recovered after 413.")]
+    flat_tools = [
+        {
+            "type": "function",
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object"},
+        }
+    ]
+
+    def _request_middleware(request, **_context):
+        replacement = copy.deepcopy(request)
+        replacement["input"].extend(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call-failed-wire",
+                    "name": "read_file",
+                    "arguments": '{"path":"/tmp/input"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-failed-wire",
+                    "output": "VERIFIED TOOL RESULT",
+                },
+            ]
+        )
+        replacement["tools"] = copy.deepcopy(flat_tools)
+        return RequestMiddlewareResult(
+            payload=replacement,
+            original_payload=copy.deepcopy(request),
+            changed=True,
+            trace=[{"source": "test"}],
+        )
+
+    def _api_call(api_kwargs):
+        wire_requests.append(copy.deepcopy(api_kwargs))
+        item = responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    fork_transport = {}
+
+    def _fork_api_call(runtime, api_kwargs, client=None, on_first_delta=None):
+        del runtime, on_first_delta
+        fork_transport["api_kwargs"] = copy.deepcopy(api_kwargs)
+        fork_transport["client"] = client
+        return _codex_message_response('{"schema_version":1}')
+
+    owned_client = SimpleNamespace(closed=False)
+    monkeypatch.setattr(
+        "fork_features.request_fork.compression_request_fork_enabled",
+        lambda _agent: True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_llm_request_middleware",
+        _request_middleware,
+    )
+
+    def _relay_execute(request, callback, **_kwargs):
+        physical = copy.deepcopy(request)
+        physical["input"].append(
+            {"role": "developer", "content": "RELAY PHYSICAL SENTINEL"}
+        )
+        physical["extra_headers"] = {
+            **dict(physical.get("extra_headers") or {}),
+            "x-relay-physical": "1",
+        }
+        return callback(physical)
+
+    monkeypatch.setattr("agent.relay_llm.execute", _relay_execute)
+    monkeypatch.setattr(codex_runtime, "run_codex_stream", _fork_api_call)
+    monkeypatch.setattr(
+        agent,
+        "_create_openai_client",
+        lambda _kwargs, *, reason, shared: owned_client,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_openai_client",
+        lambda client, *, reason, shared: setattr(client, "closed", True),
+    )
+
+    captured = {}
+
+    def _compress(
+        messages,
+        system_message,
+        *,
+        request_fork=None,
+        request_fork_rematerializer=None,
+        **_kwargs,
+    ):
+        assert isinstance(request_fork, FrozenCodexRequest)
+        assert callable(request_fork_rematerializer), request_fork.clone_body()["input"]
+        rematerialized = request_fork_rematerializer(
+            [
+                *messages[:-1],
+                {"role": "assistant", "content": "413 CONCURRENT ROW"},
+                messages[-1],
+            ]
+        )
+        assert isinstance(rematerialized, FrozenCodexRequest)
+        assert any(
+            item.get("role") == "assistant"
+            and item.get("content") == "413 CONCURRENT ROW"
+            for item in rematerialized.clone_body()["input"]
+            if isinstance(item, dict)
+        )
+        assert any(
+            item.get("type") == "function_call_output"
+            for item in rematerialized.clone_body()["input"]
+            if isinstance(item, dict)
+        )
+        captured["fidelity"] = request_fork.fidelity
+        with current_request_fork_scope(
+            agent,
+            frozen_request=request_fork,
+            client_factory=lambda: owned_client,
+            client_close=lambda client: setattr(client, "closed", True),
+            normalize_response=agent._get_transport().normalize_response,
+        ):
+            fork = RequestForkService().capture_current()
+        fork.call(
+            append_message={"role": "user", "content": "RETURN JSON ONLY"},
+            request_id="continuity:test-413:attempt-1",
+        )
+        return [
+            {"role": "user", "content": "[summary after 413]"}
+        ], system_message
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_compress_context", _compress)
+
+    result = agent.run_conversation("oversized codex request")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Recovered after 413."
+    assert captured["fidelity"] == "failed_wire"
+    assert fork_transport["api_kwargs"] == {
+        **wire_requests[0],
+        "input": [
+            *wire_requests[0]["input"],
+            {"role": "user", "content": "RETURN JSON ONLY"},
+        ],
+    }
+    assert fork_transport["api_kwargs"]["tools"] == wire_requests[0]["tools"]
+    assert fork_transport["api_kwargs"]["tools"][0]["name"] == "read_file"
+    assert fork_transport["api_kwargs"]["tools"][0]["strict"] is False
+    assert fork_transport["api_kwargs"]["extra_headers"]["x-relay-physical"] == "1"
+    assert any(
+        item.get("content") == "RELAY PHYSICAL SENTINEL"
+        for item in fork_transport["api_kwargs"]["input"]
+        if isinstance(item, dict)
+    )
+    assert any(
+        item.get("type") == "function_call"
+        for item in fork_transport["api_kwargs"]["input"]
+    )
+    assert any(
+        item.get("type") == "function_call_output"
+        for item in fork_transport["api_kwargs"]["input"]
+    )
+    assert fork_transport["client"] is owned_client
+    assert owned_client.closed is True
+
+
+def test_codex_auto_compression_receives_provider_ready_parent_request(monkeypatch):
+    from fork_features.request_fork import FrozenCodexRequest
+
+    agent = _build_agent(monkeypatch)
+    setattr(agent, "compression_enabled", True)
+    compressor = getattr(agent, "context_compressor")
+    setattr(compressor, "context_length", 2_000)
+    setattr(compressor, "threshold_tokens", 200)
+    history = [
+        {"role": "user", "content": f"earlier question {idx}"}
+        if idx % 2 == 0
+        else {"role": "assistant", "content": f"earlier answer {idx}"}
+        for idx in range(20)
+    ]
+    captured = []
+
+    def _compress(
+        messages,
+        system_message,
+        *,
+        request_fork=None,
+        request_fork_rematerializer=None,
+        **_kwargs,
+    ):
+        assert isinstance(request_fork, FrozenCodexRequest)
+        assert callable(request_fork_rematerializer)
+        adopted = [
+            *messages[:-1],
+            {"role": "assistant", "content": "CONCURRENT DURABLE ROW"},
+            messages[-1],
+        ]
+        rematerialized = request_fork_rematerializer(adopted)
+        assert isinstance(rematerialized, FrozenCodexRequest)
+        captured.append((request_fork, rematerialized))
+        setattr(compressor, "threshold_tokens", 10_000)
+        return [
+            {"role": "user", "content": "[summary before provider call]"},
+            {"role": "user", "content": "hello"},
+        ], system_message
+
+    monkeypatch.setattr(
+        "fork_features.request_fork.compression_request_fork_enabled",
+        lambda _agent: True,
+    )
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: 500,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough",
+        lambda *_args, **_kwargs: 500,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough",
+        lambda *_args, **_kwargs: 500,
+    )
+    monkeypatch.setattr(agent, "_compress_context", _compress)
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda _kwargs: _codex_message_response("After prepared checkpoint"),
+    )
+
+    result = agent.run_conversation("hello", conversation_history=history)
+
+    assert result["completed"] is True
+    assert result["final_response"] == "After prepared checkpoint"
+    assert captured
+    assert captured[0][0].fidelity == "prepared_parent"
+    assert captured[0][1].fidelity == "rematerialized_after_adopt"
+    body = captured[0][1].clone_body()
+    assert isinstance(body["input"], list)
+    assert any(
+        item.get("role") == "user" and "hello" in str(item.get("content"))
+        for item in body["input"]
+        if isinstance(item, dict)
+    )
+    assert isinstance(body["tools"], list)
+    assert body["tools"]
+    assert all("function" not in tool for tool in body["tools"])
+    assert any(
+        item.get("role") == "assistant"
+        and item.get("content") == "CONCURRENT DURABLE ROW"
+        for item in body["input"]
+        if isinstance(item, dict)
+    )
+
+
 def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(monkeypatch):
     """Long tool-heavy turns should compact before the next API request.
 
@@ -1562,7 +1836,16 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
 
     compress_calls = []
 
-    def _fake_compress_context(messages, system_message, *, approx_tokens=None, task_id="default", focus_topic=None):
+    def _fake_compress_context(
+        messages,
+        system_message,
+        *,
+        approx_tokens=None,
+        task_id="default",
+        focus_topic=None,
+        request_fork=None,
+    ):
+        del request_fork
         compress_calls.append(approx_tokens)
         return [
             {"role": "user", "content": "[summary of prior tool-heavy work]"},
@@ -1622,7 +1905,16 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
                 {"role": "tool", "tool_call_id": call.id, "content": "x" * 80_000}
             )
 
-    def _fake_compress_context(messages, system_message, *, approx_tokens=None, task_id="default", focus_topic=None):
+    def _fake_compress_context(
+        messages,
+        system_message,
+        *,
+        approx_tokens=None,
+        task_id="default",
+        focus_topic=None,
+        request_fork=None,
+    ):
+        del request_fork
         # Emulate the real in-place compaction DB side effect: soft-archive the
         # prior rows and insert the compacted set under the SAME session id,
         # then reset the flush identity seed — exactly as archive_and_compact +

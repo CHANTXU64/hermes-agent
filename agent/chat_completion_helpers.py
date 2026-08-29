@@ -512,11 +512,16 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     """
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
-        return agent._run_codex_stream(
-            api_kwargs,
-            client=request_client,
-            on_first_delta=getattr(agent, "_codex_on_first_delta", None),
+        stream_kwargs = {
+            "client": request_client,
+            "on_first_delta": getattr(agent, "_codex_on_first_delta", None),
+        }
+        on_physical_request = getattr(
+            agent, "_codex_on_physical_request", None
         )
+        if on_physical_request is not None:
+            stream_kwargs["on_physical_request"] = on_physical_request
+        return agent._run_codex_stream(api_kwargs, **stream_kwargs)
     if agent.api_mode == "anthropic_messages":
         # #67142: use a request-local Anthropic client so the stale/interrupt
         # watchdog aborts sockets from the stranger thread while the worker
@@ -2829,7 +2834,13 @@ def _build_partial_stream_stub(
     )
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(
+    agent,
+    api_kwargs: dict,
+    *,
+    on_first_delta=None,
+    on_physical_request=None,
+):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:
@@ -2890,6 +2901,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # branch below — routing through the _interruptible_api_call method keeps the
     # outer loop's per-request retry/refresh seam intact.
     if should_use_direct_api_call(agent):
+        if agent.api_mode == "codex_responses":
+            agent._codex_on_first_delta = on_first_delta
+            agent._codex_on_physical_request = on_physical_request
+            try:
+                return agent._interruptible_api_call(api_kwargs)
+            finally:
+                agent._codex_on_first_delta = None
+                agent._codex_on_physical_request = None
         return agent._interruptible_api_call(api_kwargs)
 
     if agent.api_mode == "codex_responses":
@@ -2898,6 +2917,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # ensure on_first_delta reaches it. Store it on the instance
         # temporarily so _run_codex_stream can pick it up.
         agent._codex_on_first_delta = on_first_delta
+        agent._codex_on_physical_request = on_physical_request
         _emit_stream_start()
         try:
             response = agent._interruptible_api_call(api_kwargs)
@@ -2908,6 +2928,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             raise
         finally:
             agent._codex_on_first_delta = None
+            agent._codex_on_physical_request = None
 
     # Bedrock Converse uses boto3's converse_stream() with real-time delta
     # callbacks — same UX as Anthropic and chat_completions streaming.

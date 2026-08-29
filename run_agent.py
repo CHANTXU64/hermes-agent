@@ -5393,10 +5393,22 @@ class AIAgent:
                 exc,
             )
 
-    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
+    def _run_codex_stream(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_first_delta: Optional[Callable] = None,
+        on_physical_request: Optional[Callable] = None,
+    ):
         """Forwarder — see ``agent.codex_runtime.run_codex_stream``."""
         from agent.codex_runtime import run_codex_stream
-        return run_codex_stream(self, api_kwargs, client, on_first_delta)
+        return run_codex_stream(
+            self,
+            api_kwargs,
+            client,
+            on_first_delta,
+            on_physical_request,
+        )
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Forwarder — see ``agent.codex_runtime.run_codex_create_stream_fallback``."""
@@ -6676,11 +6688,20 @@ class AIAgent:
         )
 
     def _interruptible_streaming_api_call(
-        self, api_kwargs: dict, *, on_first_delta: callable = None
+        self,
+        api_kwargs: dict,
+        *,
+        on_first_delta: Optional[Callable] = None,
+        on_physical_request: Optional[Callable] = None,
     ):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``."""
         from agent.chat_completion_helpers import interruptible_streaming_api_call
-        return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
+        return interruptible_streaming_api_call(
+            self,
+            api_kwargs,
+            on_first_delta=on_first_delta,
+            on_physical_request=on_physical_request,
+        )
 
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
@@ -7590,10 +7611,12 @@ class AIAgent:
         *,
         approx_tokens: int = None,
         task_id: str = "default",
-        focus_topic: str = None,
+        focus_topic: Optional[str] = None,
         force: bool = False,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
+        request_fork=None,
+        request_fork_rematerializer=None,
     ) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
 
@@ -7661,6 +7684,8 @@ class AIAgent:
                         defer_context_engine_notification
                     ),
                     commit_fence=fence,
+                    request_fork=request_fork,
+                    request_fork_rematerializer=request_fork_rematerializer,
                 )
 
             # Callers that already own a progress-aware wait (gateway session

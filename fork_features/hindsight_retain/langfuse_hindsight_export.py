@@ -400,6 +400,12 @@ _SYNTHETIC_USER_PREFIXES = (
     "## Hermes-LCM Recall Policy",
     "<memory-context>",
 )
+_NON_USER_RUNTIME_CONTEXT_RE = re.compile(
+    r"^<hermes-runtime-context\b"
+    r"(?=[^>]*\buser-authored\s*=\s*['\"]false['\"])"
+    r"[^>]*>",
+    flags=re.IGNORECASE,
+)
 _USER_RUNTIME_SUFFIX_MARKERS = (
     "\n\n[Your active task list was preserved across context compression]",
     "\n\n[Current user objective preserved from compacted history]",
@@ -445,6 +451,8 @@ def _clean_user_content(value) -> str:
     content = _NEW_MESSAGE_WRAPPER_RE.sub("", content).strip()
     content = _MODEL_SWITCH_NOTE_RE.sub("", content).strip()
     content = _INTERRUPTED_USER_PREFIX_RE.sub("", content).strip()
+    if _NON_USER_RUNTIME_CONTEXT_RE.match(content):
+        return ""
     if any(content.startswith(prefix) for prefix in _SYNTHETIC_USER_PREFIXES):
         content = _trailing_voice_block(content)
         if not content:

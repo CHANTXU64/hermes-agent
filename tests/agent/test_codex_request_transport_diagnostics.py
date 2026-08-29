@@ -61,3 +61,80 @@ def test_transport_failure_logs_exact_request_bytes_and_class_chain(caplog):
     assert "payload" not in message
     assert request_content.decode() not in message
     assert "example.invalid" not in message
+
+
+def test_physical_request_callback_observes_relay_output_and_stream_flag(monkeypatch):
+    observed = []
+
+    def _relay_stream(request, callback, **_kwargs):
+        physical = dict(request)
+        physical["relay_sentinel"] = "managed"
+        return callback(physical)
+
+    class FailingResponses:
+        def create(self, **kwargs):
+            observed.append(("create", dict(kwargs)))
+            raise RuntimeError("stop after physical capture")
+
+    monkeypatch.setattr("agent.relay_llm.stream", _relay_stream)
+    client = SimpleNamespace(responses=FailingResponses())
+    agent = SimpleNamespace(
+        _interrupt_requested=False,
+        _current_api_request_id="request-id",
+        _fallback_index=0,
+        is_subagent=False,
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        session_id="",
+    )
+
+    with pytest.raises(RuntimeError, match="stop after physical capture"):
+        run_codex_stream(
+            agent,
+            {"model": "gpt-5.6-sol", "input": []},
+            client=client,
+            on_physical_request=lambda body: observed.append(
+                ("capture", dict(body))
+            ),
+        )
+
+    assert observed[0][0] == "capture"
+    assert observed[0][1]["relay_sentinel"] == "managed"
+    assert observed[0][1]["stream"] is True
+    assert observed[1] == ("create", observed[0][1])
+
+
+def test_physical_request_observer_failure_cannot_block_provider_call(monkeypatch):
+    called = []
+
+    class FailingResponses:
+        def create(self, **kwargs):
+            called.append(dict(kwargs))
+            raise RuntimeError("provider failure after capture")
+
+    monkeypatch.setattr(
+        "agent.relay_llm.stream",
+        lambda request, callback, **_kwargs: callback(dict(request)),
+    )
+    client = SimpleNamespace(responses=FailingResponses())
+    agent = SimpleNamespace(
+        _interrupt_requested=False,
+        _current_api_request_id="request-id",
+        _fallback_index=0,
+        is_subagent=False,
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        session_id="",
+    )
+
+    with pytest.raises(RuntimeError, match="provider failure after capture"):
+        run_codex_stream(
+            agent,
+            {"model": "gpt-5.6-sol", "input": []},
+            client=client,
+            on_physical_request=lambda _body: (_ for _ in ()).throw(
+                RuntimeError("observer failure")
+            ),
+        )
+
+    assert len(called) == 1

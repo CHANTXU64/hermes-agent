@@ -11,6 +11,7 @@ dag_nodes: 0). With boundary_reason="compression" plugins can distinguish
 this from a real user-initiated /new.
 """
 
+import copy
 import os
 import tempfile
 from pathlib import Path
@@ -21,6 +22,15 @@ import pytest
 from agent.conversation_compression import (
     finalize_context_engine_compression_notification,
 )
+from fork_features.request_fork import FrozenCodexRequest
+
+
+def _frozen_request(messages, tools):
+    return FrozenCodexRequest(
+        body={"model": "test", "input": messages, "tools": tools},
+        fidelity="prepared_parent",
+        captured_session_id="original-session",
+    )
 
 class TestCompressionBoundaryHook:
     def _make_agent(self, session_db):
@@ -322,4 +332,205 @@ class TestSessionCompressEvent:
                 [{"role": "user", "content": "m"}], "sys", approx_tokens=100
             )
             assert compressed
+
+
+class TestGenericCompressionLifecycleHooks:
+    def _make_agent(self, session_db):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            from run_agent import AIAgent
+
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=session_db,
+                session_id="lifecycle-session",
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent.compression_in_place = True
+        agent.api_mode = "codex_responses"
+        if session_db is not None:
+            agent._ensure_db_session()
+        return agent
+
+    @staticmethod
+    def _stub_compressor(events, *, outcome="success"):
+        compressor = MagicMock()
+
+        def _compress(messages, **_kwargs):
+            events.append(("compress", {}))
+            if outcome == "error":
+                raise RuntimeError("synthetic lifecycle failure")
+            if outcome == "no_progress":
+                return messages
+            return [{"role": "user", "content": "summary"}]
+
+        compressor.compress.side_effect = _compress
+        compressor.compression_count = 1
+        compressor.last_prompt_tokens = 0
+        compressor.last_completion_tokens = 0
+        compressor._last_summary_error = None
+        compressor._last_compress_aborted = False
+        compressor._last_compression_made_progress = outcome == "success"
+        compressor._last_summary_fallback_used = False
+        compressor._last_feasibility_skip = False
+        return compressor
+
+    def test_start_precedes_summary_and_finish_follows_durable_commit(self):
+        from fork_features.request_fork import RequestForkService
+        from hermes_state import SessionDB
+
+        events = []
+        captured = []
+        request_messages = [{"role": "user", "content": "EXACT REQUEST A"}]
+        request_tools = [
+            {"type": "function", "function": {"name": "read_file"}}
+        ]
+        original_request_messages = copy.deepcopy(request_messages)
+        original_request_tools = copy.deepcopy(request_tools)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent.context_compressor = self._stub_compressor(events)
+            original_archive = db.archive_and_compact
+
+            def _archive(*args, **kwargs):
+                result = original_archive(*args, **kwargs)
+                events.append(("persist", {}))
+                return result
+
+            def _invoke(name, **kwargs):
+                if name == "on_compression_start":
+                    captured.append(RequestForkService().capture_current())
+                    assert kwargs["messages"] is not request_messages
+                    assert kwargs["request_messages"] is not request_messages
+                    assert kwargs["tools"] is not request_tools
+                    kwargs["messages"][0]["content"] = "MUTATED HOOK SNAPSHOT"
+                events.append((name, copy.deepcopy(kwargs)))
+                return []
+
+            with (
+                patch.object(db, "archive_and_compact", side_effect=_archive),
+                patch("hermes_cli.lifecycle.has_hook", side_effect=lambda name: name in {"on_compression_start", "on_compression_finish"}),
+                patch("hermes_cli.lifecycle.invoke_hook", side_effect=_invoke),
+            ):
+                agent._compress_context(
+                    [{"role": "user", "content": "TRANSCRIPT"}],
+                    "sys",
+                    approx_tokens=100,
+                    request_fork=_frozen_request(
+                        request_messages,
+                        request_tools,
+                    ),
+                )
+
+        assert [name for name, _ in events] == [
+            "on_compression_start",
+            "compress",
+            "persist",
+            "on_compression_finish",
+        ]
+        assert len(captured) == 1
+        assert events[-1][1]["outcome"] == "committed"
+        assert request_messages == original_request_messages
+        assert request_tools == original_request_tools
+
+    def test_manual_outer_commit_defers_finish_until_host_finalizes(self):
+        from hermes_state import SessionDB
+
+        lifecycle = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent.context_compressor = self._stub_compressor([])
+
+            with (
+                patch("hermes_cli.lifecycle.has_hook", return_value=True),
+                patch(
+                    "hermes_cli.lifecycle.invoke_hook",
+                    side_effect=lambda name, **payload: lifecycle.append(
+                        (name, copy.deepcopy(payload))
+                    ),
+                ),
+            ):
+                agent._compress_context(
+                    [{"role": "user", "content": "TRANSCRIPT"}],
+                    "sys",
+                    approx_tokens=100,
+                    force=True,
+                    defer_context_engine_notification=True,
+                    request_fork=_frozen_request(
+                        [{"role": "user", "content": "REQUEST A"}],
+                        [],
+                    ),
+                )
+
+                assert [name for name, _ in lifecycle] == [
+                    "on_compression_start"
+                ]
+                finalize_context_engine_compression_notification(
+                    agent,
+                    committed=True,
+                )
+
+        assert [name for name, _ in lifecycle] == [
+            "on_compression_start",
+            "on_compression_finish",
+        ]
+        assert lifecycle[-1][1]["outcome"] == "committed"
+
+    @pytest.mark.parametrize(
+        ("compressor_outcome", "expected_outcome", "expected_reason"),
+        [
+            ("no_progress", "aborted", "no_progress"),
+            ("error", "failed", "RuntimeError"),
+        ],
+    )
+    def test_started_compression_always_emits_one_terminal_outcome(
+        self,
+        compressor_outcome,
+        expected_outcome,
+        expected_reason,
+    ):
+        events = []
+        agent = self._make_agent(None)
+        agent.context_compressor = self._stub_compressor(
+            events, outcome=compressor_outcome
+        )
+
+        def _invoke(name, **kwargs):
+            events.append((name, copy.deepcopy(kwargs)))
+            return []
+
+        def _run():
+            return agent._compress_context(
+                [{"role": "user", "content": "TRANSCRIPT"}],
+                "sys",
+                approx_tokens=100,
+                request_fork=_frozen_request(
+                    [{"role": "user", "content": "REQUEST A"}],
+                    [],
+                ),
+            )
+
+        with (
+            patch("hermes_cli.lifecycle.has_hook", return_value=True),
+            patch("hermes_cli.lifecycle.invoke_hook", side_effect=_invoke),
+        ):
+            if compressor_outcome == "error":
+                with pytest.raises(RuntimeError, match="synthetic lifecycle failure"):
+                    _run()
+            else:
+                _run()
+
+        lifecycle = [item for item in events if item[0].startswith("on_compression_")]
+        assert [name for name, _ in lifecycle] == [
+            "on_compression_start",
+            "on_compression_finish",
+        ]
+        assert lifecycle[-1][1]["outcome"] == expected_outcome
+        assert expected_reason in lifecycle[-1][1]["reason"]
 

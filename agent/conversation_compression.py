@@ -58,6 +58,7 @@ import json
 import logging
 import math
 import os
+import sys
 import tempfile
 import time
 import uuid
@@ -2166,6 +2167,9 @@ def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) 
 _PENDING_CONTEXT_ENGINE_NOTIFICATION = (
     "_pending_context_engine_compression_notification"
 )
+_PENDING_COMPRESSION_LIFECYCLE_FINISH = (
+    "_pending_compression_lifecycle_finish"
+)
 
 
 def _notify_context_engine_compression_complete(
@@ -2236,12 +2240,24 @@ def finalize_context_engine_compression_notification(
     *,
     committed: bool,
 ) -> bool:
-    """Emit or discard a deferred notification; repeated calls are no-ops."""
+    """Finalize deferred outer-transaction compression notifications.
+
+    The historical name remains for compatibility. Manual hosts use this one
+    outer-commit acknowledgement for both the context-engine callback and the
+    generic compression lifecycle terminal event.
+    """
+    lifecycle_pending = getattr(
+        agent, _PENDING_COMPRESSION_LIFECYCLE_FINISH, None
+    )
+    setattr(agent, _PENDING_COMPRESSION_LIFECYCLE_FINISH, None)
+    lifecycle_emitted = False
+    if callable(lifecycle_pending):
+        lifecycle_emitted = bool(lifecycle_pending(committed))
     pending = getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)
     setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)
     if not committed or not callable(pending):
-        return False
-    return bool(pending())
+        return lifecycle_emitted
+    return bool(pending()) or lifecycle_emitted
 
 
 def compress_context(
@@ -2255,6 +2271,8 @@ def compress_context(
     force: bool = False,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
+    request_fork: Optional[Any] = None,
+    request_fork_rematerializer: Optional[Callable[[list], Any]] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -2277,6 +2295,13 @@ def compress_context(
         commit_fence: Optional cooperative fence for executor callers that
             may time out. It prevents a late worker from mutating session state
             after its caller has moved on.
+        request_fork: Frozen host-built provider-native Codex request exposed
+            mutation-safely during ``on_compression_start``. ``None`` means no
+            trustworthy provider-ready request is available for capture.
+        request_fork_rematerializer: Host-owned pure callback that can splice a
+            proven durable-parent append into the prepared request. It must not
+            run middleware, provider calls, tools, or persistence.
+
 
     Returns:
         ``(compressed_messages, new_system_prompt)`` tuple.  When
@@ -2292,7 +2317,12 @@ def compress_context(
     _durable_cooldown_state: Optional[dict[str, Any]] = None
     if (
         defer_context_engine_notification
-        and callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None))
+        and (
+            callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None))
+            or callable(
+                getattr(agent, _PENDING_COMPRESSION_LIFECYCLE_FINISH, None)
+            )
+        )
     ):
         raise RuntimeError("a compression notification is already pending")
 
@@ -2314,6 +2344,141 @@ def compress_context(
     _attempt_started_at = time.monotonic()
     _attempt_id = uuid.uuid4().hex
     _trigger_source = "manual" if force else "auto"
+    _compression_lifecycle_started = False
+    _compression_lifecycle_finished = False
+    _compression_lifecycle_outcome: Optional[str] = None
+    _compression_lifecycle_reason = ""
+    _compression_start_session_id = agent.session_id or ""
+    _request_fork_snapshot_invalidated = False
+
+    def _set_compression_lifecycle_outcome(outcome: str, reason: str = "") -> None:
+        nonlocal _compression_lifecycle_outcome, _compression_lifecycle_reason
+        _compression_lifecycle_outcome = outcome
+        _compression_lifecycle_reason = reason
+
+    def _emit_compression_start() -> None:
+        """Emit a mutation-safe observer event after final admission checks."""
+        nonlocal _compression_lifecycle_started
+        if _compression_lifecycle_started:
+            return
+        try:
+            from hermes_cli.lifecycle import has_hook, invoke_hook
+
+            if not (
+                has_hook("on_compression_start")
+                or has_hook("on_compression_finish")
+            ):
+                return
+            _compression_lifecycle_started = True
+            if not has_hook("on_compression_start"):
+                return
+            transcript_snapshot = copy.deepcopy(messages)
+            active_request_fork = (
+                request_fork
+                if request_fork is not None and not _request_fork_snapshot_invalidated
+                else None
+            )
+            exact_request_available = active_request_fork is not None
+            frozen_body = (
+                active_request_fork.clone_body()
+                if active_request_fork is not None
+                else {}
+            )
+            request_snapshot = copy.deepcopy(
+                frozen_body.get("input")
+                if isinstance(frozen_body.get("input"), list)
+                else messages
+            )
+            tools_snapshot = copy.deepcopy(
+                frozen_body.get("tools")
+                if isinstance(frozen_body.get("tools"), list)
+                else (getattr(agent, "tools", None) or [])
+            )
+            payload = {
+                "compression_id": _attempt_id,
+                "session_id": _compression_start_session_id,
+                "in_place": in_place,
+                "api_mode": str(getattr(agent, "api_mode", "") or ""),
+                "messages": transcript_snapshot,
+                "request_messages": request_snapshot,
+                "tools": tools_snapshot,
+                "request_fork_available": exact_request_available,
+                "request_fork_fidelity": (
+                    active_request_fork.fidelity
+                    if active_request_fork is not None
+                    else None
+                ),
+                "trigger_source": _trigger_source,
+            }
+            if exact_request_available:
+                from fork_features.request_fork import current_request_fork_scope
+
+                with current_request_fork_scope(
+                    agent,
+                    frozen_request=active_request_fork,
+                    progress_callback=(
+                        commit_fence.touch_progress
+                        if commit_fence is not None
+                        else None
+                    ),
+                ):
+                    invoke_hook("on_compression_start", **copy.deepcopy(payload))
+            else:
+                invoke_hook("on_compression_start", **copy.deepcopy(payload))
+        except Exception:
+            logger.warning("on_compression_start hook failed", exc_info=True)
+
+    def _publish_compression_finish(outcome: str, reason: str) -> bool:
+        try:
+            from hermes_cli.lifecycle import has_hook, invoke_hook
+
+            if not has_hook("on_compression_finish"):
+                return False
+            invoke_hook(
+                "on_compression_finish",
+                compression_id=_attempt_id,
+                session_id=agent.session_id or "",
+                old_session_id=_compression_start_session_id,
+                in_place=in_place,
+                outcome=outcome,
+                reason=reason,
+                trigger_source=_trigger_source,
+            )
+            return True
+        except Exception:
+            logger.warning("on_compression_finish hook failed", exc_info=True)
+            return False
+
+    def _emit_compression_finish() -> None:
+        """Emit exactly one terminal outcome for every emitted start."""
+        nonlocal _compression_lifecycle_finished
+        if not _compression_lifecycle_started or _compression_lifecycle_finished:
+            return
+        _compression_lifecycle_finished = True
+        outcome = _compression_lifecycle_outcome
+        reason = _compression_lifecycle_reason
+        if outcome is None:
+            exc_type = sys.exc_info()[0]
+            if exc_type is not None:
+                outcome = "failed"
+                reason = exc_type.__name__
+            else:
+                outcome = "aborted"
+                reason = "unfinished"
+        if defer_context_engine_notification and outcome == "committed":
+            def _finalize_outer_commit(committed: bool) -> bool:
+                return _publish_compression_finish(
+                    "committed" if committed else "aborted",
+                    reason if committed else "outer_commit_aborted",
+                )
+
+            setattr(
+                agent,
+                _PENDING_COMPRESSION_LIFECYCLE_FINISH,
+                _finalize_outer_commit,
+            )
+            return
+        _publish_compression_finish(outcome, reason)
     try:
         agent._compression_attempt_id = _attempt_id
         setattr(agent.context_compressor, "_compression_telemetry_seed", {
@@ -2670,15 +2835,18 @@ def compress_context(
             _complete_compaction_lifecycle()
         finally:
             try:
-                _release_lock_holder_only()
+                _emit_compression_finish()
             finally:
                 try:
-                    if commit_fence is not None:
-                        commit_fence.clear_cancelled_lock_release(
-                            _release_lock_holder_only
-                        )
+                    _release_lock_holder_only()
                 finally:
-                    _finish_lock_setup()
+                    try:
+                        if commit_fence is not None:
+                            commit_fence.clear_cancelled_lock_release(
+                                _release_lock_holder_only
+                            )
+                    finally:
+                        _finish_lock_setup()
 
     if _lock_holder is not None:
         agent._active_compression_lock_holder = _lock_holder
@@ -2906,6 +3074,25 @@ def compress_context(
                             len(durable_parent),
                         )
                         messages = durable_parent
+                        # The provider-ready request frozen before the lease is
+                        # stale after adopting a longer durable parent. Ask the
+                        # host-owned pure factory to preserve the frozen
+                        # request-only state and splice only the proven durable
+                        # append; never rebuild through middleware/vision/provider.
+                        try:
+                            request_fork = (
+                                request_fork_rematerializer(messages)
+                                if callable(request_fork_rematerializer)
+                                else None
+                            )
+                        except Exception:
+                            logger.warning(
+                                "compression request rematerialization failed "
+                                "after durable-parent adoption",
+                                exc_info=True,
+                            )
+                            request_fork = None
+                        _request_fork_snapshot_invalidated = request_fork is None
                         _pre_msg_count = len(messages)
                         # Token estimate was for the stale snapshot; clear it so
                         # the compressor re-derives from the adopted transcript
@@ -2932,6 +3119,7 @@ def compress_context(
             except Exception:
                 pass
 
+        _emit_compression_start()
         compress_fn = agent.context_compressor.compress
         compress_kwargs = _supported_compression_kwargs(
             compress_fn,
@@ -3052,6 +3240,9 @@ def compress_context(
             if _activity_heartbeat is not None:
                 _activity_heartbeat.stop("context compression rollback failed")
                 _activity_heartbeat = None
+            _set_compression_lifecycle_outcome(
+                "failed", type(_rollback_exc).__name__
+            )
             _release_lock()
             _emit_compression_attempt_telemetry(
                 agent,
@@ -3069,6 +3260,7 @@ def compress_context(
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression cancelled")
             _activity_heartbeat = None
+        _set_compression_lifecycle_outcome("aborted", "explicit_interrupt")
         _release_lock()
         _emit_compression_attempt_telemetry(
             agent,
@@ -3088,6 +3280,9 @@ def compress_context(
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression failed")
             _activity_heartbeat = None
+        _set_compression_lifecycle_outcome(
+            "failed", type(_compress_exc).__name__
+        )
         _release_lock()
         _emit_compression_attempt_telemetry(
             agent,
@@ -3124,6 +3319,9 @@ def compress_context(
         # the no-op via len(returned) == len(input).
         if getattr(agent.context_compressor, "_last_compress_aborted", False):
             try:
+                _set_compression_lifecycle_outcome(
+                    "aborted", "summary_generation_aborted"
+                )
                 _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
                 if getattr(agent, "_last_compression_summary_warning", None) != _err:
                     agent._last_compression_summary_warning = _err
@@ -3154,6 +3352,7 @@ def compress_context(
         # the live list while returning an unchanged snapshot. Neither case may
         # rotate or rewrite the session.
         if compressed == messages_before_compression:
+            _set_compression_lifecycle_outcome("aborted", "no_progress")
             if messages != messages_before_compression:
                 messages[:] = copy.deepcopy(messages_before_compression)
             logger.info(
@@ -3174,6 +3373,7 @@ def compress_context(
             return messages, _existing_sp
 
         if not compressed:
+            _set_compression_lifecycle_outcome("aborted", "empty_transcript")
             logger.error(
                 "context compression returned an empty transcript; refusing to "
                 "rotate session=%s so the parent remains resumable",
@@ -3221,6 +3421,9 @@ def compress_context(
                     commit_status="aborted",
                     split_status="aborted",
                     failure_class="commit_fence_cancelled",
+                )
+                _set_compression_lifecycle_outcome(
+                    "aborted", "commit_fence_cancelled"
                 )
                 _release_lock()
                 return messages, _existing_sp
@@ -3762,6 +3965,12 @@ def compress_context(
             f"{_compressed_est:,}",
         )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+        _set_compression_lifecycle_outcome(
+            _commit_status,
+            "compression_committed"
+            if _commit_status == "committed"
+            else "session_split_failed",
+        )
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,

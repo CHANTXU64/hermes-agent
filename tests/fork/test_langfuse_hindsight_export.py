@@ -487,6 +487,15 @@ def test_build_candidate_document_filters_runtime_user_inputs(tmp_path):
         "startTime": "2026-08-24T02:01:00Z",
         "input": [
             {"role": "user", "content": "真实用户问题"},
+            {
+                "role": "user",
+                "content": (
+                    '<hermes-runtime-context user-authored="false" '
+                    'source="long-task-continuity">\n'
+                    "绝不能归因为用户原话\n"
+                    "</hermes-runtime-context>"
+                ),
+            },
             {"role": "user", "content": "## Hermes-LCM Recall Policy\ninternal"},
             {
                 "role": "user",
@@ -532,6 +541,7 @@ def test_build_candidate_document_filters_runtime_user_inputs(tmp_path):
     assert "Hermes-LCM Recall Policy" not in rendered
     assert "IMPORTANT: Background process" not in rendered
     assert "active task list" not in rendered
+    assert "绝不能归因为用户原话" not in rendered
 
 
 def test_candidate_document_content_is_deterministic(tmp_path):

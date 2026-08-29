@@ -223,7 +223,9 @@ def apply_request_only_turn_context(
 
     memory_block = build_memory_context_block(ext_prefetch_cache)
     request_parts = [
-        part for part in (plugin_request_context, memory_block) if part
+        part
+        for part in (plugin_request_context, memory_block)
+        if part
     ]
     if (
         request_parts
@@ -236,10 +238,11 @@ def apply_request_only_turn_context(
         )
         return resolved_idx
 
+    non_memory_request_context = str(plugin_request_context or "")
     request_composed = compose_user_api_content(
         current_user.get("content", ""),
         "",
-        plugin_request_context,
+        non_memory_request_context,
     )
     if request_composed is not None:
         current_user["content"] = request_composed
@@ -866,6 +869,14 @@ def build_turn_context(
         restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     active_system_prompt = agent._cached_system_prompt
+    try:
+        from fork_features.request_fork import (
+            compression_request_fork_enabled,
+        )
+
+        _request_fork_defer = compression_request_fork_enabled(agent)
+    except Exception:
+        _request_fork_defer = False
 
     # Create the DB session row now that _cached_system_prompt is populated, so
     # the persisted snapshot is written non-NULL on the first turn (Issue
@@ -926,14 +937,22 @@ def build_turn_context(
             _idle_cooldown = getattr(
                 _compressor, "get_active_compression_failure_cooldown", lambda: None
             )()
-            if _should_idle_compact(
+            _idle_compaction_requested = _should_idle_compact(
                 enabled=agent.compression_enabled,
                 idle_after_seconds=_idle_after,
                 idle_gap_seconds=_idle_gap,
                 tokens=_idle_tokens,
                 floor_tokens=_idle_floor,
                 cooldown_active=bool(_idle_cooldown),
-            ):
+            )
+            if _idle_compaction_requested and _request_fork_defer:
+                agent._compression_request_fork_pending = True
+                logger.info(
+                    "Deferring request-fork-aware idle compaction until the "
+                    "exact API request snapshot is available (session %s)",
+                    agent.session_id or "none",
+                )
+            elif _idle_compaction_requested:
                 logger.info(
                     "Idle compaction: %ss idle >= %ss, ~%s tokens > %s floor "
                     "(session %s)",
@@ -1089,6 +1108,16 @@ def build_turn_context(
                         _compress_block_reason = _info(_preflight_tokens)[1]
                     except Exception:
                         _compress_block_reason = None
+        _request_fork_preflight_deferred = False
+        if _should_compress_now and _request_fork_defer:
+            agent._compression_request_fork_pending = True
+            _request_fork_preflight_deferred = True
+            _should_compress_now = False
+            logger.info(
+                "Deferring request-fork-aware preflight compression until the "
+                "exact API request snapshot is available (session %s)",
+                agent.session_id or "none",
+            )
         if _should_compress_now:
             _preflight_compressed = True
             # Compression is actually running (block cleared / was never
@@ -1213,7 +1242,12 @@ def build_turn_context(
             # cooldown, deferred estimate, or codex-native route must keep
             # the engine hook un-consulted (#20316 contract — the cooldown
             # exists precisely because compression recently failed).
-            if _compression_cooldown or _preflight_deferred or _codex_native_auto:
+            if (
+                _compression_cooldown
+                or _preflight_deferred
+                or _codex_native_auto
+                or _request_fork_preflight_deferred
+            ):
                 _engine_preflight = None
             else:
                 _engine_preflight = getattr(

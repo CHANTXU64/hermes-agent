@@ -19,6 +19,15 @@ from agent.context_compressor import SUMMARY_PREFIX
 from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
 from run_agent import AIAgent
 import run_agent
+from fork_features.request_fork import FrozenCodexRequest
+
+
+def _frozen_request(messages, tools):
+    return FrozenCodexRequest(
+        body={"model": "test", "input": messages, "tools": tools},
+        fidelity="prepared_parent",
+        captured_session_id="test-session",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +180,8 @@ class TestHTTP413Compression:
             result = agent.run_conversation("hello", conversation_history=prefill)
 
         mock_compress.assert_called_once()
+        overflow_kwargs = mock_compress.call_args.kwargs
+        assert overflow_kwargs["request_fork"] is None
         assert result["completed"] is True
         assert result["final_response"] == "Success after compression"
 
@@ -487,6 +498,159 @@ class TestPreflightCompression:
             ("compacted", COMPACTION_DONE_STATUS),
         ]
 
+    def test_compression_core_has_no_precommit_checkpoint_gate(self, agent):
+        """The Core surface must not accept a continuity-specific wait gate."""
+        import inspect
+
+        parameters = inspect.signature(agent._compress_context).parameters
+
+        assert "checkpoint_gate" not in parameters
+        assert "checkpoint_timeout_seconds" not in parameters
+        assert "request_fork" in parameters
+        assert "request_fork_messages" not in parameters
+        assert "request_fork_tools" not in parameters
+
+    def test_compression_emits_generic_lifecycle_without_checkpoint_payload(self, agent):
+        agent.compression_enabled = False
+        events = []
+
+        def _fake_compress(*_args, **_kwargs):
+            events.append(("compress", {}))
+            return [
+                {
+                    "role": "user",
+                    "content": f"{SUMMARY_PREFIX}\nPrevious conversation",
+                }
+            ]
+
+        def _invoke(name, **payload):
+            events.append((name, payload))
+            return []
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "compress",
+                side_effect=_fake_compress,
+            ),
+            patch(
+                "hermes_cli.lifecycle.has_hook",
+                side_effect=lambda name: name
+                in {"on_compression_start", "on_compression_finish"},
+            ),
+            patch("hermes_cli.lifecycle.invoke_hook", side_effect=_invoke),
+        ):
+            agent._compress_context(
+                [{"role": "user", "content": "current user request"}],
+                "system prompt",
+                approx_tokens=1234,
+                request_fork=_frozen_request(
+                    [{"role": "user", "content": "current user request"}],
+                    agent.tools,
+                ),
+            )
+
+        assert [name for name, _ in events] == [
+            "on_compression_start",
+            "compress",
+            "on_compression_finish",
+        ]
+        assert events[-1][1]["outcome"] == "committed"
+        assert "checkpoint_result" not in events[-1][1]
+
+    def test_compression_start_exposes_explicit_request_fork_snapshot(self, agent):
+        agent.compression_enabled = False
+        captured = {}
+        exact_messages = [
+            {"role": "system", "content": "EXACT SYSTEM"},
+            {"role": "user", "content": "USER + REQUEST-ONLY MEMORY"},
+        ]
+        exact_tools = [
+            {
+                "type": "function",
+                "function": {"name": "exact_tool", "x-cache": "same"},
+            }
+        ]
+
+        def _invoke(name, **payload):
+            if name == "on_compression_start":
+                captured.update(payload)
+            return []
+
+        with (
+            patch(
+                "hermes_cli.lifecycle.has_hook",
+                side_effect=lambda name: name
+                in {"on_compression_start", "on_compression_finish"},
+            ),
+            patch("hermes_cli.lifecycle.invoke_hook", side_effect=_invoke),
+            patch.object(
+                agent.context_compressor,
+                "compress",
+                return_value=[
+                    {
+                        "role": "user",
+                        "content": f"{SUMMARY_PREFIX}\nPrevious conversation",
+                    }
+                ],
+            ),
+        ):
+            agent._compress_context(
+                [{"role": "user", "content": "RAW USER"}],
+                "raw system",
+                approx_tokens=1234,
+                request_fork=_frozen_request(exact_messages, exact_tools),
+            )
+
+        assert captured["request_messages"] == exact_messages
+        assert captured["tools"] == exact_tools
+
+    def test_committed_compression_publishes_generic_terminal_outcome(self, agent):
+        agent.compression_enabled = False
+        hook_calls = []
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "compress",
+                return_value=[
+                    {
+                        "role": "user",
+                        "content": f"{SUMMARY_PREFIX}\nPrevious conversation",
+                    }
+                ],
+            ),
+            patch(
+                "hermes_cli.lifecycle.has_hook",
+                side_effect=lambda name: name
+                in {"on_compression_start", "on_compression_finish"},
+            ),
+            patch(
+                "hermes_cli.lifecycle.invoke_hook",
+                side_effect=lambda name, **payload: hook_calls.append((name, payload)),
+            ),
+        ):
+            agent._compress_context(
+                [{"role": "user", "content": "hello"}],
+                "system prompt",
+                approx_tokens=1234,
+                request_fork=_frozen_request(
+                    [{"role": "user", "content": "exact request"}],
+                    [],
+                ),
+            )
+
+        assert [name for name, _ in hook_calls] == [
+            "on_compression_start",
+            "on_compression_finish",
+        ]
+        name, payload = hook_calls[-1]
+        assert name == "on_compression_finish"
+        assert payload["compression_id"]
+        assert payload["session_id"] == agent.session_id
+        assert payload["outcome"] == "committed"
+        assert "checkpoint_result" not in payload
+
     def test_compress_context_emits_one_terminal_status_when_lock_is_unavailable(self, agent):
         """A rejected lock must retire the started desktop compaction phase."""
         agent.compression_enabled = False
@@ -597,6 +761,15 @@ class TestPreflightCompression:
         status_messages = []
         agent.status_callback = lambda ev, msg: status_messages.append((ev, msg))
 
+        def _inject_request_only(_agent, request_messages, **_kwargs):
+            request_messages.append(
+                {
+                    "role": "developer",
+                    "content": "REQUEST-ONLY-CONTEXT-SENTINEL",
+                }
+            )
+            return 0
+
         with (
             # Keep the turn-prologue preflight quiet-by-size so only the
             # in-loop pre-API pressure gate fires.
@@ -605,6 +778,10 @@ class TestPreflightCompression:
             patch(
                 "agent.conversation_loop.estimate_messages_tokens_rough",
                 return_value=144_669,
+            ),
+            patch(
+                "agent.conversation_loop.apply_request_only_turn_context",
+                side_effect=_inject_request_only,
             ),
             patch.object(
                 agent,
@@ -619,10 +796,12 @@ class TestPreflightCompression:
 
         assert result["completed"] is True
         assert mock_compress.call_count >= 1, "pre-API compression never ran"
+        # This fixture is Chat Completions, which is intentionally outside the
+        # provider-native Request Fork scope. The test only owns status-policy
+        # behavior; Codex provider-ready snapshots are covered separately.
         assert not any(
             "Pre-API compression" in msg for _ev, msg in status_messages
         )
-
 
     def test_preflight_compresses_oversized_history(self, agent):
         """When loaded history exceeds the model's context threshold, compress before API call."""
@@ -1024,6 +1203,39 @@ class TestPreflightCompression:
         assert agent.context_compressor.awaiting_real_usage_after_compression is True
         assert agent.context_compressor._ineffective_compression_count == 2
         assert agent.context_compressor._last_compression_savings_pct == 0.0
+
+
+    def test_non_codex_stale_request_fork_pending_is_rejected_and_cleared(
+        self,
+        agent,
+    ):
+        responses = [
+            _mock_response(content="first", finish_reason="stop"),
+            _mock_response(content="second", finish_reason="stop"),
+        ]
+        agent.client.chat.completions.create.side_effect = responses
+        agent._compression_request_fork_pending = True
+
+        def _no_progress(messages, system_message, **_kwargs):
+            return messages, system_message
+
+        prefill = [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        with (
+            patch.object(agent, "_compress_context", side_effect=_no_progress) as compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            first = agent.run_conversation("first turn", conversation_history=prefill)
+            second = agent.run_conversation("second turn", conversation_history=prefill)
+
+        assert first["final_response"] == "first"
+        assert second["final_response"] == "second"
+        assert compress.call_count == 0
+        assert agent._compression_request_fork_pending is False
 
 
 class TestToolResultPreflightCompression:

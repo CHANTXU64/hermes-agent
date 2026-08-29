@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -23,7 +24,7 @@ import random
 import re
 import ssl
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
@@ -88,6 +89,10 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
+from fork_features.request_fork import (
+    freeze_codex_request_for_compression,
+    rematerialize_codex_request_after_adopt,
+)
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
@@ -1125,6 +1130,104 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
                     }}
             new_tcs.append(tc)
         am["tool_calls"] = new_tcs
+
+
+def _build_codex_adopt_rematerializer(
+    agent: Any,
+    *,
+    prepared_request: Any,
+    original_messages: List[Dict[str, Any]],
+    current_turn_user_idx: int,
+) -> Optional[Callable[[list], Any]]:
+    """Capture a pure durable-adopt factory from one prepared Codex request."""
+
+    if prepared_request is None or not (
+        0 <= current_turn_user_idx < len(original_messages)
+    ):
+        return None
+    prepared_body = prepared_request.clone_body()
+    prepared_input = prepared_body.get("input")
+    if not isinstance(prepared_input, list):
+        return None
+    current_user_item = next(
+        (
+            copy.deepcopy(item)
+            for item in reversed(prepared_input)
+            if isinstance(item, dict) and item.get("role") == "user"
+        ),
+        None,
+    )
+    if current_user_item is None:
+        return None
+
+    provider = str(getattr(agent, "provider", "") or "")
+    base_url = str(getattr(agent, "base_url", "") or "")
+    is_github_responses = (
+        base_url_host_matches(base_url, "models.github.ai")
+        or base_url_host_matches(base_url, "githubcopilot.com")
+    )
+    is_codex_backend = bool(agent._is_codex_backend())
+    is_xai_responses = (
+        provider in {"xai", "xai-oauth"}
+        or base_url_host_matches(base_url, "api.x.ai")
+    )
+    replay_encrypted_reasoning = bool(
+        getattr(agent, "_codex_reasoning_replay_enabled", True)
+    )
+    needs_reasoning_pad = bool(agent._needs_thinking_reasoning_pad())
+    original_snapshot = copy.deepcopy(list(original_messages))
+
+    from agent.codex_responses_adapter import (
+        _chat_messages_to_responses_input,
+        _classify_responses_issuer,
+    )
+
+    issuer = _classify_responses_issuer(
+        is_xai_responses=is_xai_responses,
+        is_github_responses=is_github_responses,
+        is_codex_backend=is_codex_backend,
+        base_url=base_url,
+    )
+
+    def _convert(messages: List[Dict[str, Any]]) -> list[dict[str, Any]]:
+        from agent.message_sanitization import apply_reasoning_content_policy
+
+        prepared: List[Dict[str, Any]] = []
+        for source in messages:
+            api_message: Dict[str, Any] = copy.deepcopy(source)
+            apply_reasoning_content_policy(
+                source,
+                api_message,
+                needs_thinking_pad=needs_reasoning_pad,
+            )
+            api_message.pop("reasoning", None)
+            content = api_message.get("content")
+            if isinstance(content, str):
+                api_message["content"] = content.strip()
+            prepared.append(api_message)
+        _canonicalize_api_tool_calls(prepared)
+        _sanitize_messages_surrogates(prepared)
+        return _chat_messages_to_responses_input(
+            prepared,
+            is_xai_responses=is_xai_responses,
+            is_github_responses=is_github_responses,
+            replay_encrypted_reasoning=replay_encrypted_reasoning,
+            current_issuer_kind=issuer,
+        )
+
+    current_user_input = [current_user_item]
+
+    def _rematerialize(adopted_messages: list) -> Any:
+        return rematerialize_codex_request_after_adopt(
+            prepared_request,
+            original_messages=original_snapshot,
+            adopted_messages=adopted_messages,
+            live_tail_start=current_turn_user_idx,
+            current_user_input=current_user_input,
+            convert_added_messages=_convert,
+        )
+
+    return _rematerialize
 
 
 def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
@@ -2428,11 +2531,23 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        _request_fork_pending = bool(
+            getattr(agent, "_compression_request_fork_pending", False)
+        )
+        _request_fork_prepared_compression_due = (
+            agent.compression_enabled
+            and len(messages) > 1
+            and compression_attempts < max_compression_attempts
+            and not _preflight_compression_blocked
+            and _request_fork_pending
+            and not _compression_cooldown
+        )
         if (
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
+            and not _request_fork_pending
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
             and _compressor.should_compress(request_pressure_tokens)
@@ -2501,6 +2616,13 @@ def run_conversation(
                 if pending_moa_prepared_request is _moa_prepared_request:
                     pending_moa_prepared_request = None
             else:
+                # This request-fork-aware compression attempt actually ran.
+                # A no-progress/aborted/failed result is still terminal for the
+                # deferred trigger; only the lock-skip branch above is a true
+                # retry-later signal. Keeping pending set here would force up to
+                # max_compression_attempts on this turn and repeat on every
+                # future turn.
+                agent._compression_request_fork_pending = False
                 current_turn_user_idx = reanchor_current_turn_user_idx(
                     messages, user_message
                 )
@@ -2727,11 +2849,111 @@ def run_conversation(
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
                 # follow-ups keep the default "agent" header (#3040).
-                if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
+                _user_initiated_before_request_prepare = bool(
+                    getattr(agent, "_is_user_initiated_turn", False)
+                )
+                if _user_initiated_before_request_prepare and agent._is_copilot_url():
                     _xh = dict(api_kwargs.get("extra_headers") or {})
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
+                if _request_fork_prepared_compression_due:
+                    _prepared_request_fork = freeze_codex_request_for_compression(
+                        agent,
+                        api_kwargs,
+                        fidelity="prepared_parent",
+                    )
+                    if _prepared_request_fork is not None:
+                        _prepared_request_fork_rematerializer = (
+                            _build_codex_adopt_rematerializer(
+                                agent,
+                                prepared_request=_prepared_request_fork,
+                                original_messages=messages,
+                                current_turn_user_idx=current_turn_user_idx,
+                            )
+                        )
+                        compression_attempts += 1
+                        _clear_warn = getattr(
+                            agent, "_clear_context_overflow_warn", None
+                        )
+                        if callable(_clear_warn):
+                            _clear_warn()
+                        logger.info(
+                            "Pre-API compression with provider-ready parent: "
+                            "~%s request tokens >= %s threshold "
+                            "(context=%s, attempt=%s/%s)",
+                            f"{request_pressure_tokens:,}",
+                            f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
+                            f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
+                            if getattr(_compressor, "context_length", 0)
+                            else "unknown",
+                            compression_attempts,
+                            max_compression_attempts,
+                        )
+                        _pre_api_status = automatic_compaction_status_message(
+                            _compressor,
+                            phase="pre_api",
+                            default_message=PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
+                                tokens=request_pressure_tokens
+                            ),
+                            approx_tokens=request_pressure_tokens,
+                            threshold_tokens=int(
+                                getattr(_compressor, "threshold_tokens", 0) or 0
+                            ),
+                            context_length=int(
+                                getattr(_compressor, "context_length", 0) or 0
+                            ),
+                            model=agent.model,
+                            attempt=compression_attempts,
+                            max_attempts=max_compression_attempts,
+                        )
+                        if _pre_api_status:
+                            agent._emit_status(_pre_api_status)
+                        _last_preflight_pressure = request_pressure_tokens
+                        _pre_api_input = messages
+                        messages, active_system_prompt = agent._compress_context(
+                            messages,
+                            system_message,
+                            approx_tokens=request_pressure_tokens,
+                            task_id=effective_task_id,
+                            request_fork=_prepared_request_fork,
+                            request_fork_rematerializer=(
+                                _prepared_request_fork_rematerializer
+                            ),
+                        )
+                        if (
+                            messages is _pre_api_input
+                            and compression_skipped_due_to_lock(agent)
+                        ):
+                            compression_attempts -= 1
+                            _last_preflight_pressure = None
+                        else:
+                            agent._compression_request_fork_pending = False
+                            if _user_initiated_before_request_prepare:
+                                # The prepared parent was intentionally not sent;
+                                # preserve this one-shot flag for the rebuilt main
+                                # request after compaction.
+                                agent._is_user_initiated_turn = True
+                            current_turn_user_idx = reanchor_current_turn_user_idx(
+                                messages, user_message
+                            )
+                            agent._persist_user_message_idx = current_turn_user_idx
+                            agent._empty_content_retries = 0
+                            agent._thinking_prefill_retries = 0
+                            agent._last_content_with_tools = None
+                            agent._last_content_tools_all_housekeeping = False
+                            agent._mute_post_response = False
+                            conversation_history = conversation_history_after_compression(
+                                agent, messages, conversation_history
+                            )
+                            _retry.restart_after_prepared_compression = True
+                            break
+                    else:
+                        # The lifecycle consumer disappeared between the
+                        # turn-prologue defer and request preparation. Do not
+                        # keep a stale pending trigger or compress without a
+                        # trustworthy provider-native request.
+                        agent._compression_request_fork_pending = False
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 
@@ -2884,6 +3106,42 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                _last_dispatched_api_kwargs = None
+                _last_dispatched_request_fork = None
+                _last_dispatched_request_fork_rematerializer = None
+
+                def _capture_physical_request(physical_api_kwargs):
+                    nonlocal _last_dispatched_api_kwargs
+                    nonlocal _last_dispatched_request_fork
+                    nonlocal _last_dispatched_request_fork_rematerializer
+                    try:
+                        _last_dispatched_api_kwargs = copy.deepcopy(
+                            physical_api_kwargs
+                        )
+                        _last_dispatched_request_fork = (
+                            freeze_codex_request_for_compression(
+                                agent,
+                                physical_api_kwargs,
+                                fidelity="failed_wire",
+                            )
+                        )
+                        _last_dispatched_request_fork_rematerializer = (
+                            _build_codex_adopt_rematerializer(
+                                agent,
+                                prepared_request=_last_dispatched_request_fork,
+                                original_messages=messages,
+                                current_turn_user_idx=current_turn_user_idx,
+                            )
+                        )
+                    except Exception:
+                        _last_dispatched_api_kwargs = None
+                        _last_dispatched_request_fork = None
+                        _last_dispatched_request_fork_rematerializer = None
+                        logger.warning(
+                            "Physical request Fork capture failed; continuing provider call",
+                            exc_info=True,
+                        )
+
                 def _perform_api_call(next_api_kwargs):
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
@@ -2894,13 +3152,19 @@ def run_conversation(
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                            next_api_kwargs,
+                            on_first_delta=_stop_spinner,
+                            on_physical_request=_capture_physical_request,
                         )
                     from agent import relay_llm
 
+                    def _call_physical_provider(physical_api_kwargs):
+                        _capture_physical_request(physical_api_kwargs)
+                        return agent._interruptible_api_call(physical_api_kwargs)
+
                     return relay_llm.execute(
                         next_api_kwargs,
-                        agent._interruptible_api_call,
+                        _call_physical_provider,
                         session_id=str(agent.session_id or ""),
                         name=str(agent.provider or "provider"),
                         model_name=str(agent.model or ""),
@@ -5023,6 +5287,17 @@ def run_conversation(
                             messages, system_message,
                             approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                             task_id=effective_task_id,
+                            request_fork=(
+                                _last_dispatched_request_fork
+                                or freeze_codex_request_for_compression(
+                                    agent,
+                                    _last_dispatched_api_kwargs or api_kwargs,
+                                    fidelity="failed_wire",
+                                )
+                            ),
+                            request_fork_rematerializer=(
+                                _last_dispatched_request_fork_rematerializer
+                            ),
                         )
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
@@ -5284,6 +5559,17 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
+                        request_fork=(
+                            _last_dispatched_request_fork
+                            or freeze_codex_request_for_compression(
+                                agent,
+                                _last_dispatched_api_kwargs or api_kwargs,
+                                fidelity="failed_wire",
+                            )
+                        ),
+                        request_fork_rematerializer=(
+                            _last_dispatched_request_fork_rematerializer
+                        ),
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -5432,6 +5718,17 @@ def run_conversation(
                                 messages, system_message,
                                 approx_tokens=request_input_estimate,
                                 task_id=effective_task_id,
+                                request_fork=(
+                                    _last_dispatched_request_fork
+                                    or freeze_codex_request_for_compression(
+                                        agent,
+                                        _last_dispatched_api_kwargs or api_kwargs,
+                                        fidelity="failed_wire",
+                                    )
+                                ),
+                                request_fork_rematerializer=(
+                                    _last_dispatched_request_fork_rematerializer
+                                ),
                             )
                             if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                                 compression_attempts -= 1
@@ -5586,6 +5883,17 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
+                        request_fork=(
+                            _last_dispatched_request_fork
+                            or freeze_codex_request_for_compression(
+                                agent,
+                                _last_dispatched_api_kwargs or api_kwargs,
+                                fidelity="failed_wire",
+                            )
+                        ),
+                        request_fork_rematerializer=(
+                            _last_dispatched_request_fork_rematerializer
+                        ),
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -6258,6 +6566,28 @@ def run_conversation(
         if interrupted:
             _turn_exit_reason = "interrupted_during_api_call"
             break
+
+        if _retry.restart_after_prepared_compression:
+            api_call_count -= 1
+            agent.iteration_budget.refund()
+            _retry.restart_after_prepared_compression = False
+            if _should_skip_model_call_for_reference_handoff(
+                messages, user_message
+            ):
+                logger.info(
+                    "Skipping prepared-parent compaction restart: "
+                    "reference-only handoff would be the sole active user "
+                    "turn (#80622)"
+                )
+                if not final_response:
+                    final_response = _HANDOFF_SKIP_FINAL_RESPONSE
+                _turn_exit_reason = "compaction_handoff_not_actionable"
+                break
+            current_turn_user_idx = reanchor_current_turn_user_idx(
+                messages, user_message
+            )
+            agent._persist_user_message_idx = current_turn_user_idx
+            continue
 
         if _retry.restart_with_compressed_messages:
             api_call_count -= 1
@@ -7120,11 +7450,34 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
-                if (
+                _post_tool_compression_requested = (
                     agent.compression_enabled
                     and compression_attempts < max_compression_attempts
                     and _compressor.should_compress(_real_tokens)
+                )
+                _request_fork_post_tool_defer = False
+                if _post_tool_compression_requested:
+                    try:
+                        from fork_features.request_fork import (
+                            compression_request_fork_enabled,
+                        )
+
+                        _request_fork_post_tool_defer = (
+                            compression_request_fork_enabled(agent)
+                        )
+                    except Exception:
+                        _request_fork_post_tool_defer = False
+                if (
+                    _post_tool_compression_requested
+                    and _request_fork_post_tool_defer
                 ):
+                    agent._compression_request_fork_pending = True
+                    logger.info(
+                        "Deferring request-fork-aware post-tool compression until "
+                        "the exact API request snapshot is available (session %s)",
+                        agent.session_id or "none",
+                    )
+                elif _post_tool_compression_requested:
                     compression_attempts += 1
                     # Compression is actually running (block cleared / was
                     # never blocked) — reset the blocked-overflow warning

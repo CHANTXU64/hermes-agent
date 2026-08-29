@@ -105,6 +105,155 @@ async def test_compress_command_works_when_auto_compaction_disabled():
 
 
 @pytest.mark.asyncio
+async def test_gateway_manual_compress_passes_full_request_fork_snapshot():
+    from fork_features.request_fork import FrozenCodexRequest
+
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "compressed summary"},
+        history[-1],
+    ]
+    memory_only_tools = [
+        {"type": "function", "function": {"name": "memory"}}
+    ]
+    tools = [
+        {"type": "function", "function": {"name": "read_file"}},
+        {"type": "function", "function": {"name": "long_task_state"}},
+    ]
+    runner = _make_runner(history)
+    runner._session_db = MagicMock()
+    runner._session_db.get_session = AsyncMock(
+        return_value={"system_prompt": "PERSISTED LIVE SYSTEM"}
+    )
+    runner._session_db._db = MagicMock()
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance.tools = memory_only_tools
+    agent_instance.api_mode = "codex_responses"
+    agent_instance.is_subagent = False
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (compressed, "")
+    agent_instance._compression_skipped_due_to_lock = False
+    reconstructed = FrozenCodexRequest(
+        body={
+            "model": "test-model",
+            "instructions": "PERSISTED LIVE SYSTEM",
+            "input": history,
+            "tools": [
+                {"type": "function", "name": "read_file", "parameters": {}},
+                {
+                    "type": "function",
+                    "name": "long_task_state",
+                    "parameters": {},
+                },
+            ],
+        },
+        fidelity="reconstructed_out_of_turn",
+        captured_session_id="sess-1",
+    )
+
+    def _agent_factory(**kwargs):
+        agent_instance.tools = (
+            tools
+            if kwargs.get("enabled_toolsets")
+            == ["file", "long_task_continuity"]
+            else memory_only_tools
+        )
+        return agent_instance
+
+    with (
+        patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("gateway.run._load_gateway_config", return_value={"agent": {}}),
+        patch.object(
+            runner,
+            "_resolve_enabled_toolsets_for_source",
+            return_value=["file", "long_task_continuity"],
+        ),
+        patch("run_agent.AIAgent", side_effect=_agent_factory),
+        patch(
+            "hermes_cli.lifecycle.has_hook",
+            side_effect=lambda name: name == "on_compression_start",
+        ),
+        patch(
+            "agent.model_metadata.estimate_request_tokens_rough",
+            return_value=100,
+        ),
+        patch(
+            "fork_features.request_fork.build_out_of_turn_compression_request_snapshot",
+            return_value=reconstructed,
+        ),
+    ):
+        await runner._handle_compress_command(_make_event())
+
+    kwargs = agent_instance._compress_context.call_args.kwargs
+    assert kwargs["request_fork"] is reconstructed
+    assert kwargs["request_fork"].fidelity == "reconstructed_out_of_turn"
+
+
+@pytest.mark.asyncio
+async def test_gateway_manual_compress_aborts_lifecycle_when_outer_persist_fails():
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "compressed summary"},
+        history[-1],
+    ]
+    runner = _make_runner(history)
+    setattr(
+        runner.session_store,
+        "rewrite_transcript",
+        MagicMock(return_value=False),
+    )
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = "LIVE SYSTEM"
+    agent_instance.tools = []
+    agent_instance.api_mode = "codex_responses"
+    agent_instance.is_subagent = False
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-rotated"
+    agent_instance._last_compaction_in_place = False
+    agent_instance._compress_context.return_value = (compressed, "")
+    agent_instance._compression_skipped_due_to_lock = False
+    finalized = []
+
+    with (
+        patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch(
+            "agent.conversation_compression."
+            "finalize_context_engine_compression_notification",
+            side_effect=lambda _agent, *, committed: finalized.append(committed),
+        ),
+        patch(
+            "agent.model_metadata.estimate_request_tokens_rough",
+            return_value=100,
+        ),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "failed" in result.lower()
+    assert finalized == [False]
+    session_entry = getattr(
+        runner.session_store.get_or_create_session,
+        "return_value",
+    )
+    assert session_entry.session_id == "sess-1"
+
+
+@pytest.mark.asyncio
 async def test_compress_command_surfaces_aux_model_failure_even_when_recovered():
     """When the user's configured ``auxiliary.compression.model`` errors out
     but compression recovers by retrying on the main model, /compress must

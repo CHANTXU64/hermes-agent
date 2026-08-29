@@ -26,6 +26,7 @@ summarizer instead.
 from __future__ import annotations
 
 import os
+import copy
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -125,8 +126,60 @@ def test_adoption_preserves_unpersisted_live_user_tail(tmp_path: Path) -> None:
     """
     db = SessionDB(db_path=tmp_path / "state.db")
     agent, messages = _seed_drifted_session(db, "PREFLIGHT_ADOPT_PARENT")
+    lifecycle_events = []
+    rematerialized = []
 
-    agent._compress_context(messages, "sys", approx_tokens=120_000)
+    from fork_features.request_fork import FrozenCodexRequest
+
+    stale_request = FrozenCodexRequest(
+        body={
+            "model": "test",
+            "input": [
+                {"role": "user", "content": "STALE PRE-ADOPTION REQUEST"}
+            ],
+            "tools": [],
+        },
+        fidelity="prepared_parent",
+        captured_session_id="PREFLIGHT_ADOPT_PARENT",
+    )
+
+    def _rematerialize(adopted_messages):
+        rematerialized.append(copy.deepcopy(adopted_messages))
+        return FrozenCodexRequest(
+            body={
+                "model": "test",
+                "input": copy.deepcopy(adopted_messages),
+                "tools": [],
+            },
+            fidelity="rematerialized_after_adopt",
+            captured_session_id="PREFLIGHT_ADOPT_PARENT",
+        )
+
+    with (
+        patch(
+            "hermes_cli.lifecycle.has_hook",
+            side_effect=lambda name: name == "on_compression_start",
+        ),
+        patch(
+            "hermes_cli.lifecycle.invoke_hook",
+            side_effect=lambda name, **payload: lifecycle_events.append(
+                (name, payload)
+            ),
+        ),
+        patch(
+            "fork_features.request_fork.materialize_codex_request_for_compression",
+            side_effect=AssertionError(
+                "durable adoption must use the host-owned prepared factory"
+            ),
+        ),
+    ):
+        agent._compress_context(
+            messages,
+            "sys",
+            approx_tokens=120_000,
+            request_fork=stale_request,
+            request_fork_rematerializer=_rematerialize,
+        )
 
     parent_rows = db.get_messages_as_conversation(
         "PREFLIGHT_ADOPT_PARENT", include_inactive=True
@@ -152,6 +205,19 @@ def test_adoption_preserves_unpersisted_live_user_tail(tmp_path: Path) -> None:
         "the adopted parent (#adopt-live-tail): "
         f"agent._persist_user_message_idx={agent._persist_user_message_idx!r}, "
         f"len(adopted_parent_rows)={len(parent_rows)}"
+    )
+    assert lifecycle_events[0][0] == "on_compression_start"
+    assert lifecycle_events[0][1]["request_fork_available"] is True
+    assert (
+        lifecycle_events[0][1]["request_fork_fidelity"]
+        == "rematerialized_after_adopt"
+    )
+    assert rematerialized
+    assert "concurrent row 2" in _contents(rematerialized[0])
+    assert "LIVE USER INSTRUCTION" in _contents(rematerialized[0])
+    assert all(
+        message.get("content") != "STALE PRE-ADOPTION REQUEST"
+        for message in lifecycle_events[0][1]["request_messages"]
     )
 
 

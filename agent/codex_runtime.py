@@ -1311,7 +1311,13 @@ def _consume_codex_event_stream(
     return final
 
 
-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+def run_codex_stream(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_first_delta=None,
+    on_physical_request=None,
+):
     """Execute one streaming Responses API request and return the final response.
 
     Uses ``responses.create(stream=True)`` (low-level raw event iteration)
@@ -1355,6 +1361,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
+            if callable(on_physical_request):
+                try:
+                    on_physical_request(dict(stream_kwargs))
+                except Exception:
+                    logger.warning(
+                        "Codex physical-request observer failed; continuing provider call",
+                        exc_info=True,
+                    )
             return active_client.responses.create(**stream_kwargs)
 
         def _codex_stream_created(_raw_stream: Any) -> None:

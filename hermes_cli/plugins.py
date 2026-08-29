@@ -164,6 +164,11 @@ VALID_HOOKS: Set[str] = {
     "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
+    # Generic context-compression lifecycle. Plugins receive mutation-safe
+    # snapshots at start and one terminal outcome at finish; return values are
+    # ignored so compression behavior remains core-owned.
+    "on_compression_start",
+    "on_compression_finish",
     # Streaming LLM output observer hooks. Fired asynchronously off the token
     # path by agent.plugin_stream_hooks; callbacks observe immutable normalized
     # text/lifecycle payloads and cannot transform the stream.
@@ -1384,6 +1389,32 @@ class PluginState:
 
             atomic_json_write(self.path, data, mode=0o600)
 
+    def compare_and_set(self, key: str, *, expected: Any, value: Any) -> bool:
+        """Atomically replace one value only when its current JSON equals expected."""
+        self._validate_key(key)
+        with _locked_plugin_state(self.path):
+            data = self._read_unlocked()
+            if data.get(key) != expected:
+                return False
+            data[key] = value
+            try:
+                encoded = json.dumps(
+                    data, ensure_ascii=False, indent=2
+                ).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Plugin state value for {key!r} is not JSON-serializable"
+                ) from exc
+            if len(encoded) > self.quota_bytes:
+                raise ValueError(
+                    f"Plugin state quota exceeded: {len(encoded)} bytes is greater "
+                    f"than the {self.quota_bytes}-byte per-plugin quota"
+                )
+            from utils import atomic_json_write  # type: ignore[import-not-found]
+
+            atomic_json_write(self.path, data, mode=0o600)
+            return True
+
 
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
@@ -1393,6 +1424,7 @@ class PluginContext:
         self._manager = manager
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
+        self._request_fork: Any = None
         self._subagent_lifecycle: Any = None
         self._state: PluginState | None = None
         # Lazy-built capability-gated platform action facade (#64176).
@@ -1577,6 +1609,20 @@ class PluginContext:
             plugin_id = self.manifest.key or self.manifest.name
             self._llm = PluginLlm(plugin_id=plugin_id)
         return self._llm
+
+    @property
+    def request_fork(self) -> Any:
+        """Capture the exact current main-model request during host lifecycle hooks.
+
+        This is distinct from ``ctx.llm`` auxiliary calls: a captured Fork
+        preserves the host-built request prefix and final tool schemas, remains
+        request-local, and never executes returned tool calls.
+        """
+        if self._request_fork is None:
+            from fork_features.request_fork import RequestForkService
+
+            self._request_fork = RequestForkService()
+        return self._request_fork
 
     @property
     def subagent_lifecycle(self) -> Any:
