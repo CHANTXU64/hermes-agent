@@ -76,6 +76,11 @@ from hermes_constants import (
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli._subprocess_compat import windows_hide_flags
+from fork_features.browser_first_navigation import (
+    FIRST_NAVIGATION_DESCRIPTION,
+    ensure_first_conversation_tab,
+    serialize_conversation_navigation,
+)
 
 
 def __getattr__(name: str):
@@ -1604,36 +1609,6 @@ def _socket_safe_tmpdir() -> str:
 _active_sessions: Dict[str, Dict[str, Any]] = {}  # session_key -> {session_name, ...}
 _recording_sessions: set = set()  # session_keys with active recordings
 
-# Conversation-scoped first-navigation marker. Browser resources are cleaned at
-# the end of every agent turn, so backend session state cannot distinguish a new
-# conversation from a later turn in the same one. Gateway/CLI task IDs remain
-# stable across turns and change for a new conversation; keep this marker outside
-# cleanup_browser() so browser_navigate() opens one fresh tab per conversation.
-_conversation_tab_initialized: set[str] = set()
-_conversation_navigation_locks: Dict[str, threading.Lock] = {}
-_conversation_navigation_locks_guard = threading.Lock()
-
-
-def _conversation_navigation_lock(task_id: str) -> threading.Lock:
-    """Return the process-local lock that serializes one conversation's navigations."""
-    with _conversation_navigation_locks_guard:
-        lock = _conversation_navigation_locks.get(task_id)
-        if lock is None:
-            lock = threading.Lock()
-            _conversation_navigation_locks[task_id] = lock
-        return lock
-
-
-def _serialize_conversation_navigation(func):
-    """Keep tab creation, navigation, and its result snapshot ordered per task."""
-    @functools.wraps(func)
-    def wrapped(url: str, task_id: Optional[str] = None):
-        effective_task_id = task_id or "default"
-        with _conversation_navigation_lock(effective_task_id):
-            return func(url, task_id=task_id)
-
-    return wrapped
-
 # Tracks the most recent session_key used per task_id. Set by browser_navigate()
 # after it chooses a backend for a URL; read by every non-nav browser tool
 # (snapshot/click/fill/eval/...) so they target the session that served the last
@@ -2095,7 +2070,19 @@ atexit.register(_stop_browser_cleanup_thread)
 BROWSER_TOOL_SCHEMAS = [
     {
         "name": "browser_navigate",
-        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. On the first call in a new conversation, it automatically opens a new tab and switches to it before loading the URL. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
+        "description": (
+            "Navigate to a URL in the browser. Initializes the session and loads "
+            f"the page. {FIRST_NAVIGATION_DESCRIPTION} Must be called before other "
+            "browser tools. For simple information retrieval, prefer web_search or "
+            "web_extract (faster, cheaper). For plain-text endpoints — URLs ending "
+            "in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, "
+            "or any documented API endpoint — prefer curl via the terminal tool or "
+            "web_extract; the browser stack is overkill and much slower for these. "
+            "Use browser tools when you need to interact with a page (click, fill "
+            "forms, dynamic content). Returns a compact page snapshot with interactive "
+            "elements and ref IDs — no need to call browser_snapshot separately after "
+            "navigating."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -3249,7 +3236,7 @@ def evaluate_url_safety(url: str) -> Optional[dict]:
     return None
 
 
-@_serialize_conversation_navigation
+@serialize_conversation_navigation
 def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     """
     Navigate to a URL in the browser.
@@ -3366,26 +3353,14 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         session_info["_first_nav"] = False
         _maybe_start_recording(nav_session_key)
 
-    # On the first browser_navigate call for this conversation, create a fresh
-    # tab first. agent-browser's ``tab new`` command also activates that tab, so
-    # the existing ``open`` below cannot replace a page that was already open.
-    # This marker intentionally survives per-turn browser session cleanup.
-    with _conversation_navigation_locks_guard:
-        needs_new_tab = effective_task_id not in _conversation_tab_initialized
-    if needs_new_tab:
-        tab_result = _run_browser_command(
-            nav_session_key,
-            "tab",
-            ["new"],
-            timeout=_get_open_command_timeout(first_open=is_first_nav),
-        )
-        if not tab_result.get("success"):
-            return json.dumps({
-                "success": False,
-                "error": tab_result.get("error", "Failed to open a new browser tab"),
-            }, ensure_ascii=False)
-        with _conversation_navigation_locks_guard:
-            _conversation_tab_initialized.add(effective_task_id)
+    tab_error = ensure_first_conversation_tab(
+        task_id=effective_task_id,
+        session_key=nav_session_key,
+        run_command=_run_browser_command,
+        timeout=_get_open_command_timeout(first_open=is_first_nav),
+    )
+    if tab_error is not None:
+        return json.dumps(tab_error, ensure_ascii=False)
 
     result = _run_browser_command(
         nav_session_key,

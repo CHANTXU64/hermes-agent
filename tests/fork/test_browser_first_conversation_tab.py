@@ -5,6 +5,7 @@ import threading
 import uuid
 
 import tools.browser_tool as browser_tool
+from fork_features import browser_first_navigation
 
 
 def _description(tool_name):
@@ -53,10 +54,56 @@ def _install_navigation_harness(monkeypatch):
 def test_description_states_first_conversation_navigation_behavior():
     description = _description("browser_navigate")
 
+    assert browser_first_navigation.FIRST_NAVIGATION_DESCRIPTION in description
+
+
+def test_browser_tool_uses_fork_owned_navigation_policy():
+    """Core keeps only stable aliases; state and policy live in fork_features."""
     assert (
-        "On the first call in a new conversation, it automatically opens a new "
-        "tab and switches to it before loading the URL."
-    ) in description
+        browser_tool.serialize_conversation_navigation
+        is browser_first_navigation.serialize_conversation_navigation
+    )
+    assert (
+        browser_tool.ensure_first_conversation_tab
+        is browser_first_navigation.ensure_first_conversation_tab
+    )
+    assert not hasattr(browser_tool, "_conversation_tab_initialized")
+    assert not hasattr(browser_tool, "_conversation_navigation_locks")
+
+
+def test_policy_tracks_conversations_independently():
+    calls = []
+
+    def fake_run(session_key, command, args=None, timeout=None, **kwargs):
+        calls.append((session_key, command, list(args or []), timeout))
+        return {"success": True, "data": {}}
+
+    first_task = f"policy-a-{uuid.uuid4().hex}"
+    second_task = f"policy-b-{uuid.uuid4().hex}"
+
+    assert browser_first_navigation.ensure_first_conversation_tab(
+        task_id=first_task,
+        session_key=f"{first_task}::browser",
+        run_command=fake_run,
+        timeout=17,
+    ) is None
+    assert browser_first_navigation.ensure_first_conversation_tab(
+        task_id=second_task,
+        session_key=f"{second_task}::browser",
+        run_command=fake_run,
+        timeout=19,
+    ) is None
+    assert browser_first_navigation.ensure_first_conversation_tab(
+        task_id=first_task,
+        session_key=f"{first_task}::browser",
+        run_command=fake_run,
+        timeout=23,
+    ) is None
+
+    assert calls == [
+        (f"{first_task}::browser", "tab", ["new"], 17),
+        (f"{second_task}::browser", "tab", ["new"], 19),
+    ]
 
 
 def test_only_first_navigate_in_conversation_opens_and_switches_to_new_tab(monkeypatch):

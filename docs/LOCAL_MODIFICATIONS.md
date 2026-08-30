@@ -1187,12 +1187,13 @@ Upstream status: fork-only.
 
 ### 18. First browser navigation opens a fresh tab
 
-Status: active
+Status: policy extracted to `fork_features` (2026-08-30)
 
-Date: 2026-07-16
+Date: 2026-07-16; boundary refactored 2026-08-30
 
 Files:
 
+- `fork_features/browser_first_navigation.py`
 - `tools/browser_tool.py`
 - `tests/fork/test_browser_first_conversation_tab.py`
 - `docs/LOCAL_MODIFICATIONS.md`
@@ -1205,17 +1206,19 @@ Summary:
 
 What changed:
 
-- A conversation marker keyed by the stable task/session ID survives the normal
-  per-turn Browser resource cleanup.
-- Calls for the same task/session ID are serialized through the complete
-  `browser_navigate` result, so the first `tab new`/`open` and later navigations
-  cannot interleave; different conversations retain independent locks.
-- On the first call only, `browser_navigate` runs `tab new` before its existing
+- `fork_features/browser_first_navigation.py` owns the conversation marker,
+  per-conversation locks, complete-navigation serializer, first-call `tab new`
+  policy, failure retry semantics, and model-visible description fragment.
+- `tools/browser_tool.py` retains URL safety, backend/session selection, command
+  execution, navigation result/snapshot handling, one decorator, and one
+  `ensure_first_conversation_tab` call. It no longer stores Fork navigation
+  state or implements the tab decision inline.
+- Calls for the same task/session ID remain serialized through the complete
+  `browser_navigate` result, while different conversations keep independent
+  locks. A failed `tab new` does not mark the conversation initialized.
+- On the first call only, the policy runs `tab new` before the existing
   `open <url>` command. `agent-browser` activates the new tab as part of that
-  command.
-- The tool description states this actual first-call behavior. The earlier
-  live-CDP warning text and the unrelated `browser_vision` prompt override were
-  removed.
+  command, and the tool description still states the actual behavior.
 - This does not bind later backend reconnects to the created tab. Subsequent
   target selection remains unchanged, matching the intentionally minimal scope.
 
@@ -1226,7 +1229,10 @@ Why it matters:
 
 Merge protection:
 
-- Preserve the one-time marker separately from backend session `_first_nav`,
+- Keep the marker, locks, serializer, description fragment, and first-tab
+  decision in `fork_features/browser_first_navigation.py`; do not move their
+  state or policy back into `tools/browser_tool.py`.
+- Preserve the one-time marker separately from backend session `_first_nav`
   because Browser resources are cleaned after every agent turn.
 - Preserve the command order `tab new` then `open <url>` on the first call and
   plain `open <url>` on later calls in the same conversation.
@@ -1235,12 +1241,12 @@ Verification:
 
 ```bash
 .venv/bin/python -m pytest tests/fork/test_browser_first_conversation_tab.py -q -o 'addopts='
-.venv/bin/python -m py_compile tools/browser_tool.py tests/fork/test_browser_first_conversation_tab.py
+.venv/bin/python -m py_compile fork_features/browser_first_navigation.py tools/browser_tool.py tests/fork/test_browser_first_conversation_tab.py
 git diff --check
 ```
 
-Feature docs: none — the behavior is confined to one tool and covered by a
-focused runtime test plus this merge note.
+Feature docs: none — a Fork policy module, one Browser tool seam, and focused
+runtime contracts fully define this behavior.
 
 Upstream status: fork-only.
 
@@ -2452,6 +2458,7 @@ deltas are expected in these areas:
   - `tests/gateway/test_resume_command.py`
   - `docs/chantxu64/multi-telegram-accounts/README.md`
 - First browser navigation opens a fresh tab:
+  - `fork_features/browser_first_navigation.py`
   - `tools/browser_tool.py`
   - `tests/fork/test_browser_first_conversation_tab.py`
   - `docs/LOCAL_MODIFICATIONS.md`
