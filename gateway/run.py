@@ -63,6 +63,10 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
 )
+from fork_features.clarify_attachment_reply import (
+    ClarifyReplyDisposition,
+    resolve_pending_clarify_reply,
+)
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -16259,52 +16263,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 agent_visible_paths=True,
             )
-            if _clarify_has_audio and not _raw_clarify_reply:
+            _clarify_disposition = resolve_pending_clarify_reply(
+                session_key=_quick_key,
+                response_text=_raw_clarify_reply,
+                response_context=_clarify_media_context,
+                has_audio=_clarify_has_audio,
+                resolve_text_response=_clarify_mod.resolve_text_response_for_session,
+            )
+            if _clarify_disposition is ClarifyReplyDisposition.RETAIN_PENDING:
                 logger.info(
                     "Gateway retained pending clarify after voice transcription "
                     "produced no usable text (session=%s, id=%s)",
                     _quick_key,
                     _pending_clarify.clarify_id,
                 )
-                return ""            # Skip slash commands — the user clearly wanted to issue a
-            # command, not answer the clarify.  Leave the clarify pending
-            # so the user can retry; if it times out, the agent unblocks
-            # with an empty response.  Keep attachment media context
-            # separate so numeric and multi-select replies are normalized
-            # before the context reaches the clarify tool result.
-            if (
-                (_raw_clarify_reply or _clarify_media_context)
-                and not _raw_clarify_reply.startswith("/")
-            ):
-                _resolved = _clarify_mod.resolve_text_response_for_session(
-                    _quick_key,
-                    _raw_clarify_reply,
-                    response_context=_clarify_media_context,
+                return ""
+            if _clarify_disposition is ClarifyReplyDisposition.RESOLVED:
+                logger.info(
+                    "Gateway intercepted clarify text response (session=%s, id=%s)",
+                    _quick_key, _pending_clarify.clarify_id,
                 )
-                if _resolved:
-                    logger.info(
-                        "Gateway intercepted clarify text response (session=%s, id=%s)",
-                        _quick_key, _pending_clarify.clarify_id,
-                    )
-                    # The clarify callback pauses the platform typing/status
-                    # indicator while waiting so Slack users can type their
-                    # answer. The active agent resumes as soon as this reply
-                    # resolves the wait, so re-enable its indicator here too.
-                    # Without this, Slack stays silent until the independent
-                    # long-running heartbeat fires (three minutes by default).
-                    _clarify_adapter = self._adapter_for_source(source)
-                    if _clarify_adapter:
-                        try:
-                            _clarify_adapter.resume_typing_for_chat(source.chat_id)
-                        except Exception:
-                            logger.debug(
-                                "Failed to resume typing after clarify response",
-                                exc_info=True,
-                            )
-                    # Acknowledge with empty string so adapters that emit
-                    # the agent's response don't double-post.  The agent
-                    # itself will produce the next user-facing message.
-                    return ""
+                # The clarify callback pauses the platform typing/status
+                # indicator while waiting so Slack users can type their
+                # answer. The active agent resumes as soon as this reply
+                # resolves the wait, so re-enable its indicator here too.
+                # Without this, Slack stays silent until the independent
+                # long-running heartbeat fires (three minutes by default).
+                _clarify_adapter = self._adapter_for_source(source)
+                if _clarify_adapter:
+                    try:
+                        _clarify_adapter.resume_typing_for_chat(source.chat_id)
+                    except Exception:
+                        logger.debug(
+                            "Failed to resume typing after clarify response",
+                            exc_info=True,
+                        )
+                # Acknowledge with empty string so adapters that emit
+                # the agent's response don't double-post.  The agent
+                # itself will produce the next user-facing message.
+                return ""
 
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are

@@ -1,7 +1,7 @@
 """Regression tests for clarify replies while a gateway session is busy."""
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -189,3 +189,68 @@ async def test_gateway_clarify_choice_with_document_keeps_canonical_choice():
     assert isinstance(answer, ClarifyResponsePayload)
     assert answer.user_response == "继续处理"
     assert agent_path in answer.response_context
+
+
+@pytest.mark.asyncio
+async def test_gateway_empty_voice_transcript_keeps_clarify_pending():
+    """An unusable voice reply must not resolve with its audio placeholder."""
+    _clear_clarify_state()
+    from gateway.run import GatewayRunner
+    from tools import clarify_gateway as cm
+
+    voice_path = "/Users/robot/.hermes/cache/voice/clarify-empty.ogg"
+    agent_path = "/root/.hermes/cache/voice/clarify-empty.ogg"
+    event = _event(
+        "",
+        message_type=MessageType.VOICE,
+        media_urls=[voice_path],
+        media_types=["audio/ogg"],
+    )
+    adapter = _ClarifyBypassAdapter()
+    adapter.resume_typing_for_chat = Mock()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized = (
+        lambda source, *, allow_adapter_delegation=True: True
+    )
+    runner._session_key_for_source = lambda source: "clarify-voice-session"
+    runner._adapter_for_source = lambda source: adapter
+    runner._update_prompt_pending = {}
+
+    cm.register(
+        "clarify-voice",
+        "clarify-voice-session",
+        "请用语音回答",
+        None,
+    )
+
+    with (
+        patch.object(
+            runner,
+            "_pending_event_audio_paths",
+            return_value=[voice_path],
+        ),
+        patch.object(
+            runner,
+            "_prepare_clarify_reply_text",
+            new=AsyncMock(return_value=""),
+        ),
+        patch(
+            "tools.credential_files.to_agent_visible_cache_path",
+            return_value=agent_path,
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = await runner._handle_message(event)
+
+    pending = cm.get_pending_for_session(
+        "clarify-voice-session",
+        include_choice_prompts=True,
+    )
+    assert result == ""
+    assert pending is not None
+    assert pending.clarify_id == "clarify-voice"
+    adapter.resume_typing_for_chat.assert_not_called()
+    cm.clear_session("clarify-voice-session")

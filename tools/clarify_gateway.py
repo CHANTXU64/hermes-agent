@@ -37,6 +37,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+from fork_features.clarify_attachment_reply import attach_clarify_response_context
+
 logger = logging.getLogger(__name__)
 
 
@@ -340,15 +342,10 @@ def resolve_text_response_for_session(
         # Response rejected: message should continue as a normal turn
         return False
 
-    resolved_response: object = coerced
-    normalized_context = str(response_context or "").strip()
-    if normalized_context:
-        from tools.clarify_tool import ClarifyResponsePayload
-
-        resolved_response = ClarifyResponsePayload(
-            user_response=coerced,
-            response_context=normalized_context,
-        )
+    resolved_response = attach_clarify_response_context(
+        coerced,
+        response_context,
+    )
 
     return resolve_gateway_clarify(
         entry.clarify_id,

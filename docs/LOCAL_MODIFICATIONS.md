@@ -1266,15 +1266,17 @@ Upstream status: fork-only.
 
 ### 19. Clarify attachment replies preserve media paths
 
-Status: active
+Status: policy extracted to `fork_features` (2026-08-30)
 
-Date: 2026-07-28
+Date: 2026-07-28; boundary refactored 2026-08-30
 
 Files:
 
+- `fork_features/clarify_attachment_reply.py`
 - `gateway/run.py`
 - `tools/clarify_gateway.py`
 - `tools/clarify_tool.py`
+- `tests/fork/test_clarify_attachment_reply.py`
 - `tests/gateway/test_clarify_active_session_bypass.py`
 - `tests/tools/test_clarify_gateway.py`
 - `docs/LOCAL_MODIFICATIONS.md`
@@ -1286,9 +1288,16 @@ Summary:
 
 What changed:
 
-- The Gateway passes the raw typed reply and media context separately to the
-  resolver. Numeric, label, and multi-select replies are normalized before the
-  context is attached, so `user_response` keeps its original string/list shape.
+- `fork_features/clarify_attachment_reply.py` owns the three-way reply
+  disposition (pass through, retain pending, resolved) and wraps canonical
+  answers with separate attachment context only after successful normalization.
+- The Gateway retains authorization, control/update precedence, pending-entry
+  lookup, audio transcription, agent-visible media placeholder construction,
+  logging, and typing restoration. Its Clarify block now prepares those inputs
+  and makes one `resolve_pending_clarify_reply` policy call.
+- `tools/clarify_gateway.py` retains numeric, label, and multi-select
+  normalization, then uses one `attach_clarify_response_context` call. Thus
+  `user_response` keeps its original string/list shape.
 - `ClarifyResponsePayload` carries the canonical response and optional context
   through the blocking callback. `clarify_tool` exposes that context as a
   separate `response_context` field only when an attachment was present.
@@ -1310,6 +1319,10 @@ Why it matters:
 
 Merge protection:
 
+- Keep empty-audio retention, slash bypass, attachment-aware resolution, and
+  response-context wrapping in `fork_features/clarify_attachment_reply.py`;
+  do not move those Fork decisions back into `gateway/run.py` or concatenate
+  media context before `tools/clarify_gateway.py` normalizes the response.
 - Preserve until upstream's pending-Clarify interception carries agent-visible
   attachment paths in a field separate from canonical choice/text responses.
 - Do not move this after normal media processing: the active agent is blocked
@@ -1321,13 +1334,13 @@ Merge protection:
 Verification:
 
 ```bash
-.venv/bin/python -m pytest tests/gateway/test_clarify_active_session_bypass.py tests/tools/test_clarify_gateway.py tests/tools/test_clarify_tool.py -q -o 'addopts='
-.venv/bin/python -m py_compile gateway/run.py tools/clarify_gateway.py tools/clarify_tool.py tests/gateway/test_clarify_active_session_bypass.py tests/tools/test_clarify_gateway.py
+.venv/bin/python -m pytest tests/fork/test_clarify_attachment_reply.py tests/gateway/test_clarify_active_session_bypass.py tests/tools/test_clarify_gateway.py tests/tools/test_clarify_tool.py -q -o 'addopts='
+.venv/bin/python -m py_compile fork_features/clarify_attachment_reply.py gateway/run.py tools/clarify_gateway.py tests/fork/test_clarify_attachment_reply.py tests/gateway/test_clarify_active_session_bypass.py tests/tools/test_clarify_gateway.py
 git diff --check
 ```
 
-Feature docs: none — this is a narrow Gateway interception contract covered by
-runtime regression tests and this merge note.
+Feature docs: none — a Fork policy module, two thin host seams, and runtime
+contracts define this narrow authenticated Gateway interception behavior.
 
 Upstream status: fork-only.
 
@@ -2414,9 +2427,11 @@ deltas are expected in these areas:
   - `tests/fork/test_transport_disconnect_classification.py`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Clarify attachment reply context:
+  - `fork_features/clarify_attachment_reply.py`
   - `gateway/run.py`
   - `tools/clarify_gateway.py`
   - `tools/clarify_tool.py`
+  - `tests/fork/test_clarify_attachment_reply.py`
   - `tests/gateway/test_clarify_active_session_bypass.py`
   - `tests/tools/test_clarify_gateway.py`
 - Auditable autonomous built-in memory governance:
