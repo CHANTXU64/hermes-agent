@@ -246,15 +246,27 @@ When `MemoryProvider.prefetch`, turn-context assembly, Hindsight prefetch, or au
 Do not restore a Provider-level `run_recall_preprocessor` alias or duplicate the
 old-ref/new-query/failure branches in the high-frequency Provider main file.
 
+This P5 unit imports `RecallSnapshot` and relies on the generation/Session cache
+lifecycle from commit `b7cf9981c7`. Revert in reverse dependency order:
+`541b8f1083` first, then `b7cf9981c7`; keeping P5 after removing the cache unit
+is unsupported.
+
 ## Verification
 
 Focused regression command:
 
 ```bash
-python -m pytest tests/fork_features/test_hindsight_p5_policy.py tests/fork/test_hindsight_recall_preprocessor.py tests/plugins/memory/test_hindsight_provider.py tests/fork/test_hindsight_provider_regressions.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_provider.py tests/agent/test_turn_context.py tests/run_agent/test_run_agent_codex_responses.py tests/agent/test_auxiliary_client.py::TestCodexAdapterReasoningTranslation tests/hermes_cli/test_plugin_auxiliary_tasks.py -q -o 'addopts='
+scripts/run_tests.sh tests/fork_features/test_hindsight_p5_policy.py tests/fork/test_hindsight_recall_preprocessor.py tests/plugins/memory/test_hindsight_provider.py tests/fork/test_hindsight_provider_regressions.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_provider.py tests/agent/test_turn_context.py tests/run_agent/test_run_agent_codex_responses.py tests/agent/test_auxiliary_client.py tests/hermes_cli/test_plugin_auxiliary_tasks.py -q
 ```
 
-Orchestration-boundary verification on 2026-08-30:
+Current canonical follow-up on 2026-08-31:
+
+```text
+10 files, 480 tests passed, 0 failed
+runner: scripts/run_tests.sh (clean environment, per-file subprocess isolation)
+```
+
+Historical direct-pytest implementation evidence from 2026-08-30:
 
 ```text
 direct P5 policy and Provider-boundary contracts: 10 passed

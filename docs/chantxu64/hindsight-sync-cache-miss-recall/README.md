@@ -30,15 +30,20 @@ This fork adds a bounded synchronous fallback inside the Hindsight provider:
 
 The provider-neutral `MemoryManager` only supplies a bounded worker thread and
 the `on_prefetch_timeout` callback. Fork-owned cache lifecycle rules live in
-`fork_features/hindsight_recall_cache.py`; Hindsight API calls, formatting and
-the P5 query algorithm remain in the provider.
+`fork_features/hindsight_recall_cache.py`. The Hindsight Provider owns API calls,
+query clipping, formatting, cache-miss trigger/callback and snapshot carry. P5
+model decisions and result orchestration live in the Fork-only
+`plugins/memory/hindsight/recall_preprocessor.py` module.
 
 ## Files
 
 - `fork_features/hindsight_recall_cache.py` — Session-scoped carried cache,
   generation/timeout invalidation and sync-miss gate.
-- `plugins/memory/hindsight/__init__.py` — Hindsight API calls, sync fallback,
-  config, formatting and P5 orchestration through the Fork state object.
+- `plugins/memory/hindsight/__init__.py` — Hindsight API calls, sync fallback
+  trigger/callback, config, formatting and snapshot carry.
+- `plugins/memory/hindsight/recall_preprocessor.py` — P5 model decision,
+  old-result filtering, optional Recall callback, failure restoration and
+  outcome construction.
 - `tests/fork_features/test_hindsight_recall_cache.py` — direct lifecycle
   contracts for consume/carry/timeout/Session/Undo/gating.
 - `tests/fork/test_hindsight_provider_regressions.py` — public Provider fallback
@@ -84,23 +89,33 @@ Fixed upstream `66666f6e2eca0ae883195a34c66131985ea7dd06` has an opt-in
 `recall_sync` mode that recalls on every eligible turn and defaults off. It is
 not equivalent to the Fork's default-on, cache-miss-only fallback.
 
+The P5 orchestration commit `541b8f1083` statically depends on the Recall cache
+lifecycle introduced by `b7cf9981c7`. If reverting these units, revert P5 first
+and the cache lifecycle second; retaining P5 while removing the cache unit is
+unsupported.
+
 Conflict handling notes:
 
-- Do not preserve `_prefetch_result` clearing alone as sufficient stale-context protection; the structured snapshot must follow the same generation, session-switch, and rewind lifecycle.
+- Do not treat clearing only the formatted cache text as sufficient
+  stale-context protection; the structured snapshot must follow the same
+  generation, session-switch and rewind lifecycle.
 - Do not reuse the general Hindsight API timeout as the sync fallback timeout.
 - Do not reintroduce a post-turn raw-user-query recall.
 
 ## Verification
 
-Focused verification (`84 passed` on the 2026-08-30 migration):
+Current canonical focused verification (`84 passed` on the 2026-08-31
+documentation follow-up):
 
 ```bash
-python -m pytest tests/fork_features/test_hindsight_recall_cache.py tests/fork/test_hindsight_provider_regressions.py tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/run_agent/test_memory_sync_interrupted.py -q -o 'addopts='
+scripts/run_tests.sh tests/fork_features/test_hindsight_recall_cache.py tests/fork/test_hindsight_provider_regressions.py tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/run_agent/test_memory_sync_interrupted.py -q
 ```
 
-The expanded 2026-08-30 gate additionally covered all Hindsight Fork/plugin
-suites, MemoryManager, Request-only injection, pre-compression and Gateway memory
-paths. It reported `384 passed` with `7` third-party deprecation warnings.
+The earlier 2026-08-30 expanded direct-pytest gate additionally covered all
+Hindsight Fork/plugin suites, MemoryManager, Request-only injection,
+pre-compression and Gateway memory paths. It reported `384 passed` with `7`
+third-party deprecation warnings; this is historical implementation evidence,
+not the canonical command above.
 
 Manual smoke check used during implementation:
 

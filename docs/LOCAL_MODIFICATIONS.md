@@ -241,9 +241,11 @@ What changed:
 - The Fork-owned cache lifecycle now lives in
   `fork_features/hindsight_recall_cache.py`: atomic consume, generation-checked
   carry, matching-turn timeout invalidation, Session rotation, Undo invalidation,
-  and the synchronous-miss gate. The Hindsight Provider still owns API calls,
-  query truncation, result formatting and the P5 algorithm; `MemoryManager`
-  remains provider-neutral and only supplies the outer timeout/thread boundary.
+  and the synchronous-miss gate. The Hindsight Provider owns API calls, query
+  truncation, result formatting, sync-fallback trigger/callback and snapshot
+  carry; P5 model decisions and result orchestration live in
+  `plugins/memory/hindsight/recall_preprocessor.py`. `MemoryManager` remains
+  provider-neutral and only supplies the outer timeout/thread boundary.
 - Shared recall/reflect parameter handling lives in a single helper used by the
   synchronous current-turn fallback and P5-generated recall. Hindsight's
   post-turn `queue_prefetch()` hook is intentionally a no-op.
@@ -438,6 +440,9 @@ Merge protection:
 - Keep old-ref selection, new-query recall and failure restoration in the
   Fork-only P5 module. Do not re-export `run_recall_preprocessor` from the
   Provider or copy those branches back into `plugins/memory/hindsight/__init__.py`.
+- The P5 orchestration commit `541b8f1083` statically depends on the Recall cache
+  lifecycle from `b7cf9981c7`. Revert P5 first and the cache lifecycle second;
+  retaining P5 after removing the cache unit is unsupported.
 - Preserve provider-specific prefetch budgeting. Do not replace the generic
   external-provider 8-second guard with a Hindsight-specific global constant,
   and do not let that generic guard silently override P5/recall stage timeouts.
@@ -454,9 +459,10 @@ Verification after the 2026-08-30 orchestration migration:
   raw-runner alias, plus rejection of a non-fallback outcome without a snapshot.
   Four adjacent contracts for no-old-result fallback, null reuse and successful
   empty Recall were GREEN through those shared branches.
-- P5 focused integration gate: `302 passed`.
-- Hindsight/MemoryManager/Request-only/compression/Session/Gateway expanded gate:
-  `394 passed` with `7` third-party deprecation warnings.
+- Historical direct-pytest P5 focused integration gate: `302 passed`.
+- Historical direct-pytest Hindsight/MemoryManager/Request-only/compression/
+  Session/Gateway expanded gate: `394 passed` with `7` third-party deprecation
+  warnings.
 - Prompt SHA-256 remained
   `b9b182478b41ab593398bb1649b8a318ab7f59464cd4abe5681a7add6481106f`.
 - Fixed-SHA three-way simulation remained `2 → 2` text conflict regions; both
@@ -469,6 +475,13 @@ Verification after the 2026-08-30 orchestration migration:
   Runtime Flow now assigns filtering/recall/outcome work to the P5 module, and
   the Provider explicitly rejects a non-fallback outcome without a snapshot
   instead of silently reusing old text.
+- A later full fourth-batch review using `openai-codex/gpt-5.6-sol` with `max`
+  reasoning returned `PATCH` for documentation only and `0` blocking findings;
+  all three code commits were recommended for retention. The responsibility map,
+  static dependency/revert order and canonical test commands were corrected.
+- Canonical `scripts/run_tests.sh` follow-up on 2026-08-31 passed all three
+  focused gates: request-only/cache routing `345`, cache-miss lifecycle `84`,
+  and P5 integration `480`, with `0` failures.
 
 Feature docs: `docs/chantxu64/hindsight-p5-recall-preprocessor/README.md`
 
