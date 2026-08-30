@@ -49,16 +49,6 @@ def test_hindsight_retain_tool_preserves_bank_tags_metadata_and_unicode(provider
     assert item["metadata"]["user_id"] == "user-1"
 
 
-def test_official_auto_retain_serializer_keeps_unicode_readable(provider):
-    provider.sync_turn("中文问题", "中文回答")
-    provider._retain_queue.join()
-
-    item = provider._client.aretain_batch.call_args.kwargs["items"][0]
-    assert "中文问题" in item["content"]
-    assert "中文回答" in item["content"]
-    assert "\\u4e2d" not in item["content"]
-
-
 def test_provider_does_not_expose_manual_retain_or_retain_on_new():
     provider = HindsightMemoryProvider()
     config_keys = {item["key"] for item in provider.get_config_schema()}

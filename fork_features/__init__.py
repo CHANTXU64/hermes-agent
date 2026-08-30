@@ -1,1 +1,1 @@
-"""Fork-owned approval extensions."""
+"""Fork-owned feature extensions."""

@@ -38,21 +38,25 @@ Validation after a merge:
 
 ### 1. Hindsight Chinese / Unicode support
 
-Date: 2026-04-20
+Status: production boundary decoupled; fork contract only (2026-08-30)
+
+Date: 2026-04-20; contract isolated 2026-08-30
 
 Commit: `7428b0da`
 
 Files:
 
-- `plugins/memory/hindsight/__init__.py`
-- `.gitignore`
+- `plugins/memory/hindsight/__init__.py` — production serializer
+- `tests/fork/test_hindsight_unicode_contract.py` — fork behavior contract
 
 What changed:
 
 - `json.dumps` in the Hindsight memory plugin uses `ensure_ascii=False`.
 - Chinese and other Unicode text are stored/read as real characters instead of
   escaped `\uXXXX` sequences.
-- `.gitignore` gained local development ignores.
+- The fork no longer carries a separate Unicode production implementation. A
+  dedicated contract test observes the actual retain payload at the provider
+  boundary instead of coupling this behavior to the retired manual-retain tests.
 
 Why it matters:
 
@@ -61,11 +65,20 @@ Why it matters:
 
 Merge protection:
 
-- If this file conflicts, preserve `ensure_ascii=False` unless upstream has an
-  equivalent Unicode-preserving implementation.
-- Verify by inspecting the actual `json.dumps` call, not by keyword guessing.
+- Keep the dedicated contract test even when the production serializer moves.
+- Verify the actual retain payload contains literal Chinese text and does not
+  contain `\uXXXX`; keyword inspection alone is insufficient.
+- Do not create a fork serializer, runtime hook, or release-time text patch for
+  this one-line contract while the provider boundary satisfies it directly.
 
-Upstream status: fork-only.
+Verification:
+
+```bash
+./venv/bin/python -m pytest tests/fork/test_hindsight_unicode_contract.py -q -o 'addopts='
+```
+
+Production ownership: normal Hindsight provider path; fork ownership is the
+Unicode behavior contract.
 
 ### 4. Safe command rewrite for terminal tool
 
@@ -144,21 +157,23 @@ Upstream status: fork-only documentation.
 
 ### 6. Disable newly bundled skills by default when configured
 
-Date: 2026-05-09
+Status: policy extracted to `fork_features` (2026-08-30)
+
+Date: 2026-05-09; boundary refactored 2026-08-30
 
 Files:
 
-- `tools/skills_sync.py`
-- `hermes_cli/config.py`
-- `hermes_cli/main.py`
-- `hermes_cli/update_cmd.py`
-- `tests/tools/test_skills_sync.py`
+- `fork_features/bundled_skills_policy.py` — fork-owned policy
+- `tools/skills_sync.py` — one post-copy call and result handoff
+- `hermes_cli/update_cmd.py` — reports the generic `auto_disabled` result
+- `tests/fork/test_bundled_skills_policy.py`
+- `tests/fork/test_skills_auto_disable.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
 What changed:
 
-- Added `skills.auto_enable_new_bundled` config with upstream-compatible default
-  `true`.
+- `skills.auto_enable_new_bundled` remains an optional config with default
+  behavior `true` when absent.
 - When set to `false`, newly discovered bundled skills are still copied into
   `~/.hermes/skills/` and recorded in `.bundled_manifest`, but their names are
   appended to `skills.disabled` during that first sync.
@@ -167,6 +182,10 @@ What changed:
   left alone.
 - `hermes update` output reports when new bundled skills were disabled by this
   config.
+- The config decision and write now live in the fork-owned policy module.
+  `tools/skills_sync.py` passes only the names copied in the current sync through
+  one thin post-copy seam, so installs, updates, gateway startup, and named
+  profile syncs retain identical behavior.
 
 Why it matters:
 
@@ -181,8 +200,16 @@ Merge protection:
 - Preserve the `false` behavior that only disables skills in `result["copied"]`;
   do not disable all bundled skills or re-disable skills the user already chose
   to enable.
-- Run `tests/tools/test_skills_sync.py` after conflicts touching skill sync or
-  skill config behavior.
+- Keep policy logic out of `tools/skills_sync.py`; that upstream synchronizer may
+  collect copied names, call the fork policy once, and return its result only.
+- Run the fork policy and integration tests after conflicts touching skill sync,
+  config persistence, profile seeding, or update reporting.
+
+Verification:
+
+```bash
+./venv/bin/python -m pytest tests/fork/test_bundled_skills_policy.py tests/fork/test_skills_auto_disable.py tests/tools/test_skills_sync.py -q -o 'addopts='
+```
 
 Upstream status: fork-only.
 
@@ -1578,7 +1605,7 @@ Upstream status: fork-only.
 
 ### 24. Launchd gateway open-file ceiling
 
-Status: superseded by upstream (2026-08-11 sync)
+Status: production boundary decoupled to runtime config; fork contract only
 
 Date: 2026-08-10; superseded 2026-08-11
 
@@ -1598,6 +1625,9 @@ Summary:
   only a thin regression that the official path still writes the plist key.
 - Operator config on this machine: `runtime.nofile_soft_limit: 65536` in
   `~/.hermes/config.yaml` (higher than upstream default 4096).
+- No fork production branch remains in `hermes_cli/gateway.py` or
+  `hermes_cli/resource_limits.py`; deployment config owns the selected value and
+  the fork test guards the generated launchd contract.
 
 What changed:
 
@@ -1614,12 +1644,13 @@ Why it matters:
 
 Merge protection:
 
-- Preserve when: only the fork regression that official configurable emission
-  still works; do not reintroduce a hard-coded 8192 block.
-- Drop when: upstream's own tests already cover the same emission contract and
-  the fork regression is pure duplication.
-- Ask user when: a replacement removes launchd SoftResourceLimits entirely or
+- Preserve the fork regression that configurable emission still works; do not
+  reintroduce a hard-coded 8192 block or a second plist writer.
+- Ask user when a replacement removes launchd SoftResourceLimits entirely or
   lowers the operator-chosen floor without an equivalent guarantee.
+- Runtime activation still requires the normal service rewrite/restart path;
+  static source and plist generation checks must not be reported as a live
+  process restart.
 
 Verification:
 
@@ -2252,6 +2283,7 @@ deltas are expected in these areas:
   - `plugins/memory/hindsight/__init__.py`
   - `hermes_state.py`
   - `tests/plugins/memory/test_hindsight_provider.py`
+  - `tests/fork/test_hindsight_unicode_contract.py`
   - `tests/test_hermes_state.py`
   - `tests/agent/test_memory_session_switch.py`
   - `tests/fork/test_hindsight_provider_regressions.py`
@@ -2320,9 +2352,13 @@ deltas are expected in these areas:
   - `tests/fork/test_safe_cmd_rewrite.py`
   - `pyproject.toml`
 - Disable newly bundled skills by default when configured:
+  - `fork_features/bundled_skills_policy.py`
   - `tools/skills_sync.py`
-  - `hermes_cli/main.py`
+  - `hermes_cli/update_cmd.py`
+  - `tests/fork/test_bundled_skills_policy.py`
+  - `tests/fork/test_skills_auto_disable.py`
   - `tests/tools/test_skills_sync.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
 - Request-only recall isolation and Codex prompt-cache routing:
   - `agent/chat_completion_helpers.py`
   - `agent/transports/codex.py`

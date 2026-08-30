@@ -34,6 +34,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
+from fork_features.bundled_skills_policy import (
+    disable_new_bundled_skills_if_configured,
+)
+
 # Force stdout/stderr to UTF-8. On non-UTF-8 Windows locales (e.g. CP936/GBK
 # on zh-CN), Python's default stream encoding can't represent the checkmark /
 # arrow glyphs this script prints (✓ U+2713, ↑ U+2191), raising
@@ -267,39 +271,6 @@ def _dir_hash(directory: Path) -> str:
         pass
     return hasher.hexdigest()
 
-
-def _disable_new_bundled_skills_if_configured(skill_names: List[str]) -> List[str]:
-    """Append newly copied bundled skills to skills.disabled when configured.
-
-    Default Hermes behavior remains unchanged: new bundled skills are enabled
-    unless the user explicitly sets ``skills.auto_enable_new_bundled: false``.
-    This only applies to skills copied during the current sync; existing,
-    updated, user-modified, or user-deleted bundled skills are left alone.
-    """
-    if not skill_names:
-        return []
-
-    try:
-        from hermes_cli.config import load_config, save_config
-
-        config = load_config()
-        skills_cfg = config.setdefault("skills", {})
-        if skills_cfg.get("auto_enable_new_bundled", True) is not False:
-            return []
-
-        disabled_raw = skills_cfg.get("disabled", [])
-        disabled = [str(name) for name in disabled_raw] if isinstance(disabled_raw, list) else []
-        disabled_set = set(disabled)
-        added = [name for name in skill_names if name not in disabled_set]
-        if not added:
-            return []
-
-        skills_cfg["disabled"] = sorted(disabled + added)
-        save_config(config)
-        return added
-    except Exception as e:
-        logger.debug("Failed to disable newly bundled skills %s: %s", skill_names, e, exc_info=True)
-        return []
 
 def _safe_rel_install_path(path: Path, base: Path) -> str:
     """Return a normalized relative POSIX path, rejecting traversal/absolute paths."""
@@ -956,7 +927,7 @@ def sync_skills(quiet: bool = False) -> dict:
     for name in cleaned:
         del manifest[name]
 
-    auto_disabled = _disable_new_bundled_skills_if_configured(copied)
+    auto_disabled = disable_new_bundled_skills_if_configured(copied)
 
     # Also copy DESCRIPTION.md files for categories (if not already present)
     for desc_md in bundled_dir.rglob("DESCRIPTION.md"):
