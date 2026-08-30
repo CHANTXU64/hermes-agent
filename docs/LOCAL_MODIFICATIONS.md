@@ -2058,20 +2058,26 @@ Upstream status: fork-only.
 
 ### 29. Provider-native long-task continuity Request Fork
 
-Status: active fork maintenance; source and standalone plugin implemented,
-locally verified, enabled, and live-verified in the default Gateway Profile
+Status: active fork maintenance; current persistent compression-boundary delivery
+is locally verified but not yet loaded or live-verified in the default Gateway.
+The earlier request-local delivery was previously live-verified and is now
+superseded.
 
-Date: 2026-08-28
+Date: 2026-08-28; persistent delivery redesign 2026-08-30
 
 Files:
 
 - `fork_features/request_fork/__init__.py`
 - `agent/conversation_loop.py`
 - `agent/conversation_compression.py`
+- `agent/context_compressor.py`
+- `agent/agent_runtime_helpers.py`
 - `agent/turn_context.py`
 - `agent/turn_retry_state.py`
 - `run_agent.py`
 - `gateway/slash_commands.py`
+- `gateway/run.py`
+- `gateway/platforms/base.py`
 - `hermes_cli/plugins.py`
 - `fork_features/hindsight_retain/langfuse_hindsight_export.py`
 - `tests/fork_features/test_current_request_fork.py`
@@ -2079,11 +2085,17 @@ Files:
 - `tests/fork_features/test_long_task_continuity_recovery.py`
 - `tests/fork_features/test_plugin_state_cas.py`
 - `tests/agent/test_compression_adoption_preserves_live_tail.py`
+- `tests/agent/test_compression_concurrent_fork.py`
+- `tests/agent/test_reference_handoff_active_turn.py`
 - `tests/agent/test_turn_retry_state.py`
+- `tests/run_agent/test_message_sequence_repair.py`
+- `tests/run_agent/test_thinking_only_sanitizer.py`
 - `tests/run_agent/test_413_compression.py`
 - `tests/run_agent/test_compression_boundary_hook.py`
 - `tests/run_agent/test_run_agent_codex_responses.py`
 - `tests/gateway/test_compress_command.py`
+- `tests/gateway/test_auto_voice_reply_format.py`
+- `tests/gateway/test_history_media_current_turn.py`
 - `tests/fork/test_langfuse_hindsight_export.py`
 - user plugin `~/.hermes/plugins/long-task-continuity/`
 - `docs/LOCAL_MODIFICATIONS.md`
@@ -2120,23 +2132,36 @@ What changed:
   `reconstructed_out_of_turn`; multimodal history that cannot be reconstructed
   without vision side effects makes the Fork unavailable. Outer transcript
   persistence/session transition still decides committed versus aborted.
-- Recovery remains request-local synthetic user context. It is wrapped in a
-  generic `<hermes-runtime-context user-authored="false" ...>` provenance
-  envelope, and the Langfuse-to-Hindsight exporter excludes any runtime context
-  carrying that generic non-user provenance rather than matching continuity
-  business text.
-- The standalone plugin keeps pending deliveries in a CAS-updated per-session
-  map (with read migration for the previous single-slot shape). Different
-  sessions coexist; compression generations prevent a late older checkpoint
-  from overwriting a newer same-session pending state;
-  acknowledgement deletes only an exact session/compression/checkpoint identity.
-  A checkpoint whose base authority changed before join terminates as
-  `superseded`, clears its active record, and delivers the latest authoritative
-  state instead of exposing an unconsumed retry.
+- Compression recovery is persisted once at the common local
+  `compress_context` commit boundary as one hidden synthetic `role=user` row
+  wrapped in the generic `<hermes-runtime-context user-authored="false" ...>`
+  provenance envelope. Later model requests see the same stable row through
+  ordinary session-history replay; `llm_request` middleware no longer appends a
+  fresh compression recovery item on every tool-loop request.
+- Before any local context engine or compression-boundary Memory provider sees
+  the transcript, Core creates a private copy with the previous runtime-context
+  row removed. The unfiltered live list remains available to the already-frozen
+  Request Fork and rollback. No-progress comparison uses the same filtered
+  baseline, so filtering alone cannot cause a false commit.
+- After an engine makes progress, a bounded `on_compression_prepare_commit` hook
+  joins the already-running Checkpoint outside the DB commit fence. Core validates
+  and wraps at most one returned context row, then the existing in-place or
+  rotation transaction persists it atomically with the compressed transcript.
+  The next successful compression replaces the old row instead of stacking it.
+- The central real-user predicate and both user-message merge paths recognize the
+  stable runtime-context envelope, so the synthetic row is not treated as user
+  evidence or merged into genuine user text. Gateway voice and media current-turn
+  boundaries use the same predicate. The standalone plugin rejects the envelope
+  in checkpoint `append_user_messages` and keeps new-session root delivery as a
+  separate one-time middleware path.
 - The private Request Fork reuses the host-parsed `agent.api_max_retries` ceiling
   for retryable transport failures, creates a fresh independently owned client
   for every attempt, and uses the host backoff policy. Checkpoint JSON correction
   attempts remain separate from transport retries.
+- Every successful Request Fork call emits one fail-open WARNING usage line keyed by
+  `request_id`, with total prompt tokens, uncached input, cache read/write tokens,
+  and cache-hit percentage. This keeps checkpoint cache behavior locally auditable
+  without routing the private Fork through normal parent-request hooks.
 - If all checkpoint attempts fail, diagnostic details remain in durable plugin
   state and are not injected into the model. Recovery uses the last accepted
   root, user messages, and next action when available; otherwise it gives only
@@ -2167,33 +2192,45 @@ Merge protection:
 - Keep the Fork client explicit and independently closed. Do not reintroduce
   `copy.copy(agent)`, implicit primary-client lookup, parent transcript writes,
   normal middleware, or tool execution in the private Fork.
-- Preserve compression/Fork parallelism: compression commit does not wait for
-  the checkpoint. Only committed compression may join before the next real
-  provider request; aborted/failed attempts discard their Fork result.
-- Preserve generic `user-authored=false` filtering and synthetic user role; do
-  not replace it with a continuity-specific Retain string rule or a developer
-  message.
-- Preserve per-session CAS mutation and exact acknowledgement identity. A stale
-  checkpoint result must not overwrite a newer same-session generation, and a
-  stale acknowledgement must not remove a newer same-session pending value or
-  another session's value.
+- Preserve compression/Fork parallelism while the context engine runs. After a
+  successful summary, join the Checkpoint before `begin_commit`; never move the
+  potentially long model wait inside the DB commit fence or back into ordinary
+  `llm_request` middleware.
+- Preserve generic `user-authored=false` filtering and the hidden synthetic user
+  row. Do not replace it with continuity-specific Retain text matching, a
+  developer role, dynamic instructions, or direct provider-payload mutation.
+- Keep previous-row filtering, no-progress comparison, Memory handoff, and
+  rollback snapshots on their documented separate copies. A merge that filters
+  the live list or compares filtered output with an unfiltered baseline can
+  silently delete context or publish a false compression boundary.
+- Preserve named-delta CAS authority and the local storage retry. Runtime-context
+  envelopes must never enter authoritative `root.user_messages`, and a stale
+  checkpoint result must not overwrite a newer authority revision.
 
 Validation:
 
-- Final post-review related Core, Gateway, lifecycle, transport, and exporter
-  regressions: `262 passed` with `7` third-party deprecation warnings.
-- After the transport-retry change, the directly affected host regressions:
-  `25 passed`.
-- Standalone plugin suite after retry and compact-fallback changes: `32 passed`.
-- Plugin Doctor: runtime discovery/import/registration passed, with `1 tool` and
-  `3 hooks`.
-- Ruff, `py_compile`, and `git diff --check` passed.
-- The default Gateway was manually restarted after the final code changes. A
-  real Codex checkpoint saved authoritative revision `1`, injected recovery on
-  the next request, received a successful delivery acknowledgement, and left no
-  failed checkpoint or pending delivery. This verifies the success path; the
-  retry and terminal-failure branches remain covered by deterministic tests.
-- No push was run.
+- Current persistent-delivery source validation: `193 passed` across compression,
+  rotation, message repair, hidden-message classification, Gateway voice/media,
+  and lifecycle tests; the focused PluginManager whitelist/API suite adds
+  `57 passed`.
+- Standalone continuity plugin: `42 passed`; Ruff, `py_compile`, and
+  `git diff --check` passed in both repositories.
+- A real isolated PluginManager discovery probe loaded the copied standalone
+  plugin, registered `on_compression_prepare_commit`, retained the separate
+  `llm_request` middleware, and treated a missing checkpoint as a no-op without
+  calling any model or touching the active Profile.
+- Consecutive-compression tests verify exactly one persisted row with the newer
+  revision; both in-place and rotation tests preserve `display_kind=hidden` and
+  unchanged real user text. No-progress, commit-fence order, CAS retry, synthetic
+  user rejection, and Gateway current-turn boundaries are covered.
+- A broader unrelated Gateway media sweep reported `184 passed` and one existing
+  test-double signature failure before reaching this feature's code; it was not
+  changed as part of this maintenance unit.
+- The earlier request-local design was historically live-verified after a
+  Gateway restart. The current persistent-delivery source has not been loaded by
+  the running Gateway and has no live Langfuse evidence yet.
+- No Gateway restart or push was run after the mid-turn Request Fork fix; the
+  final source still has no post-fix live Gateway evidence.
 
 Upstream status: fork-only.
 

@@ -93,6 +93,43 @@ class TestAutoVoiceReplyFormat:
         voice_event = _make_event(Platform.TELEGRAM, chat_id="123", message_type=MessageType.VOICE)
         assert runner._should_send_voice_reply(voice_event, "hello", [], already_sent=True) is True
 
+    def test_should_send_voice_reply_ignores_persistent_runtime_user_boundary(self):
+        runner = _make_runner()
+        runner._voice_mode["telegram:123"] = "all"
+        adapter = _make_adapter(Platform.TELEGRAM)
+        adapter._should_auto_tts_for_chat = MagicMock(return_value=True)
+        runner.adapters[Platform.TELEGRAM] = adapter
+        event = _make_event(Platform.TELEGRAM, chat_id="123")
+        agent_messages = [
+            {"role": "user", "content": "real request"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "text_to_speech", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": (
+                    '<hermes-runtime-context user-authored="false" '
+                    'source="long-task-continuity">\nstate\n'
+                    "</hermes-runtime-context>"
+                ),
+                "display_kind": "hidden",
+            },
+        ]
+
+        assert runner._should_send_voice_reply(
+            event,
+            "hello",
+            agent_messages,
+        ) is False
+
+
 def _make_runner() -> GatewayRunner:
     with patch("gateway.run.GatewayRunner._load_voice_modes", return_value={}):
         runner = GatewayRunner.__new__(GatewayRunner)

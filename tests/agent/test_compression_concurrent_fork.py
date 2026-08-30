@@ -1830,3 +1830,220 @@ def test_exact_cooldown_restore_api_propagates_sqlite_write_failure(
                 "error": "must propagate",
             },
         )
+
+
+def _runtime_context_message(payload: str) -> dict:
+    return {
+        "role": "user",
+        "content": (
+            '<hermes-runtime-context user-authored="false" '
+            'source="long-task-continuity">\n'
+            f"{payload}\n"
+            "</hermes-runtime-context>"
+        ),
+        "display_kind": "hidden",
+    }
+
+
+def _runtime_context_rows(messages: list[dict]) -> list[dict]:
+    return [
+        message
+        for message in messages
+        if isinstance(message.get("content"), str)
+        and message["content"].startswith(
+            '<hermes-runtime-context user-authored="false" '
+        )
+    ]
+
+
+@pytest.mark.parametrize("in_place", [True, False])
+def test_compression_persists_one_runtime_context_from_common_commit_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    in_place: bool,
+) -> None:
+    from hermes_cli import lifecycle
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = f"PERSISTENT_CONTEXT_{in_place}"
+    db.create_session(parent_sid, source="telegram")
+    agent = _build_agent_with_db(db, parent_sid)
+    agent.compression_in_place = in_place
+    real_user = {"role": "user", "content": "keep this byte-identical"}
+    old_context = _runtime_context_message("revision=1")
+    messages = [
+        real_user,
+        {"role": "assistant", "content": "prior answer"},
+        old_context,
+    ]
+    engine_inputs: list[list[dict]] = []
+    events: list[str] = []
+
+    def _compress(engine_messages, **_kwargs):
+        engine_inputs.append(copy.deepcopy(engine_messages))
+        return [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": "keep this byte-identical"},
+        ]
+
+    agent.context_compressor.compress.side_effect = _compress
+
+    def _invoke(hook_name: str, **_kwargs):
+        assert hook_name == "on_compression_prepare_commit"
+        events.append("prepare")
+        return [{"source": "long-task-continuity", "context": "revision=2"}]
+
+    monkeypatch.setattr(
+        lifecycle,
+        "has_hook",
+        lambda name: name == "on_compression_prepare_commit",
+    )
+    monkeypatch.setattr(lifecycle, "invoke_hook", _invoke)
+
+    from agent.conversation_compression import CompressionCommitFence
+
+    class _Fence(CompressionCommitFence):
+        def begin_commit(self, cancel_event=None):
+            events.append("begin_commit")
+            return super().begin_commit(cancel_event)
+
+    compressed, _prompt = agent._compress_context(
+        messages,
+        "sys",
+        approx_tokens=120_000,
+        force=True,
+        commit_fence=_Fence(),
+    )
+
+    assert events == ["prepare", "begin_commit"]
+    assert len(engine_inputs) == 1
+    assert _runtime_context_rows(engine_inputs[0]) == []
+    blocks = _runtime_context_rows(compressed)
+    assert len(blocks) == 1
+    assert "revision=2" in blocks[0]["content"]
+    assert blocks[0]["display_kind"] == "hidden"
+    assert real_user["content"] == "keep this byte-identical"
+    durable = db.get_messages_as_conversation(agent.session_id)
+    assert len(_runtime_context_rows(durable)) == 1
+    assert "revision=2" in _runtime_context_rows(durable)[0]["content"]
+
+
+def test_filtered_runtime_context_noop_does_not_commit_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import lifecycle
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "PERSISTENT_CONTEXT_NOOP"
+    db.create_session(session_id, source="cli")
+    agent = _build_agent_with_db(db, session_id)
+    old_context = _runtime_context_message("revision=1")
+    messages = [
+        {"role": "user", "content": "real ask"},
+        {"role": "assistant", "content": "answer"},
+        old_context,
+    ]
+    engine_inputs: list[list[dict]] = []
+    prepare_calls: list[str] = []
+
+    def _no_progress(engine_messages, **_kwargs):
+        engine_inputs.append(copy.deepcopy(engine_messages))
+        return copy.deepcopy(engine_messages)
+
+    agent.context_compressor.compress.side_effect = _no_progress
+    monkeypatch.setattr(
+        lifecycle,
+        "has_hook",
+        lambda name: name == "on_compression_prepare_commit",
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda hook_name, **_kwargs: prepare_calls.append(hook_name) or [],
+    )
+
+    returned, _prompt = agent._compress_context(
+        messages,
+        "sys",
+        approx_tokens=120_000,
+        force=True,
+    )
+
+    assert returned is messages
+    assert _runtime_context_rows(engine_inputs[0]) == []
+    assert _runtime_context_rows(messages) == [old_context]
+    assert prepare_calls == []
+    assert agent.session_id == session_id
+    assert db.find_live_compression_child(session_id) is None
+
+
+def test_next_compression_replaces_runtime_context_instead_of_stacking(tmp_path):
+    db = SessionDB(db_path=tmp_path / "replace-runtime-context.db")
+    session_id = "session-replace-runtime-context"
+    db.create_session(session_id, source="test")
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = True
+    real_user = {"role": "user", "content": "keep this exact user text"}
+    messages = [
+        real_user,
+        {"role": "assistant", "content": "old answer"},
+    ]
+    engine_inputs = []
+    engine_runs = 0
+
+    def _compress(engine_messages, **_kwargs):
+        nonlocal engine_runs
+        engine_runs += 1
+        engine_inputs.append(copy.deepcopy(engine_messages))
+        return [
+            {
+                "role": "user",
+                "content": f"[CONTEXT COMPACTION] summary-{engine_runs}",
+            },
+            copy.deepcopy(real_user),
+        ]
+
+    agent.context_compressor.compress.side_effect = _compress
+    hook_runs = 0
+
+    def _invoke_hook(name, **_kwargs):
+        nonlocal hook_runs
+        assert name == "on_compression_prepare_commit"
+        hook_runs += 1
+        return [
+            {
+                "source": "long-task-continuity",
+                "context": f"persistent-revision-{hook_runs}",
+            }
+        ]
+
+    with patch(
+        "hermes_cli.lifecycle.has_hook",
+        side_effect=lambda name: name == "on_compression_prepare_commit",
+    ), patch("hermes_cli.lifecycle.invoke_hook", side_effect=_invoke_hook):
+        first, _ = agent._compress_context(
+            messages,
+            "sys",
+            approx_tokens=120_000,
+            force=True,
+        )
+        second, _ = agent._compress_context(
+            first,
+            "sys",
+            approx_tokens=120_000,
+            force=True,
+        )
+
+    assert len(engine_inputs) == 2
+    assert _runtime_context_rows(engine_inputs[0]) == []
+    assert _runtime_context_rows(engine_inputs[1]) == []
+    runtime_rows = _runtime_context_rows(second)
+    assert len(runtime_rows) == 1
+    assert "persistent-revision-2" in runtime_rows[0]["content"]
+    assert "persistent-revision-1" not in runtime_rows[0]["content"]
+    assert messages[0]["content"] == "keep this exact user text"
+    stored = db.get_messages_as_conversation(session_id)
+    stored_runtime_rows = _runtime_context_rows(stored)
+    assert len(stored_runtime_rows) == 1
+    assert "persistent-revision-2" in stored_runtime_rows[0]["content"]

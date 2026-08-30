@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import threading
 import time
 from types import SimpleNamespace
@@ -183,6 +184,51 @@ def test_frozen_responses_request_reaches_transport_without_second_conversion(
     assert captured["client"] is not agent.client
     assert captured["on_first_delta"] is None
     assert agent.stream_delta_callback is not None
+
+
+def test_request_fork_logs_prompt_cache_usage(monkeypatch, caplog):
+    import agent.codex_runtime as codex_runtime
+
+    agent = _Agent()
+    monkeypatch.setattr(
+        _Normalized,
+        "usage",
+        {
+            "input_tokens": 225_367,
+            "output_tokens": 2_212,
+            "input_tokens_details": {"cached_tokens": 224_768},
+        },
+    )
+    monkeypatch.setattr(
+        codex_runtime,
+        "run_codex_stream",
+        lambda runtime, api_kwargs, client=None: "RAW RESPONSE",
+    )
+    frozen = FrozenCodexRequest(
+        body={
+            "model": "gpt-test",
+            "input": [{"role": "user", "content": "FULL PREFIX"}],
+            "tools": [],
+        },
+        fidelity="prepared_parent",
+        captured_session_id="same-session",
+    )
+    with _fake_scope(agent, frozen):
+        request_fork = RequestForkService().capture_current()
+
+    caplog.set_level(logging.WARNING, logger="fork_features.request_fork")
+    request_fork.call(
+        append_message={"role": "user", "content": "RETURN JSON"},
+        request_id="continuity:cp-cache:attempt-1",
+    )
+
+    assert (
+        "request Fork usage request_id=continuity:cp-cache:attempt-1 "
+        "prompt_tokens=225367 uncached_input_tokens=599 "
+        "cache_read_tokens=224768 cache_write_tokens=0 "
+        "cache_hit_rate=99.73%"
+    ) in caplog.text
+    assert caplog.records[-1].levelno == logging.WARNING
 
 
 def test_request_fork_uses_host_api_attempt_limit_for_transient_connection_errors(

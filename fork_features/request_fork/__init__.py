@@ -84,6 +84,51 @@ def _usage_mapping(value: Any) -> dict[str, Any]:
         return {}
 
 
+def _log_request_fork_usage(
+    *,
+    request_id: str,
+    usage: Mapping[str, Any],
+    provider: str,
+) -> None:
+    if not usage:
+        logger.warning(
+            "request Fork usage request_id=%s usage_unavailable=true",
+            request_id,
+        )
+        return
+    try:
+        from agent.usage_pricing import normalize_usage
+
+        canonical = normalize_usage(
+            usage,
+            provider=provider,
+            api_mode="codex_responses",
+        )
+        prompt_tokens = canonical.prompt_tokens
+        cache_hit_rate = (
+            canonical.cache_read_tokens / prompt_tokens * 100
+            if prompt_tokens
+            else 0.0
+        )
+        logger.warning(
+            "request Fork usage request_id=%s prompt_tokens=%s "
+            "uncached_input_tokens=%s cache_read_tokens=%s "
+            "cache_write_tokens=%s cache_hit_rate=%.2f%%",
+            request_id,
+            prompt_tokens,
+            canonical.input_tokens,
+            canonical.cache_read_tokens,
+            canonical.cache_write_tokens,
+            cache_hit_rate,
+        )
+    except Exception:
+        logger.debug(
+            "request Fork usage logging failed request_id=%s",
+            request_id,
+            exc_info=True,
+        )
+
+
 @dataclass(frozen=True)
 class _RequestForkTemplate:
     frozen_request: FrozenCodexRequest
@@ -166,6 +211,11 @@ class CurrentRequestFork:
                 usage = _usage_mapping(getattr(normalized, "usage", None))
                 if not usage:
                     usage = _usage_mapping(getattr(response, "usage", None))
+                _log_request_fork_usage(
+                    request_id=str(request_id or "request-fork"),
+                    usage=usage,
+                    provider=self._template.provider,
+                )
                 return RequestForkResult(
                     raw_output=(
                         content if isinstance(content, str) else str(content or "")

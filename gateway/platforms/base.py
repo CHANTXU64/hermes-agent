@@ -3746,19 +3746,15 @@ class BasePlatformAdapter(ABC):
             return None
         if not transcript:
             return None
-        # Exclude the CURRENT TURN entirely — everything from the last user
-        # message onward. The agent persists rows as it produces them, so by
-        # delivery time the transcript already contains this turn's tool
-        # results and assistant reply. The old form dropped only the most
-        # recent assistant entry, which left THIS turn's tool results in
-        # "history": a text_to_speech result carrying media_tag then put its
-        # own path into the dedup set and delivery silently stripped the
-        # attachment (staging repro 2026-07-29 — `response_delivery_dropped`
-        # for a MEDIA-tag-only reply; user saw TTS produce no audio).
+        # Exclude the CURRENT TURN entirely — everything from the last human
+        # user message onward. Persisted non-user runtime context can follow
+        # current tool/media rows and must not move this boundary.
+        from agent.context_compressor import is_user_originated_turn
+
         history = list(transcript)
         last_user_idx = None
         for i in range(len(history) - 1, -1, -1):
-            if history[i].get("role") == "user":
+            if is_user_originated_turn(history[i]):
                 last_user_idx = i
                 break
         if last_user_idx is not None:

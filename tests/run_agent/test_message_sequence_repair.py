@@ -16,6 +16,19 @@ def _bare_agent():
     return AIAgent.__new__(AIAgent)
 
 
+def _persistent_runtime_context():
+    return {
+        "role": "user",
+        "content": (
+            '<hermes-runtime-context user-authored="false" '
+            'source="long-task-continuity">\n'
+            "persistent authority\n"
+            "</hermes-runtime-context>"
+        ),
+        "display_kind": "hidden",
+    }
+
+
 # ── _drop_trailing_empty_response_scaffolding ──────────────────────────────
 
 def test_drop_scaffolding_rewinds_orphan_tool_tail():
@@ -55,6 +68,19 @@ def test_repair_merges_consecutive_user_messages():
     assert len(messages) == 1
     assert messages[0]["role"] == "user"
     assert messages[0]["content"] == "first\n\nsecond"
+
+
+def test_repair_keeps_persistent_runtime_context_separate_from_real_user():
+    agent = _bare_agent()
+    real_user = {"role": "user", "content": "keep this byte-identical"}
+    runtime_context = _persistent_runtime_context()
+    messages = [real_user, runtime_context]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 0
+    assert messages == [real_user, runtime_context]
+    assert real_user["content"] == "keep this byte-identical"
 
 
 def test_repair_preserves_user_content_when_one_side_empty():

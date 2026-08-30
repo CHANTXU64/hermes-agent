@@ -82,6 +82,34 @@ def test_current_turn_tts_media_not_treated_as_history():
     assert not paths or current not in paths
 
 
+def test_persistent_runtime_context_does_not_move_current_turn_boundary():
+    old = "/opt/data/cache/audio/tts_old_runtime.mp3"
+    current = "/opt/data/cache/audio/tts_now_runtime.mp3"
+    transcript = [
+        {"role": "user", "content": "speak"},
+        _tts_tool_row(old),
+        {"role": "assistant", "content": f"MEDIA:{old}"},
+        {"role": "user", "content": "current request"},
+        _tts_tool_row(current),
+        {"role": "assistant", "content": f"MEDIA:{current}"},
+        {
+            "role": "user",
+            "content": (
+                '<hermes-runtime-context user-authored="false" '
+                'source="long-task-continuity">\nstate\n'
+                "</hermes-runtime-context>"
+            ),
+            "display_kind": "hidden",
+        },
+    ]
+    adapter = _StubAdapter(transcript)
+
+    paths = adapter._history_media_paths_for_session("k")
+
+    assert paths and old in paths
+    assert current not in paths
+
+
 def test_prior_turn_media_still_deduped():
     """A file delivered in a PRIOR turn stays in the dedup set."""
     old = "/opt/data/cache/audio/tts_old.mp3"

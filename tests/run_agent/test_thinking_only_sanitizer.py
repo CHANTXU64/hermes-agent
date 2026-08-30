@@ -14,6 +14,19 @@ backstory on why the alternative — fabricating "." stub text — was rejected.
 from run_agent import AIAgent
 
 
+def _persistent_runtime_context():
+    return {
+        "role": "user",
+        "content": (
+            '<hermes-runtime-context user-authored="false" '
+            'source="long-task-continuity">\n'
+            "persistent authority\n"
+            "</hermes-runtime-context>"
+        ),
+        "display_kind": "hidden",
+    }
+
+
 # ---------------------------------------------------------------------------
 # _is_thinking_only_assistant — detection
 # ---------------------------------------------------------------------------
@@ -106,6 +119,20 @@ class TestDropThinkingOnlyAndMergeUsers:
         assert roles == ["user", "assistant"]
         assert out[0]["content"] == "u1\n\nu2"
         assert out[1]["content"] == "real reply"
+
+    def test_drop_keeps_runtime_context_separate_from_real_user(self):
+        real_user = {"role": "user", "content": "keep this byte-identical"}
+        runtime_context = _persistent_runtime_context()
+        msgs = [
+            real_user,
+            {"role": "assistant", "content": "", "reasoning": "..."},
+            runtime_context,
+        ]
+
+        out = AIAgent._drop_thinking_only_and_merge_users(msgs)
+
+        assert out == [real_user, runtime_context]
+        assert real_user["content"] == "keep this byte-identical"
 
 
 

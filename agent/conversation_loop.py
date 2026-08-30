@@ -90,6 +90,7 @@ from agent.retry_utils import (
 )
 from agent.trajectory import has_incomplete_scratchpad
 from fork_features.request_fork import (
+    compression_request_fork_enabled,
     freeze_codex_request_for_compression,
     rematerialize_codex_request_after_adopt,
 )
@@ -2542,7 +2543,7 @@ def run_conversation(
             and _request_fork_pending
             and not _compression_cooldown
         )
-        if (
+        _pre_api_compression_requested = (
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
@@ -2551,7 +2552,25 @@ def run_conversation(
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
             and _compressor.should_compress(request_pressure_tokens)
-        ):
+        )
+        _request_fork_mid_turn_defer = False
+        if _pre_api_compression_requested:
+            try:
+                _request_fork_mid_turn_defer = (
+                    compression_request_fork_enabled(agent)
+                )
+            except Exception:
+                _request_fork_mid_turn_defer = False
+            if _request_fork_mid_turn_defer:
+                agent._compression_request_fork_pending = True
+                _request_fork_pending = True
+                _request_fork_prepared_compression_due = True
+                logger.info(
+                    "Deferring request-fork-aware mid-turn preflight compression "
+                    "until the exact API request snapshot is available (session %s)",
+                    agent.session_id or "none",
+                )
+        if _pre_api_compression_requested and not _request_fork_mid_turn_defer:
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
             compression_attempts += 1
@@ -2616,7 +2635,8 @@ def run_conversation(
                 if pending_moa_prepared_request is _moa_prepared_request:
                     pending_moa_prepared_request = None
             else:
-                # This request-fork-aware compression attempt actually ran.
+                # This direct compression attempt actually ran. Request-Fork
+                # consumers take the prepared-parent branch later in this loop.
                 # A no-progress/aborted/failed result is still terminal for the
                 # deferred trigger; only the lock-skip branch above is a true
                 # retry-later signal. Keeping pending set here would force up to
@@ -2949,8 +2969,8 @@ def run_conversation(
                             _retry.restart_after_prepared_compression = True
                             break
                     else:
-                        # The lifecycle consumer disappeared between the
-                        # turn-prologue defer and request preparation. Do not
+                        # The lifecycle consumer disappeared between a
+                        # request-fork-aware defer and request preparation. Do not
                         # keep a stale pending trigger or compress without a
                         # trustworthy provider-native request.
                         agent._compression_request_fork_pending = False
@@ -7458,10 +7478,6 @@ def run_conversation(
                 _request_fork_post_tool_defer = False
                 if _post_tool_compression_requested:
                     try:
-                        from fork_features.request_fork import (
-                            compression_request_fork_enabled,
-                        )
-
                         _request_fork_post_tool_defer = (
                             compression_request_fork_enabled(agent)
                         )

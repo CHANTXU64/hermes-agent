@@ -4592,6 +4592,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         content = message.get("content")
         if cls._is_context_summary_content(content):
             return True
+        if is_non_user_runtime_context_message(message):
+            return True
         text = _content_text_for_contains(content).strip()
         # Sibling recovery nudges from agent.conversation_loop's retry loop:
         # same "ephemeral scaffolding, not a real human turn" class as the
@@ -7387,3 +7389,24 @@ def is_user_originated_turn(message: Any) -> bool:
     if ContextCompressor._is_synthetic_compression_user_turn(message):
         return False
     return ContextCompressor._is_actionable_user_turn(message)
+
+
+_NON_USER_RUNTIME_CONTEXT_PREFIX = (
+    '<hermes-runtime-context user-authored="false" '
+)
+_NON_USER_RUNTIME_CONTEXT_END = "</hermes-runtime-context>"
+
+
+def is_non_user_runtime_context_message(message: Any) -> bool:
+    """Recognize a persisted internal context row by its stable body envelope.
+
+    ``display_kind`` is durable but stripped from provider-bound copies before
+    request sanitation.  The body envelope therefore remains the common
+    identity across live history, SessionDB reloads, and per-request copies.
+    """
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    text = _content_text_for_contains(message.get("content")).strip()
+    return text.startswith(_NON_USER_RUNTIME_CONTEXT_PREFIX) and text.endswith(
+        _NON_USER_RUNTIME_CONTEXT_END
+    )

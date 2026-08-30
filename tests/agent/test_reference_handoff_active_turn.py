@@ -39,6 +39,18 @@ def _standalone_handoff(task: str = "finish the already-done refactor") -> dict:
     }
 
 
+def _persistent_runtime_context() -> dict:
+    return {
+        "role": "user",
+        "content": (
+            '<hermes-runtime-context user-authored="false" '
+            'source="long-task-continuity">\n'
+            "persistent authority\n"
+            "</hermes-runtime-context>"
+        ),
+    }
+
+
 class TestReferenceHandoffWouldDriveNextModelCall:
     def test_standalone_handoff_alone_drives(self):
         messages = [_standalone_handoff()]
@@ -147,6 +159,11 @@ class TestUserOriginatedTurnPredicate:
             )
             is False
         )
+
+    def test_persistent_runtime_context_not_originated_after_db_projection(self):
+        # SessionDB preserves role/content even when optional display metadata is
+        # absent, so the stable body marker must remain authoritative.
+        assert is_user_originated_turn(_persistent_runtime_context()) is False
 
 
 class TestReanchorSkipsHandoffFallback:

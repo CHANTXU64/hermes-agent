@@ -11,6 +11,7 @@ import pytest
 
 
 
+import copy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1278,6 +1279,273 @@ class TestToolResultPreflightCompression:
 
         mock_compress.assert_called_once()
         assert result["completed"] is True
+
+    def test_large_tool_result_codex_compression_waits_for_prepared_parent(
+        self, agent
+    ):
+        """Mid-turn Codex pressure freezes the real provider-ready parent."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 130_000
+        agent.context_compressor.last_prompt_tokens = 1_000
+        agent.context_compressor.last_completion_tokens = 100
+        agent.model = "gpt-5.6-sol"
+        agent.provider = "openai-codex"
+        agent.api_mode = "codex_responses"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._disable_streaming = True
+
+        tool_resp = SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="function_call",
+                    id="fc_1",
+                    call_id="tc1",
+                    name="web_search",
+                    arguments='{"query":"test"}',
+                )
+            ],
+            usage=SimpleNamespace(
+                input_tokens=1_000,
+                output_tokens=100,
+                total_tokens=1_100,
+            ),
+            status="completed",
+            model=agent.model,
+        )
+        ok_resp = SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    status="completed",
+                    phase="final_answer",
+                    content=[
+                        SimpleNamespace(
+                            type="output_text",
+                            text="Done after request-fork-aware compression",
+                        )
+                    ],
+                )
+            ],
+            usage=SimpleNamespace(
+                input_tokens=40_000,
+                output_tokens=100,
+                total_tokens=40_100,
+            ),
+            status="completed",
+            model=agent.model,
+        )
+        responses = iter([tool_resp, ok_resp])
+        dispatched = []
+
+        def _perform_api_call(api_kwargs):
+            dispatched.append(copy.deepcopy(api_kwargs))
+            return next(responses)
+
+        def _estimate(messages, *_args, **_kwargs):
+            if any(
+                isinstance(message, dict)
+                and message.get("role") == "tool"
+                and len(str(message.get("content") or "")) >= 100_000
+                for message in messages
+            ):
+                return 150_000
+            if any(
+                isinstance(message, dict)
+                and SUMMARY_PREFIX in str(message.get("content") or "")
+                for message in messages
+            ):
+                return 40_000
+            return 1_000
+
+        with (
+            patch(
+                "agent.turn_context.estimate_request_tokens_rough",
+                return_value=1_000,
+            ),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                side_effect=_estimate,
+            ),
+            patch("run_agent.handle_function_call", return_value="x" * 100_000),
+            patch(
+                "hermes_cli.lifecycle.has_hook",
+                side_effect=lambda name: name == "on_compression_start",
+            ),
+            patch.object(
+                agent.context_compressor,
+                "should_defer_preflight_to_real_usage",
+                return_value=False,
+            ),
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=_perform_api_call,
+            ),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [
+                    {
+                        "role": "user",
+                        "content": f"{SUMMARY_PREFIX}\nPrevious conversation",
+                    }
+                ],
+                "compressed prompt",
+            )
+            result = agent.run_conversation("hello")
+
+        mock_compress.assert_called_once()
+        frozen = mock_compress.call_args.kwargs["request_fork"]
+        assert isinstance(frozen, FrozenCodexRequest)
+        assert frozen.fidelity == "prepared_parent"
+        frozen_body = frozen.clone_body()
+        assert frozen_body["model"] == agent.model
+        assert isinstance(frozen_body["input"], list)
+        assert any(
+            item.get("type") == "function_call_output"
+            for item in frozen_body["input"]
+            if isinstance(item, dict)
+        )
+        assert any(
+            tool.get("name") == "web_search"
+            for tool in frozen_body["tools"]
+            if isinstance(tool, dict)
+        )
+        assert len(dispatched) == 2
+        assert result["completed"] is True
+        assert result["final_response"] == (
+            "Done after request-fork-aware compression"
+        )
+
+    def test_mid_turn_codex_freeze_unavailable_clears_pending_and_sends_request(
+        self, agent
+    ):
+        """A vanished Fork consumer must not strand or drop the parent request."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 130_000
+        agent.context_compressor.last_prompt_tokens = 1_000
+        agent.context_compressor.last_completion_tokens = 100
+        agent.model = "gpt-5.6-sol"
+        agent.provider = "openai-codex"
+        agent.api_mode = "codex_responses"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._disable_streaming = True
+
+        tool_resp = SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="function_call",
+                    id="fc_1",
+                    call_id="tc1",
+                    name="web_search",
+                    arguments='{"query":"test"}',
+                )
+            ],
+            usage=SimpleNamespace(
+                input_tokens=1_000,
+                output_tokens=100,
+                total_tokens=1_100,
+            ),
+            status="completed",
+            model=agent.model,
+        )
+        ok_resp = SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    status="completed",
+                    phase="final_answer",
+                    content=[
+                        SimpleNamespace(
+                            type="output_text",
+                            text="Sent without a request Fork",
+                        )
+                    ],
+                )
+            ],
+            usage=SimpleNamespace(
+                input_tokens=150_000,
+                output_tokens=100,
+                total_tokens=150_100,
+            ),
+            status="completed",
+            model=agent.model,
+        )
+        responses = iter([tool_resp, ok_resp])
+        dispatched = []
+
+        def _perform_api_call(api_kwargs):
+            dispatched.append(copy.deepcopy(api_kwargs))
+            return next(responses)
+
+        def _estimate(messages, *_args, **_kwargs):
+            return (
+                150_000
+                if any(
+                    isinstance(message, dict)
+                    and message.get("role") == "tool"
+                    and len(str(message.get("content") or "")) >= 100_000
+                    for message in messages
+                )
+                else 1_000
+            )
+
+        with (
+            patch(
+                "agent.turn_context.estimate_request_tokens_rough",
+                return_value=1_000,
+            ),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                side_effect=_estimate,
+            ),
+            patch("run_agent.handle_function_call", return_value="x" * 100_000),
+            patch(
+                "hermes_cli.lifecycle.has_hook",
+                side_effect=lambda name: name == "on_compression_start",
+            ),
+            patch(
+                "agent.conversation_loop.freeze_codex_request_for_compression",
+                return_value=None,
+            ) as freeze_request,
+            patch.object(
+                agent.context_compressor,
+                "should_defer_preflight_to_real_usage",
+                return_value=False,
+            ),
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=_perform_api_call,
+            ),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        prepared_parent_calls = [
+            call
+            for call in freeze_request.call_args_list
+            if call.kwargs.get("fidelity") == "prepared_parent"
+        ]
+        assert len(prepared_parent_calls) == 1
+        mock_compress.assert_not_called()
+        assert agent._compression_request_fork_pending is False
+        assert len(dispatched) == 2
+        assert any(
+            item.get("type") == "function_call_output"
+            for item in dispatched[1]["input"]
+            if isinstance(item, dict)
+        )
+        assert result["completed"] is True
+        assert result["final_response"] == "Sent without a request Fork"
 
     def test_mid_turn_retry_compares_fully_assembled_requests(self, agent):
         """API-only context must not make marginal compression look effective."""

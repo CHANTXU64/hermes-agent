@@ -168,6 +168,10 @@ VALID_HOOKS: Set[str] = {
     # snapshots at start and one terminal outcome at finish; return values are
     # ignored so compression behavior remains core-owned.
     "on_compression_start",
+    # Prepare at most one bounded, model-visible context row after a successful
+    # summary but before the commit fence. The core owns wrapping, placement,
+    # persistence, and rollback; plugins may only return source + context text.
+    "on_compression_prepare_commit",
     "on_compression_finish",
     # Streaming LLM output observer hooks. Fired asynchronously off the token
     # path by agent.plugin_stream_hooks; callbacks observe immutable normalized
@@ -393,6 +397,7 @@ VALID_HOOKS: Set[str] = {
 # have its output silently ignored — registration is refused loudly instead.
 # Support for a shell response shape can lift an event out of this set.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "on_compression_prepare_commit",
     "transform_api_error_classification",
 }
 

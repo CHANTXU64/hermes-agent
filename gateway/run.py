@@ -21287,10 +21287,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return False
 
-        # Dedup: agent already called TTS tool in THIS turn only
+        # Dedup: agent already called TTS tool in THIS turn only. Persisted
+        # non-user runtime context must not reset the human turn boundary.
+        from agent.context_compressor import is_user_originated_turn
+
         last_user_idx = None
         for i, msg in enumerate(reversed(agent_messages)):
-            if msg.get("role") == "user":
+            if is_user_originated_turn(msg):
                 last_user_idx = len(agent_messages) - 1 - i; break
         turn_messages = agent_messages[last_user_idx:] if last_user_idx is not None else agent_messages
         has_agent_tts = any(

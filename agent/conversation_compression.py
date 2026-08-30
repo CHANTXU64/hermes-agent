@@ -77,6 +77,8 @@ from agent.session_activity import ActivityProvenance, normalize_activity_proven
 
 logger = logging.getLogger(__name__)
 
+_MAX_PERSISTENT_COMPRESSION_CONTEXT_CHARS = 64_000
+
 # Terminal compression outcomes published by host/hygiene timeout or cooldown
 # writers. Detached heartbeat workers must not clobber these back to
 # agent.compression after cancel (otherwise timeout is unobservable). Observing
@@ -2449,6 +2451,76 @@ def compress_context(
             logger.warning("on_compression_finish hook failed", exc_info=True)
             return False
 
+    def _prepare_persistent_compression_context() -> Optional[dict[str, Any]]:
+        """Collect one bounded plugin context before entering the commit fence."""
+        try:
+            from hermes_cli.lifecycle import has_hook, invoke_hook
+
+            if not has_hook("on_compression_prepare_commit"):
+                return None
+            results = invoke_hook(
+                "on_compression_prepare_commit",
+                compression_id=_attempt_id,
+                session_id=_compression_start_session_id,
+                in_place=in_place,
+                api_mode=str(getattr(agent, "api_mode", "") or ""),
+                trigger_source=_trigger_source,
+            )
+        except Exception:
+            logger.warning(
+                "on_compression_prepare_commit hook failed",
+                exc_info=True,
+            )
+            return None
+
+        prepared: Optional[dict[str, Any]] = None
+        for result in results or []:
+            if not isinstance(result, dict):
+                continue
+            source = str(result.get("source") or "").strip()
+            context = result.get("context")
+            if (
+                not source
+                or len(source) > 64
+                or any(
+                    char not in "abcdefghijklmnopqrstuvwxyz0123456789-_"
+                    for char in source
+                )
+                or not isinstance(context, str)
+                or not context.strip()
+            ):
+                logger.warning("Ignoring invalid persistent compression context result")
+                continue
+            context = context.strip()
+            if len(context) > _MAX_PERSISTENT_COMPRESSION_CONTEXT_CHARS:
+                logger.warning(
+                    "Ignoring oversized persistent compression context "
+                    "from source=%s chars=%d limit=%d",
+                    source,
+                    len(context),
+                    _MAX_PERSISTENT_COMPRESSION_CONTEXT_CHARS,
+                )
+                continue
+            candidate = {
+                "role": "user",
+                "content": (
+                    '<hermes-runtime-context user-authored="false" '
+                    f'source="{source}">\n'
+                    f"{context}\n"
+                    "</hermes-runtime-context>"
+                ),
+                "display_kind": "hidden",
+            }
+            if prepared is None:
+                prepared = candidate
+            else:
+                logger.warning(
+                    "Ignoring additional persistent compression context "
+                    "from source=%s; only one row is supported",
+                    source,
+                )
+        return prepared
+
     def _emit_compression_finish() -> None:
         """Emit exactly one terminal outcome for every emitted start."""
         nonlocal _compression_lifecycle_finished
@@ -2968,6 +3040,7 @@ def compress_context(
             return messages, existing_prompt
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
+    live_messages_before_compression = None
     messages_before_compression = None
     try:
         if _lock_holder is not None:
@@ -3106,6 +3179,20 @@ def compress_context(
                         # re-appending the concurrent rows and the live tail.
                         agent._persist_user_message_idx = len(messages)
 
+        # Persisted non-user runtime context is already model-visible through
+        # active history. It must not be summarized, re-ingested by a context
+        # engine, or handed to a memory provider as human transcript. Keep the
+        # live list untouched for Request Fork fidelity and rollback; every
+        # compression consumer receives the same private filtered copy.
+        from agent.context_compressor import is_non_user_runtime_context_message
+
+        live_messages_before_compression = copy.deepcopy(messages)
+        compression_input = [
+            copy.deepcopy(message)
+            for message in messages
+            if not is_non_user_runtime_context_message(message)
+        ]
+
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
         # wants surfaced inside the compression summary; capture and forward it
@@ -3113,7 +3200,7 @@ def compress_context(
         memory_context = ""
         if agent._memory_manager:
             try:
-                _maybe_ctx = agent._memory_manager.on_pre_compress(messages)
+                _maybe_ctx = agent._memory_manager.on_pre_compress(compression_input)
                 if isinstance(_maybe_ctx, str):
                     memory_context = sanitize_memory_context(_maybe_ctx)
             except Exception:
@@ -3145,7 +3232,7 @@ def compress_context(
                     engine_name,
                 )
 
-        messages_before_compression = copy.deepcopy(messages)
+        messages_before_compression = copy.deepcopy(compression_input)
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence
         ).start()
@@ -3206,7 +3293,7 @@ def compress_context(
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
                 ):
-                    compressed = compress_fn(messages, **compress_kwargs)
+                    compressed = compress_fn(compression_input, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
                     # session state.
@@ -3233,10 +3320,10 @@ def compress_context(
             # Compensation failure must surface, but it must not strand the
             # session lease or retain an in-memory transcript mutation.
             if (
-                messages_before_compression is not None
-                and messages != messages_before_compression
+                live_messages_before_compression is not None
+                and messages != live_messages_before_compression
             ):
-                messages[:] = copy.deepcopy(messages_before_compression)
+                messages[:] = copy.deepcopy(live_messages_before_compression)
             if _activity_heartbeat is not None:
                 _activity_heartbeat.stop("context compression rollback failed")
                 _activity_heartbeat = None
@@ -3253,10 +3340,10 @@ def compress_context(
             )
             raise
         if (
-            messages_before_compression is not None
-            and messages != messages_before_compression
+            live_messages_before_compression is not None
+            and messages != live_messages_before_compression
         ):
-            messages[:] = copy.deepcopy(messages_before_compression)
+            messages[:] = copy.deepcopy(live_messages_before_compression)
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression cancelled")
             _activity_heartbeat = None
@@ -3353,8 +3440,11 @@ def compress_context(
         # rotate or rewrite the session.
         if compressed == messages_before_compression:
             _set_compression_lifecycle_outcome("aborted", "no_progress")
-            if messages != messages_before_compression:
-                messages[:] = copy.deepcopy(messages_before_compression)
+            if (
+                live_messages_before_compression is not None
+                and messages != live_messages_before_compression
+            ):
+                messages[:] = copy.deepcopy(live_messages_before_compression)
             logger.info(
                 "Compression made no progress (session=%s) — skipping boundary rewrite.",
                 agent.session_id or "none",
@@ -3392,6 +3482,11 @@ def compress_context(
             _release_lock()
             return messages, _existing_sp
 
+        # This hook may wait for an already-running checkpoint LLM request.
+        # It therefore runs before begin_commit; the commit fence remains a
+        # short, DB-only critical section.
+        persistent_compression_context = _prepare_persistent_compression_context()
+
         if commit_fence is not None:
             _commit_fence_entered = commit_fence.begin_commit(_hard_cancel_event)
             if not _commit_fence_entered:
@@ -3402,10 +3497,10 @@ def compress_context(
                     durable_cooldown_state=_durable_cooldown_state,
                 )
                 if (
-                    messages_before_compression is not None
-                    and messages != messages_before_compression
+                    live_messages_before_compression is not None
+                    and messages != live_messages_before_compression
                 ):
-                    messages[:] = copy.deepcopy(messages_before_compression)
+                    messages[:] = copy.deepcopy(live_messages_before_compression)
                 logger.info(
                     "Compression commit cancelled before session mutation "
                     "(session=%s).",
@@ -3505,6 +3600,8 @@ def compress_context(
                     "_todo_snapshot_synthetic": True,
                 })
         _ensure_compressed_has_user_turn(messages, compressed)
+        if persistent_compression_context is not None:
+            compressed.append(persistent_compression_context)
 
         cached_system_prompt = agent._cached_system_prompt
         agent._invalidate_system_prompt()
@@ -3552,7 +3649,7 @@ def compress_context(
                 # transcript is rewritten (runs in BOTH modes — the logical
                 # conversation's pre-compaction turns are about to be summarized
                 # away regardless of whether the id rotates).
-                agent.commit_memory_session(messages)
+                agent.commit_memory_session(messages_before_compression)
 
                 if in_place:
                     # ── In-place compaction: keep the same session_id ──────────
@@ -3762,7 +3859,7 @@ def compress_context(
                     # Atomic publication failed (including lease loss): keep the
                     # parent live and discard the stale compacted snapshot.
                     old_session_id = None
-                    messages[:] = copy.deepcopy(messages_before_compression)
+                    messages[:] = copy.deepcopy(live_messages_before_compression)
                     compressed = messages
                     _compression_made_progress = False
                     # Restore ONLY the prune runway, not the full attempt

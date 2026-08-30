@@ -729,6 +729,8 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
 
     # Pass 2: merge consecutive user messages. Preserves all user input
     # so nothing the user typed is lost.
+    from agent.context_compressor import is_non_user_runtime_context_message
+
     merged: List[Dict] = []
     for msg in filtered:
         if (
@@ -737,6 +739,8 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             and msg.get("role") == "user"
             and isinstance(merged[-1], dict)
             and merged[-1].get("role") == "user"
+            and not is_non_user_runtime_context_message(msg)
+            and not is_non_user_runtime_context_message(merged[-1])
         ):
             prev = merged[-1]
             prev_content = prev.get("content", "")
@@ -1404,6 +1408,8 @@ def drop_thinking_only_and_merge_users(
         return messages
 
     # Pass 2: merge any newly-adjacent user messages.
+    from agent.context_compressor import is_non_user_runtime_context_message
+
     merged: List[Dict[str, Any]] = []
     merges = 0
     for m in kept:
@@ -1412,6 +1418,8 @@ def drop_thinking_only_and_merge_users(
             prev is not None
             and prev.get("role") == "user"
             and m.get("role") == "user"
+            and not is_non_user_runtime_context_message(prev)
+            and not is_non_user_runtime_context_message(m)
         ):
             prev_content = prev.get("content", "")
             cur_content = m.get("content", "")
