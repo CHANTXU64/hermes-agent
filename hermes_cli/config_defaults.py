@@ -1629,27 +1629,6 @@ DEFAULT_CONFIG = {
         "xai": {
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
-        "custom_api": {
-            # Neutral schema leaves keep load_config()'s deep merge from
-            # overriding legacy endpoint inference or STT_CUSTOM_API_* env
-            # fallbacks. Runtime defaults are resolved in transcription_tools.
-            "base_url": None,
-            "api_key": "",
-            "api_key_env": None,
-            "model": None,
-            "endpoint": None,
-            "mode": None,
-            "response_format": None,
-            # Language hints are sent only by compatible multipart and
-            # chat-completions modes; DashScope multimodal does not use one.
-            "language": None,
-            # None selects the mode-aware default: no prompt for DashScope
-            # multimodal; the historical instruction for compatible modes.
-            "prompt": None,
-            # DashScope multimodal sends these as ASR context before the audio.
-            "keywords": [],
-            "timeout": None,
-        },
         "elevenlabs": {
             "model_id": "scribe_v2",  # scribe_v2, scribe_v1
             "language_code": "",  # auto-detect by default; set to "eng", "spa", "fra", etc. to force

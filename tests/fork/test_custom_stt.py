@@ -25,12 +25,18 @@ def test_custom_api_when_configured():
     }
     assert _get_provider(stt_config) == "custom_api"
 
-def test_custom_api_requires_key_and_base_url():
-    from tools.transcription_tools import _get_provider
-    assert _get_provider({"provider": "custom_api", "custom_api": {}}) == "none"
+def test_custom_api_requires_credentials(monkeypatch):
+    from plugins.qwen_stt import QwenSTTProvider
+
+    monkeypatch.delenv("QWEN_API_KEY", raising=False)
+    with patch(
+        "plugins.qwen_stt._load_stt_config",
+        return_value={"custom_api": {"api_key_env": "MISSING_QWEN_TEST_KEY"}},
+    ):
+        assert QwenSTTProvider().is_available() is False
 
 def test_successful_text_response(tmp_path):
-    from tools.transcription_tools import _transcribe_custom_api
+    from plugins.qwen_stt import _transcribe_custom_api
 
     audio_file = tmp_path / "test.wav"
     audio_file.write_bytes(b"fake audio")
@@ -56,7 +62,7 @@ def test_successful_text_response(tmp_path):
             "language": "zh",
         },
     }
-    with patch("tools.transcription_tools._load_stt_config", return_value=cfg), \
+    with patch("plugins.qwen_stt._load_stt_config", return_value=cfg), \
          patch("requests.post", side_effect=fake_post):
         result = _transcribe_custom_api(str(audio_file), "qwen3-asr")
 
@@ -66,7 +72,7 @@ def test_successful_text_response(tmp_path):
     assert captured["data"] == {"model": "qwen3-asr", "response_format": "json", "language": "zh"}
 
 def test_successful_choices_response(tmp_path):
-    from tools.transcription_tools import _transcribe_custom_api
+    from plugins.qwen_stt import _transcribe_custom_api
 
     audio_file = tmp_path / "test.wav"
     audio_file.write_bytes(b"fake audio")
@@ -80,7 +86,7 @@ def test_successful_choices_response(tmp_path):
             "response_format": "",
         },
     }
-    with patch("tools.transcription_tools._load_stt_config", return_value=cfg), \
+    with patch("plugins.qwen_stt._load_stt_config", return_value=cfg), \
          patch("requests.post", return_value=response):
         result = _transcribe_custom_api(str(audio_file), "qwen3-asr")
 
@@ -88,7 +94,7 @@ def test_successful_choices_response(tmp_path):
     assert result["transcript"] == "选择格式文本"
 
 def test_successful_chat_completions_response(tmp_path):
-    from tools.transcription_tools import _transcribe_custom_api
+    from plugins.qwen_stt import _transcribe_custom_api
 
     audio_file = tmp_path / "test.ogg"
     audio_file.write_bytes(b"fake audio")
@@ -113,7 +119,7 @@ def test_successful_chat_completions_response(tmp_path):
             "prompt": "术语提示",
         },
     }
-    with patch("tools.transcription_tools._load_stt_config", return_value=cfg), \
+    with patch("plugins.qwen_stt._load_stt_config", return_value=cfg), \
          patch("requests.post", side_effect=fake_post):
         result = _transcribe_custom_api(str(audio_file), "qwen3-asr-flash-2026-02-10")
 
@@ -146,7 +152,7 @@ def test_successful_chat_completions_response(tmp_path):
 
 def test_default_config_recognizes_and_resolves_latest_qwen_custom_stt(monkeypatch):
     from hermes_cli.config_defaults import DEFAULT_CONFIG
-    from tools.transcription_tools import _resolve_custom_api_config
+    from plugins.qwen_stt import _resolve_custom_api_config
 
     for name in (
         "STT_CUSTOM_API_BASE_URL",
@@ -159,22 +165,9 @@ def test_default_config_recognizes_and_resolves_latest_qwen_custom_stt(monkeypat
     ):
         monkeypatch.delenv(name, raising=False)
 
-    custom_schema = DEFAULT_CONFIG["stt"]["custom_api"]
-    assert {
-        "base_url",
-        "api_key",
-        "api_key_env",
-        "model",
-        "endpoint",
-        "mode",
-        "response_format",
-        "language",
-        "prompt",
-        "keywords",
-        "timeout",
-    } <= custom_schema.keys()
+    assert "custom_api" not in DEFAULT_CONFIG["stt"]
 
-    cfg = _resolve_custom_api_config(DEFAULT_CONFIG["stt"])
+    cfg = _resolve_custom_api_config({})
     assert cfg["base_url"] == "https://dashscope.aliyuncs.com"
     assert cfg["api_key_env"] == "QWEN_API_KEY"
     assert cfg["model"] == "qwen-audio-3.0-asr-flash"
@@ -199,7 +192,7 @@ def test_loaded_legacy_endpoint_without_mode_still_infers_multipart(tmp_path, mo
     )
 
     from hermes_cli.config import load_config
-    from tools.transcription_tools import _load_stt_config, _resolve_custom_api_config
+    from plugins.qwen_stt import _load_stt_config, _resolve_custom_api_config
 
     loaded = load_config()
     stt_config = _load_stt_config()
@@ -231,7 +224,7 @@ def test_loaded_custom_stt_uses_environment_before_qwen_defaults(tmp_path, monke
         monkeypatch.setenv(name, value)
 
     from hermes_cli.config import load_config
-    from tools.transcription_tools import _load_stt_config, _resolve_custom_api_config
+    from plugins.qwen_stt import _load_stt_config, _resolve_custom_api_config
 
     loaded = load_config()
     stt_config = _load_stt_config()
@@ -254,7 +247,7 @@ def test_loaded_custom_stt_uses_environment_before_qwen_defaults(tmp_path, monke
 
 
 def test_custom_stt_config_overrides_environment_including_timeout(monkeypatch):
-    from tools.transcription_tools import _resolve_custom_api_config
+    from plugins.qwen_stt import _resolve_custom_api_config
 
     env = {
         "STT_CUSTOM_API_BASE_URL": "https://env.example",
@@ -292,7 +285,7 @@ def test_custom_stt_config_overrides_environment_including_timeout(monkeypatch):
 
 
 def test_default_custom_api_preserves_empty_prompt_and_global_language():
-    from tools.transcription_tools import _resolve_custom_api_config
+    from plugins.qwen_stt import _resolve_custom_api_config
 
     cfg = _resolve_custom_api_config(
         {
@@ -310,7 +303,7 @@ def test_default_custom_api_preserves_empty_prompt_and_global_language():
 
 
 def test_custom_api_normalizes_keyword_list():
-    from tools.transcription_tools import _resolve_custom_api_config
+    from plugins.qwen_stt import _resolve_custom_api_config
 
     cfg = _resolve_custom_api_config(
         {
@@ -327,7 +320,7 @@ def test_custom_api_normalizes_keyword_list():
 
 @pytest.mark.parametrize("invalid_keywords", [123, True, {"里仁洞": 1}])
 def test_custom_api_ignores_invalid_keyword_types(invalid_keywords):
-    from tools.transcription_tools import _resolve_custom_api_config
+    from plugins.qwen_stt import _resolve_custom_api_config
 
     cfg = _resolve_custom_api_config(
         {
@@ -343,7 +336,7 @@ def test_custom_api_ignores_invalid_keyword_types(invalid_keywords):
 
 
 def test_default_custom_api_targets_latest_qwen_audio_model():
-    from tools.transcription_tools import _resolve_custom_api_config
+    from plugins.qwen_stt import _resolve_custom_api_config
 
     stt_config = {
         "custom_api": {
@@ -367,7 +360,7 @@ def test_default_custom_api_targets_latest_qwen_audio_model():
 
 
 def test_successful_dashscope_multimodal_response(tmp_path):
-    from tools.transcription_tools import _transcribe_custom_api
+    from plugins.qwen_stt import _transcribe_custom_api
 
     audio_file = tmp_path / "test.ogg"
     audio_file.write_bytes(b"fake audio")
@@ -399,7 +392,7 @@ def test_successful_dashscope_multimodal_response(tmp_path):
             "keywords": ["里仁洞", "FIP"],
         },
     }
-    with patch("tools.transcription_tools._load_stt_config", return_value=cfg), \
+    with patch("plugins.qwen_stt._load_stt_config", return_value=cfg), \
          patch("requests.post", side_effect=fake_post):
         result = _transcribe_custom_api(str(audio_file), "qwen-audio-3.0-asr-flash")
 
@@ -444,7 +437,7 @@ def test_successful_dashscope_multimodal_response(tmp_path):
 
 
 def test_dashscope_multimodal_omits_empty_context(tmp_path):
-    from tools.transcription_tools import _transcribe_custom_api
+    from plugins.qwen_stt import _transcribe_custom_api
 
     audio_file = tmp_path / "test.ogg"
     audio_file.write_bytes(b"fake audio")
@@ -468,7 +461,7 @@ def test_dashscope_multimodal_omits_empty_context(tmp_path):
             "keywords": [],
         },
     }
-    with patch("tools.transcription_tools._load_stt_config", return_value=cfg), \
+    with patch("plugins.qwen_stt._load_stt_config", return_value=cfg), \
          patch("requests.post", side_effect=fake_post):
         result = _transcribe_custom_api(str(audio_file), "qwen-audio-3.0-asr-flash")
 
@@ -479,7 +472,7 @@ def test_dashscope_multimodal_omits_empty_context(tmp_path):
 
 
 def test_invalid_custom_api_mode_fails_before_request(tmp_path):
-    from tools.transcription_tools import _transcribe_custom_api
+    from plugins.qwen_stt import _transcribe_custom_api
 
     audio_file = tmp_path / "test.ogg"
     audio_file.write_bytes(b"fake audio")
@@ -491,7 +484,7 @@ def test_invalid_custom_api_mode_fails_before_request(tmp_path):
         }
     }
 
-    with patch("tools.transcription_tools._load_stt_config", return_value=cfg), \
+    with patch("plugins.qwen_stt._load_stt_config", return_value=cfg), \
          patch("requests.post") as post:
         result = _transcribe_custom_api(str(audio_file), "qwen-audio-3.0-asr-flash")
 
@@ -506,25 +499,8 @@ def test_invalid_custom_api_mode_fails_before_request(tmp_path):
     post.assert_not_called()
 
 
-def test_dispatches_to_custom_api(tmp_path):
-    audio_file = tmp_path / "test.ogg"
-    audio_file.write_bytes(b"fake audio")
-    stt_config = {
-        "provider": "custom_api",
-        "custom_api": {"model": "qwen3-asr", "base_url": "https://example.com/v1", "api_key": "key"},
-    }
-
-    with patch("tools.transcription_tools._load_stt_config", return_value=stt_config), \
-         patch("tools.transcription_tools._get_provider", return_value="custom_api"), \
-         patch("tools.transcription_tools._transcribe_custom_api", return_value={"success": True, "transcript": "hi"}) as mock_custom:
-        from tools.transcription_tools import transcribe_audio
-        result = transcribe_audio(str(audio_file))
-
-    assert result["success"] is True
-    mock_custom.assert_called_once_with(str(audio_file), "qwen3-asr")
-
 def test_explicit_custom_api_sees_dotenv_env_key():
-    from tools import transcription_tools as tt
+    from plugins import qwen_stt
 
     stt_config = {
         "enabled": True,
@@ -535,10 +511,10 @@ def test_explicit_custom_api_sees_dotenv_env_key():
         },
     }
     with patch("hermes_cli.config.load_env", return_value={"QWEN_API_KEY": "dotenv-secret"}):
-        assert tt._get_provider(stt_config) == "custom_api"
+        assert qwen_stt._resolve_custom_api_config(stt_config)["api_key"] == "dotenv-secret"
 
 def test_default_custom_api_uses_qwen_dotenv_key():
-    from tools import transcription_tools as tt
+    from plugins import qwen_stt
 
     stt_config = {
         "enabled": True,
@@ -548,10 +524,10 @@ def test_default_custom_api_uses_qwen_dotenv_key():
         },
     }
     with patch("hermes_cli.config.load_env", return_value={"QWEN_API_KEY": "dotenv-secret"}):
-        assert tt._get_provider(stt_config) == "custom_api"
+        assert qwen_stt._resolve_custom_api_config(stt_config)["api_key"] == "dotenv-secret"
 
 def test_transcribe_custom_api_forwards_dotenv_env_key():
-    from tools import transcription_tools as tt
+    from plugins import qwen_stt as tt
 
     captured: dict = {}
 

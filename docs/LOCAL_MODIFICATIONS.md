@@ -612,125 +612,144 @@ git diff --check
 
 ### 10. Custom hosted STT provider
 
-Status: active
+Status: active; plugin-owned boundary (2026-08-30)
 
-Date: 2026-05-22; Qwen Audio 3.0 update 2026-08-01; custom keyword context 2026-08-02
+Date: 2026-05-22; Qwen Audio 3.0 update 2026-08-01; custom keyword
+context 2026-08-02; moved to the official transcription-provider plugin seam
+2026-08-30
 
 Files:
 
-- `tools/transcription_tools.py`
-- `hermes_cli/config_defaults.py`
-- `agent/transcription_registry.py`
+- `plugins/qwen_stt/plugin.yaml`
+- `plugins/qwen_stt/__init__.py`
+- `tools/transcription_tools.py` (generic plugin dispatch only)
+- `agent/transcription_registry.py` (generic plugin registry only)
 - `tests/fork/test_custom_stt.py`
+- `tests/fork/test_qwen_stt_plugin.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
 Summary:
 
-- Adds a configurable custom STT provider that supports generic OpenAI-compatible endpoints and Alibaba DashScope multimodal ASR, with `qwen-audio-3.0-asr-flash` as the fork default.
+- Provides the existing `stt.provider: custom_api` behavior through the bundled
+  `qwen-stt` plugin. The plugin supports generic OpenAI-compatible multipart and
+  chat-completions endpoints plus Alibaba DashScope multimodal ASR, with
+  `qwen-audio-3.0-asr-flash` as the Fork default.
 
 What changed:
 
-- Added `stt.provider: custom_api` dispatch in `tools/transcription_tools.py`.
-- Added `stt.custom_api` config for `base_url`, `api_key` / `api_key_env`, `model`, `endpoint`, `mode`, `response_format`, `language`, `prompt`, `keywords`, and `timeout`.
-- Preserved generic multipart audio uploads and DashScope-style chat-completions audio input.
-- Added `dashscope_multimodal` mode for Qwen-Audio-3.0-ASR-Flash. It posts a Base64 Data URL through DashScope's `input.messages[].content[].input_audio` shape, requests a non-SSE response, and reads `output.text`.
-- Runtime custom STT defaults now target `qwen-audio-3.0-asr-flash` at DashScope's multimodal generation endpoint. Neutral `DEFAULT_CONFIG` schema leaves preserve legacy endpoint inference and the `config.yaml` > `STT_CUSTOM_API_*` environment > runtime-default resolution order. Its effective prompt is empty because DashScope treats text messages as ASR context rather than transcription instructions; compatible modes retain their historical prompt default.
-- DashScope multimodal mode normalizes `keywords` as an ordered, de-duplicated list. A configured `prompt` and/or keyword list is sent as an `input_text` context message immediately before the audio message; empty values preserve the prior audio-only request shape.
-- Custom STT language hints follow the shared provider/global resolution order for compatible multipart and chat-completions modes. DashScope multimodal does not use a language hint. Unsupported mode names fail before any network request.
-- It parses common transcription response shapes: `{text: ...}`, plain text, `{choices:[{message:{content: ...}}]}`, and DashScope `{output:{text: ...}}`.
-- Added tests for provider selection, dotenv/env-key resolution, default configuration, all three request modes, response parsing, and `transcribe_audio()` dispatch.
+- Moved all `stt.custom_api` defaults, credential resolution, request
+  construction, keyword/Prompt mapping, response parsing and error envelopes
+  from `tools/transcription_tools.py` into `plugins/qwen_stt/__init__.py`.
+- The plugin registers the historical Provider name `custom_api` through
+  `PluginContext.register_transcription_provider()`. Existing `stt.provider`,
+  `stt.custom_api`, `STT_CUSTOM_API_*` and `QWEN_API_KEY` configuration remains
+  valid; no user STT configuration migration is required.
+- Removed `custom_api` from the core built-in/reserved Provider sets and removed
+  its special dispatch branch. `tools/transcription_tools.py` now reaches it only
+  through Hermes' generic plugin dispatcher.
+- Removed the custom STT schema/default block from core `DEFAULT_CONFIG`; the
+  plugin owns mode-aware defaults while `load_config()` continues to preserve
+  the user's `stt.custom_api` mapping.
+- Preserved generic multipart uploads, DashScope-style chat completions and
+  `dashscope_multimodal`. The latter sends an ordered, de-duplicated keyword list
+  and optional Prompt as an `input_text` context message immediately before the
+  Base64 audio message, requests a non-SSE response and reads `output.text`.
+- Preserved common response parsing, dotenv/API-key lookup, configuration-over-
+  environment precedence, legacy endpoint mode inference and pre-request
+  rejection of unsupported mode names.
+- Added a public-boundary regression that enables the real bundled plugin through
+  `PluginManager`, verifies `custom_api` registration and calls
+  `transcribe_audio()` through the existing Gateway-facing path.
 
 Why it matters:
 
-- The user's gateway can use the evaluated Qwen Audio 3.0 STT model through normal Hermes configuration while retaining generic custom endpoint support.
-- Future upstream merges must not collapse custom STT back into OpenAI-only credentials or hardcoded provider names.
+- Qwen/custom STT remains behavior-compatible while vendor HTTP logic no longer
+  lives in the high-churn 3,000+ line core transcription dispatcher.
+- Future upstream merges only need to preserve the general plugin registration
+  and dispatch seam; Qwen request semantics are reviewed in one isolated plugin.
 
 Merge protection:
 
-- Preserve explicit `stt.provider: custom_api` behavior and do not silently fall back to another STT provider when custom credentials are missing.
-- Preserve `custom_api` as a native/built-in STT provider name in `agent/transcription_registry.py`; command providers and plugin providers must not shadow the fork's configured custom STT implementation.
-- Preserve `api_key_env` lookup through `get_env_value()` so keys in `~/.hermes/.env` work.
-- Preserve the Qwen Audio 3.0 configuration shape: `QWEN_API_KEY`, model `qwen-audio-3.0-asr-flash`, base URL `https://dashscope.aliyuncs.com`, endpoint `/api/v1/services/aigc/multimodal-generation/generation`, and `dashscope_multimodal` mode.
-- Preserve `stt.custom_api.keywords` and its DashScope `input_text` context mapping; do not move keywords into the audio item or send an empty context message.
-- Preserve response parsing for OpenAI-compatible and DashScope multimodal response shapes unless upstream has a verified equivalent.
+- Preserve `plugins/qwen_stt` and its registration name `custom_api`; do not
+  restore Qwen/custom HTTP logic as a core built-in Provider.
+- Preserve explicit `stt.provider: custom_api` behavior and do not silently fall
+  back to another STT Provider when the plugin is unavailable.
+- Preserve `api_key_env` lookup through `get_env_value()` so keys in
+  `~/.hermes/.env` work.
+- Preserve the Qwen Audio 3.0 configuration shape: `QWEN_API_KEY`, model
+  `qwen-audio-3.0-asr-flash`, base URL `https://dashscope.aliyuncs.com`, endpoint
+  `/api/v1/services/aigc/multimodal-generation/generation`, and
+  `dashscope_multimodal` mode.
+- Preserve `stt.custom_api.prompt`/`keywords` and the DashScope `input_text`
+  context mapping; do not move keywords into the audio item or send an empty
+  context message.
+- Preserve the generic plugin dispatcher in `tools/transcription_tools.py` and
+  the registration hook in `agent/transcription_registry.py`; Provider-specific
+  behavior belongs in the plugin.
 
 Verification:
 
 ```bash
-python -m py_compile tools/transcription_tools.py hermes_cli/config_defaults.py tests/fork/test_custom_stt.py
-python -m pytest tests/fork/test_custom_stt.py tests/tools/test_transcription.py tests/tools/test_transcription_dotenv_fallback.py tests/hermes_cli/test_config.py tests/gateway/test_stt_config.py -q -o 'addopts='
+./venv/bin/python -m pytest tests/fork/test_custom_stt.py tests/fork/test_qwen_stt_plugin.py tests/tools/test_transcription.py tests/tools/test_transcription_dotenv_fallback.py tests/hermes_cli/test_config.py tests/gateway/test_stt_config.py -q -o 'addopts='
+./venv/bin/python -m py_compile plugins/qwen_stt/__init__.py tools/transcription_tools.py agent/transcription_registry.py
 ```
 
-Feature docs: none — this remains a focused provider extension fully described in the index.
+Feature docs: none — this focused Provider plugin is fully described here.
 
-Upstream status: fork-only.
+Upstream status: fork-only plugin; generic registration/dispatch seam is upstream.
 
 ### 11. Custom Qwen/DashScope TTS provider
 
-Status: active
+Status: removed on user request (2026-08-30); do not revive
 
-Date: 2026-05-28
+Date introduced: 2026-05-28; removed 2026-08-30
 
-Files:
+Current files:
 
-- `agent/tts_registry.py`
-- `tools/tts_tool.py`
-- `tests/agent/test_tts_registry.py`
-- `tests/fork/test_custom_qwen_tts.py`
+- `tests/fork/test_custom_tts_removed.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
 Summary:
 
-- Adds a configurable `tts.provider: custom_api` path so the fork can synthesize speech through Qwen/DashScope using the same `QWEN_API_KEY` convention as custom STT.
+- The entire core `custom_api` TTS Provider was removed, including both the
+  Qwen/DashScope multimodal mode and the generic custom HTTP `/audio/speech`
+  mode. The default Profile now uses the upstream Edge Provider and no longer
+  contains a `tts.custom_api` block.
 
-What changed:
+What was removed:
 
-- Added `custom_api` as a built-in TTS provider in `tools/tts_tool.py`.
-- Reserved `custom_api` in `agent/tts_registry.py` so plugin registration cannot
-  shadow the fork's native provider; this list must stay synchronized with
-  `BUILTIN_TTS_PROVIDERS`.
-- Added `tts.custom_api` resolution for `base_url`, `endpoint`, `mode`, `api_key` / `api_key_env`, `model`, `voice`, `language_type`, `response_format`, `speed`, `timeout`, and `extra_body`.
-- Default custom TTS config targets Alibaba DashScope Qwen TTS: `https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation`, `mode: dashscope_multimodal`, model `qwen3-tts-flash`, voice `Cherry`, and `api_key_env: QWEN_API_KEY`.
-- The DashScope multimodal mode posts `model` plus `input.text` / `input.voice`, then downloads the returned `output.audio.url` into the requested audio file.
-- A generic `audio_speech` mode remains available for OpenAI-compatible `/audio/speech` endpoints.
-- Custom API JSON, direct-audio, and DashScope URL-download responses use the upstream bounded streaming reader and the shared TTS response-size limit.
-- Telegram voice delivery can convert custom TTS output to Opus/OGG for voice-compatible media.
-- Added focused tests for OpenAI-compatible request construction, DashScope multimodal request construction, URL audio download, JSON base64 audio parsing, and missing `QWEN_API_KEY` errors.
+- `custom_api` from `BUILTIN_TTS_PROVIDERS`, Provider length limits,
+  `agent.tts_registry` reserved names, availability detection, synthesis
+  dispatch and hard-coded Opus routing.
+- Qwen/custom TTS defaults, configuration resolution, request construction,
+  bounded response parsing, Base64/URL audio extraction and active Fork tests.
+- The old `tests/fork/test_custom_qwen_tts.py` active behavior suite.
 
 Why it matters:
 
-- The user wants Chinese voice replies to use the existing Qwen/DashScope credential setup rather than Edge TTS or a separate TTS-specific key.
-- Future upstream merges must not remove the `custom_api` TTS provider path or collapse it into Edge/OpenAI-only behavior.
+- The user no longer needs this feature. Removing the complete maintenance unit
+  eliminates recurring merge work in the high-churn TTS tool instead of leaving
+  disabled dead code or a partial generic mode.
 
 Merge protection:
 
-- Preserve `custom_api` as a native/built-in TTS provider name; command providers or plugin providers must not shadow this configured implementation.
-- Keep `agent.tts_registry._BUILTIN_NAMES` synchronized with
-  `tools.tts_tool.BUILTIN_TTS_PROVIDERS`; run the registry invariant test after
-  upstream changes to TTS provider discovery.
-- Preserve `api_key_env` lookup through `get_env_value()` so keys in `~/.hermes/.env` work.
-- Preserve DashScope multimodal handling of `output.audio.url`; Qwen TTS does not use the OpenAI-compatible `/audio/speech` endpoint shape by default.
-- Keep custom API POST responses and DashScope audio downloads on the shared bounded streaming reader; do not restore eager `response.content` / `response.json()` reads.
-- Preserve the generic `audio_speech` mode unless upstream provides a verified equivalent configurable HTTP TTS provider.
-- Preserve Telegram Opus conversion behavior for `custom_api` when voice-compatible delivery is needed.
+- Do not restore `custom_api` as a core/native TTS Provider during conflict
+  resolution or from older Fork history.
+- Do not restore Qwen/DashScope defaults, `tts.custom_api`, generic custom HTTP
+  TTS, Qwen-specific Opus routing, or the deleted active behavior tests unless
+  the user explicitly requests the feature again.
+- Keep the removal regression: the core TTS module must not contain the removed
+  Provider name, and `agent.tts_registry` must not reserve it.
 
 Verification:
 
 ```bash
-scripts/run_tests.sh tests/agent/test_tts_registry.py tests/fork/test_custom_qwen_tts.py tests/tools/test_tts_response_body_cap.py tests/tools/test_tts_plugin_dispatch.py tests/tools/test_tts_command_providers.py tests/tools/test_tts_opus_routing.py tests/tools/test_tts_max_text_length.py -q
+./venv/bin/python -m pytest tests/fork/test_custom_tts_removed.py tests/agent/test_tts_registry.py tests/tools/test_tts_plugin_dispatch.py tests/tools/test_tts_command_providers.py tests/tools/test_tts_opus_routing.py tests/tools/test_tts_max_text_length.py -q -o 'addopts='
 ```
 
-- 2026-07-10 upstream sync: upstream's newer provider registry exposed a logical
-  merge gap because `custom_api` existed only in the dispatcher. After reserving
-  it in `agent/tts_registry.py`, the fork and changed-upstream focused suite
-  reported `2070 passed`; the TTS subset in the command above was included.
-- Later in the same sync, upstream advanced another 9 commits including null
-  subsection guards in `tools/transcription_tools.py` and `tools/tts_tool.py`.
-  The final fork plus changed-upstream focused suite reported `1210 passed`.
+Feature docs: none — historical removal is recorded here to prevent revival.
 
-Feature docs: none — TTS provider extension documented in this index.
-
-Upstream status: fork-only.
+Upstream status: reverted Fork-only feature.
 
 
 ### 12. Request-only recall isolation and Codex prompt-cache routing
@@ -2293,14 +2312,19 @@ deltas are expected in these areas:
   - `tests/gateway/test_undo_rewind_session.py`
   - `tui_gateway/server.py`
   - `tests/tui_gateway/test_undo_command.py`
-- Custom STT API / custom Qwen TTS API:
+- Custom STT API plugin:
+  - `plugins/qwen_stt/plugin.yaml`
+  - `plugins/qwen_stt/__init__.py`
   - `tools/transcription_tools.py`
-  - `tools/tts_tool.py`
   - `agent/transcription_registry.py`
-  - `agent/tts_registry.py`
+  - `tests/fork/test_custom_stt.py`
+  - `tests/fork/test_qwen_stt_plugin.py`
   - `tests/tools/test_transcription.py`
   - `tests/tools/test_transcription_dotenv_fallback.py`
-  - `tests/fork/test_custom_qwen_tts.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
+- Removed custom Qwen/custom HTTP TTS regression:
+  - `tests/fork/test_custom_tts_removed.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
 - Successful STT voice-origin enrichment:
   - `gateway/run.py`
   - `tests/gateway/test_stt_config.py`
@@ -2482,9 +2506,9 @@ deltas are expected in these areas:
 
 Documented entries: 29 major entries.
 
-Active / current entries: 24.
+Active / current entries: 23.
 
-Historical reverted / abandoned / superseded areas: 5.
+Historical reverted / abandoned / superseded areas: 6.
 
 Fork-only non-merge commits represented here: see
 `git log --no-merges upstream/main..HEAD`.

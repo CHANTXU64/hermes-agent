@@ -1,0 +1,5 @@
+name: qwen-stt
+version: 1.0.0
+description: "Qwen/DashScope and compatible custom HTTP speech-to-text backend."
+author: Hermes Fork
+kind: backend
