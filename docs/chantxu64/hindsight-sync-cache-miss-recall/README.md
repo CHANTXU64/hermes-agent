@@ -28,11 +28,29 @@ This fork adds a bounded synchronous fallback inside the Hindsight provider:
 - Hindsight's post-turn `queue_prefetch()` is a no-op; it never recalls the
   completed turn's raw user text.
 
+The provider-neutral `MemoryManager` only supplies a bounded worker thread and
+the `on_prefetch_timeout` callback. Fork-owned cache lifecycle rules live in
+`fork_features/hindsight_recall_cache.py`; Hindsight API calls, formatting and
+the P5 query algorithm remain in the provider.
+
 ## Files
 
-- `plugins/memory/hindsight/__init__.py` — Hindsight provider implementation, sync fallback, config parsing, generation guard.
-- `tests/plugins/memory/test_hindsight_provider.py` — provider behavior and race regression tests.
-- `tests/agent/test_memory_session_switch.py` — bare-provider session switch state tests updated for generation fields.
+- `fork_features/hindsight_recall_cache.py` — Session-scoped carried cache,
+  generation/timeout invalidation and sync-miss gate.
+- `plugins/memory/hindsight/__init__.py` — Hindsight API calls, sync fallback,
+  config, formatting and P5 orchestration through the Fork state object.
+- `tests/fork_features/test_hindsight_recall_cache.py` — direct lifecycle
+  contracts for consume/carry/timeout/Session/Undo/gating.
+- `tests/fork/test_hindsight_provider_regressions.py` — public Provider fallback
+  and carry behavior.
+- `tests/fork/test_hindsight_recall_preprocessor.py` — P5 fixture/read migration
+  and unchanged query/selection/fallback contracts.
+- `tests/fork/test_hindsight_manual_retain_removed.py` — rewind invalidation
+  without reviving the retired manual-retain ledger.
+- `tests/plugins/memory/test_hindsight_provider.py` — provider behavior and race
+  regression tests.
+- `tests/agent/test_memory_session_switch.py` — bare-provider Session switch
+  state tests.
 - `docs/LOCAL_MODIFICATIONS.md` — fork modification index entry.
 - `docs/chantxu64/hindsight-sync-cache-miss-recall/README.md` — this feature document.
 
@@ -62,6 +80,10 @@ The fallback is skipped when:
 - Drop when: upstream implements equivalent current-turn cache-miss recall with stale prefetch protection and a bounded sync timeout.
 - Ask user when: upstream changes the memory prefetch lifecycle, Hindsight provider state model, or session-switch semantics in a way that is similar but not identical.
 
+Fixed upstream `66666f6e2eca0ae883195a34c66131985ea7dd06` has an opt-in
+`recall_sync` mode that recalls on every eligible turn and defaults off. It is
+not equivalent to the Fork's default-on, cache-miss-only fallback.
+
 Conflict handling notes:
 
 - Do not preserve `_prefetch_result` clearing alone as sufficient stale-context protection; the structured snapshot must follow the same generation, session-switch, and rewind lifecycle.
@@ -70,15 +92,15 @@ Conflict handling notes:
 
 ## Verification
 
+Focused verification (`84 passed` on the 2026-08-30 migration):
+
 ```bash
-python -m pytest tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/run_agent/test_memory_sync_interrupted.py -q -o 'addopts='
+python -m pytest tests/fork_features/test_hindsight_recall_cache.py tests/fork/test_hindsight_provider_regressions.py tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/run_agent/test_memory_sync_interrupted.py -q -o 'addopts='
 ```
 
-Expected result from the implementation change:
-
-```text
-149 passed
-```
+The expanded 2026-08-30 gate additionally covered all Hindsight Fork/plugin
+suites, MemoryManager, Request-only injection, pre-compression and Gateway memory
+paths. It reported `384 passed` with `7` third-party deprecation warnings.
 
 Manual smoke check used during implementation:
 

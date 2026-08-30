@@ -215,11 +215,16 @@ Upstream status: fork-only.
 
 ### 8. Hindsight synchronous cache-miss recall
 
-Date: 2026-05-22; upstream merge boundary reconfirmed 2026-08-08
+Date: 2026-05-22; cache lifecycle boundary migrated 2026-08-30
 
 Files:
 
+- `fork_features/hindsight_recall_cache.py`
 - `plugins/memory/hindsight/__init__.py`
+- `tests/fork_features/test_hindsight_recall_cache.py`
+- `tests/fork/test_hindsight_provider_regressions.py`
+- `tests/fork/test_hindsight_recall_preprocessor.py`
+- `tests/fork/test_hindsight_manual_retain_removed.py`
 - `tests/plugins/memory/test_hindsight_provider.py`
 - `tests/agent/test_memory_session_switch.py`
 - `docs/LOCAL_MODIFICATIONS.md`
@@ -233,6 +238,12 @@ What changed:
   settings. Defaults: enabled, 5 seconds.
 - Current-turn recall snapshots are guarded by a generation counter so a late
   result from an older turn/session cannot overwrite newer recall context.
+- The Fork-owned cache lifecycle now lives in
+  `fork_features/hindsight_recall_cache.py`: atomic consume, generation-checked
+  carry, matching-turn timeout invalidation, Session rotation, Undo invalidation,
+  and the synchronous-miss gate. The Hindsight Provider still owns API calls,
+  query truncation, result formatting and the P5 algorithm; `MemoryManager`
+  remains provider-neutral and only supplies the outer timeout/thread boundary.
 - Shared recall/reflect parameter handling lives in a single helper used by the
   synchronous current-turn fallback and P5-generated recall. Hindsight's
   post-turn `queue_prefetch()` hook is intentionally a no-op.
@@ -258,10 +269,34 @@ Merge protection:
 - Upstream's post-turn queued-prefetch retain-drain feature is not applicable
   while this provider intentionally keeps `queue_prefetch()` as a no-op. Do not
   expose its settings or retain-operation polling as if that path were active.
+- Fixed upstream `66666f6e2eca0ae883195a34c66131985ea7dd06` has a different
+  `recall_sync` option: it synchronously recalls every eligible turn and defaults
+  off. It is not equivalent to this Fork's default-on, cache-miss-only fallback.
+  Do not replace one with the other without a separate behavior decision.
 
 Feature docs: `docs/chantxu64/hindsight-sync-cache-miss-recall/README.md`
 
-Upstream status: fork-only.
+Verification after the 2026-08-30 boundary migration:
+
+- Seven Fork state contracts were observed RED before each capability existed,
+  then GREEN for Session-scoped consume, stale-generation carry rejection,
+  matching-turn timeout invalidation, Session rotation, non-invalidating Session
+  rebind, Undo invalidation and all synchronous-miss skip conditions. A separate
+  structure contract rejects reintroduced legacy fields or compatibility
+  properties on the Provider.
+- Hindsight/Fork/provider/MemoryManager/Session/Request-only/compression/Gateway
+  memory regression set: `384 passed` with `7` third-party deprecation warnings.
+- Fixed-SHA three-way merge simulation remained `2 → 2` text conflict regions;
+  no conflict-count reduction is claimed. The high-frequency Provider file
+  changed by `+56/-99`, moving the concrete state policy behind one Fork object.
+- Independent `xai-oauth/grok-4.6` `xhigh` review returned `PASS` with `0`
+  blocking findings. Its applicable findings were closed before commit:
+  `sync_turn` now rebinds the cache Session without clearing carried Recall,
+  the structure contract also rejects properties, fixture-only `seed()` is
+  labeled, and the verification/file indexes were corrected.
+
+Upstream status: intentional Fork divergence from upstream's every-turn
+`recall_sync` option.
 
 ### 9. Hindsight P5 recall preprocessor
 
@@ -2361,13 +2396,16 @@ deltas are expected in these areas:
   - `.gitignore`
   - `agent/memory_manager.py`
   - `agent/memory_provider.py`
+  - `fork_features/hindsight_recall_cache.py`
   - `plugins/memory/hindsight/__init__.py`
   - `hermes_state.py`
+  - `tests/fork_features/test_hindsight_recall_cache.py`
   - `tests/plugins/memory/test_hindsight_provider.py`
   - `tests/fork/test_hindsight_unicode_contract.py`
   - `tests/test_hermes_state.py`
   - `tests/agent/test_memory_session_switch.py`
   - `tests/fork/test_hindsight_provider_regressions.py`
+  - `tests/fork/test_hindsight_recall_preprocessor.py`
   - `tests/fork/test_hindsight_rewind.py`
   - `cli.py`
   - `gateway/slash_commands.py`

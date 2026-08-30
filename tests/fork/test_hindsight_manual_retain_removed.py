@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
-
+from fork_features.hindsight_recall_cache import CarryResult, RecallSnapshot
 from hermes_cli.commands import resolve_command
 from plugins.memory.hindsight import HindsightMemoryProvider
 from tests.plugins.memory.test_hindsight_provider import provider
@@ -74,13 +73,23 @@ def test_rewind_only_invalidates_recall_without_manual_ledger(tmp_path, monkeypa
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = HindsightMemoryProvider()
     provider._session_id = "session-1"
-    provider._prefetch_result = "stale recall"
-    provider._prefetch_snapshot = cast(Any, object())
-    provider._active_prefetch_turn = ("session-1", 1)
+    provider._recall_cache.switch_session("session-1")
+    active = provider._recall_cache.begin_turn(
+        requested_session_id="session-1",
+        turn_id="turn-before-rewind",
+    )
+    assert active is not None
+    provider._recall_cache.seed(
+        RecallSnapshot(query="stale query", results=("stale recall",))
+    )
 
     provider.on_session_rewind("session-1", turns_undone=1)
 
-    assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot is None
-    assert provider._active_prefetch_turn is None
+    assert provider._recall_cache.result == ""
+    assert provider._recall_cache.snapshot is None
+    assert provider._recall_cache.carry(
+        RecallSnapshot(query="late", results=("late recall",)),
+        expected_generation=active.generation,
+        expected_session_id="session-1",
+    ) is CarryResult.STALE_GENERATION
     assert not (tmp_path / "hindsight" / "retain_turns.sqlite3").exists()

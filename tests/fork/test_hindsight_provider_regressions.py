@@ -8,6 +8,7 @@ behaviour plus one append-mode compatibility boundary.
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from fork_features.hindsight_recall_cache import RecallSnapshot
 from plugins.memory.hindsight import _append_capability_cache, _append_capability_lock
 from tests.plugins.memory.test_hindsight_provider import provider, provider_with_config
 
@@ -36,9 +37,9 @@ def test_prefetch_sync_fallback_carries_actual_recall_for_next_turn(provider):
     result = provider.prefetch("first turn")
 
     assert "Memory 1" in result
-    assert provider._prefetch_snapshot.query == "first turn"
-    assert provider._prefetch_snapshot.results == ("Memory 1", "Memory 2")
-    assert provider._prefetch_result == "- Memory 1\n- Memory 2"
+    assert provider._recall_cache.snapshot.query == "first turn"
+    assert provider._recall_cache.snapshot.results == ("Memory 1", "Memory 2")
+    assert provider._recall_cache.result == "- Memory 1\n- Memory 2"
 
 
 def test_prefetch_sync_skipped_in_tools_mode(provider_with_config):
@@ -67,11 +68,10 @@ def test_prefetch_sync_errors_are_best_effort(provider):
 
 
 def test_queue_prefetch_does_not_recall_or_replace_carried_snapshot(provider):
-    provider._prefetch_result = "- actual current recall"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="specific current query",
         results=("actual current recall",),
-    )
+    ))
     provider._recall_snapshot_for_query = MagicMock(
         side_effect=AssertionError("post-turn raw query must not recall")
     )
@@ -79,29 +79,48 @@ def test_queue_prefetch_does_not_recall_or_replace_carried_snapshot(provider):
     provider.queue_prefetch("继续。", session_id="test-session", turn_id="turn-2")
 
     provider._recall_snapshot_for_query.assert_not_called()
-    assert provider._prefetch_result == "- actual current recall"
-    assert provider._prefetch_snapshot.query == "specific current query"
-    assert provider._prefetch_snapshot.results == ("actual current recall",)
+    assert provider._recall_cache.result == "- actual current recall"
+    assert provider._recall_cache.snapshot.query == "specific current query"
+    assert provider._recall_cache.snapshot.results == ("actual current recall",)
 
 
 def test_prefetch_result_cleared_on_switch(provider_with_config):
     """Stale recall text from the old session must not leak into the
     next session's first prefetch read."""
     provider = provider_with_config(recall_sync_on_cache_miss=False)
-    provider._prefetch_result = "old-session recall: User likes Rust"
+    provider._recall_cache.seed(RecallSnapshot(
+        query="old-session query",
+        results=("old-session recall: User likes Rust",),
+    ))
     provider.on_session_switch("new-sid")
-    assert provider._prefetch_result == ""
+    assert provider._recall_cache.result == ""
     # And subsequent prefetch() should now report empty, not the leftover.
     assert provider.prefetch("anything") == ""
 
 
 def test_first_prefetch_after_switch_sync_recalls_new_query(provider):
-    provider._prefetch_result = "old-session recall"
+    provider._recall_cache.seed(RecallSnapshot(
+        query="old-session query",
+        results=("old-session recall",),
+    ))
     provider.on_session_switch("new-sid")
     result = provider.prefetch("new-session question")
     assert "Memory 1" in result
     assert "old-session recall" not in result
     assert provider._client.arecall.call_args.kwargs["query"] == "new-session question"
+
+
+def test_sync_turn_rebinds_cache_session_without_clearing_carried_recall(provider):
+    provider._retain_every_n_turns = 2
+    provider._recall_cache.seed(
+        RecallSnapshot(query="carried target", results=("carried memory",))
+    )
+
+    provider.sync_turn("user", "assistant", session_id="session-b")
+
+    assert provider._session_id == "session-b"
+    assert provider._recall_cache.session_id == "session-b"
+    assert provider._recall_cache.result == "- carried memory"
 
 
 def test_modern_api_auto_retain_appends_only_new_turn_after_first_flush(provider, monkeypatch):

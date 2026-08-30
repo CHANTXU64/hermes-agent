@@ -51,6 +51,13 @@ from hermes_time import now as _hermes_now
 from agent.secret_scope import get_secret
 
 from agent.memory_provider import MemoryProvider
+from fork_features.hindsight_recall_cache import (
+    CarryResult,
+    HindsightRecallCache,
+    RecallSnapshot as _RecallSnapshot,
+    render_snapshot,
+    should_sync_cache_miss,
+)
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
@@ -740,12 +747,6 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class _RecallSnapshot:
-    query: str
-    results: tuple[str, ...]
-
-
 class HindsightMemoryProvider(MemoryProvider):
     """Hindsight long-term memory with knowledge graph and multi-strategy retrieval."""
 
@@ -786,11 +787,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._client = None
         self._timeout = _DEFAULT_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
-        self._prefetch_result = ""
-        self._prefetch_snapshot: _RecallSnapshot | None = None
-        self._prefetch_lock = threading.Lock()
-        self._prefetch_generation = 0
-        self._active_prefetch_turn: tuple[str, int] | None = None
+        self._recall_cache = HindsightRecallCache()
         # Single-writer model for retain. sync_turn() enqueues; the writer
         # thread drains sequentially. Avoids spawning ad-hoc threads that
         # can race the interpreter shutdown and emit "cannot schedule new
@@ -1355,6 +1352,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
+        self._recall_cache = HindsightRecallCache(initial_session_id=self._session_id)
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
 
         # Each process lifecycle gets its own document_id. Reusing session_id
@@ -1630,7 +1628,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     @staticmethod
     def _recall_snapshot_text(snapshot: _RecallSnapshot) -> str:
-        return "\n".join(f"- {text}" for text in snapshot.results if text)
+        return render_snapshot(snapshot)
 
     def _recall_snapshot_for_query(
         self,
@@ -1694,34 +1692,23 @@ class HindsightMemoryProvider(MemoryProvider):
         session_id: str = "",
     ) -> None:
         """Keep the recall actually used this turn for the next P5 decision."""
-        carried_snapshot = _RecallSnapshot(
-            query=str(snapshot.query or ""),
-            results=tuple(str(text) for text in snapshot.results),
+        result = self._recall_cache.carry(
+            snapshot,
+            expected_generation=expected_generation,
+            expected_session_id=session_id,
         )
-        carried_text = self._recall_snapshot_text(carried_snapshot)
-        expected_session_id = str(session_id or "").strip()
-        with self._prefetch_lock:
-            if expected_generation != self._prefetch_generation:
-                logger.debug(
-                    "Prefetch: discarded carried snapshot from stale generation %s",
-                    expected_generation,
-                )
-                return
-            current_session_id = str(self._session_id or "").strip()
-            if (
-                expected_session_id
-                and current_session_id
-                and expected_session_id != current_session_id
-            ):
-                logger.debug(
-                    "Prefetch: discarded carried snapshot for stale session %s "
-                    "(current=%s)",
-                    expected_session_id,
-                    current_session_id,
-                )
-                return
-            self._prefetch_snapshot = carried_snapshot
-            self._prefetch_result = carried_text
+        if result is CarryResult.STALE_GENERATION:
+            logger.debug(
+                "Prefetch: discarded carried snapshot from stale generation %s",
+                expected_generation,
+            )
+        elif result is CarryResult.STALE_SESSION:
+            logger.debug(
+                "Prefetch: discarded carried snapshot for stale session %s "
+                "(current=%s)",
+                str(session_id or "").strip(),
+                str(self._session_id or "").strip(),
+            )
 
     def prefetch(
         self,
@@ -1740,26 +1727,20 @@ class HindsightMemoryProvider(MemoryProvider):
 
         requested_session_id = str(session_id or "").strip()
         requested_turn_id = str(turn_id or "").strip()
-        with self._prefetch_lock:
-            current_session_id = str(self._session_id or "").strip()
-            if (
-                requested_session_id
-                and current_session_id
-                and requested_session_id != current_session_id
-            ):
-                logger.debug(
-                    "Prefetch: skipped stale session %s (current=%s)",
-                    requested_session_id,
-                    current_session_id,
-                )
-                return ""
-            self._prefetch_generation += 1
-            snapshot_generation = self._prefetch_generation
-            self._active_prefetch_turn = (requested_turn_id, snapshot_generation)
-            result = self._prefetch_result
-            snapshot = self._prefetch_snapshot
-            self._prefetch_result = ""
-            self._prefetch_snapshot = None
+        cached_turn = self._recall_cache.begin_turn(
+            requested_session_id=requested_session_id,
+            turn_id=requested_turn_id,
+        )
+        if cached_turn is None:
+            logger.debug(
+                "Prefetch: skipped stale session %s (current=%s)",
+                requested_session_id,
+                str(self._session_id or "").strip(),
+            )
+            return ""
+        snapshot_generation = cached_turn.generation
+        result = cached_turn.result
+        snapshot = cached_turn.snapshot
 
         preprocessor_snapshot = snapshot
         if (
@@ -1842,12 +1823,12 @@ class HindsightMemoryProvider(MemoryProvider):
                     return ""
 
         if not result:
-            if (
-                self._memory_mode == "tools"
-                or not self._auto_recall
-                or self._shutting_down.is_set()
-                or not self._recall_sync_on_cache_miss
-                or not str(query or "").strip()
+            if not should_sync_cache_miss(
+                sync_enabled=self._recall_sync_on_cache_miss,
+                memory_mode=self._memory_mode,
+                auto_recall=self._auto_recall,
+                shutting_down=self._shutting_down.is_set(),
+                query=query,
             ):
                 logger.debug("Prefetch: no results available")
                 return ""
@@ -1878,28 +1859,10 @@ class HindsightMemoryProvider(MemoryProvider):
         turn_id: str = "",
     ) -> None:
         """Invalidate only the abandoned Hindsight prefetch generation."""
-        timed_out_session_id = str(session_id or "").strip()
-        timed_out_turn_id = str(turn_id or "").strip()
-        with self._prefetch_lock:
-            current_session_id = str(self._session_id or "").strip()
-            if (
-                timed_out_session_id
-                and current_session_id
-                and timed_out_session_id != current_session_id
-            ):
-                return
-            active_turn = self._active_prefetch_turn
-            if active_turn is None:
-                return
-            active_turn_id, active_generation = active_turn
-            if timed_out_turn_id and timed_out_turn_id != active_turn_id:
-                return
-            if active_generation != self._prefetch_generation:
-                return
-            self._prefetch_generation += 1
-            self._prefetch_result = ""
-            self._prefetch_snapshot = None
-            self._active_prefetch_turn = None
+        self._recall_cache.invalidate_timeout(
+            session_id=session_id,
+            turn_id=turn_id,
+        )
 
     def queue_prefetch(
         self,
@@ -1948,11 +1911,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._last_retained_turn_count = min(self._last_retained_turn_count, keep)
             self._turn_counter = keep
             self._turn_index = keep
-        with self._prefetch_lock:
-            self._prefetch_generation += 1
-            self._prefetch_result = ""
-            self._prefetch_snapshot = None
-            self._active_prefetch_turn = None
+        self._recall_cache.invalidate()
         logger.debug(
             "Hindsight on_session_rewind: session=%s turns_undone=%s",
             sid,
@@ -2039,7 +1998,9 @@ class HindsightMemoryProvider(MemoryProvider):
             return
 
         if session_id:
-            self._session_id = str(session_id).strip()
+            rebound_session_id = str(session_id).strip()
+            self._recall_cache.bind_session(rebound_session_id)
+            self._session_id = rebound_session_id
 
         turn = json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
         self._session_turns.append(turn)
@@ -2263,12 +2224,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._register_atexit()
                 self._retain_queue.put(_flush)
 
-        with self._prefetch_lock:
-            self._prefetch_generation += 1
-            self._prefetch_result = ""
-            self._prefetch_snapshot = None
-            self._active_prefetch_turn = None
-            self._session_id = new_id
+        self._recall_cache.switch_session(new_id)
+        self._session_id = new_id
 
         self._parent_session_id = str(parent_session_id or "").strip()
         start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")

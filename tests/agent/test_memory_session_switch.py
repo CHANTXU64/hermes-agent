@@ -12,6 +12,7 @@ import pytest
 
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
+from fork_features.hindsight_recall_cache import HindsightRecallCache
 
 
 class _RecordingProvider(MemoryProvider):
@@ -190,10 +191,7 @@ def _make_hindsight_provider():
     provider._retain_async = False
     provider._bank_id = "test-bank"
     # Carried recall state the switch path clears.
-    provider._prefetch_generation = 0
-    provider._prefetch_lock = threading.Lock()
-    provider._prefetch_result = ""
-    provider._prefetch_snapshot = None
+    provider._recall_cache = HindsightRecallCache(initial_session_id="old-sid")
     # Sync thread tracking (legacy alias at the writer).
     provider._sync_thread = None
     # Writer queue infra the flush-on-switch path enqueues onto. We stub

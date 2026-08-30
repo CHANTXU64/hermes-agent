@@ -13,6 +13,7 @@ import pytest
 import agent.turn_context as turn_context
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
+from fork_features.hindsight_recall_cache import RecallSnapshot
 from tests.plugins.memory.test_hindsight_provider import provider, provider_with_config
 from tests.agent.test_turn_context import _build, _make_agent_with_cooldown
 
@@ -959,11 +960,10 @@ def test_hindsight_prefetch_filters_cached_snapshot_and_appends_new_recall(
     provider,
     monkeypatch,
 ):
-    provider._prefetch_result = "- 仍相关的旧记忆\n- 明确旁题"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="检查启动报错",
         results=("仍相关的旧记忆", "明确旁题"),
-    )
+    ))
     preprocessor_calls = []
 
     def _run_preprocessor(**kwargs):
@@ -1070,11 +1070,10 @@ def test_hindsight_post_turn_queue_does_not_recall_raw_user_query_or_replace_act
     provider,
     monkeypatch,
 ):
-    provider._prefetch_result = "- previous memory"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="previous query",
         results=("previous memory",),
-    )
+    ))
     preprocessor_calls = []
     decisions = iter(
         [
@@ -1205,22 +1204,21 @@ def test_hindsight_public_prefetch_late_turn_cannot_replace_newer_snapshot(
     assert not old_thread.is_alive()
     assert "memory for old turn target" in old_result["context"]
     assert "memory for new turn target" in new_context
-    assert provider._prefetch_result == "- memory for new turn target"
-    assert provider._prefetch_snapshot.query == "new turn target"
-    assert provider._prefetch_snapshot.results == ("memory for new turn target",)
+    assert provider._recall_cache.result == "- memory for new turn target"
+    assert provider._recall_cache.snapshot.query == "new turn target"
+    assert provider._recall_cache.snapshot.results == ("memory for new turn target",)
 
 
 def test_hindsight_session_switch_clears_structured_prefetch_snapshot(provider):
-    provider._prefetch_result = "- old-session recall"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="old-session query",
         results=("old-session recall",),
-    )
+    ))
 
     provider.on_session_switch("new-session")
 
-    assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot is None
+    assert provider._recall_cache.result == ""
+    assert provider._recall_cache.snapshot is None
 
 
 def test_memory_manager_timeout_invalidates_late_hindsight_snapshot(
@@ -1259,8 +1257,8 @@ def test_memory_manager_timeout_invalidates_late_hindsight_snapshot(
     thread.join(timeout=5.0)
 
     assert not thread.is_alive()
-    assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot is None
+    assert provider._recall_cache.result == ""
+    assert provider._recall_cache.snapshot is None
 
 
 def test_hindsight_public_prefetch_late_old_session_result_is_not_carried(
@@ -1293,8 +1291,8 @@ def test_hindsight_public_prefetch_late_old_session_result_is_not_carried(
 
     assert not old_thread.is_alive()
     assert "old-session memory" in old_result["context"]
-    assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot is None
+    assert provider._recall_cache.result == ""
+    assert provider._recall_cache.snapshot is None
 
 
 def test_hindsight_stale_session_prefetch_cannot_consume_current_snapshot(
@@ -1302,31 +1300,29 @@ def test_hindsight_stale_session_prefetch_cannot_consume_current_snapshot(
 ):
     old_session_id = provider._session_id
     provider.on_session_switch("new-session")
-    provider._prefetch_result = "- new-session memory"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="new-session target",
         results=("new-session memory",),
-    )
+    ))
 
     result = provider.prefetch("late old request", session_id=old_session_id)
 
     assert result == ""
-    assert provider._prefetch_result == "- new-session memory"
-    assert provider._prefetch_snapshot.query == "new-session target"
-    assert provider._prefetch_snapshot.results == ("new-session memory",)
+    assert provider._recall_cache.result == "- new-session memory"
+    assert provider._recall_cache.snapshot.query == "new-session target"
+    assert provider._recall_cache.snapshot.results == ("new-session memory",)
 
 
 def test_hindsight_session_rewind_clears_carried_recall_snapshot(provider):
-    provider._prefetch_result = "- rewound recall"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="rewound query",
         results=("rewound recall",),
-    )
+    ))
 
     provider.on_session_rewind(provider._session_id, turns_undone=1)
 
-    assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot is None
+    assert provider._recall_cache.result == ""
+    assert provider._recall_cache.snapshot is None
 
 
 def test_hindsight_public_prefetch_late_rewound_result_is_not_carried(
@@ -1362,19 +1358,18 @@ def test_hindsight_public_prefetch_late_rewound_result_is_not_carried(
 
     assert not old_thread.is_alive()
     assert "rewound late memory" in old_result["context"]
-    assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot is None
+    assert provider._recall_cache.result == ""
+    assert provider._recall_cache.snapshot is None
 
 
 def test_hindsight_empty_generated_recall_is_carried_as_real_snapshot(
     provider,
     monkeypatch,
 ):
-    provider._prefetch_result = "- old memory"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="old query",
         results=("old memory",),
-    )
+    ))
     preprocessor_calls = []
     decisions = iter(
         [
@@ -1412,20 +1407,19 @@ def test_hindsight_empty_generated_recall_is_carried_as_real_snapshot(
     assert second_result == ""
     assert preprocessor_calls[1]["previous_recall_query"] == "empty target"
     assert preprocessor_calls[1]["previous_recall_results"] == ()
-    assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot.query == "empty target"
-    assert provider._prefetch_snapshot.results == ()
+    assert provider._recall_cache.result == ""
+    assert provider._recall_cache.snapshot.query == "empty target"
+    assert provider._recall_cache.snapshot.results == ()
 
 
 def test_hindsight_prefetch_null_query_reuses_selected_old_results_without_new_recall(
     provider,
     monkeypatch,
 ):
-    provider._prefetch_result = "- keep\n- drop"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="old query",
         results=("keep", "drop"),
-    )
+    ))
     monkeypatch.setattr(
         "plugins.memory.hindsight.run_recall_preprocessor",
         lambda **kwargs: SimpleNamespace(drop_old_refs=(2,), new_query=None),
@@ -1445,20 +1439,19 @@ def test_hindsight_prefetch_null_query_reuses_selected_old_results_without_new_r
 
     assert "keep" in result
     assert "drop" not in result
-    assert provider._prefetch_result == "- keep"
-    assert provider._prefetch_snapshot.query == "old query"
-    assert provider._prefetch_snapshot.results == ("keep",)
+    assert provider._recall_cache.result == "- keep"
+    assert provider._recall_cache.snapshot.query == "old query"
+    assert provider._recall_cache.snapshot.results == ("keep",)
 
 
 def test_hindsight_prefetch_null_query_all_dropped_clears_old_recall(
     provider,
     monkeypatch,
 ):
-    provider._prefetch_result = "- first old\n- second old"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="old query",
         results=("first old", "second old"),
-    )
+    ))
     monkeypatch.setattr(
         "plugins.memory.hindsight.run_recall_preprocessor",
         lambda **kwargs: SimpleNamespace(drop_old_refs=(1, 2), new_query=None),
@@ -1477,20 +1470,19 @@ def test_hindsight_prefetch_null_query_all_dropped_clears_old_recall(
     )
 
     assert result == ""
-    assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot.query == ""
-    assert provider._prefetch_snapshot.results == ()
+    assert provider._recall_cache.result == ""
+    assert provider._recall_cache.snapshot.query == ""
+    assert provider._recall_cache.snapshot.results == ()
 
 
 def test_hindsight_null_query_reuses_old_results_and_post_turn_queue_is_noop(
     provider,
     monkeypatch,
 ):
-    provider._prefetch_result = "- old memory"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="old query",
         results=("old memory",),
-    )
+    ))
     monkeypatch.setattr(
         "plugins.memory.hindsight.run_recall_preprocessor",
         lambda **kwargs: SimpleNamespace(drop_old_refs=(), new_query=None),
@@ -1517,9 +1509,9 @@ def test_hindsight_null_query_reuses_old_results_and_post_turn_queue_is_noop(
 
     assert "old memory" in result
     assert recall_calls == []
-    assert provider._prefetch_result == "- old memory"
-    assert provider._prefetch_snapshot.query == "old query"
-    assert provider._prefetch_snapshot.results == ("old memory",)
+    assert provider._recall_cache.result == "- old memory"
+    assert provider._recall_cache.snapshot.query == "old query"
+    assert provider._recall_cache.snapshot.results == ("old memory",)
 
 
 def test_hindsight_null_query_delayed_old_session_queue_cannot_repopulate_after_switch(
@@ -1527,11 +1519,10 @@ def test_hindsight_null_query_delayed_old_session_queue_cannot_repopulate_after_
     monkeypatch,
 ):
     old_session_id = provider._session_id
-    provider._prefetch_result = "- old memory"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="old query",
         results=("old memory",),
-    )
+    ))
     monkeypatch.setattr(
         "plugins.memory.hindsight.run_recall_preprocessor",
         lambda **kwargs: SimpleNamespace(drop_old_refs=(), new_query=None),
@@ -1560,19 +1551,18 @@ def test_hindsight_null_query_delayed_old_session_queue_cannot_repopulate_after_
     assert "old memory" in result
     assert recall_calls == []
     assert provider._session_id == "new-session"
-    assert provider._prefetch_result == ""
-    assert provider._prefetch_snapshot is None
+    assert provider._recall_cache.result == ""
+    assert provider._recall_cache.snapshot is None
 
 
 def test_hindsight_recall_after_null_query_merges_reused_old_and_new_results(
     provider,
     monkeypatch,
 ):
-    provider._prefetch_result = "- second-turn memory"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="second-turn query",
         results=("second-turn memory",),
-    )
+    ))
     preprocessor_calls = []
     decisions = iter(
         [
@@ -1629,11 +1619,10 @@ def test_hindsight_prefetch_preprocessor_failure_preserves_full_old_cache(
     provider,
     monkeypatch,
 ):
-    provider._prefetch_result = "- first old\n- second old"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="old query",
         results=("first old", "second old"),
-    )
+    ))
     monkeypatch.setattr(
         "plugins.memory.hindsight.run_recall_preprocessor",
         lambda **kwargs: (_ for _ in ()).throw(ValueError("invalid JSON")),
@@ -1649,11 +1638,10 @@ def test_hindsight_prefetch_new_recall_failure_restores_full_old_cache(
     provider,
     monkeypatch,
 ):
-    provider._prefetch_result = "- first old\n- second old"
-    provider._prefetch_snapshot = SimpleNamespace(
+    provider._recall_cache.seed(RecallSnapshot(
         query="old query",
         results=("first old", "second old"),
-    )
+    ))
     monkeypatch.setattr(
         "plugins.memory.hindsight.run_recall_preprocessor",
         lambda **kwargs: SimpleNamespace(

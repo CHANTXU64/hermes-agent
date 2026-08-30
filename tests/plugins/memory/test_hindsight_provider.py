@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from fork_features.hindsight_recall_cache import RecallSnapshot
 from hermes_cli.memory_setup import _CANCELLED
 import plugins.memory as memory_package
 import plugins.memory.hindsight as hindsight_module
@@ -745,16 +746,15 @@ class TestSessionSwitchBufferFlush:
 
 
     def test_session_switch_clears_carried_recall_snapshot(self, provider):
-        provider._prefetch_result = "- old-session recall"
-        provider._prefetch_snapshot = SimpleNamespace(
+        provider._recall_cache.seed(RecallSnapshot(
             query="old-session query",
             results=("old-session recall",),
-        )
+        ))
 
         provider.on_session_switch("new-sid")
 
-        assert provider._prefetch_result == ""
-        assert provider._prefetch_snapshot is None
+        assert provider._recall_cache.result == ""
+        assert provider._recall_cache.snapshot is None
 
     def test_flush_serializes_behind_pending_retains_via_writer_queue(
         self, provider_with_config
