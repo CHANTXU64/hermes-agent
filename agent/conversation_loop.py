@@ -40,11 +40,13 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
-    apply_request_only_turn_context,
     _compression_warrants_another_preflight_pass,
     build_turn_context,
-    compose_user_api_content,
     reanchor_current_turn_user_idx,
+)
+from fork_features.request_context import (
+    apply_request_only_turn_context,
+    compose_user_api_content,
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd

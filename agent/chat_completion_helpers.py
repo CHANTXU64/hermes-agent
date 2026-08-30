@@ -31,8 +31,12 @@ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
-from agent.turn_context import apply_request_only_turn_context, strip_legacy_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
+from fork_features.prompt_cache_routing import resolve_codex_prompt_cache_scope
+from fork_features.request_context import (
+    apply_request_only_turn_context,
+    strip_legacy_api_content,
+)
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_sanitization import (
@@ -1331,43 +1335,6 @@ def interruptible_api_call(agent, api_kwargs: dict):
     return result["response"]
 
 
-def _codex_prompt_cache_scope(agent, session_id: str | None) -> str | None:
-    """Return a stable logical cache scope when the runtime has one.
-
-    Gateway routing keys survive physical session rotation. Non-gateway
-    compression children reuse the root compression session. Ordinary CLI and
-    cron sessions with known non-compression lineage return ``None`` so the
-    transport can retain upstream's static content-addressed cache key. Missing
-    or failing lineage lookup falls back to the physical session id.
-    """
-    gateway_key = str(getattr(agent, "_gateway_session_key", "") or "").strip()
-    if gateway_key:
-        return gateway_key
-
-    original = str(session_id or "").strip()
-    if not original:
-        return None
-
-    db = getattr(agent, "_session_db", None)
-    if db is None or not hasattr(db, "get_compression_lineage"):
-        return original
-
-    try:
-        lineage = db.get_compression_lineage(original)
-    except Exception:
-        return original
-
-    if (
-        isinstance(lineage, list)
-        and len(lineage) > 1
-        and original in lineage
-        and isinstance(lineage[0], str)
-        and lineage[0]
-    ):
-        return lineage[0]
-    return None
-
-
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
@@ -1482,7 +1449,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             tools=tools_for_api,
             reasoning_config=agent.reasoning_config,
             session_id=session_id,
-            prompt_cache_key=_codex_prompt_cache_scope(agent, session_id),
+            prompt_cache_key=resolve_codex_prompt_cache_scope(agent, session_id),
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),

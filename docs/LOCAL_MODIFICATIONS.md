@@ -840,6 +840,32 @@ Decision and behavior:
   normal memory lifecycle but is not injected into its persistent Codex thread,
   because the protocol has no safe per-request volatile input slot.
 
+Fourth-batch responsibility boundary (2026-08-30):
+
+- The Fork-owned placement and legacy-sidecar policy now lives in
+  `fork_features/request_context.py`. The conversation loop, max-iteration
+  helper, and focused tests import that policy directly; `agent/turn_context.py`
+  only collects the current values and no longer defines or re-exports the
+  provider-specific placement rules.
+- The Fork-owned logical-scope priority, explicit-key precedence, and Codex
+  `session_id` / `thread-id` / `x-client-request-id` alignment now live in
+  `fork_features/prompt_cache_routing.py`. The Responses transport retains its
+  provider-neutral key hashing and delegates only the Fork routing decision.
+- `fork_features/request_fork` remains a separate compression-checkpoint service
+  for frozen provider-native requests. It is not the request-only Recall
+  container and must not absorb this policy.
+- Fixed upstream `66666f6e2eca0ae883195a34c66131985ea7dd06`
+  intentionally persists `api_content` and its own
+  `test_next_turn_replays_previous_turn_bytes` requires exact next-turn replay.
+  That is an upstream cache-first contract, not an accidental omission. This
+  Fork deliberately keeps the current-turn-only contract instead.
+- The same upstream snapshot has a reusable compression-lineage resolver, but
+  adopting it wholesale would change this Fork's real routing: upstream feeds
+  physical/root scope into content hashing, while the Fork gives Gateway keys
+  and compression roots explicit logical-key precedence and mirrors that key in
+  `thread-id`. Keep the exact existing Fork outputs until live evidence and a
+  separate user decision justify a cache-bucket migration.
+
 Codex Responses cache routing:
 
 - The physical Hermes `session_id` remains distinct from the logical cache
@@ -868,13 +894,15 @@ Codex Responses cache routing:
 
 Primary files:
 
-- `agent/turn_context.py`
-- `agent/conversation_loop.py`
+- `fork_features/request_context.py` (Fork placement and sidecar policy)
+- `fork_features/prompt_cache_routing.py` (Fork scope/header policy)
+- `agent/turn_context.py` (collection only; no Fork placement policy)
+- `agent/conversation_loop.py` (request-copy application seam)
 - `agent/codex_responses_adapter.py`
-- `agent/chat_completion_helpers.py`
+- `agent/chat_completion_helpers.py` (summary/cache seam)
 - `agent/model_metadata.py`
 - `agent/turn_finalizer.py`
-- `agent/transports/codex.py`
+- `agent/transports/codex.py` (one routing-policy call)
 - `run_agent.py`
 - `gateway/run.py`
 - `gateway/session.py`
@@ -889,6 +917,8 @@ Primary files:
 - `tests/run_agent/test_run_agent_codex_responses.py`
 - `tests/run_agent/test_codex_app_server_integration.py`
 - `tests/agent/test_codex_request_only_memory_context.py`
+- `tests/fork_features/test_request_context_policy.py`
+- `tests/fork_features/test_long_task_continuity_recovery.py`
 
 Merge protection:
 
@@ -965,6 +995,22 @@ Verification after the 2026-07-22 restoration:
   prompt-tail, and state compatibility, reported `408 passed`. The adjacent
   regression suite remained `389 passed` with the same `7` third-party
   deprecation warnings; `git diff --check` and `py_compile` passed.
+
+- The 2026-08-30 fourth-batch boundary migration was observed RED before the
+  policy modules existed (`ModuleNotFoundError` for
+  `fork_features.prompt_cache_routing`). After migration, direct old/new
+  comparisons matched for 720 request-placement combinations, 16 content
+  combinations, 24 logical-scope cases, and 8 Codex body/header routing cases.
+- The final pre-review focused request-only, Codex, Gateway replay, app-server,
+  long-task request-context, transport, and summary suite reported `382 passed`
+  with `7` third-party deprecation warnings. The adjacent MoA, Fork, compression,
+  replay, Session/branch/Undo, lineage, and state suite reported `1155 passed`
+  plus `4` existing failures; a detached clean `HEAD` reproduced all four
+  failures exactly, so they are not part of this maintenance unit.
+- Independent `xai-oauth/grok-4.6` `xhigh` read-only review returned `PASS`
+  with `0` blocking findings. Its only applicable non-blocking finding was the
+  missing boundary-test entries in this section's Primary files; both entries
+  were added before commit.
 
 Upstream status: intentional fork divergence from persistent `api_content`
 replay; compatible upstream schema and content-addressed key hardening retained.
@@ -2400,6 +2446,8 @@ deltas are expected in these areas:
   - `tests/tools/test_skills_sync.py`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Request-only recall isolation and Codex prompt-cache routing:
+  - `fork_features/request_context.py`
+  - `fork_features/prompt_cache_routing.py`
   - `agent/chat_completion_helpers.py`
   - `agent/transports/codex.py`
   - `agent/conversation_loop.py`
@@ -2410,6 +2458,7 @@ deltas are expected in these areas:
   - `gateway/session.py`
   - `gateway/slash_commands.py`
   - `hermes_cli/cli_commands_mixin.py`
+  - `tests/fork_features/test_request_context_policy.py`
   - `tests/agent/test_api_content_sidecar.py`
   - `tests/agent/test_gateway_turn_sidecar.py`
   - `tests/agent/transports/test_codex_transport.py`

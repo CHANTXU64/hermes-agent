@@ -29,6 +29,7 @@ def _cache_scope_from_session_id(session_id: Optional[str]) -> str:
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
+from fork_features.prompt_cache_routing import apply_codex_backend_cache_routing
 
 
 def _bounded_prompt_cache_key(value: Any) -> Optional[str]:
@@ -43,15 +44,6 @@ def _bounded_prompt_cache_key(value: Any) -> Optional[str]:
     # Match _content_cache_key's compact, collision-resistant routing-key shape.
     digest = hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:24]
     return f"pck_{digest}"
-
-
-def _first_bounded_prompt_cache_key(*values: Any) -> Optional[str]:
-    """Return the first valid string cache key in precedence order."""
-    for value in values:
-        key = _bounded_prompt_cache_key(value)
-        if key:
-            return key
-    return None
 
 
 # Wire-name used when Hermes keeps client-side web_search on xAI Responses.
@@ -586,69 +578,13 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs.pop("timeout", None)
 
         if is_codex_backend:
-            # The Codex backend rejects body-level ``extra_headers`` with
-            # HTTP 400, but the OpenAI SDK's ``extra_headers`` kwarg maps
-            # to actual HTTP request headers (not body fields). ``session_id``
-            # carries the raw physical session identity. Both cache-routing
-            # headers mirror the body's bounded effective prompt_cache_key so
-            # Gateway/compression continuity, cron stability, and request-header
-            # routing all agree on one logical bucket.
-            # ``extra_body`` is merged into the request body after typed SDK
-            # kwargs. Let an explicit caller override participate in the same
-            # precedence as the top-level override, then remove the duplicate
-            # body field so it cannot silently outrun the headers. Top-level
-            # wins when a caller supplies both spellings.
-            existing_extra_body = kwargs.get("extra_body")
-            extra_body_cache_key = None
-            if isinstance(existing_extra_body, dict):
-                copied_extra_body = dict(existing_extra_body)
-                extra_body_cache_key = copied_extra_body.pop(
-                    "prompt_cache_key", None
-                )
-                if copied_extra_body:
-                    kwargs["extra_body"] = copied_extra_body
-                else:
-                    kwargs.pop("extra_body", None)
-            override_cache_key = None
-            override_extra_body_cache_key = None
-            if isinstance(request_overrides, dict):
-                override_cache_key = request_overrides.get("prompt_cache_key")
-                override_extra_body = request_overrides.get("extra_body")
-                if isinstance(override_extra_body, dict):
-                    override_extra_body_cache_key = override_extra_body.get(
-                        "prompt_cache_key"
-                    )
-            final_cache_key = _first_bounded_prompt_cache_key(
-                override_cache_key,
-                override_extra_body_cache_key,
-                extra_body_cache_key,
-                kwargs.get("prompt_cache_key"),
-                cache_key,
+            kwargs = apply_codex_backend_cache_routing(
+                kwargs,
+                session_id=session_id,
+                request_overrides=request_overrides,
+                fallback_cache_key=cache_key,
+                bound_key=_bounded_prompt_cache_key,
             )
-            if final_cache_key:
-                kwargs["prompt_cache_key"] = final_cache_key
-            else:
-                kwargs.pop("prompt_cache_key", None)
-            existing_extra_headers = kwargs.get("extra_headers")
-            merged_extra_headers: Dict[str, str] = {}
-            if isinstance(existing_extra_headers, dict):
-                merged_extra_headers.update(
-                    {
-                        str(key): str(value)
-                        for key, value in existing_extra_headers.items()
-                        if key and value is not None
-                    }
-                )
-            merged_extra_headers.pop("session-id", None)
-            if session_id:
-                merged_extra_headers["session_id"] = session_id
-            if final_cache_key:
-                merged_extra_headers["thread-id"] = final_cache_key
-                merged_extra_headers["x-client-request-id"] = final_cache_key
-            if merged_extra_headers:
-                kwargs["extra_headers"] = merged_extra_headers
-            else:
-                kwargs.pop("extra_headers", None)
 
         max_tokens = params.get("max_tokens")
         if max_tokens is not None and not is_codex_backend:

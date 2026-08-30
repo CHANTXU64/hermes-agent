@@ -369,25 +369,25 @@ def test_openai_api_responses_omits_official_codex_cache_headers(monkeypatch):
 
 
 def test_codex_prompt_cache_scope_uses_compression_root_only():
-    from agent.chat_completion_helpers import _codex_prompt_cache_scope
+    from fork_features.prompt_cache_routing import resolve_codex_prompt_cache_scope
 
     db = SimpleNamespace(get_compression_lineage=lambda _sid: ["root", "child", "tip"])
     agent = SimpleNamespace(_gateway_session_key="", _session_db=db)
 
-    assert _codex_prompt_cache_scope(agent, "tip") == "root"
+    assert resolve_codex_prompt_cache_scope(agent, "tip") == "root"
 
 
 def test_codex_prompt_cache_scope_does_not_merge_branch_or_delegate_parent():
-    from agent.chat_completion_helpers import _codex_prompt_cache_scope
+    from fork_features.prompt_cache_routing import resolve_codex_prompt_cache_scope
 
     db = SimpleNamespace(get_compression_lineage=lambda sid: [sid])
     agent = SimpleNamespace(_gateway_session_key="", _session_db=db)
 
-    assert _codex_prompt_cache_scope(agent, "branch-or-delegate") is None
+    assert resolve_codex_prompt_cache_scope(agent, "branch-or-delegate") is None
 
 
 def test_codex_prompt_cache_scope_falls_back_to_physical_on_lineage_error():
-    from agent.chat_completion_helpers import _codex_prompt_cache_scope
+    from fork_features.prompt_cache_routing import resolve_codex_prompt_cache_scope
 
     def _raise(_sid):
         raise RuntimeError("db unavailable")
@@ -395,7 +395,7 @@ def test_codex_prompt_cache_scope_falls_back_to_physical_on_lineage_error():
     db = SimpleNamespace(get_compression_lineage=_raise)
     agent = SimpleNamespace(_gateway_session_key="", _session_db=db)
 
-    assert _codex_prompt_cache_scope(agent, "physical-session") == "physical-session"
+    assert resolve_codex_prompt_cache_scope(agent, "physical-session") == "physical-session"
 
 
 def test_build_api_kwargs_mantle_sets_extended_prompt_cache_retention(monkeypatch):

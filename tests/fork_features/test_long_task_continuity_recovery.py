@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from agent.turn_context import apply_request_only_turn_context
+from fork_features.request_context import apply_request_only_turn_context
 
 
 def _codex_agent(**extra):

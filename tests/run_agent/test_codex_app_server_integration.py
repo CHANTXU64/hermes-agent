@@ -141,13 +141,14 @@ class TestRunConversationCodexPath:
         memory_manager.prefetch_all.return_value = "VOLATILE-RECALL"
         setattr(agent, "_memory_manager", memory_manager)
 
+        prompt = "Explain the database migration plan"
         with patch.object(agent, "_spawn_background_review", return_value=None):
-            result = agent.run_conversation("hello")
+            result = agent.run_conversation(prompt)
 
         memory_manager.prefetch_all.assert_called_once()
-        assert sent_inputs == ["hello"]
+        assert sent_inputs == [prompt]
         user_messages = [m for m in result["messages"] if m.get("role") == "user"]
-        assert user_messages[-1]["content"] == "hello"
+        assert user_messages[-1]["content"] == prompt
         assert "api_content" not in user_messages[-1]
 
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):

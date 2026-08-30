@@ -17,10 +17,12 @@ import pytest
 
 from agent.memory_manager import build_memory_context_block
 from agent.turn_context import (
-    apply_request_only_turn_context,
     build_turn_context,
-    compose_user_api_content,
     consume_gateway_turn_context_notes,
+)
+from fork_features.request_context import (
+    apply_request_only_turn_context,
+    compose_user_api_content,
 )
 
 
