@@ -1060,12 +1060,13 @@ Upstream status: fork-only (related open PRs/issues exist, not merged as equival
 
 ### 15. Telegram tool-progress literal-text rendering
 
-Status: active
+Status: policy extracted to `fork_features` (2026-08-30)
 
-Date: 2026-07-16
+Date: 2026-07-16; boundary refactored 2026-08-30
 
 Files:
 
+- `fork_features/telegram_tool_progress.py`
 - `gateway/run.py`
 - `plugins/platforms/telegram/adapter.py`
 - `tests/fork/test_telegram_tool_progress_literal_text.py`
@@ -1081,9 +1082,13 @@ Summary:
 
 What changed:
 
-- `GatewayRunner` marks only Telegram tool-progress sends and edits as
-  `plain_text`, retaining topic/reply metadata and leaving typing indicators,
-  approvals, final replies, and other platforms unchanged.
+- `fork_features/telegram_tool_progress.py` owns the Telegram-only metadata
+  decision. It copies Telegram metadata before adding `plain_text=True` and
+  returns every non-Telegram metadata object unchanged.
+- `GatewayRunner` keeps progress creation, accumulation, topics, reply metadata,
+  edits, rollover, typing, approvals, and final replies. Its sole progress
+  delivery call uses a thin alias imported from the Fork policy module; the
+  core no longer contains a Telegram platform branch for this behavior.
 - The Telegram adapter bypasses both rich-message delivery and MarkdownV2
   conversion for that marker, including finalized accumulated bubbles and
   overflow continuations. Regexes, code fragments, URLs, backticks, pipes, and
@@ -1106,6 +1111,10 @@ Why it matters:
 
 Merge protection:
 
+- Keep the Telegram-only tool-progress metadata decision in
+  `fork_features/telegram_tool_progress.py`; do not move the platform branch
+  back into `gateway/run.py`. Keep generic `plain_text` rendering in the
+  Telegram adapter.
 - Preserve when: Telegram tool-progress still routes dynamic arguments through
   a Markdown or rich-message parser without an equivalent literal-text guard.
 - Drop when: upstream supplies equivalent all-tool Telegram literal delivery
@@ -1119,12 +1128,12 @@ Verification:
 .venv/bin/python -m pytest tests/fork/test_telegram_tool_progress_literal_text.py -q -o 'addopts='
 .venv/bin/python -m pytest tests/gateway/test_run_progress_topics.py -q -o 'addopts='
 .venv/bin/python -m pytest tests/gateway/test_telegram_rich_messages.py -q -o 'addopts='
-.venv/bin/python -m py_compile gateway/run.py plugins/platforms/telegram/adapter.py tests/fork/test_telegram_tool_progress_literal_text.py tests/gateway/test_run_progress_topics.py tests/gateway/test_telegram_rich_messages.py
+.venv/bin/python -m py_compile fork_features/telegram_tool_progress.py gateway/run.py plugins/platforms/telegram/adapter.py tests/fork/test_telegram_tool_progress_literal_text.py tests/gateway/test_run_progress_topics.py tests/gateway/test_telegram_rich_messages.py
 git diff --check
 ```
 
-Feature docs: none — localized gateway/Telegram display behavior with merge
-guidance and verification captured in this index entry.
+Feature docs: none — a Fork metadata policy, one Gateway alias, generic adapter
+rendering, and focused runtime contracts fully define this behavior.
 
 Upstream status: fork-only.
 
@@ -2491,6 +2500,7 @@ deltas are expected in these areas:
   - `tests/fork/test_browser_first_conversation_tab.py`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Telegram tool-progress literal-text rendering:
+  - `fork_features/telegram_tool_progress.py`
   - `gateway/run.py`
   - `plugins/platforms/telegram/adapter.py`
   - `tests/fork/test_telegram_tool_progress_literal_text.py`

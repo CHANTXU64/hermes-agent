@@ -67,6 +67,9 @@ from fork_features.clarify_attachment_reply import (
     ClarifyReplyDisposition,
     resolve_pending_clarify_reply,
 )
+from fork_features.telegram_tool_progress import (
+    tool_progress_delivery_metadata as _tool_progress_delivery_metadata,
+)
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -483,19 +486,6 @@ def _non_conversational_metadata(
         return metadata
     merged = dict(metadata or {})
     merged["non_conversational"] = True
-    return merged
-
-
-def _tool_progress_delivery_metadata(
-    metadata: Optional[Dict[str, Any]] = None,
-    *,
-    platform: Any = None,
-) -> Optional[Dict[str, Any]]:
-    """Mark only Telegram's dynamic tool-progress text for literal delivery."""
-    if _gateway_platform_value(platform) != "telegram":
-        return metadata
-    merged = dict(metadata or {})
-    merged["plain_text"] = True
     return merged
 
 

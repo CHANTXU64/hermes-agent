@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from fork_features import telegram_tool_progress
+import gateway.run as gateway_run
 from gateway.config import Platform, PlatformConfig
 from gateway.run import _tool_progress_delivery_metadata
 from plugins.platforms.telegram.adapter import TelegramAdapter
@@ -37,6 +39,16 @@ def test_telegram_progress_metadata_preserves_topic_and_marks_literal_text():
     assert literal == {"thread_id": "17585", "plain_text": True}
     assert topic_metadata == {"thread_id": "17585"}
     assert _tool_progress_delivery_metadata(topic_metadata, platform=Platform.DISCORD) is topic_metadata
+
+
+def test_gateway_uses_fork_owned_progress_metadata_policy():
+    assert (
+        gateway_run._tool_progress_delivery_metadata
+        is telegram_tool_progress.tool_progress_delivery_metadata
+    )
+    assert telegram_tool_progress.tool_progress_delivery_metadata(
+        platform="telegram"
+    ) == {"plain_text": True}
 
 
 @pytest.mark.asyncio
