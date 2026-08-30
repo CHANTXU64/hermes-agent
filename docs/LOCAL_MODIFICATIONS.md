@@ -526,6 +526,43 @@ Merge protection:
 
 Upstream status: reverted fork-only experiment.
 
+### 16. Prompt execution-contract deduplication
+
+Status: historical / reverted per user decision
+
+Date introduced: 2026-07-17
+
+Date reverted: 2026-08-30
+
+Historical files:
+
+- `agent/prompt_builder.py`
+- `agent/system_prompt.py`
+- `tests/agent/test_prompt_builder.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Historical behavior:
+
+- Replaced upstream's repeated persistence language with a bounded universal
+  execution contract and a narrower same-response tool-follow-through block.
+- Removed the extra Gemini/Gemma `Keep going` directive.
+
+Current status:
+
+- The user explicitly chose to restore current `upstream/main` after being told
+  that it still contains the stronger `Keep working until the task is actually
+  complete` and Gemini/Gemma `Keep going` directives.
+- Prompt constants, their assembly comment, and tests now follow the current
+  upstream behavior for this area.
+
+Merge protection:
+
+- Do not restore the former bounded execution contract during an upstream merge
+  unless the user explicitly requests that behavior again.
+- Keep current upstream Prompt behavior canonical for this area.
+
+Upstream status: restored to current upstream per user decision.
+
 ## Active modifications (continued)
 
 ### 9. Hindsight manual full-session retain
@@ -1088,68 +1125,6 @@ git diff --check
 
 Feature docs: none — localized gateway/Telegram display behavior with merge
 guidance and verification captured in this index entry.
-
-Upstream status: fork-only.
-
-### 16. Prompt execution-contract deduplication
-
-Status: active
-
-Date: 2026-07-16
-
-Files:
-
-- `agent/prompt_builder.py`
-- `agent/system_prompt.py`
-- `tests/agent/test_prompt_builder.py`
-- `docs/LOCAL_MODIFICATIONS.md`
-
-Summary:
-
-- The universal task-completion block is now a bounded execution contract, and
-  the model-family tool-use block only enforces same-response follow-through.
-
-What changed:
-
-- The universal contract keeps real delivery, prerequisites, reasonable
-  in-scope recovery, and anti-fabrication while adding explicit goal, scope,
-  authorization, material-ambiguity, and sufficient-evidence stop boundaries.
-- `TOOL_USE_ENFORCEMENT_GUIDANCE` no longer repeats unbounded completion or
-  persistence pressure; it only prevents promise-only turns when a tool action
-  is stated.
-- Gemini/Gemma guidance no longer adds a second `Keep going` instruction.
-- `OPENAI_MODEL_EXECUTION_GUIDANCE`, Memory/Skill guidance, tool descriptions,
-  and their write-gate implementation are intentionally unchanged by this
-  source modification.
-
-Why it matters:
-
-- Repeated persistence language can overweight continued action after the
-  user's requested result is already supported by sufficient evidence.
-- Clarification must also cover material changes to authorization, scope,
-  acceptance criteria, and user-visible effects, even when the same tool would
-  be used.
-
-Merge protection:
-
-- Preserve when: upstream still distributes completion, stop, and
-  same-response tool-follow-through policy across overlapping prompt blocks.
-- Drop when: upstream supplies an equivalent or stronger bounded execution
-  contract without weakening real delivery, grounding, or anti-fabrication.
-- Ask user when: upstream redesigns the GPT/Codex execution overlay or moves
-  authorization and stop policy into a different runtime-enforced layer.
-
-Verification:
-
-```bash
-.venv/bin/python -m pytest tests/agent/test_prompt_builder.py -q -o 'addopts='
-.venv/bin/python -m pytest tests/run_agent/test_run_agent.py::TestToolUseEnforcementConfig tests/run_agent/test_run_agent.py::TestTaskCompletionGuidance -q -o 'addopts='
-.venv/bin/python -m py_compile agent/prompt_builder.py agent/system_prompt.py tests/agent/test_prompt_builder.py
-git diff --check
-```
-
-Feature docs: none — prompt behavior and merge guidance are captured by the
-behavior-contract tests and this index entry.
 
 Upstream status: fork-only.
 
@@ -2487,11 +2462,6 @@ deltas are expected in these areas:
   - `tests/gateway/test_run_progress_topics.py`
   - `tests/gateway/test_telegram_rich_messages.py`
   - `docs/LOCAL_MODIFICATIONS.md`
-- Prompt execution-contract deduplication:
-  - `agent/prompt_builder.py`
-  - `agent/system_prompt.py`
-  - `tests/agent/test_prompt_builder.py`
-  - `docs/LOCAL_MODIFICATIONS.md`
 - Self-contained Clarify decision cards:
   - `tools/clarify_tool.py`
   - `tests/tools/test_clarify_tool.py`
@@ -2506,9 +2476,9 @@ deltas are expected in these areas:
 
 Documented entries: 29 major entries.
 
-Active / current entries: 23.
+Active / current entries: 22.
 
-Historical reverted / abandoned / superseded areas: 6.
+Historical reverted / abandoned / superseded areas: 7.
 
 Fork-only non-merge commits represented here: see
 `git log --no-merges upstream/main..HEAD`.

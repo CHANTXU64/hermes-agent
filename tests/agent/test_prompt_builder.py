@@ -958,16 +958,17 @@ class TestToolUseEnforcementGuidance:
         text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
         assert "same response" in text
         assert "promise" in text
-    def test_guidance_requires_progress_or_delivery(self):
-        text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
-        assert "progress" in text
-        assert "result" in text
-        assert "blocker" in text
 
-    def test_guidance_does_not_duplicate_completion_policy(self):
+    def test_guidance_requires_action_and_continued_execution(self):
         text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
-        assert "keep working until the task" not in text
-        assert "actually complete" not in text
+        assert "must use your tools" in text
+        assert "keep working until the task is actually complete" in text
+        assert "tools available that can accomplish the task" in text
+
+    def test_guidance_requires_progress_or_final_delivery(self):
+        text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
+        assert "contain tool calls that make progress" in text
+        assert "deliver a final result" in text
 
 
 
@@ -977,34 +978,25 @@ class TestToolUseEnforcementGuidance:
 
 
 class TestTaskCompletionGuidance:
-    """Behavior contract for the universal execution guidance."""
+    """Behavior contract for upstream's universal finishing guidance."""
 
-    def test_bounds_work_by_goal_scope_and_authorization(self):
+    def test_requires_a_working_artifact_and_real_tool_output(self):
         text = TASK_COMPLETION_GUIDANCE.lower()
-        assert "goal" in text
-        assert "scope" in text
-        assert "authorization" in text
+        assert "working artifact backed by real tool output" in text
+        assert "not a description of one" in text
 
-    def test_material_ambiguity_requires_clarification_even_with_same_tool(self):
+    def test_does_not_stop_at_a_stub_plan_or_single_command(self):
         text = TASK_COMPLETION_GUIDANCE.lower()
-        assert "ask before proceeding" in text
-        assert "acceptance criteria" in text
-        assert "user-visible" in text
-        assert "even if the same tool" in text
-
-    def test_preserves_real_delivery_and_anti_fabrication(self):
-        text = TASK_COMPLETION_GUIDANCE.lower()
-        assert "working artifact" in text
         assert "stub" in text
-        assert "requested deliverable" in text
-        assert "never fabricate" in text
+        assert "plan" in text
+        assert "single command" in text
+        assert "actually exercised the code" in text
 
-    def test_stops_after_required_verification(self):
+    def test_requires_honest_blockers_and_forbids_fabrication(self):
         text = TASK_COMPLETION_GUIDANCE.lower()
-        assert "stop when the core request" in text
-        assert "required verification" in text
-        assert "optional polish" in text
-        assert "unrequested optimization" in text
+        assert "say so directly and try an alternative" in text
+        assert "never substitute plausible-looking fabricated output" in text
+        assert "reporting a blocker honestly" in text
 
     def test_stays_bounded_for_the_cached_prompt(self):
         assert len(TASK_COMPLETION_GUIDANCE) < 1500
@@ -1047,8 +1039,10 @@ class TestParallelToolCallGuidance:
         assert PARALLEL_TOOL_CALL_GUIDANCE.lstrip().startswith("#")
 
 
-    def test_google_guidance_does_not_duplicate_unbounded_persistence(self):
-        assert "keep going" not in GOOGLE_MODEL_OPERATIONAL_GUIDANCE.lower()
+    def test_google_guidance_keeps_upstream_persistence_directive(self):
+        text = GOOGLE_MODEL_OPERATIONAL_GUIDANCE.lower()
+        assert "keep going" in text
+        assert "work autonomously until the task is fully resolved" in text
 
 
 # =========================================================================
