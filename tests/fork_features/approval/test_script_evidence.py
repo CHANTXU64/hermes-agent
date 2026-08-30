@@ -11,6 +11,15 @@ from fork_features.approval.script_evidence import (
 )
 
 
+def _init_git(path) -> None:
+    subprocess.run(
+        ["git", "init", "--quiet", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_reads_direct_entry_without_following_local_python_import(tmp_path):
     entry = tmp_path / "entry.py"
     helper = tmp_path / "helper.py"
@@ -28,6 +37,149 @@ def test_reads_direct_entry_without_following_local_python_import(tmp_path):
             "path": str(entry),
             "status": "read",
             "content": entry.read_text(encoding="utf-8"),
+        }
+    ]
+
+
+def test_skips_git_tracked_direct_entry_source(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    script = project / "tracked.py"
+    script.write_text("print('tracked')\n", encoding="utf-8")
+    _init_git(project)
+    subprocess.run(
+        ["git", "-C", str(project), "add", "tracked.py"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    read_paths = []
+
+    evidence = collect_direct_script_evidence(
+        "python tracked.py",
+        cwd=str(project),
+        source_kind="shell",
+        read_script=lambda path: read_paths.append(path) or "not expected",
+    )
+
+    assert evidence == [
+        {"path": str(script), "status": "skipped_git_tracked", "content": ""}
+    ]
+    assert read_paths == []
+
+
+def test_reads_untracked_direct_entry_inside_git_worktree(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    script = project / "untracked.py"
+    script.write_text("print('untracked')\n", encoding="utf-8")
+    _init_git(project)
+
+    evidence = collect_direct_script_evidence(
+        "python untracked.py",
+        cwd=str(project),
+        source_kind="shell",
+    )
+
+    assert evidence == [
+        {
+            "path": str(script),
+            "status": "read",
+            "content": "print('untracked')\n",
+        }
+    ]
+
+
+def test_new_git_tracking_takes_effect_without_process_restart(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    script = project / "entry.py"
+    script.write_text("print('entry')\n", encoding="utf-8")
+
+    before = collect_direct_script_evidence(
+        "python entry.py",
+        cwd=str(project),
+        source_kind="shell",
+    )
+    _init_git(project)
+    subprocess.run(
+        ["git", "-C", str(project), "add", "entry.py"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    after = collect_direct_script_evidence(
+        "python entry.py",
+        cwd=str(project),
+        source_kind="shell",
+    )
+
+    assert before == [
+        {"path": str(script), "status": "read", "content": "print('entry')\n"}
+    ]
+    assert after == [
+        {"path": str(script), "status": "skipped_git_tracked", "content": ""}
+    ]
+
+
+def test_reads_untracked_direct_entry_in_other_git_worktree(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    script = project / "untracked.py"
+    script.write_text("print('other untracked')\n", encoding="utf-8")
+    _init_git(project)
+    caller = tmp_path / "caller"
+    caller.mkdir()
+
+    evidence = collect_direct_script_evidence(
+        f"python {script}",
+        cwd=str(caller),
+        source_kind="shell",
+    )
+
+    assert evidence == [
+        {
+            "path": str(script),
+            "status": "read",
+            "content": "print('other untracked')\n",
+        }
+    ]
+
+
+def test_oversized_direct_entry_returns_truncated_prefix(tmp_path):
+    script = tmp_path / "oversized.py"
+    script.write_text("x" * (MAX_SCRIPT_BYTES + 73), encoding="utf-8")
+
+    evidence = collect_direct_script_evidence(
+        "python oversized.py",
+        cwd=str(tmp_path),
+        source_kind="shell",
+    )
+
+    assert evidence == [
+        {
+            "path": str(script),
+            "status": "truncated",
+            "content": "x" * MAX_SCRIPT_BYTES,
+        }
+    ]
+
+
+def test_oversized_remote_reader_result_returns_truncated_prefix(tmp_path):
+    script = tmp_path / "remote.py"
+
+    evidence = collect_direct_script_evidence(
+        "python remote.py",
+        cwd=str(tmp_path),
+        source_kind="shell",
+        read_script=lambda _path: "y" * (MAX_SCRIPT_BYTES + 73),
+    )
+
+    assert evidence == [
+        {
+            "path": str(script),
+            "status": "truncated",
+            "content": "y" * MAX_SCRIPT_BYTES,
         }
     ]
 
@@ -198,7 +350,7 @@ spec.loader.exec_module(module)
     ]
 
 
-def test_does_not_read_explicit_path_in_unrecognized_temp_root(tmp_path):
+def test_reads_untracked_explicit_path_outside_task_temp_root(tmp_path):
     external_root = tmp_path.parent / "arbitrary-external-project"
     external_root.mkdir()
     script = external_root / "helper.py"
@@ -217,9 +369,9 @@ runpy.run_path({str(script)!r})
     )
 
     assert evidence == [
-        {"path": str(script), "status": "unreadable", "content": ""}
+        {"path": str(script), "status": "read", "content": "print('not read')\\n"}
     ]
-    assert read_paths == []
+    assert read_paths == [str(script)]
 
 
 @pytest.mark.parametrize(
@@ -230,7 +382,7 @@ runpy.run_path({str(script)!r})
         "/opt/python/lib/python3.13/dist-packages/vendor.py",
     ],
 )
-def test_does_not_read_protected_external_python_paths(tmp_path, forbidden_path):
+def test_reads_untracked_explicit_external_python_paths(tmp_path, forbidden_path):
     read_paths = []
     code = f"""
 import importlib.util
@@ -245,12 +397,12 @@ spec = importlib.util.spec_from_file_location("forbidden", {forbidden_path!r})
     )
 
     assert evidence == [
-        {"path": forbidden_path, "status": "unreadable", "content": ""}
+        {"path": forbidden_path, "status": "read", "content": "print('not read')\\n"}
     ]
-    assert read_paths == []
+    assert read_paths == [forbidden_path]
 
 
-def test_does_not_read_hermes_implementation_path(tmp_path):
+def test_skips_git_tracked_hermes_implementation_path(tmp_path):
     hermes_source = os.path.realpath(
         os.path.join(os.path.dirname(__file__), "../../../tools/approval.py")
     )
@@ -268,12 +420,12 @@ runpy.run_path({hermes_source!r})
     )
 
     assert evidence == [
-        {"path": hermes_source, "status": "unreadable", "content": ""}
+        {"path": hermes_source, "status": "skipped_git_tracked", "content": ""}
     ]
     assert read_paths == []
 
 
-def test_does_not_read_symlink_to_hermes_implementation(tmp_path):
+def test_skips_symlink_to_git_tracked_hermes_implementation(tmp_path):
     hermes_source = os.path.realpath(
         os.path.join(os.path.dirname(__file__), "../../../tools/approval.py")
     )
@@ -293,12 +445,16 @@ runpy.run_path({str(task_link)!r})
     )
 
     assert evidence == [
-        {"path": str(task_link), "status": "unreadable", "content": ""}
+        {
+            "path": str(task_link),
+            "status": "skipped_git_tracked",
+            "content": "",
+        }
     ]
     assert read_paths == []
 
 
-def test_does_not_follow_symlink_outside_allowed_root(tmp_path):
+def test_reads_untracked_symlink_target_outside_cwd(tmp_path):
     external_root = tmp_path.parent / "arbitrary-external-project-symlink"
     external_root.mkdir()
     external = external_root / "external.py"
@@ -319,12 +475,12 @@ runpy.run_path({str(link)!r})
     )
 
     assert evidence == [
-        {"path": str(link), "status": "unreadable", "content": ""}
+        {"path": str(link), "status": "read", "content": "print('not read')\\n"}
     ]
-    assert read_paths == []
+    assert read_paths == [str(link)]
 
 
-def test_does_not_read_explicit_path_in_other_git_project(tmp_path):
+def test_skips_tracked_explicit_path_in_other_git_project(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
     script = project / "audit.py"
@@ -333,6 +489,12 @@ def test_does_not_read_explicit_path_in_other_git_project(tmp_path):
     outer.mkdir()
     subprocess.run(
         ["git", "init", "--quiet", str(project)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project), "add", "audit.py"],
         check=True,
         capture_output=True,
         text=True,
@@ -351,7 +513,7 @@ runpy.run_path({str(script)!r})
     assert evidence == [
         {
             "path": str(script),
-            "status": "unreadable",
+            "status": "skipped_git_tracked",
             "content": "",
         }
     ]
@@ -560,7 +722,7 @@ def test_copy_then_execute_reads_destination_only(tmp_path):
     assert all(item["path"] != str(source) for item in evidence)
 
 
-def test_missing_and_oversized_entries_are_bounded_evidence_gaps(tmp_path):
+def test_missing_is_gap_and_oversized_entry_is_truncated(tmp_path):
     oversized = tmp_path / "oversized.py"
     oversized.write_text("x" * (MAX_SCRIPT_BYTES + 1), encoding="utf-8")
 
@@ -579,7 +741,11 @@ def test_missing_and_oversized_entries_are_bounded_evidence_gaps(tmp_path):
         {"path": str(tmp_path / "missing.py"), "status": "unreadable", "content": ""}
     ]
     assert too_large == [
-        {"path": str(oversized), "status": "unreadable", "content": ""}
+        {
+            "path": str(oversized),
+            "status": "truncated",
+            "content": "x" * MAX_SCRIPT_BYTES,
+        }
     ]
 
 
@@ -642,7 +808,7 @@ def test_execute_code_launcher_options_keep_the_direct_script(code, tmp_path):
     ]
 
 
-def test_duplicate_paths_do_not_consume_the_unique_script_limit(tmp_path):
+def test_duplicate_paths_are_deduplicated_without_hiding_later_scripts(tmp_path):
     repeated = tmp_path / "repeated.py"
     final = tmp_path / "final.py"
     repeated.write_text("print('repeated')\n", encoding="utf-8")

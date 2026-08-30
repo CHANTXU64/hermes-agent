@@ -1860,7 +1860,7 @@ Files:
 - `tools/tirith_security.py`
 - `tools/terminal_tool.py`
 - `tools/code_execution_tool.py`
-- `tests/tools/test_smart_approval_context.py`
+- `tests/fork_features/approval/test_smart_approval_context.py`
 - `tests/tools/test_denial_retry_escalation.py`
 - `tests/tools/test_denial_circuit_breaker.py`
 - `tests/tools/test_smart_approval_injection.py`
@@ -1877,7 +1877,7 @@ Files:
 Summary:
 
 - Smart Approval now judges actual risk and current authorization separately,
-  using only the latest real user-authored turn, completed Clarify
+  using the complete latest real user-authored turn without character truncation, all completed Clarify
   question/answer pairs after that turn, the action about to run, and bounded
   best-effort contents of directly executed entry scripts plus explicitly
   named local Python files. A first Smart Review
@@ -1907,14 +1907,16 @@ What changed:
   them and sent as bounded evidence. A literal `hermes_tools.terminal(...)`
   command can expose its directly invoked Python script path. Ordinary imports,
   module-name-only dynamic imports, and non-literal terminal commands are not
-  expanded. Missing, unreadable, oversized, or excess script evidence no longer
-  forces manual review by itself. The reviewer judges the visible action and
-  operational consequences; external dependency trees are not inspected.
-- Source reads are gated before any reader call: paths under the execution
-  cwd/current Git worktree and recognized task roots named `hindsight-*` or
-  `hermes-task-*` may be read; standard-library, installed-package,
-  Hermes-source, symlink-to-protected, arbitrary temporary-root, and
-  other-Git-project paths remain bounded `unreadable` evidence.
+  expanded. A directly named file recorded by its containing Git index is
+  marked `skipped_git_tracked` without reading its source. An untracked directly
+  named file is read even inside another Git worktree or outside the current
+  cwd; oversized source returns a 32,000-byte `truncated` prefix instead of an
+  empty unreadable result. All unique direct-entry paths are collected; duplicate
+  paths are deduplicated without hiding later entries. Missing, unreadable,
+  Git-tracked/skipped, or truncated script evidence never forces denial or manual review by itself. The
+  reviewer must infer likely effects from the command, path, filename, flags,
+  argument names and values, cwd, visible side effects, and current authorization;
+  external dependency trees are not inspected.
 - Interpreter stdin and shell here-doc forms such as `python - <<'PY'` are
   treated as inline command content rather than nonexistent external script
   paths. A genuine entry script before a here-doc, such as
@@ -2018,7 +2020,10 @@ Verification:
 - 2026-08-25 boundary correction: bounded script-evidence/context `59 passed`; adjacent Smart Approval/`execute_code` wiring `52 passed`; Terminal/code-execution/Tirith/i18n `167 passed`, `7 subtests passed`; isolated approval-mode parity `7 passed`.
 - The standalone approval file remained `95 passed`, `1 failed` on the unchanged macOS `/tmp` verification-artifact baseline. Ruff, `py_compile`, and `git diff --check` passed for the boundary correction.
 - 2026-08-25 issue 1/2/3 and I1/I2 repair validation: bounded script-evidence and Smart Approval context coverage `127 passed`, including current-worktree versus other-Git-project boundaries, recognized/unrecognized task temporary roots, protected-source and outside-root symlinks, interpreter-option handling, literal nested `hermes_tools.terminal` evidence, `execute_code` approval wiring, and Terminal integration. Ruff, `py_compile`, and `git diff --check` passed; this was targeted local validation only.
-- All approval-model test paths were mocked. No paid model replay, production configuration/provider/endpoint/fallback change, Gateway restart, live-main copy, commit, or push was performed.
+- The preceding approval-model test paths were mocked. No production configuration/provider/endpoint/fallback change, Gateway restart, live-main copy, commit, or push was performed.
+- 2026-08-30 Git-tracking/oversized-prefix/context correction: focused direct-script and reviewer/context tests `93 passed`; Fork Smart Approval/policy/injection/`execute_code`/retry/latch regression `179 passed`; adjacent Terminal/code-execution/Tirith/approval-mode/i18n/Cron-session regression `280 passed`, `1 deselected`, `7 subtests passed`. The deselected macOS `/tmp` verification-artifact baseline still fails independently and is not part of this change.
+- Before local Git tracking, a live collector probe against `/Users/robot/.hermes/scripts/nc_report.py` from the Ontology cwd returned a `32,000`-byte `truncated` prefix. After a local scripts repository tracked and committed only `nc_report.py`, the same probe returned `skipped_git_tracked` with zero source bytes. Two live `openai-codex / gpt-5.6-luna` review-only probes with missing source returned `approve/low/sufficient` for a visible read-only `/tmp` diagnostic and `deny/critical/none` for visible `--delete-all /Users/robot/Documents` under an explicit no-delete instruction; neither command was executed.
+- `py_compile`, Ruff, and `git diff --check` passed for this correction. No configuration change or Gateway restart was performed, and the Hermes Agent Fork remains uncommitted. The only commit is the local scripts-repository snapshot of `nc_report.py`; nothing was pushed.
 - The following 2026-08-16 results remain historical evidence for the original
   latest-turn context, Tirith, and language-aware implementation.
 - Approval, terminal, `execute_code`, and Tirith regression coverage:
@@ -2296,7 +2301,7 @@ deltas are expected in these areas:
   - `tools/tirith_security.py`
   - `tools/terminal_tool.py`
   - `tools/code_execution_tool.py`
-  - `tests/tools/test_smart_approval_context.py`
+  - `tests/fork_features/approval/test_smart_approval_context.py`
   - `tests/tools/test_denial_retry_escalation.py`
   - `tests/tools/test_denial_circuit_breaker.py`
   - `tests/tools/test_smart_approval_injection.py`

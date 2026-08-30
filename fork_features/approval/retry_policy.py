@@ -319,7 +319,7 @@ def generate_repeat_manual_description(
     source_kind: str = "shell",
 ) -> str:
     """Ask the approval model for a self-contained Chinese owner-review brief."""
-    latest_user_message = str(latest_user_message or "")[:8_000]
+    latest_user_message = str(latest_user_message or "")
     try:
         safe_action = redact_action(action)[:1_500]
     except Exception:

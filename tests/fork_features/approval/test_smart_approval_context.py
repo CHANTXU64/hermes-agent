@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.tool_executor import build_smart_approval_context
+from fork_features.approval.script_evidence import MAX_SCRIPT_BYTES
 from tools.todo_tool import TODO_INJECTION_HEADER
 from tools.approval import (
     SmartApprovalResult,
@@ -495,7 +496,7 @@ def test_direct_script_evidence_does_not_follow_local_imports(tmp_path: Path):
     ]
 
 
-def test_oversized_direct_script_remains_optional_unreadable_evidence(tmp_path: Path):
+def test_oversized_direct_script_returns_optional_truncated_evidence(tmp_path: Path):
     oversized = tmp_path / "oversized.py"
     oversized.write_text("x = 1\n" * 10_000)
 
@@ -506,11 +507,15 @@ def test_oversized_direct_script_remains_optional_unreadable_evidence(tmp_path: 
     )
 
     assert evidence == [
-        {"path": str(oversized), "status": "unreadable", "content": ""}
+        {
+            "path": str(oversized),
+            "status": "truncated",
+            "content": oversized.read_text()[:MAX_SCRIPT_BYTES],
+        }
     ]
 
 
-def test_direct_script_limit_reports_unreviewed_remainder(tmp_path: Path):
+def test_all_untracked_direct_scripts_are_read(tmp_path: Path):
     commands = []
     for index in range(5):
         script = tmp_path / f"task-{index}.py"
@@ -523,11 +528,14 @@ def test_direct_script_limit_reports_unreviewed_remainder(tmp_path: Path):
         source_kind="shell",
     )
 
-    assert evidence[-1] == {
-        "path": "<additional-direct-scripts>",
-        "status": "unreadable",
-        "content": "",
-    }
+    assert evidence == [
+        {
+            "path": str(tmp_path / f"task-{index}.py"),
+            "status": "read",
+            "content": f"print({index})\n",
+        }
+        for index in range(5)
+    ]
 
 
 def test_terminal_smart_review_reads_direct_script_once(monkeypatch, tmp_path: Path):
@@ -757,14 +765,22 @@ def test_prompt_keeps_baseline_risk_independent_from_task_relevance():
     )
 
 
-def test_prompt_uses_user_context_only_for_explicit_overrides():
+def test_prompt_uses_user_context_only_after_concrete_risk():
     prompt = _smart_system_prompt_for(
         "perform a flagged operation",
         "请用合适的方法处理",
     )
 
-    assert "Use authorization evidence only for explicit overrides" in prompt
-    assert "explicit approval of the risky action" in prompt
+    assert "Risk first, authorization second." in prompt
+    assert "Stage 2 — narrow authorization use." in prompt
+    assert (
+        "authorization evidence only to permit an identified non-critical risky action"
+        in prompt
+    )
+    assert (
+        "Authorization evidence is not a task-alignment, relevance, or per-tool permission "
+        "check."
+    ) in prompt
     assert "explicit prohibition, refusal, or mandatory condition" in prompt
     assert (
         "Ordinary task descriptions, preferences, requested methods, and silence are "
@@ -780,7 +796,7 @@ def test_prompt_marks_baseline_safe_actions_as_sufficiently_authorized():
 
     assert (
         "For a baseline-safe action, use authorization=sufficient even when the user "
-        "message does not mention it."
+        "message is empty, unrelated, or does not mention the action."
     ) in prompt
 
 
@@ -860,14 +876,10 @@ def test_prompt_does_not_require_recursive_source_for_visible_read_only_command(
         "information, treat it as baseline-safe without requiring the tool's implementation "
         "source."
     ) in prompt
-    assert (
-        "Visible evidence of mutation or interactive behavior still requires normal risk "
-        "review."
-    ) in prompt
-    assert (
-        "Do not escalate merely because direct entry-script evidence is missing, unreadable, "
-        "oversized, or incomplete."
-    ) in prompt
+    assert "Do not deny or escalate solely because direct entry-script evidence" in prompt
+    assert "file path, filename, command name, flags, argument names and values" in prompt
+    assert "must contribute zero risk by itself" in prompt
+    assert "must not be combined with absent authorization" in prompt
     assert "Do not recursively inspect imports or dependency trees." in prompt
 
 

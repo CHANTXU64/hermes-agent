@@ -11,13 +11,11 @@ import ast
 import os
 import re
 import shlex
-import sysconfig
-import tempfile
+import subprocess
 from collections.abc import Callable
 from typing import Optional
 
 MAX_SCRIPT_BYTES = 32_000
-MAX_SCRIPT_COUNT = 4
 
 _TRUSTED_API_TARGETS = {
     "hermes_tools.terminal",
@@ -33,11 +31,6 @@ _TRUSTED_API_MODULES = {
     "runpy",
 }
 _GIT_ROOT_CACHE: dict[str, Optional[str]] = {}
-_HERMES_SOURCE_ROOT = os.path.realpath(
-    os.path.join(os.path.dirname(__file__), "../..")
-)
-
-
 def _shell_segments(source: str) -> list[list[str]]:
     """Tokenize direct shell commands without executing expansions."""
     try:
@@ -529,13 +522,6 @@ def _call_argument(
     return None
 
 
-def _path_is_within(path: str, root: str) -> bool:
-    try:
-        return os.path.commonpath([path, root]) == root
-    except (OSError, ValueError):
-        return False
-
-
 def _git_root_for(path: str) -> Optional[str]:
     """Return the containing Git worktree marker without executing a command."""
     absolute = os.path.abspath(path)
@@ -546,7 +532,7 @@ def _git_root_for(path: str) -> Optional[str]:
             return None
         directory = parent
     directory = os.path.realpath(directory or os.getcwd())
-    if directory in _GIT_ROOT_CACHE:
+    if _GIT_ROOT_CACHE.get(directory):
         return _GIT_ROOT_CACHE[directory]
     current = directory
     while current:
@@ -558,126 +544,64 @@ def _git_root_for(path: str) -> Optional[str]:
         if parent == current:
             break
         current = parent
-    _GIT_ROOT_CACHE[directory] = None
     return None
 
 
-def _path_components(path: str) -> set[str]:
-    return {component.lower() for component in path.split(os.sep) if component}
-
-
-def _is_protected_source_path(path: str) -> bool:
-    """Reject standard-library, installed-package, and Hermes source paths."""
-    candidates = {os.path.abspath(path), os.path.realpath(path)}
-    stdlib_roots = {
-        os.path.realpath(value)
-        for value in (
-            sysconfig.get_path("stdlib"),
-            sysconfig.get_path("platstdlib"),
-        )
-        if value
-    }
+def _is_git_tracked_path(path: str) -> bool:
+    """Return whether Git currently records the executed file path."""
+    candidates = list(dict.fromkeys((os.path.abspath(path), os.path.realpath(path))))
     for candidate in candidates:
-        if _path_is_within(candidate, _HERMES_SOURCE_ROOT):
-            return True
-        components = _path_components(candidate)
-        if {"site-packages", "dist-packages"} & components:
-            return True
-        if any(_path_is_within(candidate, root) for root in stdlib_roots):
-            return True
-        parts = candidate.split(os.sep)
-        if any(
-            re.fullmatch(r"python\d+(?:\.\d+)*", part, re.IGNORECASE)
-            and index > 0
-            and parts[index - 1].lower() in {"lib", "libs"}
-            for index, part in enumerate(parts)
-        ):
-            return True
-    return False
-
-
-_TASK_TEMP_ROOT_PATTERN = re.compile(
-    r"(?:hindsight|hermes-task)-[a-z0-9][a-z0-9-]*$", re.IGNORECASE
-)
-
-
-def _is_task_temp_path(path: str) -> bool:
-    temp_roots = {
-        os.path.realpath(tempfile.gettempdir()),
-        os.path.realpath("/tmp"),
-        os.path.realpath("/private/tmp"),
-    }
-    candidate = os.path.realpath(path)
-    for root in temp_roots:
-        if not _path_is_within(candidate, root):
+        root = _git_root_for(candidate)
+        if not root:
             continue
-        relative_parts = os.path.relpath(candidate, root).split(os.sep)
-        if not relative_parts or relative_parts[0] in {".", ".."}:
-            return False
-        if not any(
-            _TASK_TEMP_ROOT_PATTERN.fullmatch(part)
-            for part in relative_parts[:-1]
-        ):
-            return False
-        if relative_parts[0].lower() in {
-            "bin",
-            "lib",
-            "lib64",
-            "sbin",
-            "site-packages",
-            "dist-packages",
-        }:
-            return False
-        return True
+        try:
+            relative = os.path.relpath(candidate, root)
+            if relative == ".." or relative.startswith(f"..{os.sep}"):
+                continue
+            result = subprocess.run(
+                ["git", "-C", root, "ls-files", "--error-unmatch", "--", relative],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        if result.returncode == 0:
+            return True
     return False
-
-
-def _is_allowed_local_script_path(path: str, *, cwd: str) -> bool:
-    """Apply the local evidence boundary before any content reader is called."""
-    lexical = os.path.abspath(path)
-    resolved = os.path.realpath(path)
-    if _is_protected_source_path(lexical) or _is_protected_source_path(resolved):
-        return False
-
-    roots = {os.path.realpath(os.path.abspath(cwd))}
-    base_git_root = _git_root_for(cwd)
-    if base_git_root:
-        roots.add(base_git_root)
-    target_git_root = _git_root_for(resolved)
-    if target_git_root and not any(
-        _path_is_within(resolved, root) for root in roots
-    ):
-        return False
-    if any(_path_is_within(resolved, root) for root in roots):
-        return True
-    return _is_task_temp_path(resolved)
 
 
 def _read_bounded_source(
     path: str,
     *,
     read_script: Optional[Callable[[str], Optional[str]]],
-) -> Optional[str]:
+) -> tuple[Optional[str], bool]:
     try:
         if read_script is not None:
             candidate = read_script(path)
-            if (
-                isinstance(candidate, str)
-                and len(candidate.encode("utf-8", errors="replace")) <= MAX_SCRIPT_BYTES
-                and "\x00" not in candidate
-            ):
-                return candidate
-            return None
+            if not isinstance(candidate, str) or "\x00" in candidate:
+                return None, False
+            data = candidate.encode("utf-8", errors="replace")
+            truncated = len(data) > MAX_SCRIPT_BYTES
+            return (
+                data[:MAX_SCRIPT_BYTES].decode("utf-8", errors="replace"),
+                truncated,
+            )
         real_path = os.path.realpath(path)
         if not os.path.isfile(real_path):
-            return None
+            return None, False
         with open(real_path, "rb") as handle:
             data = handle.read(MAX_SCRIPT_BYTES + 1)
-        if len(data) > MAX_SCRIPT_BYTES or b"\x00" in data:
-            return None
-        return data.decode("utf-8", errors="replace")
+        if b"\x00" in data:
+            return None, False
+        truncated = len(data) > MAX_SCRIPT_BYTES
+        return (
+            data[:MAX_SCRIPT_BYTES].decode("utf-8", errors="replace"),
+            truncated,
+        )
     except Exception:
-        return None
+        return None, False
 
 
 def _literal_argv(node: Optional[ast.AST]) -> list[Optional[str]] | str | None:
@@ -1044,44 +968,43 @@ def collect_direct_script_evidence(
     evidence: list[dict[str, str]] = []
     seen: set[str] = set()
     base = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
-    has_additional_scripts = False
 
     def add_direct_script(raw_path: str) -> None:
-        nonlocal has_additional_scripts
         expanded = os.path.expanduser(raw_path)
         resolved = os.path.abspath(
             expanded if os.path.isabs(expanded) else os.path.join(base, expanded)
         )
         if resolved in seen or _is_virtualenv_console_entrypoint(resolved):
             return
-        if len(seen) >= MAX_SCRIPT_COUNT:
-            has_additional_scripts = True
-            return
         seen.add(resolved)
-        content = (
-            _read_bounded_source(resolved, read_script=read_script)
-            if _is_allowed_local_script_path(resolved, cwd=base)
-            else None
+        if _is_git_tracked_path(resolved):
+            evidence.append(
+                {
+                    "path": resolved,
+                    "status": "skipped_git_tracked",
+                    "content": "",
+                }
+            )
+            return
+        content, truncated = _read_bounded_source(
+            resolved,
+            read_script=read_script,
+        )
+        status = (
+            "unreadable"
+            if content is None
+            else "truncated"
+            if truncated
+            else "read"
         )
         evidence.append(
             {
                 "path": resolved,
-                "status": "read" if content is not None else "unreadable",
+                "status": status,
                 "content": content or "",
             }
         )
 
     for raw_path in raw_paths:
         add_direct_script(raw_path)
-        if len(seen) >= MAX_SCRIPT_COUNT and has_additional_scripts:
-            break
-
-    if has_additional_scripts:
-        evidence.append(
-            {
-                "path": "<additional-direct-scripts>",
-                "status": "unreadable",
-                "content": "",
-            }
-        )
     return evidence

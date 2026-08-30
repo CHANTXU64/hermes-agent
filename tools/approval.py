@@ -4570,7 +4570,11 @@ def check_all_command_guards(command: str, env_type: str,
             script_key = f"direct_script:{script_path}"
             if is_approved(session_key, script_key):
                 continue
-            availability = "content read" if script["status"] == "read" else "content unavailable"
+            availability = {
+                "read": "content read",
+                "truncated": "content read as a bounded prefix",
+                "skipped_git_tracked": "content intentionally skipped because Git tracks it",
+            }.get(script["status"], "content unavailable")
             warnings.append((
                 script_key,
                 f"Direct script execution ({script_path}; {availability})",

@@ -63,6 +63,36 @@ def test_review_returns_structured_result_and_uses_bounded_current_evidence(tmp_
     assert "不得进入审批证据的内部摘要" not in user_prompt
 
 
+def test_review_forwards_complete_latest_user_message_and_all_clarifications(tmp_path):
+    entry = tmp_path / "entry.py"
+    entry.write_text("print('current entry')\n", encoding="utf-8")
+    captured = {}
+    marker = "完整用户消息末尾授权"
+    latest_user_message = "前置内容" * 4_000 + marker
+    clarifications = [
+        {"question": f"问题{i}", "answer": f"回答{i}"}
+        for i in range(12)
+    ]
+
+    _review(
+        tmp_path,
+        response=_response(
+            '{"decision":"approve","risk_level":"low",'
+            '"authorization":"exact","reason":"用户已完整授权。"}'
+        ),
+        context={
+            "latest_user_message": latest_user_message,
+            "clarifications": clarifications,
+        },
+        call_log=captured,
+    )
+
+    user_prompt = captured["messages"][1]["content"]
+    assert marker in user_prompt
+    assert "问题11" in user_prompt
+    assert "回答11" in user_prompt
+
+
 def test_unreadable_direct_entry_does_not_override_safe_model_decision(tmp_path):
     result = _review(
         tmp_path,
@@ -75,6 +105,77 @@ def test_unreadable_direct_entry_does_not_override_safe_model_decision(tmp_path)
 
     assert result.decision == "approve"
     assert result.authorization == "sufficient"
+
+
+def test_prompt_infers_risk_from_visible_metadata_when_source_is_incomplete(tmp_path):
+    captured = {}
+
+    _review(
+        tmp_path,
+        command="python missing.py --send-final /tmp/run --recipient fixed@example.test",
+        response=_response(
+            '{"decision":"approve","risk_level":"low",'
+            '"authorization":"sufficient","reason":"可见参数可判断。"}'
+        ),
+        call_log=captured,
+    )
+
+    system_prompt = captured["messages"][0]["content"]
+    assert "Do not deny or escalate solely" in system_prompt
+    assert "file path" in system_prompt
+    assert "filename" in system_prompt
+    assert "flags" in system_prompt
+    assert "argument names and values" in system_prompt
+    assert "working directory" in system_prompt
+
+
+def test_baseline_safe_local_state_write_does_not_require_authorization(tmp_path):
+    required_contract = (
+        "Risk first, authorization second.",
+        "Local state, cursor/progress, and ordinary output-file writes",
+        "must contribute zero risk by itself",
+        "must not be combined with absent authorization",
+        "not a task-alignment, relevance, or per-tool permission check",
+    )
+
+    def call_llm(**kwargs):
+        system_prompt = kwargs["messages"][0]["content"]
+        if all(clause in system_prompt for clause in required_contract):
+            return _response(
+                '{"decision":"approve","risk_level":"low",'
+                '"authorization":"sufficient","reason":"普通本地状态更新无需逐项授权。"}'
+            )
+        return _response(
+            '{"decision":"escalate","risk_level":"medium",'
+            '"authorization":"none","reason":"没有明确授权写入状态。"}'
+        )
+
+    result = review_action(
+        "python update_cursor.py --state /tmp/state.json --output /tmp/result.json",
+        "direct script execution",
+        approval_context={"latest_user_message": "", "clarifications": []},
+        cwd=str(tmp_path),
+        source_kind="shell",
+        read_script=None,
+        interface_language="zh",
+        operator_policy="",
+        strip_shell_comments=lambda value: value,
+        call_llm=call_llm,
+        script_evidence=[
+            {
+                "path": str(tmp_path / "update_cursor.py"),
+                "status": "skipped_git_tracked",
+                "content": "",
+            }
+        ],
+    )
+
+    assert result == SmartApprovalResult(
+        "approve",
+        "low",
+        "sufficient",
+        "普通本地状态更新无需逐项授权。",
+    )
 
 
 def test_invalid_response_escalates_with_chinese_reason(tmp_path):

@@ -213,3 +213,40 @@ def test_repeat_description_is_for_current_action_and_one_execution():
     assert "project-b.py" in description
     assert "一次" in description
     assert "转人工原因" in description
+
+
+def test_repeat_description_forwards_complete_latest_user_message():
+    captured = {}
+    marker = "完整用户消息末尾条件"
+    latest_user_message = "前置内容" * 3_000 + marker
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=(
+                        "目的：完成当前任务。\n"
+                        "实际动作：执行 project-b.py 一次。\n"
+                        "预期影响：目标文件会更新。\n"
+                        "风险：会产生实际写入。\n"
+                        "转人工原因：相似操作首次被自动拒绝。"
+                    )
+                )
+            )
+        ]
+    )
+
+    def call_llm(**kwargs):
+        captured.update(kwargs)
+        return response
+
+    retry_policy.generate_repeat_manual_description(
+        "python /tmp/project-b.py",
+        "会产生实际写入",
+        latest_user_message=latest_user_message,
+        redact_action=lambda action: action,
+        call_llm=call_llm,
+        source_kind="shell",
+    )
+
+    user_prompt = captured["messages"][1]["content"]
+    assert marker in user_prompt
