@@ -1130,12 +1130,13 @@ Upstream status: fork-only.
 
 ### 17. Self-contained Clarify decision cards
 
-Status: active
+Status: policy extracted to `fork_features` (2026-08-30)
 
-Date: 2026-07-16
+Date: 2026-07-16; boundary refactored 2026-08-30
 
 Files:
 
+- `fork_features/clarify_decision_card.py`
 - `tools/clarify_tool.py`
 - `tests/tools/test_clarify_tool.py`
 - `docs/LOCAL_MODIFICATIONS.md`
@@ -1147,8 +1148,15 @@ Summary:
 
 What changed:
 
-- The tool schema now explains that messaging UIs may render Clarify as a
-  standalone card.
+- `fork_features/clarify_decision_card.py` owns the self-contained,
+  decision-first, scope/impact/recommendation, and standalone-choice guidance.
+- `tools/clarify_tool.py` keeps the current single-question base Schema and one
+  pure `apply_decision_card_policy` call. Its callback, result shape,
+  `question`/`choices`/`multi_select` parameters, and registry path are unchanged.
+- Applying the policy returns a deep copy and preserves the complete pre-refactor
+  rendered Schema byte-for-byte. The policy also extends upstream's newer
+  `questions[]` shape additively without changing that API, reducing future
+  merge work; this commit does not adopt the batch API.
 - Action and approval questions must briefly state the current situation,
   proposed action and scope, material impact or trade-off, and a recommendation
   when one exists.
@@ -1165,23 +1173,28 @@ Why it matters:
 
 Merge protection:
 
+- Keep Fork decision-card text and composition logic in
+  `fork_features/clarify_decision_card.py`; the Clarify tool may retain only its
+  base Schema and one policy application call.
 - Preserve when: upstream Clarify guidance still permits context-dependent
   questions that messaging surfaces can render alone.
 - Drop when: upstream supplies an equivalent or stronger self-contained
   decision-card contract while keeping choices independently selectable.
-- Ask user when: upstream replaces the single question string with structured
-  context, impact, recommendation, or approval fields.
+- Ask user when: upstream replaces question text with structured context,
+  impact, recommendation, or approval fields. Upstream's current `questions[]`
+  container alone is already supported by the policy and does not justify
+  moving the Fork text back into core.
 
 Verification:
 
 ```bash
 .venv/bin/python -m pytest tests/tools/test_clarify_tool.py -q -o 'addopts='
-.venv/bin/python -m py_compile tools/clarify_tool.py tests/tools/test_clarify_tool.py
+.venv/bin/python -m py_compile fork_features/clarify_decision_card.py tools/clarify_tool.py tests/tools/test_clarify_tool.py
 git diff --check
 ```
 
-Feature docs: none — this is model-visible tool guidance with behavior-contract
-coverage and no platform API change.
+Feature docs: none — a Fork policy module, one Schema composition seam, and
+behavior contracts fully define the unchanged user-visible guidance.
 
 Upstream status: fork-only.
 
@@ -2470,6 +2483,7 @@ deltas are expected in these areas:
   - `tests/gateway/test_telegram_rich_messages.py`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Self-contained Clarify decision cards:
+  - `fork_features/clarify_decision_card.py`
   - `tools/clarify_tool.py`
   - `tests/tools/test_clarify_tool.py`
   - `docs/LOCAL_MODIFICATIONS.md`

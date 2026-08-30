@@ -18,6 +18,8 @@ import json
 from dataclasses import dataclass
 from typing import List, Optional, Callable
 
+from fork_features.clarify_decision_card import apply_decision_card_policy
+
 
 # Maximum number of predefined choices the agent can offer.
 # A 5th "Other (type your answer)" option is always appended by the UI.
@@ -202,7 +204,7 @@ def check_clarify_requirements() -> bool:
 # OpenAI Function-Calling Schema
 # =============================================================================
 
-CLARIFY_SCHEMA = {
+_BASE_CLARIFY_SCHEMA = {
     "name": "clarify",
     "description": (
         "Ask the user a question when you need clarification, feedback, or a "
@@ -213,23 +215,6 @@ CLARIFY_SCHEMA = {
         "multiple options via checkboxes. user_response will be a list of selected choices.\n"
         "3. **Open-ended** — omit choices entirely. The user types a free-form "
         "response.\n\n"
-        "SELF-CONTAINED PROMPT: the clarify UI may render this as a standalone "
-        "card without any other assistant prose from the tool-call turn. Put all "
-        "context the user needs to decide in `question`. For an action or approval "
-        "decision, briefly explain the current situation, proposed action and "
-        "scope, material impact or trade-off, and your recommendation when you "
-        "have one. Do not use references such as 'above', 'earlier', 'the "
-        "recommended scope', or 'as discussed' as substitutes for that context; "
-        "the user must be able to answer from the card alone.\n\n"
-        "DECISION-FIRST AND CONCISE: ask one user decision per card. If the user's "
-        "goal or overall approach is not confirmed, ask that before asking about "
-        "implementation scope. Use plain language, usually 2-5 short sentences. "
-        "For approval, name the complete plan, state what will actually change, "
-        "its scope and material impacts, give a recommendation when useful, then "
-        "ask whether to execute that named plan. A local path, plan document, link, "
-        "internal task number, or prior prose never substitutes for this explanation. "
-        "The user's choice authorizes only the scope stated in the card; material "
-        "scope added later requires a new clarification.\n\n"
         "CRITICAL: when you are offering options, put each option ONLY in the "
         "`choices` array — NEVER enumerate the options inside the `question` "
         "text. The UI renders `choices` as selectable rows; options written "
@@ -251,17 +236,9 @@ CLARIFY_SCHEMA = {
             "question": {
                 "type": "string",
                 "description": (
-                    "The complete, self-contained prompt shown to the user. Include "
-                    "all context needed to answer without relying on earlier "
-                    "assistant prose. For an action or approval decision, briefly "
-                    "state the current situation and one decision in plain language, "
-                    "usually in 2-5 short sentences. Name the complete plan, proposed "
-                    "action and scope, "
-                    "material impact or trade-off, and your recommendation when one "
-                    "exists, then ask whether to execute that named plan. Do not rely "
-                    "on a local path, plan document, link, internal task number, or "
-                    "later-added scope. Do not embed the answer options here — pass "
-                    "them as separate elements in `choices`."
+                    "The question itself, and ONLY the question (e.g. 'Which "
+                    "deployment target?'). Do NOT embed the answer options here "
+                    "— pass them as separate elements in `choices`."
                 ),
             },
             "choices": {
@@ -271,9 +248,6 @@ CLARIFY_SCHEMA = {
                 "description": (
                     "REQUIRED whenever you are presenting selectable options: "
                     "each distinct option is its own array element (up to 4). "
-                    "Each choice must stand alone and name the complete action or "
-                    "plan; never use labels such as 'Task 1-3', 'the recommended "
-                    "scope', or 'the plan above' as substitutes for the action. "
                     "The UI renders these as pickable rows and auto-appends an "
                     "'Other (type your answer)' option. Omit this parameter "
                     "entirely ONLY for a genuinely open-ended free-text question."
@@ -292,6 +266,8 @@ CLARIFY_SCHEMA = {
         "required": ["question"],
     },
 }
+
+CLARIFY_SCHEMA = apply_decision_card_policy(_BASE_CLARIFY_SCHEMA)
 
 
 # --- Registry ---
