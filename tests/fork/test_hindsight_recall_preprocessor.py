@@ -403,7 +403,7 @@ def test_hindsight_budget_covers_rewrite_recall_and_current_query_fallback(
             results=("fallback memory",),
         )
 
-    monkeypatch.setattr(hindsight_module, "run_recall_preprocessor", _preprocess)
+    monkeypatch.setattr(preprocessor, "run_recall_preprocessor", _preprocess)
     monkeypatch.setattr(hindsight, "_recall_snapshot_for_query", _recall)
 
     manager = MemoryManager()
@@ -983,7 +983,7 @@ def test_hindsight_prefetch_filters_cached_snapshot_and_appends_new_recall(
         )
 
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         _run_preprocessor,
         raising=False,
     )
@@ -1036,7 +1036,7 @@ def test_hindsight_prefetch_uses_assistant_derived_query_when_cache_is_empty(
         )
 
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         _run_preprocessor,
     )
     monkeypatch.setattr(provider, "_recall_snapshot_for_query", _recall_snapshot)
@@ -1093,7 +1093,7 @@ def test_hindsight_post_turn_queue_does_not_recall_raw_user_query_or_replace_act
         return SimpleNamespace(query=query, results=(f"memory for {query}",))
 
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         _preprocess,
     )
     monkeypatch.setattr(provider, "_recall_snapshot_for_query", _recall)
@@ -1146,7 +1146,7 @@ def test_hindsight_first_turn_sync_recall_becomes_next_turn_previous_recall(
 
     monkeypatch.setattr(provider, "_recall_snapshot_for_query", _recall)
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         _preprocess,
     )
 
@@ -1383,7 +1383,7 @@ def test_hindsight_empty_generated_recall_is_carried_as_real_snapshot(
         return next(decisions)
 
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         _preprocess,
     )
     monkeypatch.setattr(
@@ -1421,7 +1421,7 @@ def test_hindsight_prefetch_null_query_reuses_selected_old_results_without_new_r
         results=("keep", "drop"),
     ))
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         lambda **kwargs: SimpleNamespace(drop_old_refs=(2,), new_query=None),
     )
     monkeypatch.setattr(
@@ -1453,7 +1453,7 @@ def test_hindsight_prefetch_null_query_all_dropped_clears_old_recall(
         results=("first old", "second old"),
     ))
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         lambda **kwargs: SimpleNamespace(drop_old_refs=(1, 2), new_query=None),
     )
     monkeypatch.setattr(
@@ -1484,7 +1484,7 @@ def test_hindsight_null_query_reuses_old_results_and_post_turn_queue_is_noop(
         results=("old memory",),
     ))
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         lambda **kwargs: SimpleNamespace(drop_old_refs=(), new_query=None),
     )
     recall_calls = []
@@ -1524,7 +1524,7 @@ def test_hindsight_null_query_delayed_old_session_queue_cannot_repopulate_after_
         results=("old memory",),
     ))
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         lambda **kwargs: SimpleNamespace(drop_old_refs=(), new_query=None),
     )
     recall_calls = []
@@ -1582,7 +1582,7 @@ def test_hindsight_recall_after_null_query_merges_reused_old_and_new_results(
         return SimpleNamespace(query=query, results=("fourth-turn memory",))
 
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         _preprocess,
     )
     monkeypatch.setattr(provider, "_recall_snapshot_for_query", _recall)
@@ -1624,7 +1624,7 @@ def test_hindsight_prefetch_preprocessor_failure_preserves_full_old_cache(
         results=("first old", "second old"),
     ))
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         lambda **kwargs: (_ for _ in ()).throw(ValueError("invalid JSON")),
     )
 
@@ -1643,7 +1643,7 @@ def test_hindsight_prefetch_new_recall_failure_restores_full_old_cache(
         results=("first old", "second old"),
     ))
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         lambda **kwargs: SimpleNamespace(
             drop_old_refs=(2,),
             new_query="new target query",
@@ -1676,7 +1676,7 @@ def test_hindsight_prefetch_does_not_run_preprocessor_when_auto_recall_is_inacti
     inactive_provider = provider_with_config(**config)
     preprocessor_calls = []
     monkeypatch.setattr(
-        "plugins.memory.hindsight.run_recall_preprocessor",
+        "plugins.memory.hindsight.recall_preprocessor.run_recall_preprocessor",
         lambda **kwargs: preprocessor_calls.append(kwargs),
     )
 

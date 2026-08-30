@@ -7,7 +7,9 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
+
+from fork_features.hindsight_recall_cache import RecallSnapshot
 
 
 logger = logging.getLogger(__name__)
@@ -72,6 +74,12 @@ new_query 必须是独立的长期记忆检索语句，只写希望召回的正�
 class RecallPreprocessDecision:
     drop_old_refs: tuple[int, ...]
     new_query: str | None
+
+
+@dataclass(frozen=True)
+class RecallPreprocessOutcome:
+    snapshot: RecallSnapshot | None
+    fall_back_to_current_query: bool = False
 
 
 def get_recall_preprocessor_timeout_seconds() -> float:
@@ -475,3 +483,70 @@ def run_recall_preprocessor(
         decision.new_query is not None,
     )
     return decision
+
+
+def apply_recall_preprocessor(
+    *,
+    current_user_message: str,
+    previous_assistant_message: str,
+    previous_snapshot: RecallSnapshot,
+    recall_snapshot_for_query: Callable[[str], RecallSnapshot],
+) -> RecallPreprocessOutcome:
+    """Apply P5's decision to the prior real recall snapshot."""
+    original_results = tuple(previous_snapshot.results)
+    try:
+        decision = run_recall_preprocessor(
+            current_user_message=str(current_user_message or ""),
+            previous_assistant_message=str(previous_assistant_message or ""),
+            previous_recall_query=previous_snapshot.query,
+            previous_recall_results=original_results,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Hindsight recall preprocessor failed; using full cached recall: %s",
+            exc,
+        )
+        if original_results:
+            return RecallPreprocessOutcome(snapshot=previous_snapshot)
+        return RecallPreprocessOutcome(
+            snapshot=None,
+            fall_back_to_current_query=True,
+        )
+    dropped = set(decision.drop_old_refs)
+    selected_results = [
+        text
+        for index, text in enumerate(original_results, 1)
+        if index not in dropped
+    ]
+    selected_query = previous_snapshot.query
+    if decision.new_query is None:
+        if original_results and not selected_results:
+            selected_query = ""
+        logger.debug(
+            "Prefetch: preprocessor skipped new recall; reusing %d "
+            "selected old results",
+            len(selected_results),
+        )
+    else:
+        try:
+            new_snapshot = recall_snapshot_for_query(decision.new_query)
+        except Exception as exc:
+            logger.warning(
+                "Hindsight recall for preprocessor query failed; "
+                "restoring full cached recall: %s",
+                exc,
+            )
+            if original_results:
+                return RecallPreprocessOutcome(snapshot=previous_snapshot)
+            return RecallPreprocessOutcome(
+                snapshot=None,
+                fall_back_to_current_query=True,
+            )
+        selected_query = new_snapshot.query
+        selected_results.extend(new_snapshot.results)
+    return RecallPreprocessOutcome(
+        snapshot=RecallSnapshot(
+            query=selected_query,
+            results=tuple(selected_results),
+        )
+    )

@@ -22,26 +22,37 @@ It returns exactly:
 {"drop_old_refs":[1,2],"new_query":"short positive query or null"}
 ```
 
-The provider then:
+`apply_recall_preprocessor` then:
 
 - when `new_query` is non-null, keeps every old result not listed in
-  `drop_old_refs`, performs one bounded read-only recall, and appends the new
-  results; the exact query and merged results actually used by the current turn
-  become the next turn's previous-recall snapshot;
-- when `new_query` is null, performs no new Hindsight recall but still injects
-  and carries every old result not listed in `drop_old_refs`; dropping every old
-  ref together with a null query clears the recall chain;
-- the generic post-turn `queue_prefetch()` hook is always a no-op for Hindsight,
-  so the completed turn's raw user text never starts another recall;
+  `drop_old_refs`, invokes one bounded read-only recall callback, appends the new
+  results, and returns the exact query/results used by the current turn;
+- when `new_query` is null, invokes no new recall but returns every un-dropped old
+  result; dropping every old ref together with a null query returns an empty
+  snapshot and clears the recall chain.
+
+The Provider supplies that bounded callback, carries the returned snapshot for
+the next turn, and:
+
+- keeps the generic post-turn `queue_prefetch()` hook as a no-op, so the
+  completed turn's raw user text never starts another recall;
 - when no carried snapshot exists but a previous assistant response is
-  available (for example after compression/session rotation), P5 may derive the
-  bounded recall query from that conversational target; a genuinely fresh turn
-  with no previous assistant, or a failed P5 route with no old results, uses the
-  bounded current-query sync fallback;
+  available (for example after compression/session rotation), supplies an empty
+  real snapshot so P5 may derive a bounded recall query from that conversational
+  target; a genuinely fresh turn with no previous assistant, or a failed P5
+  route with no old results, uses the bounded current-query sync fallback;
 - formats non-empty output through the existing Hindsight memory-context
   formatter.
 
 The assistant response is input to the auxiliary preprocessor only. It is never copied directly into the Hindsight query. The durable conversation history and system prompt are not mutated, preserving prompt-cache stability.
+
+The Fork-only `recall_preprocessor.py` owns both the model decision and the
+result policy: old-ref filtering, optional read-only recall callback, complete
+old-cache restoration, current-query fallback signaling and construction of the
+actual snapshot. The Provider owns the bounded Hindsight callback and carries
+that snapshot under the shared Session/generation lifecycle. Generic
+`MemoryManager`, TurnContext, auxiliary-task registration and Codex model
+provenance remain unchanged extension seams.
 
 ## Auxiliary Model Configuration and Prompt Contract
 
@@ -151,7 +162,7 @@ containing:
 
 - the actual query sent after input-length clipping;
 - ordered result texts;
-- the historical formatted `_prefetch_result` string for compatibility.
+- the equivalent formatted cache text held by the Fork recall-cache object.
 
 The generation and session guards protect both the text cache and structured
 snapshot while the current turn is recalling. Session switching and rewind
@@ -192,8 +203,13 @@ The preprocessor is skipped when Hindsight is in tools-only mode, `auto_recall` 
 - `hermes_cli/plugins.py` and `plugins/memory/__init__.py` — bridge auxiliary
   tasks declared by the active memory provider into the standard Hermes model
   configuration surfaces.
-- `plugins/memory/hindsight/recall_preprocessor.py` — frozen P5 prompt, strict parser, configured primary call, and task-local configured fallback call.
-- `plugins/memory/hindsight/__init__.py` — structured snapshot, filtering/merge, recall, failure and lifecycle behavior.
+- `plugins/memory/hindsight/recall_preprocessor.py` — frozen P5 prompt, strict
+  parser, configured primary/fallback calls, old-ref filtering, optional recall
+  callback, failure restoration and actual snapshot construction.
+- `plugins/memory/hindsight/__init__.py` — supplies the bounded Hindsight recall
+  callback, consumes the P5 outcome and carries it through the shared lifecycle.
+- `tests/fork_features/test_hindsight_p5_policy.py` — direct orchestration and
+  Provider-boundary contracts.
 - `tests/fork/test_hindsight_recall_preprocessor.py` — prompt/schema,
   explicit-route/model-provenance, provider/failure, null lifecycle, carried
   snapshot, and no-post-turn-recall tests.
@@ -227,12 +243,30 @@ Drop only when upstream provides equivalent behavior and the user confirms the r
 
 When `MemoryProvider.prefetch`, turn-context assembly, Hindsight prefetch, or auxiliary-client routing conflicts during an upstream merge, compare actual behavior and run the focused tests rather than preserving individual lines mechanically.
 
+Do not restore a Provider-level `run_recall_preprocessor` alias or duplicate the
+old-ref/new-query/failure branches in the high-frequency Provider main file.
+
 ## Verification
 
 Focused regression command:
 
 ```bash
-python -m pytest tests/fork/test_hindsight_recall_preprocessor.py tests/plugins/memory/test_hindsight_provider.py tests/fork/test_hindsight_provider_regressions.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_provider.py tests/agent/test_turn_context.py tests/run_agent/test_run_agent.py::TestMemoryProviderTurnStart tests/run_agent/test_run_agent_codex_responses.py tests/agent/test_auxiliary_client.py::TestCodexAdapterReasoningTranslation tests/hermes_cli/test_plugin_auxiliary_tasks.py -q -o 'addopts='
+python -m pytest tests/fork_features/test_hindsight_p5_policy.py tests/fork/test_hindsight_recall_preprocessor.py tests/plugins/memory/test_hindsight_provider.py tests/fork/test_hindsight_provider_regressions.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_provider.py tests/agent/test_turn_context.py tests/run_agent/test_run_agent_codex_responses.py tests/agent/test_auxiliary_client.py::TestCodexAdapterReasoningTranslation tests/hermes_cli/test_plugin_auxiliary_tasks.py -q -o 'addopts='
+```
+
+Orchestration-boundary verification on 2026-08-30:
+
+```text
+direct P5 policy and Provider-boundary contracts: 10 passed
+focused P5/Hindsight/MemoryManager/Codex/plugin integration: 302 passed
+expanded Hindsight/Request-only/compression/Session/Gateway memory gate:
+  394 passed, 7 third-party deprecation warnings
+Ruff: All checks passed
+py_compile: passed
+git diff --check: passed
+P5 prompt SHA-256: b9b182478b41ab593398bb1649b8a318ab7f59464cd4abe5681a7add6481106f
+fixed-SHA Provider merge simulation: 2 conflict regions before and after;
+  both remaining regions are unrelated retain/observation conflicts
 ```
 
 Implementation verification on 2026-07-17:

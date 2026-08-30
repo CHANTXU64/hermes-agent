@@ -61,7 +61,7 @@ from fork_features.hindsight_recall_cache import (
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
-from .recall_preprocessor import run_recall_preprocessor
+from .recall_preprocessor import apply_recall_preprocessor
 
 logger = logging.getLogger(__name__)
 
@@ -1751,67 +1751,23 @@ class HindsightMemoryProvider(MemoryProvider):
             preprocessor_snapshot = _RecallSnapshot(query="", results=())
 
         if preprocessor_snapshot is not None:
-            original_results = tuple(preprocessor_snapshot.results)
-            selected_query = preprocessor_snapshot.query
-            fall_back_to_current_query = False
-            try:
-                decision = run_recall_preprocessor(
-                    current_user_message=str(query or ""),
-                    previous_assistant_message=str(previous_assistant_message or ""),
-                    previous_recall_query=preprocessor_snapshot.query,
-                    previous_recall_results=original_results,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Hindsight recall preprocessor failed; using full cached recall: %s",
-                    exc,
-                )
-                if original_results:
-                    selected_results = original_results
-                else:
-                    selected_results = ()
-                    fall_back_to_current_query = True
-            else:
-                dropped = set(decision.drop_old_refs)
-                selected_results = tuple(
-                    text
-                    for ref, text in enumerate(original_results, 1)
-                    if ref not in dropped
-                )
-                if decision.new_query is None:
-                    if original_results and not selected_results:
-                        selected_query = ""
-                    logger.debug(
-                        "Prefetch: preprocessor skipped new recall; reusing %d "
-                        "selected old results",
-                        len(selected_results),
+            outcome = apply_recall_preprocessor(
+                current_user_message=str(query or ""),
+                previous_assistant_message=str(previous_assistant_message or ""),
+                previous_snapshot=preprocessor_snapshot,
+                recall_snapshot_for_query=lambda recall_query: (
+                    self._recall_snapshot_for_query(
+                        recall_query,
+                        timeout=self._recall_sync_timeout_seconds,
                     )
-                else:
-                    try:
-                        new_snapshot = self._recall_snapshot_for_query(
-                            decision.new_query,
-                            timeout=self._recall_sync_timeout_seconds,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Hindsight recall for preprocessor query failed; "
-                            "restoring full cached recall: %s",
-                            exc,
-                        )
-                        if original_results:
-                            selected_results = original_results
-                        else:
-                            selected_results = ()
-                            fall_back_to_current_query = True
-                    else:
-                        selected_query = new_snapshot.query
-                        selected_results += tuple(new_snapshot.results)
-
-            if not fall_back_to_current_query:
-                selected_snapshot = _RecallSnapshot(
-                    query=selected_query,
-                    results=selected_results,
-                )
+                ),
+            )
+            if not outcome.fall_back_to_current_query:
+                selected_snapshot = outcome.snapshot
+                if selected_snapshot is None:
+                    raise RuntimeError(
+                        "recall preprocessor policy returned no snapshot without fallback"
+                    )
                 result = self._recall_snapshot_text(selected_snapshot)
                 self._carry_recall_snapshot_to_next_turn(
                     selected_snapshot,

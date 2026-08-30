@@ -300,7 +300,8 @@ Upstream status: intentional Fork divergence from upstream's every-turn
 
 ### 9. Hindsight P5 recall preprocessor
 
-Date: 2026-07-17; external-prefetch timeout compatibility fix 2026-07-19; configured model fallback 2026-08-09
+Date: 2026-07-17; external-prefetch timeout compatibility fix 2026-07-19;
+configured model fallback 2026-08-09; orchestration boundary migrated 2026-08-30
 
 Files:
 
@@ -313,6 +314,7 @@ Files:
 - `plugins/memory/__init__.py`
 - `plugins/memory/hindsight/recall_preprocessor.py`
 - `plugins/memory/hindsight/__init__.py`
+- `tests/fork_features/test_hindsight_p5_policy.py`
 - `tests/fork/test_hindsight_recall_preprocessor.py`
 - `tests/agent/test_memory_provider.py`
 - `tests/fork/test_hindsight_provider_regressions.py`
@@ -362,6 +364,15 @@ What changed:
   P5 decision. A null query skips only the new recall: un-dropped old results
   remain injected and carried. Dropping every old ref with a null query clears
   the chain.
+- The Fork-only `recall_preprocessor.py` now owns both the model decision and
+  the pure result orchestration: old-ref filtering, optional recall callback,
+  complete-old-cache restoration, current-query fallback signaling and actual
+  snapshot construction. The high-frequency Hindsight Provider supplies the
+  bounded recall callback and carries the returned snapshot; it no longer
+  imports the raw preprocessor runner or duplicates the P5 branches. Existing
+  `MemoryManager`, TurnContext, auxiliary-task registration and Codex model
+  provenance remain generic extension seams and were not modified by this
+  boundary migration.
 - Query generation keeps or omits details according to whether they could have
   existed before the current session and whether they improve retrieval of
   useful history, not according to a field-type whitelist. A fresh commit hash
@@ -424,6 +435,9 @@ Merge protection:
   only the query/results actually used by the current turn.
 - Preserve fail-open restoration of old recall and the tools/auto_recall/
   shutdown guards.
+- Keep old-ref selection, new-query recall and failure restoration in the
+  Fork-only P5 module. Do not re-export `run_recall_preprocessor` from the
+  Provider or copy those branches back into `plugins/memory/hindsight/__init__.py`.
 - Preserve provider-specific prefetch budgeting. Do not replace the generic
   external-provider 8-second guard with a Hindsight-specific global constant,
   and do not let that generic guard silently override P5/recall stage timeouts.
@@ -431,6 +445,30 @@ Merge protection:
   because old results appear to cover the target.
 - Run the focused command documented in the feature README after conflicts
   touching memory prefetch, turn context, Hindsight, or auxiliary routing.
+
+Verification after the 2026-08-30 orchestration migration:
+
+- Six policy/boundary contracts were observed RED then GREEN: missing
+  orchestration entry, P5-route failure restoration, generated-query Recall
+  failure restoration, all-old-refs chain clearing, and removal of the Provider
+  raw-runner alias, plus rejection of a non-fallback outcome without a snapshot.
+  Four adjacent contracts for no-old-result fallback, null reuse and successful
+  empty Recall were GREEN through those shared branches.
+- P5 focused integration gate: `302 passed`.
+- Hindsight/MemoryManager/Request-only/compression/Session/Gateway expanded gate:
+  `394 passed` with `7` third-party deprecation warnings.
+- Prompt SHA-256 remained
+  `b9b182478b41ab593398bb1649b8a318ab7f59464cd4abe5681a7add6481106f`.
+- Fixed-SHA three-way simulation remained `2 → 2` text conflict regions; both
+  are unrelated retain/observation conflicts, so no conflict-count reduction is
+  claimed. The high-frequency Provider changed by `+17/-61`, the Fork-only P5
+  module by `+76/-1`, and no `agent/`, `hermes_cli/`, or generic memory-plugin
+  bridge file changed in this unit.
+- Independent `xai-oauth/grok-4.6` `xhigh` review returned `PASS` with `0`
+  blocking findings. Its two applicable findings were closed before commit:
+  Runtime Flow now assigns filtering/recall/outcome work to the P5 module, and
+  the Provider explicitly rejects a non-fallback outcome without a snapshot
+  instead of silently reusing old text.
 
 Feature docs: `docs/chantxu64/hindsight-p5-recall-preprocessor/README.md`
 
@@ -2400,6 +2438,7 @@ deltas are expected in these areas:
   - `plugins/memory/hindsight/__init__.py`
   - `hermes_state.py`
   - `tests/fork_features/test_hindsight_recall_cache.py`
+  - `tests/fork_features/test_hindsight_p5_policy.py`
   - `tests/plugins/memory/test_hindsight_provider.py`
   - `tests/fork/test_hindsight_unicode_contract.py`
   - `tests/test_hermes_state.py`
