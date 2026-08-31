@@ -566,7 +566,7 @@ def test_review_thread_receives_live_governance_context_only_for_memory(
     monkeypatch.setattr(
         background_review,
         "_run_review_in_thread",
-        lambda _agent, _messages, prompt: captured.append(prompt),
+        lambda _agent, _messages, prompt, **_kwargs: captured.append(prompt),
     )
 
     class Agent:

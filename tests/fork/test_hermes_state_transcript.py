@@ -18,16 +18,26 @@ def test_get_messages_as_conversation_can_omit_timestamps(db):
 
     default_messages = db.get_messages_as_conversation("s_timestamp_opt")
     assert default_messages == [
-        {"role": "user", "content": "hello", "timestamp": 1710000000.0},
-        {"role": "assistant", "content": "world", "timestamp": 1710000001.0},
+        {
+            "role": "user",
+            "content": "hello",
+            "_db_persisted": True,
+            "timestamp": 1710000000.0,
+        },
+        {
+            "role": "assistant",
+            "content": "world",
+            "_db_persisted": True,
+            "timestamp": 1710000001.0,
+        },
     ]
 
     without_timestamps = db.get_messages_as_conversation(
         "s_timestamp_opt", include_timestamps=False
     )
     assert without_timestamps == [
-        {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "world"},
+        {"role": "user", "content": "hello", "_db_persisted": True},
+        {"role": "assistant", "content": "world", "_db_persisted": True},
     ]
 
 

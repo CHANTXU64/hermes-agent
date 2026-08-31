@@ -36,9 +36,38 @@ from __future__ import annotations
 import logging
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Version 1 is the historical, implicit contract every provider is already
+# on: best-effort on_pre_compress() with the raw message list. Version 2 is
+# the opt-in fail-closed checkpoint contract (normalized evidence handoff +
+# strict-mode failure propagation).
+PRE_COMPRESS_CHECKPOINT_API_VERSION = 2
+
+# Default glyph for the deterministic memory indicators. Providers override
+# per-status with their own brand mark (e.g. Hindsight uses "👁️").
+INDICATOR_GLYPH = "🧠"
+
+
+@dataclass(frozen=True)
+class RecallStatus:
+    """Summary of what a provider's most recent prefetch injected this turn.
+
+    Returned by :meth:`MemoryProvider.recall_status` so the agent can emit a
+    deterministic, model-independent "memory was used" indicator (see
+    ``MemoryManager.describe_recall``). ``count`` is the number of discrete
+    memories injected; ``0`` means content was injected but has no discrete
+    count (e.g. a synthesized reflect answer), which the indicator renders
+    generically rather than as "0 memories". ``glyph`` is the brand mark the
+    indicator leads with.
+    """
+
+    provider_label: str
+    count: int
+    glyph: str = INDICATOR_GLYPH
 
 
 # Prompts that carry no semantic signal — trivial acknowledgements, greetings,
@@ -80,6 +109,12 @@ def is_trivial_prompt(text: Optional[str]) -> bool:
 
 class MemoryProvider(ABC):
     """Abstract base class for memory providers."""
+
+    # Providers that durably checkpoint every successful on_pre_compress()
+    # call may opt into that host contract by setting the current version
+    # (PRE_COMPRESS_CHECKPOINT_API_VERSION). Version 1 is the implicit
+    # historical contract: best-effort semantics, raw message list.
+    pre_compress_checkpoint_api_version = 1
 
     @property
     @abstractmethod

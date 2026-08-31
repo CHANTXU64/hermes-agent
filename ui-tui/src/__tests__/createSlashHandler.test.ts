@@ -483,7 +483,63 @@ describe('createSlashHandler', () => {
     await vi.waitFor(() => {
       expect(ctx.session.newSession).toHaveBeenCalledWith('new session started', 'sprint planning')
     })
-    expect(rpc).not.toHaveBeenCalled()
+    expect(ctx.gateway.rpc).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['/new sprint planning', 'new session started', 'sprint planning'],
+    ['/clear', undefined, undefined]
+  ])('skips the confirmation for %s when config disables it', async (command, message, title) => {
+    patchUiState({ destructiveSlashConfirm: false })
+    const ctx = buildCtx()
+
+    expect(createSlashHandler(ctx)(command)).toBe(true)
+
+    expect(getOverlayState().confirm).toBeNull()
+    await vi.waitFor(() => {
+      expect(ctx.session.newSession).toHaveBeenCalledWith(message, title)
+    })
+  })
+
+  it('routes the /reset catalog alias through the local fresh-session lifecycle', async () => {
+    const ctx = buildCtx({
+      local: {
+        catalog: {
+          canon: {
+            '/new': '/new',
+            '/reset': '/new'
+          }
+        }
+      }
+    })
+
+    createSlashHandler(ctx)('/reset')
+    getOverlayState().confirm?.onConfirm()
+
+    await vi.waitFor(() => {
+      expect(ctx.session.newSession).toHaveBeenCalledWith('new session started', undefined)
+    })
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+  })
+
+  it('skips the confirmation for the /reset alias when config disables it', () => {
+    patchUiState({ destructiveSlashConfirm: false })
+
+    const ctx = buildCtx({
+      local: {
+        catalog: {
+          canon: {
+            '/new': '/new',
+            '/reset': '/new'
+          }
+        }
+      }
+    })
+
+    expect(createSlashHandler(ctx)('/reset')).toBe(true)
+
+    expect(getOverlayState().confirm).toBeNull()
+    expect(ctx.session.newSession).toHaveBeenCalledWith('new session started', undefined)
   })
 
   it('keeps visible scrollback when branching a TUI session', async () => {

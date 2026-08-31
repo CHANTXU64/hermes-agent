@@ -35,6 +35,30 @@ from tools.safe_cmd_rewrite import (
 
 
 # ===========================================================================
+# Import boundary regression
+# ===========================================================================
+
+
+def test_terminal_tool_defers_safe_rewrite_parser_until_command_execution():
+    repo_root = Path(__file__).resolve().parents[2]
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import tools.terminal_tool; "
+                "print(int('tools.safe_cmd_rewrite' in sys.modules))"
+            ),
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert probe.stdout.strip().splitlines()[-1] == "0"
+
+
+# ===========================================================================
 # Helper function tests
 # ===========================================================================
 

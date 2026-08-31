@@ -139,6 +139,7 @@ def test_repeat_one_shot_cli_offers_only_once_or_deny(monkeypatch):
             display_target="python current-action.py",
             approval_callback=approval_callback,
             cron_deny_message="blocked",
+            single_query_deny_message="blocked",
             autoapprove_log_prefix="repeat-test",
             fail_closed_when_no_human=True,
             no_human_block_message="blocked",

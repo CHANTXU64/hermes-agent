@@ -38,6 +38,14 @@ def test_timeout_parses_minutes_to_seconds():
     assert parse_idle_timeout_seconds("5") == 300.0
 
 
+def test_timeout_invalid_values_degrade_to_default():
+    # Behavior contract: bad config falls back to the module default (whatever
+    # its current value), never to zero/negative — an instant-dormant gateway
+    # is never the intent.
+    for bad in (None, "", "nope", 0, -3):
+        assert parse_idle_timeout_seconds(bad) == DEFAULT_IDLE_TIMEOUT_MINUTES * 60.0
+
+
 # ── messaging_is_relay_only_or_absent (F6/D1) ────────────────────────────────
 
 
@@ -71,7 +79,7 @@ def test_arm_blocked_without_wake_url():
 
 def _idle_kwargs(**over):
     base = dict(
-        running_agent_count=0,
+        active_work_count=0,
         seconds_since_last_inbound=600.0,
         idle_timeout_seconds=300.0,
         has_live_background_work=False,
@@ -81,7 +89,7 @@ def _idle_kwargs(**over):
 
 
 def test_not_idle_with_running_agent():
-    assert is_idle(**_idle_kwargs(running_agent_count=1)) is False
+    assert is_idle(**_idle_kwargs(active_work_count=1)) is False
 
 
 def test_idle_exactly_at_threshold():
@@ -116,7 +124,7 @@ _FLY_ENV = {FLY_APP_NAME_ENV: "hermes-agent-stg-test", FLY_MACHINE_ID_ENV: "d891
 
 def _fake_flaps(tmp_path, status_line, capture):
     """One-shot unix-socket HTTP server standing in for flaps."""
-    sock_path = str(tmp_path / "fly-api.sock")
+    sock_path = f"/tmp/hermes-flaps-{os.getpid()}-{id(capture):x}.sock"
     server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     server.bind(sock_path)
     server.listen(1)
@@ -136,6 +144,10 @@ def _fake_flaps(tmp_path, status_line, capture):
                 f"HTTP/1.1 {status_line}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}".encode()
             )
         server.close()
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
 
     t = threading.Thread(target=serve, daemon=True)
     t.start()

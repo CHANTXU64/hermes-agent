@@ -50,7 +50,7 @@ from hermes_time import now as _hermes_now
 
 from agent.secret_scope import get_secret
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, RecallStatus
 from fork_features.hindsight_recall_cache import (
     CarryResult,
     HindsightRecallCache,
@@ -59,6 +59,7 @@ from fork_features.hindsight_recall_cache import (
     should_sync_cache_miss,
 )
 from hermes_constants import get_hermes_home
+from hermes_time import now as _hermes_now
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
 from .recall_preprocessor import apply_recall_preprocessor
@@ -374,8 +375,10 @@ RETAIN_SCHEMA = {
                 "type": "string",
                 "description": (
                     "When the remembered event actually happened, as an ISO-8601 date "
-                    "or datetime. Pass this when the memory references a specific event "
-                    "time; omit it for timeless facts and preferences."
+                    "or datetime (e.g. '2026-08-20' or '2026-08-20T14:30:00+02:00'). "
+                    "Pass this whenever the memory references a specific event time "
+                    "('yesterday', 'last Tuesday', 'on March 3rd') so Hindsight can "
+                    "anchor it on the timeline. Omit for timeless facts/preferences."
                 ),
             },
         },
@@ -553,13 +556,15 @@ def _normalize_observation_scopes(value: Any) -> Any:
 
 
 def _utc_timestamp() -> str:
-    """Return current UTC timestamp in ISO-8601 with milliseconds and Z suffix."""
+    """Return the UTC write/audit time for retain metadata."""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _event_timestamp() -> str:
     """Return the configured Hermes event time with an explicit UTC offset."""
     event_time = _hermes_now()
+    # hermes_time.now() guarantees an aware datetime. Keep this fallback so a
+    # replacement clock cannot silently emit an offset-less Hindsight Event Date.
     if event_time.tzinfo is None or event_time.utcoffset() is None:
         event_time = event_time.astimezone()
     return event_time.isoformat(timespec="seconds")
@@ -1915,6 +1920,10 @@ class HindsightMemoryProvider(MemoryProvider):
         retain_async: bool | None = None,
         occurred_at: str | None = None,
     ) -> Dict[str, Any]:
+        # The item-level timestamp is what the Hindsight server uses to resolve
+        # occurred_start/occurred_end (including relative phrases in content).
+        # An explicit occurred_at (from the retain tool) wins; otherwise default
+        # to the configured event clock so relative times still resolve (#93568).
         kwargs: Dict[str, Any] = {
             "bank_id": self._bank_id,
             "content": content,

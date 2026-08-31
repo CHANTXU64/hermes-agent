@@ -99,6 +99,7 @@ _fake_telegram_ext = types.ModuleType("telegram.ext")
 _fake_telegram_ext.Application = object
 _fake_telegram_ext.CommandHandler = object
 _fake_telegram_ext.CallbackQueryHandler = object
+_fake_telegram_ext.InlineQueryHandler = object
 _fake_telegram_ext.MessageHandler = object
 _fake_telegram_ext.TypeHandler = object
 _fake_telegram_ext.ContextTypes = SimpleNamespace(DEFAULT_TYPE=object)
@@ -327,6 +328,7 @@ async def test_gateway_runner_busy_ack_replies_to_triggering_message_for_telegra
         chat_type="dm",
         thread_id="20197",
         user_id="user-1",
+        account_id=None,
     )
     event = MessageEvent(
         text="busy follow-up",
