@@ -104,10 +104,9 @@ class GatewayAuthorizationMixin:
         When a stamped profile has its own adapter registry entry, the default
         profile's same-platform adapter must not be consulted as a fallback.
 
-        Fork multi-Telegram: named bots live in ``_telegram_account_adapters``
-        keyed by ``account_id``. A stamped account_id must resolve to that map
-        (or None) — never fall back to the primary token (would send out the
-        wrong bot).
+        Fork multi-Telegram: named bots resolve through the isolated Telegram
+        runtime. A stamped valid account must resolve there (or None) — never
+        fall back to the primary token, which would send through the wrong bot.
         """
         if not platform:
             return None
@@ -131,22 +130,21 @@ class GatewayAuthorizationMixin:
             # default profile's adapter — that sends replies out the wrong bot.
             return None
 
-        # Named multi-account bots (same profile, extra TELEGRAM_BOT_TOKEN_*).
+        # Fork seam: a valid named Telegram stamp resolves through the isolated
+        # runtime and fails closed when that account is currently disconnected.
         acc = (account_id or "").strip() or None
         if platform == Platform.TELEGRAM and acc:
-            try:
-                from gateway.session import normalize_account_id
+            runtime = getattr(self, "_telegram_accounts", None)
+            if runtime is None:
+                from fork_features.multi_telegram_accounts.runtime import (
+                    TelegramAccountRuntime,
+                )
 
-                acc = normalize_account_id(acc)
-            except Exception:
-                acc = acc.lower() if acc else None
-            if acc:
-                extra = getattr(self, "_telegram_account_adapters", None) or {}
-                if acc in extra:
-                    return extra[acc]
-                # Fail closed: a valid stamped named account with no live adapter
-                # must not fall back to primary (would reply from the wrong bot).
-                return None
+                runtime = TelegramAccountRuntime(self)
+                self._telegram_accounts = runtime
+            recognized, adapter = runtime.resolve_stamped_adapter(acc)
+            if recognized:
+                return adapter
 
         adapters = getattr(self, "adapters", None) or {}
         return adapters.get(platform)

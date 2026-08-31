@@ -38,7 +38,11 @@ from gateway.session import (
     SessionSource,
     build_session_key,
     is_shared_multi_user_session,
-    split_account_session_key,
+)
+from fork_features.multi_telegram_accounts.session_routing import (
+    cleanup_detached_session_routes,
+    plan_cross_account_resume,
+    switch_resumed_session,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
 from utils import (
@@ -4749,20 +4753,15 @@ class GatewaySlashCommandsMixin:
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
 
-        cross_account_route_keys: list[str] = []
+        cross_account_plan = None
         if source.platform == Platform.TELEGRAM:
-            target_route_keys = await self.async_session_store.routing_keys_for_session_id(
-                target_id
+            cross_account_plan = await plan_cross_account_resume(
+                self.async_session_store,
+                session_key=session_key,
+                target_id=target_id,
+                running_session_keys=(getattr(self, "_running_agents", {}) or {}),
             )
-            current_account = split_account_session_key(session_key)[1]
-            cross_account_route_keys = [
-                key
-                for key in target_route_keys
-                if key != session_key
-                and split_account_session_key(key)[1] != current_account
-            ]
-            running_agents = getattr(self, "_running_agents", {}) or {}
-            if any(key in running_agents for key in cross_account_route_keys):
+            if cross_account_plan.blocked_by_running:
                 return (
                     "That session is still running in another Telegram bot. "
                     "Wait for it to finish or stop it there, then resume again."
@@ -4775,9 +4774,12 @@ class GatewaySlashCommandsMixin:
         # Telegram resume is a move: one persisted session may have only one
         # active Bot route at a time.
         detached_route_keys: list[str] = []
-        if cross_account_route_keys:
-            new_entry, detached_route_keys = (
-                await self.async_session_store.transfer_session(session_key, target_id)
+        if cross_account_plan is not None:
+            new_entry, detached_route_keys = await switch_resumed_session(
+                self.async_session_store,
+                session_key=session_key,
+                target_id=target_id,
+                plan=cross_account_plan,
             )
         else:
             new_entry = await self.async_session_store.switch_session(
@@ -4785,27 +4787,7 @@ class GatewaySlashCommandsMixin:
             )
         if not new_entry:
             return t("gateway.resume.switch_failed")
-        for detached_key in detached_route_keys:
-            # Cross-account resume permanently unbinds the old Telegram route.
-            # Apply upstream's single conversation-boundary funnel so new
-            # per-session state cannot leak when that registry grows, then
-            # clear the detached route's turn/cache state and staged payloads.
-            release_running = getattr(self, "_release_running_agent_state", None)
-            if callable(release_running):
-                release_running(detached_key)
-            clear_scope = getattr(self, "_clear_conversation_scope", None)
-            if callable(clear_scope):
-                clear_scope(detached_key, reason="resume_transfer")
-            evict_agent = getattr(self, "_evict_cached_agent", None)
-            if callable(evict_agent):
-                evict_agent(detached_key)
-            for attr in (
-                "_pending_messages",
-                "_pending_native_image_paths_by_session",
-            ):
-                state = getattr(self, attr, None)
-                if isinstance(state, dict):
-                    state.pop(detached_key, None)
+        cleanup_detached_session_routes(self, detached_route_keys)
 
         # Conversation boundary: clear ALL conversation-scoped per-session
         # state (model/reasoning overrides #10702, one-turn restores, model

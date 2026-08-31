@@ -95,6 +95,11 @@ from .whatsapp_identity import (
     normalize_whatsapp_identifier,  # noqa: F401 - re-exported for gateway.session callers
 )
 from utils import atomic_replace
+from fork_features.multi_telegram_accounts.identity import (
+    append_account_session_key,
+    normalize_account_id,
+    split_account_session_key,
+)
 
 
 # Session keys/ids flow into filesystem paths downstream (e.g.
@@ -1073,49 +1078,6 @@ def is_shared_multi_user_session(
     if source.thread_id:
         return not thread_sessions_per_user
     return not group_sessions_per_user
-
-
-def normalize_account_id(value: Optional[str]) -> Optional[str]:
-    """Normalize a multi-account id for session keys / env discovery.
-
-    Accepts ``[A-Za-z0-9_-]`` up to 32 chars; returns lowercase form or None.
-    """
-    if value is None:
-        return None
-    raw = str(value).strip().lower()
-    if not raw:
-        return None
-    import re
-
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", raw):
-        return None
-    return raw
-
-
-def append_account_session_key(session_key: str, account_id: Optional[str]) -> str:
-    """Append/replace trailing ``:account:<id>`` (primary remains bare)."""
-    acc = normalize_account_id(account_id)
-    if not acc:
-        return session_key
-    base, current = split_account_session_key(session_key)
-    if current == acc:
-        return session_key
-    return f"{base}:account:{acc}"
-
-
-def split_account_session_key(session_key: str) -> tuple:
-    """Split trailing ``:account:<id>`` from a session key.
-
-    Returns ``(base_key, account_id_or_None)``.
-    """
-    marker = ":account:"
-    if marker not in (session_key or ""):
-        return session_key, None
-    base, acc = session_key.rsplit(marker, 1)
-    acc = normalize_account_id(acc)
-    if not acc:
-        return session_key, None
-    return base, acc
 
 
 def _session_key_namespace(profile: Optional[str]) -> str:

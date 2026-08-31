@@ -458,6 +458,20 @@ async def test_named_account_fatal_without_primary_queues_without_stopping_gatew
     assert runner._exit_reason is None
 
 
+def test_already_queued_named_fatal_never_falls_back_to_primary_retry_slot():
+    runner = _make_runtime_runner()
+    adapter = StubTelegramAdapter(token="222:BBB", account_id="work")
+    adapter._set_fatal_error("network_error", "DNS failure", retryable=True)
+    runner._failed_telegram_accounts["work"] = {
+        "config": adapter.config,
+        "attempts": 0,
+        "next_retry": 0.0,
+    }
+
+    assert runner._queue_retryable_fatal_adapter(adapter) is True
+    assert Platform.TELEGRAM not in runner._failed_platforms
+
+
 @pytest.mark.asyncio
 async def test_nontelegram_account_id_is_not_misrouted_to_telegram_queue():
     runner = _make_runtime_runner()
@@ -493,7 +507,7 @@ async def test_named_account_reconnect_restores_map_and_direct_handler(monkeypat
         AsyncMock(return_value=True),
     )
 
-    await runner._reconnect_failed_telegram_accounts()
+    await runner._telegram_accounts.reconnect_failed()
 
     assert runner._telegram_account_adapters["work"] is adapter
     assert "work" not in runner._failed_telegram_accounts
@@ -531,7 +545,7 @@ async def test_start_named_account_failure_enters_named_reconnect_queue(monkeypa
     )
     monkeypatch.setattr(runner, "_safe_adapter_disconnect", AsyncMock())
 
-    connected = await runner._start_telegram_account_adapters()
+    connected = await runner._telegram_accounts.start()
 
     assert connected == 0
     assert "work" in runner._failed_telegram_accounts

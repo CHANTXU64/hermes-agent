@@ -70,6 +70,12 @@ from fork_features.clarify_attachment_reply import (
 from fork_features.telegram_tool_progress import (
     tool_progress_delivery_metadata as _tool_progress_delivery_metadata,
 )
+from fork_features.multi_telegram_accounts.runtime import (
+    TelegramAccountRuntime,
+    telegram_failed_accounts_property,
+    telegram_live_adapters_property,
+    telegram_runtime_property,
+)
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -6396,6 +6402,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_vc_last = legacy_dict_property("_session_vc_last")
     _pending_approvals = legacy_dict_property("_pending_approvals")
     _update_prompt_pending = legacy_dict_property("_update_prompt_pending")
+    # Compatibility views for tests and older local callers. The isolated Fork
+    # runtime remains the sole owner of both registries.
+    _telegram_accounts = telegram_runtime_property()
+    _telegram_account_adapters = telegram_live_adapters_property()
+    _failed_telegram_accounts = telegram_failed_accounts_property()
 
     # -- SessionState accessors -----------------------------------------
     def _sessions_map(self) -> Dict[str, "SessionState"]:
@@ -6471,11 +6482,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
-        # Fork multi-Telegram: extra named bots in the SAME profile.
-        # Primary still lives at self.adapters[Platform.TELEGRAM]; named
-        # accounts are keyed by account_id here so legacy call sites keep
-        # working and replies continue to go through the inbound adapter.
-        self._telegram_account_adapters: Dict[str, BasePlatformAdapter] = {}
+        # Fork seam: named Telegram registries and lifecycle policy live behind
+        # one Telegram-specific facade; the primary remains in self.adapters.
+        self._telegram_accounts = TelegramAccountRuntime(self)
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -6684,11 +6693,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
         self._failed_platforms: Dict[Platform, Dict[str, Any]] = {}
-        # Fork multi-Telegram: named account adapters that failed and need
-        # independent reconnect (must not share Platform.TELEGRAM primary queue).
-        # Key: account_id, Value: {"config": PlatformConfig, "attempts": int, "next_retry": float}
-        self._failed_telegram_accounts: Dict[str, Dict[str, Any]] = {}
-
         # Strong refs to detached fatal-error handler tasks (see
         # _handle_adapter_fatal_error) so the event loop can't GC them mid-run.
         self._fatal_handler_tasks: set = set()
@@ -7841,24 +7845,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # it: the caller sees CancelledError, the handler runs to completion.
         await asyncio.shield(task)
 
-    @staticmethod
-    def _named_telegram_account_id(
-        adapter: BasePlatformAdapter,
-    ) -> Optional[str]:
-        """Return the normalized named Telegram slot owned by *adapter*."""
-        if adapter.platform != Platform.TELEGRAM:
-            return None
-        try:
-            cfg = getattr(adapter, "config", None)
-            raw_account_id = (getattr(cfg, "extra", None) or {}).get("account_id")
-            if not raw_account_id:
-                return None
-            from gateway.session import normalize_account_id
-
-            return normalize_account_id(raw_account_id)
-        except Exception:
-            return None
-
     def _queue_retryable_fatal_platform(self, adapter: BasePlatformAdapter) -> bool:
         """Queue a retryable fatal adapter for background reconnection.
 
@@ -7893,6 +7879,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._ensure_reconnect_watcher_running()
         return True
 
+    def _queue_retryable_fatal_adapter(self, adapter: BasePlatformAdapter) -> bool:
+        """Route retry ownership without letting named bots enter primary slot."""
+        if self._telegram_accounts.account_id_for(adapter):
+            self._telegram_accounts.queue_retryable(adapter)
+            return True
+        return self._queue_retryable_fatal_platform(adapter)
+
     async def _handle_adapter_fatal_error_detached(
         self, adapter: BasePlatformAdapter
     ) -> None:
@@ -7924,12 +7917,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         adapter.platform.value,
                         outer,
                     )
-                    self._queue_retryable_fatal_platform(adapter)
+                    self._queue_retryable_fatal_adapter(adapter)
         except asyncio.CancelledError:
             # Best-effort queue before re-raising: a cancelled fatal handler
             # must not strand a retryable platform (#80598).
             try:
-                self._queue_retryable_fatal_platform(adapter)
+                self._queue_retryable_fatal_adapter(adapter)
             except Exception:
                 logger.debug(
                     "Failed to queue %s after fatal-handler cancellation",
@@ -7945,7 +7938,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Best-effort queue so an unexpected raise mid-handler cannot
             # leave a retryable platform permanently deaf (#80598).
             try:
-                self._queue_retryable_fatal_platform(adapter)
+                self._queue_retryable_fatal_adapter(adapter)
             except Exception:
                 logger.debug(
                     "Failed to queue %s after fatal-handler exception",
@@ -7955,15 +7948,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             platform = adapter.platform
             shutdown_event = getattr(self, "_shutdown_event", None)
-            account_id = self._named_telegram_account_id(adapter)
+            account_id = self._telegram_accounts.account_id_for(adapter)
             if account_id:
-                live_accounts = getattr(self, "_telegram_account_adapters", {})
-                failed_accounts = getattr(self, "_failed_telegram_accounts", {})
-                stranded = (
-                    adapter.fatal_error_retryable
-                    and account_id not in live_accounts
-                    and account_id not in failed_accounts
-                    and not (shutdown_event is not None and shutdown_event.is_set())
+                stranded = self._telegram_accounts.is_stranded(
+                    adapter,
+                    shutdown_requested=bool(
+                        shutdown_event is not None and shutdown_event.is_set()
+                    ),
                 )
             else:
                 stranded = (
@@ -7985,14 +7976,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self.stop()
 
     async def _handle_adapter_fatal_error_impl(self, adapter: BasePlatformAdapter) -> None:
-        # Fork multi-Telegram: named account adapters live outside
-        # ``self.adapters[Platform.TELEGRAM]`` and must use their own teardown
-        # and reconnect maps. Run this inside the detached handler so adapter
-        # shutdown cannot cancel the requeue operation.
-        account_id = self._named_telegram_account_id(adapter)
-
-        if adapter.platform == Platform.TELEGRAM and account_id:
-            await self._handle_telegram_account_fatal_error(adapter, account_id)
+        # Fork seam: the Telegram facade owns named-slot teardown and retry.
+        if await self._telegram_accounts.handle_fatal(adapter):
             return
 
         # Snapshot the current owner of this platform slot before doing
@@ -8059,10 +8044,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._safe_adapter_disconnect(adapter, adapter.platform)
 
         if not self.adapters and not self._failed_platforms:
-            # Named telegram accounts may still be connected — keep gateway up.
-            extra_live = bool(getattr(self, "_telegram_account_adapters", None))
-            extra_queued = bool(getattr(self, "_failed_telegram_accounts", None))
-            if extra_live or extra_queued:
+            # Named Telegram accounts may still be live/queued — keep Gateway up.
+            if self._telegram_accounts.has_live_or_queued():
                 logger.warning(
                     "Primary adapters empty but multi-Telegram account bots "
                     "still live/queued — gateway staying alive."
@@ -8092,171 +8075,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "retry in background.",
                 len(self._failed_platforms),
             )
-
-    async def _handle_telegram_account_fatal_error(
-        self,
-        adapter: BasePlatformAdapter,
-        account_id: str,
-    ) -> None:
-        """Teardown / requeue a named multi-Telegram account adapter."""
-        extra = getattr(self, "_telegram_account_adapters", None)
-        if extra is None:
-            self._telegram_account_adapters = {}
-            extra = self._telegram_account_adapters
-        failed = getattr(self, "_failed_telegram_accounts", None)
-        if failed is None:
-            self._failed_telegram_accounts = {}
-            failed = self._failed_telegram_accounts
-
-        existing = extra.get(account_id)
-        if existing is not None and existing is not adapter:
-            logger.debug(
-                "Ignoring stale fatal error from superseded telegram[%s] adapter: %s",
-                account_id,
-                adapter.fatal_error_code or "unknown",
-            )
-            return
-        if existing is None and account_id in failed:
-            logger.debug(
-                "Ignoring duplicate fatal error from already-queued telegram[%s] adapter",
-                account_id,
-            )
-            return
-
-        logger.error(
-            "Fatal telegram[%s] adapter error (%s): %s",
-            account_id,
-            adapter.fatal_error_code or "unknown",
-            adapter.fatal_error_message or "unknown error",
-        )
-        status_key = f"telegram[{account_id}]"
-        if adapter.fatal_error_code == "relay_disabled":
-            platform_state = "disabled"
-        elif adapter.fatal_error_retryable:
-            platform_state = "retrying"
-        else:
-            platform_state = "fatal"
-        self._update_platform_runtime_status(
-            status_key,
-            platform_state=platform_state,
-            error_code=adapter.fatal_error_code,
-            error_message=adapter.fatal_error_message,
-        )
-
-        if existing is adapter:
-            extra.pop(account_id, None)
-            await self._safe_adapter_disconnect(adapter, Platform.TELEGRAM)
-
-        if adapter.fatal_error_retryable and account_id not in failed:
-            # Prefer the live adapter's PlatformConfig (has this account's token).
-            account_cfg = getattr(adapter, "config", None)
-            if account_cfg is None:
-                from gateway.config import PlatformConfig
-
-                primary = self.config.platforms.get(Platform.TELEGRAM)
-                extra_map = ((primary.extra if primary else {}) or {}).get("accounts") or {}
-                tok = ""
-                if isinstance(extra_map.get(account_id), dict):
-                    tok = (extra_map[account_id].get("token") or "").strip()
-                account_cfg = PlatformConfig(
-                    enabled=True,
-                    token=tok,
-                    extra={"account_id": account_id},
-                )
-            failed[account_id] = {
-                "config": account_cfg,
-                "attempts": 0,
-                "next_retry": time.monotonic(),
-            }
-            logger.info("telegram[%s] queued for background reconnection", account_id)
-            self._ensure_reconnect_watcher_running()
-
-    async def _reconnect_failed_telegram_accounts(self) -> None:
-        """One pass of named multi-Telegram account reconnects."""
-        failed = getattr(self, "_failed_telegram_accounts", None) or {}
-        if not failed:
-            return
-        now = time.monotonic()
-        for account_id in list(failed.keys()):
-            if not self._running:
-                return
-            info = failed[account_id]
-            if info.get("paused") or now < info["next_retry"]:
-                continue
-            platform_config = info["config"]
-            attempt = info["attempts"] + 1
-            logger.info("Reconnecting telegram[%s] (attempt %d)...", account_id, attempt)
-            adapter = None
-            try:
-                adapter = self._create_adapter(Platform.TELEGRAM, platform_config)
-                if not adapter:
-                    logger.warning(
-                        "Reconnect telegram[%s]: adapter creation returned None",
-                        account_id,
-                    )
-                    info["attempts"] = attempt
-                    info["next_retry"] = now + min(300, 30 * (2 ** min(attempt - 1, 4)))
-                    continue
-                adapter.set_message_handler(self._handle_message)
-                adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-                adapter.set_session_store(self.session_store)
-                adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-                adapter.set_authorization_check(
-                    self._make_adapter_auth_check(adapter.platform)
-                )
-                adapter._busy_text_mode = self._busy_text_mode
-                success = await self._connect_adapter_with_timeout(
-                    adapter, Platform.TELEGRAM, is_reconnect=True
-                )
-                if success:
-                    self._telegram_account_adapters[account_id] = adapter
-                    self._sync_voice_mode_state_to_adapter(adapter)
-                    del self._failed_telegram_accounts[account_id]
-                    self._update_platform_runtime_status(
-                        f"telegram[{account_id}]",
-                        platform_state="connected",
-                        error_code=None,
-                        error_message=None,
-                    )
-                    logger.info("✓ telegram[%s] reconnected successfully", account_id)
-                else:
-                    await self._safe_adapter_disconnect(adapter, Platform.TELEGRAM)
-                    if adapter.has_fatal_error and not adapter.fatal_error_retryable:
-                        self._update_platform_runtime_status(
-                            f"telegram[{account_id}]",
-                            platform_state="fatal",
-                            error_code=adapter.fatal_error_code,
-                            error_message=(
-                                adapter.fatal_error_message or "failed to reconnect"
-                            ),
-                        )
-                        del self._failed_telegram_accounts[account_id]
-                        logger.warning(
-                            "Reconnect telegram[%s]: non-retryable error, "
-                            "removing from retry queue",
-                            account_id,
-                        )
-                        continue
-                    info["attempts"] = attempt
-                    info["next_retry"] = now + min(
-                        300, 30 * (2 ** min(attempt - 1, 4))
-                    )
-                    self._update_platform_runtime_status(
-                        f"telegram[{account_id}]",
-                        platform_state="retrying",
-                        error_code=adapter.fatal_error_code,
-                        error_message=(
-                            adapter.fatal_error_message or "failed to reconnect"
-                        ),
-                    )
-            except Exception as e:
-                logger.error(
-                    "✗ telegram[%s] reconnect error: %s", account_id, e, exc_info=True
-                )
-                if adapter is not None:
-                    await self._safe_adapter_disconnect(adapter, Platform.TELEGRAM)
-                info["attempts"] = attempt
-                info["next_retry"] = now + min(300, 30 * (2 ** min(attempt - 1, 4)))
 
     def _request_clean_exit(self, reason: str) -> None:
         self._exit_cleanly = True
@@ -12389,7 +12207,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Fork: extra Telegram bots in the same profile (TELEGRAM_BOT_TOKEN_*).
         try:
-            _tg_extra = await self._start_telegram_account_adapters()
+            _tg_extra = await self._telegram_accounts.start()
             connected_count += _tg_extra
         except Exception as e:
             logger.error("Telegram multi-account startup failed: %s", e, exc_info=True)
@@ -13602,23 +13420,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         await asyncio.sleep(10)  # initial delay — let startup finish
         while self._running:
-            if not self._failed_platforms and not getattr(
-                self, "_failed_telegram_accounts", None
-            ):
+            if not self._failed_platforms and not self._telegram_accounts.has_failed():
                 # Nothing to reconnect — sleep and check again
                 for _ in range(30):
                     if not self._running:
                         return
-                    if self._failed_platforms or getattr(
-                        self, "_failed_telegram_accounts", None
-                    ):
+                    if self._failed_platforms or self._telegram_accounts.has_failed():
                         break
                     await asyncio.sleep(1)
                 continue
 
             # Fork: reconnect named multi-Telegram accounts independently.
             try:
-                await self._reconnect_failed_telegram_accounts()
+                await self._telegram_accounts.reconnect_failed()
             except Exception:
                 logger.debug(
                     "telegram multi-account reconnect pass failed", exc_info=True
@@ -14247,15 +14061,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
 
-            # Disconnect fork multi-Telegram account adapters.
-            for _acc_id, adapter in list(
-                getattr(self, "_telegram_account_adapters", {}).items()
-            ):
-                await self._bounded_adapter_teardown(
-                    adapter, Platform.TELEGRAM, profile=f"telegram:{_acc_id}"
-                )
-            if hasattr(self, "_telegram_account_adapters"):
-                self._telegram_account_adapters.clear()
+            # Fork seam: bounded teardown for all named Telegram accounts.
+            telegram_runtime = getattr(self, "_telegram_accounts", None)
+            if telegram_runtime is not None:
+                await telegram_runtime.stop()
 
             # Disconnect secondary-profile adapters (multiplex mode).
             for _prof, _amap in list(getattr(self, "_profile_adapters", {}).items()):
@@ -14694,124 +14503,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.error("✗ %s error (profile: %s): %s", platform.value, profile_name, e)
                 await self._safe_adapter_disconnect(adapter, platform)
-        return connected
-
-    async def _start_telegram_account_adapters(self) -> int:
-        """Start extra Telegram bots configured via TELEGRAM_BOT_TOKEN_*.
-
-        Primary TELEGRAM_BOT_TOKEN remains at ``self.adapters[Platform.TELEGRAM]``.
-        Named accounts are stored in ``self._telegram_account_adapters`` and
-        stamp ``source.account_id`` so session keys isolate per bot while the
-        real Telegram user/chat id is preserved for /resume ownership.
-        """
-        from gateway.config import PlatformConfig
-        from gateway.session import normalize_account_id
-
-        tg_cfg = self.config.platforms.get(Platform.TELEGRAM)
-        if not tg_cfg or not getattr(tg_cfg, "enabled", False):
-            return 0
-        raw_accounts = (tg_cfg.extra or {}).get("accounts") or {}
-        if not isinstance(raw_accounts, dict) or not raw_accounts:
-            return 0
-
-        connected = 0
-        for account_id, account_info in sorted(raw_accounts.items()):
-            acc = normalize_account_id(account_id)
-            if not acc:
-                logger.warning(
-                    "Skipping telegram account %r: invalid account id", account_id
-                )
-                continue
-            if isinstance(account_info, dict):
-                token = (account_info.get("token") or "").strip()
-            else:
-                token = str(account_info or "").strip()
-            if not token:
-                logger.warning("Skipping telegram account %s: empty token", acc)
-                continue
-
-            # Build a PlatformConfig clone for this account (no nested accounts).
-            extra = dict(tg_cfg.extra or {})
-            extra.pop("accounts", None)
-            extra["account_id"] = acc
-            account_cfg = PlatformConfig(
-                enabled=True,
-                token=token,
-                api_key=tg_cfg.api_key,
-                home_channel=tg_cfg.home_channel,
-                reply_to_mode=tg_cfg.reply_to_mode,
-                gateway_restart_notification=getattr(
-                    tg_cfg, "gateway_restart_notification", True
-                ),
-                typing_indicator=getattr(tg_cfg, "typing_indicator", True),
-                channel_overrides=dict(getattr(tg_cfg, "channel_overrides", {}) or {}),
-                extra=extra,
-            )
-
-            adapter = self._create_adapter(Platform.TELEGRAM, account_cfg)
-            if not adapter:
-                logger.warning("No Telegram adapter for account '%s'", acc)
-                continue
-
-            adapter.set_message_handler(self._handle_message)
-            adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-            adapter.set_session_store(self.session_store)
-            adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-            adapter.set_authorization_check(
-                self._make_adapter_auth_check(adapter.platform)
-            )
-            adapter._busy_text_mode = self._busy_text_mode
-
-            logger.info("Connecting to telegram[%s]...", acc)
-            try:
-                success = await self._connect_adapter_with_timeout(
-                    adapter, Platform.TELEGRAM
-                )
-                if success:
-                    self._telegram_account_adapters[acc] = adapter
-                    self._sync_voice_mode_state_to_adapter(adapter)
-                    connected += 1
-                    logger.info("✓ telegram[%s] connected", acc)
-                else:
-                    logger.warning("✗ telegram[%s] failed to connect", acc)
-                    await self._safe_adapter_disconnect(adapter, Platform.TELEGRAM)
-                    # Match primary startup semantics: retry transient/no-detail
-                    # failures and retryable fatal errors with this account's
-                    # own config/token, never the primary PlatformConfig.
-                    if (not adapter.has_fatal_error) or adapter.fatal_error_retryable:
-                        self._failed_telegram_accounts[acc] = {
-                            "config": account_cfg,
-                            "attempts": 1,
-                            "next_retry": time.monotonic() + 30,
-                        }
-                    self._update_platform_runtime_status(
-                        f"telegram[{acc}]",
-                        platform_state=(
-                            "retrying"
-                            if (not adapter.has_fatal_error)
-                            or adapter.fatal_error_retryable
-                            else "fatal"
-                        ),
-                        error_code=adapter.fatal_error_code,
-                        error_message=(
-                            adapter.fatal_error_message or "failed to connect"
-                        ),
-                    )
-            except Exception as e:
-                logger.error("✗ telegram[%s] error: %s", acc, e, exc_info=True)
-                await self._safe_adapter_disconnect(adapter, Platform.TELEGRAM)
-                self._failed_telegram_accounts[acc] = {
-                    "config": account_cfg,
-                    "attempts": 1,
-                    "next_retry": time.monotonic() + 30,
-                }
-                self._update_platform_runtime_status(
-                    f"telegram[{acc}]",
-                    platform_state="retrying",
-                    error_code=None,
-                    error_message=str(e),
-                )
-
         return connected
 
     def _configure_profile_adapter(
