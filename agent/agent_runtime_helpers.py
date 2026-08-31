@@ -3055,6 +3055,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         def _execute(next_args: dict) -> Any:
             target = next_args.get("target", "memory")
             operations = next_args.get("operations")
+            from fork_features.memory_governance import forwarded_memory_kwargs
             from tools.memory_tool import memory_tool as _memory_tool
             result = _memory_tool(
                 action=next_args.get("action"),
@@ -3062,13 +3063,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 content=next_args.get("content"),
                 old_text=next_args.get("old_text"),
                 operations=operations,
-                reason=next_args.get("reason"),
-                evidence=next_args.get("evidence"),
-                change_type=next_args.get("change_type"),
-                deletion_type=next_args.get("deletion_type"),
-                loss_note=next_args.get("loss_note"),
-                related_skill=next_args.get("related_skill"),
                 store=agent._memory_store,
+                **forwarded_memory_kwargs(next_args),
             )
             # Mirror successful built-in memory writes to external providers.
             # All gating/op-expansion lives behind the manager interface

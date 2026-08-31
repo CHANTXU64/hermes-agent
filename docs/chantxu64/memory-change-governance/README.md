@@ -1,6 +1,7 @@
 # Auditable built-in memory governance
 
-Status: fork-only behavior; it takes effect when a process loads this version.
+Status: fork-owned policy and audit boundary; it takes effect when a process
+loads this version.
 
 ## Purpose
 
@@ -55,6 +56,47 @@ workflow does not append either file to the memory-governance context or modify
 them. The background agent's pre-existing inherited system identity remains
 unchanged.
 
+## Responsibility map
+
+- `tools/memory_tool.py` owns the upstream-facing `MemoryStore`, character
+  limits, file locks, atomic Store writes, public tool registration, and one
+  `MemoryStore.transaction(...)` seam. The Fork mutation path reaches private
+  Store mutation and rollback state only through that Host-owned transaction;
+  history and background context use public read-only Store readers.
+- `fork_features/memory_governance.py` owns mutation metadata policy,
+  single/batch normalization, exact change tracing, audit/rollback orchestration,
+  public Schema/Prompt policy, live review-context rendering, and the shared
+  sequential/concurrent forwarding field list.
+- `fork_features/memory_audit.py` owns profile-scoped JSONL baseline, append,
+  parsing, merge-only lineage, threat scanning, field bounds, and the 8,000
+  character result bound.
+- `agent/background_review.py`, `agent/prompt_builder.py`,
+  `agent/tool_executor.py`, and `agent/agent_runtime_helpers.py` keep only thin
+  composition or forwarding calls. The Fork modules do not import
+  `tools.memory_tool` or call Store private methods.
+
+This split keeps Store/data ownership visible instead of moving the old
+governance functions to another directory while retaining hidden private-method
+coupling.
+
+## Maintenance exposure evidence
+
+At upstream SHA `4f22543509d1b91dc45bcb369447126c5eb14fb7` and Fork
+baseline `b6519e453af5ee74bda5619981e9748d690e5d8f`, the maintenance
+profile counted one path touch per non-merge commit from
+`git log --no-merges --since=2026-05-01 --name-status --find-renames`:
+
+- `tools/memory_tool.py`: 34 upstream touches / 1 Fork-only non-merge touch;
+- `agent/background_review.py`: 45 / 1;
+- `agent/prompt_builder.py`: 112 / 3.
+
+These are path-exposure counts, not measured merge-conflict or Token savings.
+The repository-local `docs/FORK_SYNC_HISTORY.jsonl` was absent. The external
+decoupling ledger inspected for the profile contained 13 implementation records
+but no sync or follow-up records, so sync-outcome coverage is missing. No
+measured conflict hunks, resolution time, rework, defects, or Token evidence was
+available.
+
 ## Merge protection
 
 Preserve:
@@ -67,6 +109,9 @@ Preserve:
 - target locking, rollback, and stale-snapshot protection when the audit record
   cannot be written;
 - structured JSONL records with transaction IDs;
+- Store-private mutation, rollback, file-lock operations remaining behind the
+  public `MemoryStore.transaction(...)` seam, while read-only consumers use
+  public Store readers;
 - bounded, threat-scanned, related-only history lookup before existing-entry
   changes, while pure adds skip history;
 - threat scanning and data encoding for live MEMORY/USER context;
@@ -84,6 +129,7 @@ adds SOUL files to background memory context.
   tests/agent/test_prompt_builder.py \
   tests/agent/test_memory_write_bridge.py \
   tests/fork/test_memory_changelog_governance.py \
+  tests/fork_features/test_memory_governance_boundary.py \
   tests/tools/test_memory_tool.py \
   tests/tools/test_memory_tool_schema.py \
   tests/tools/test_write_approval.py \

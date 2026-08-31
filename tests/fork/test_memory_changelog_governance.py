@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from agent import background_review
+from fork_features.memory_audit import MEMORY_HISTORY_MAX_CHARS, MemoryAuditSink
+from fork_features.memory_governance import MemoryGovernance
 from tools import memory_tool as memory_module
 from tools.memory_tool import MemoryStore, memory_tool
 
@@ -70,7 +72,7 @@ def test_pure_add_does_not_call_model_history_lookup(
     def _unexpected_history(*_args: object, **_kwargs: object) -> dict:
         raise AssertionError("pure add must not call history")
 
-    monkeypatch.setattr(memory_module, "_memory_history", _unexpected_history)
+    monkeypatch.setattr(MemoryGovernance, "history", _unexpected_history)
 
     result = _call(
         governed_store,
@@ -91,7 +93,10 @@ def test_jsonl_baseline_has_one_structured_record_per_existing_entry(
     (tmp_path / "MEMORY.md").write_text("memory one\n§\nmemory two", encoding="utf-8")
     (tmp_path / "USER.md").write_text("user one", encoding="utf-8")
 
-    memory_module.initialize_memory_changelog()
+    MemoryAuditSink(
+        tmp_path,
+        read_entries=MemoryStore.read_entries,
+    ).initialize()
     records = _read_log_records()
 
     assert len(records) == 3
@@ -263,7 +268,7 @@ def test_history_returns_only_related_jsonl_records_with_a_fixed_bound(
         record["after"] != "Unrelated durable entry."
         for record in result["history"]
     )
-    assert result["max_chars"] == memory_module.MEMORY_HISTORY_MAX_CHARS
+    assert result["max_chars"] == MEMORY_HISTORY_MAX_CHARS
     assert len(json.dumps(result["history"], ensure_ascii=False)) <= result["max_chars"]
 
 
@@ -475,11 +480,11 @@ def test_history_bound_holds_for_one_oversized_structured_record() -> None:
         "after": "a" * 10_000,
     }
 
-    history, truncated = memory_module._bounded_history([oversized])
+    history, truncated = MemoryAuditSink.bounded_history([oversized])
 
     assert truncated is True
     assert len(json.dumps(history, ensure_ascii=False)) <= (
-        memory_module.MEMORY_HISTORY_MAX_CHARS
+        MEMORY_HISTORY_MAX_CHARS
     )
 
 
@@ -586,8 +591,8 @@ def test_changelog_failure_rolls_back_memory_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        memory_module,
-        "_append_governance_records",
+        MemoryAuditSink,
+        "append",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad journal data")),
     )
 
@@ -670,7 +675,7 @@ def test_transient_unchecked_snapshot_failure_cannot_erase_memory_on_rollback(
     def _journal_failure(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated journal failure")
 
-    monkeypatch.setattr(memory_module, "_append_governance_records", _journal_failure)
+    monkeypatch.setattr(MemoryAuditSink, "append", _journal_failure)
 
     result = _call(
         governed_store,
@@ -723,7 +728,7 @@ def test_changelog_failure_does_not_erase_a_newer_external_write(
         )
         raise ValueError("bad journal data")
 
-    monkeypatch.setattr(memory_module, "_append_governance_records", _external_write_then_fail)
+    monkeypatch.setattr(MemoryAuditSink, "append", _external_write_then_fail)
 
     result = _call(
         governed_store,

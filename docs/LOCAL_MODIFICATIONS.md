@@ -1718,13 +1718,16 @@ large-session context-overflow inference.
 
 ### 23. Auditable autonomous built-in memory governance
 
-Status: fork-only; active after a process loads this version
+Status: Fork policy/audit isolated behind a Store transaction seam; active after
+a process loads this version
 
-Date: 2026-08-08
+Date: 2026-08-08; responsibility boundary refactored 2026-08-31
 
 Files:
 
 - `tools/memory_tool.py`
+- `fork_features/memory_governance.py`
+- `fork_features/memory_audit.py`
 - `agent/background_review.py`
 - `agent/prompt_builder.py`
 - `agent/tool_executor.py`
@@ -1732,6 +1735,7 @@ Files:
 - `tests/agent/test_prompt_builder.py`
 - `tests/agent/test_memory_write_bridge.py`
 - `tests/fork/test_memory_changelog_governance.py`
+- `tests/fork_features/test_memory_governance_boundary.py`
 - `tests/tools/test_memory_tool.py`
 - `tests/tools/test_memory_tool_schema.py`
 - `tests/tools/test_write_approval.py`
@@ -1746,6 +1750,22 @@ Summary:
 
 What changed:
 
+- `MemoryStore` and its private file/lock implementation remain Host-owned.
+  `MemoryStore.transaction(...)` exposes one stable coordinator-lock then
+  target-lock transaction object. The Fork mutation path reaches private Store
+  mutation and rollback state only through that Host-owned transaction; history
+  and background context use public read-only Store readers. Fork mutation
+  policy no longer imports `tools.memory_tool` or calls a bundle of private
+  Store methods.
+- `fork_features/memory_governance.py` owns reason/evidence and typed-deletion
+  policy, exact trace/rollback orchestration, public memory Schema/Prompt policy,
+  background live-context rendering, and the shared governance metadata field
+  list. `fork_features/memory_audit.py` owns JSONL baseline/append/parse,
+  merge-only lineage, threat scanning and the 8,000-character result bound.
+- High-change Prompt/background/execution files now keep only thin composition
+  or forwarding calls; the evaluated main Prompt, memory-review Prompt,
+  combined-review Prompt and public Schema remain byte/value equivalent to the
+  pre-refactor baseline.
 - The public memory tool requires reason/evidence metadata, writes exact
   before/after events to profile-scoped `MEMORY_CHANGELOG.jsonl`, classifies
   removal as `safe`, `expired`, or `forced_capacity`, and groups batch operations
@@ -1785,6 +1805,8 @@ Why it matters:
 
 Merge protection:
 
+- Preserve the Host Store/Fork policy/Fork audit responsibility map. Do not move
+  Store private calls into Fork modules or duplicate a second Store/audit path.
 - Preserve when: upstream still lacks equivalent per-change audit history,
   deletion typing, sanitized live memory-review context, metadata-preserving
   dispatch, and journal-failure rollback without stale-snapshot data loss.
@@ -1797,11 +1819,26 @@ Verification:
 
 ```bash
 ./venv/bin/python -m pytest -q -o 'addopts=' tests/agent/test_prompt_builder.py tests/agent/test_memory_write_bridge.py tests/fork/test_memory_changelog_governance.py tests/tools/test_memory_tool.py tests/tools/test_memory_tool_schema.py tests/tools/test_write_approval.py tests/run_agent/test_run_agent.py::TestExecuteToolCalls tests/run_agent/test_background_review_cache_parity.py tests/run_agent/test_background_review_toolset_restriction.py tests/test_background_review_list_shapes.py tests/test_background_review_session_isolation.py
+./venv/bin/python -m pytest -q -o 'addopts=' tests/fork_features/test_memory_governance_boundary.py
 ```
 
 Feature docs: `docs/chantxu64/memory-change-governance/README.md`
 
-Upstream status: fork-only.
+Maintenance exposure: at upstream SHA
+`4f22543509d1b91dc45bcb369447126c5eb14fb7` and Fork baseline
+`b6519e453af5ee74bda5619981e9748d690e5d8f`, counting one path touch per
+non-merge commit from
+`git log --no-merges --since=2026-05-01 --name-status --find-renames` yielded
+34 upstream / 1 Fork-only non-merge touches for `tools/memory_tool.py`, 45 / 1
+for `agent/background_review.py`, and 112 / 3 for `agent/prompt_builder.py`.
+These are exposure counts, not measured conflict or Token savings. The
+repository-local `docs/FORK_SYNC_HISTORY.jsonl` was absent; the external
+decoupling ledger contained 13 implementation records but zero sync/follow-up
+records, so no measured conflict hunks, resolution time, rework, defect, or
+Token evidence was available.
+
+Upstream status: policy/audit behavior remains fork-only at the fixed upstream
+SHA above.
 
 
 ### 24. Launchd gateway open-file ceiling
@@ -2628,6 +2665,8 @@ deltas are expected in these areas:
   - `tests/tools/test_clarify_gateway.py`
 - Auditable autonomous built-in memory governance:
   - `tools/memory_tool.py`
+  - `fork_features/memory_governance.py`
+  - `fork_features/memory_audit.py`
   - `agent/background_review.py`
   - `agent/prompt_builder.py`
   - `agent/tool_executor.py`
@@ -2635,6 +2674,7 @@ deltas are expected in these areas:
   - `tests/agent/test_prompt_builder.py`
   - `tests/agent/test_memory_write_bridge.py`
   - `tests/fork/test_memory_changelog_governance.py`
+  - `tests/fork_features/test_memory_governance_boundary.py`
   - `tests/tools/test_memory_tool.py`
   - `tests/tools/test_memory_tool_schema.py`
   - `tests/tools/test_write_approval.py`

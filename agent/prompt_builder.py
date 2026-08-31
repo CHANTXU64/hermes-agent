@@ -35,6 +35,9 @@ from agent.skill_utils import (
     skill_matches_platform,
     skill_matches_platform_list,
 )
+from fork_features.memory_governance import (
+    MAIN_AGENT_MEMORY_GUIDANCE as MEMORY_GUIDANCE,
+)
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -160,47 +163,6 @@ HERMES_AGENT_HELP_GUIDANCE = (
     "information. Load the `hermes-agent` skill with skill_view(name='hermes-agent') "
     "for additional guidance and proven workflows, but treat the docs as the source "
     "of truth when the two differ."
-)
-
-MEMORY_GUIDANCE = (
-    "You have persistent memory across sessions. Save durable facts using the memory "
-    "tool: user preferences, environment details, tool quirks, and stable conventions. "
-    "Memory is injected into every turn, so keep it compact and focused on facts that "
-    "will still matter later.\n"
-    "Prioritize what reduces future user steering — the most valuable memory is one "
-    "that prevents the user from having to correct or remind you again. "
-    "User preferences and recurring corrections matter more than procedural task details.\n"
-    "For every proposed memory, distinguish evidence of an actually observed incident or "
-    "user correction from a merely preventive concern. Never label an unobserved concern "
-    "as a lesson, and do not save generic safety precautions solely because they seem "
-    "important; normal model safeguards do not need a duplicate memory.\n"
-    "Do not save implementation designs, architecture notes, or fork-only behavior "
-    "already documented in repository docs. Keep only a short pre-load trigger when it "
-    "is needed to select the correct Skill before those docs are read.\n"
-    "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
-    "state to memory; use session_search to recall those from past transcripts. "
-    "Specifically: do not record PR numbers, issue numbers, commit SHAs, 'fixed bug X', "
-    "'submitted PR Y', 'Phase N done', file counts, or any artifact that will be stale "
-    "in 7 days. If a fact will be stale in a week, it does not belong in memory. "
-    "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool. If a memory may duplicate "
-    "a Skill, inspect the actual Skill with skill_view before removing the memory; remove "
-    "it only when that Skill normally loads, and keep a short global trigger when needed.\n"
-    "Every memory operation must state its reason and evidence; successful changes are "
-    "journaled with exact before/after text in a structured audit log. For a pure add, "
-    "do not read history. Before replacing, merging, compressing, migrating, or deleting "
-    "an existing entry, call memory(action='history', target=..., old_text=...) and inspect "
-    "only its bounded related records; never load the full audit log into model context. "
-    "Preserve the original problem, cause, scope, and exceptions. Classify removals as "
-    "safe, expired, or forced_capacity. forced_capacity is the last resort after "
-    "loss-preserving compression and safe/expired deletion; use it only for a higher-value "
-    "new fact and record the still-possible loss in loss_note.\n"
-    "Write memories as declarative facts, not instructions to yourself. "
-    "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
-    "'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. "
-    "Imperative phrasing gets re-read as a directive in later sessions and can "
-    "cause repeated work or override the user's current request. Procedures and "
-    "workflows belong in skills, not memory."
 )
 
 SESSION_SEARCH_GUIDANCE = (
