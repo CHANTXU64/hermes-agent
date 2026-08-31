@@ -2130,6 +2130,7 @@ Files:
 - `pyproject.toml`
 - `fork_features/__init__.py`
 - `fork_features/approval/__init__.py`
+- `fork_features/approval/policy.py`
 - `fork_features/approval/script_evidence.py`
 - `fork_features/approval/smart_review.py`
 - `fork_features/approval/retry_policy.py`
@@ -2141,6 +2142,7 @@ Files:
 - `tools/tirith_security.py`
 - `tools/terminal_tool.py`
 - `tools/code_execution_tool.py`
+- `tests/fork_features/approval/test_policy_boundary.py`
 - `tests/fork_features/approval/test_smart_approval_context.py`
 - `tests/tools/test_denial_retry_escalation.py`
 - `tests/tools/test_denial_circuit_breaker.py`
@@ -2226,13 +2228,17 @@ What changed:
 - Existing integrations that compare the historical one-word smart decision
   remain compatible. Smart approvals still do not create a permanent broad
   allowlist entry.
-- Fork-owned policy bodies now live under `fork_features/approval`: direct-script
-  evidence (including explicitly named nested script paths), structured Smart Review,
-  and denial-retry/final-denial state. These
-  modules do not import approval/Terminal hosts; request context, language,
-  script readers, LLM access, redaction, the shared lock, and human-approval
-  transport remain explicit host inputs. `tools/approval.py` keeps compatibility
-  wrappers and core authorization/transport integration.
+- `fork_features/approval/policy.py` is the only public Fork Smart Approval
+  facade. It owns the request-local context, latest-real-turn/Clarify composition,
+  structured reviewer access, bounded direct-script evidence access, and same-turn
+  retry state. The evidence, reviewer, and retry modules remain internal Policy
+  implementation and do not import approval/Terminal/`execute_code` hosts.
+- `agent/tool_executor.py` now keeps only a thin adapter that injects the
+  conversation subsystem's canonical real-user classifiers into the Fork context
+  builder. `model_tools.py` binds that Fork request context directly.
+  `tools/approval.py` imports only the public Policy facade and keeps deterministic
+  floors, YOLO/mode/allowlists, Tirith warning keys, the shared lock, verdict
+  execution, human approval transport, persistence, observability, and fail-closed.
 - On the first Smart denial, the agent is told it may submit the same or a
   textually similar operation again only when it remains necessary. Candidates
   are scoped to the same session, verified user turn, and tool kind. Exact
@@ -2263,6 +2269,24 @@ What changed:
 - The feature intentionally omits file hashes/version binding, external
   dependency graphs, ordinary-import following, non-literal dynamic dependency
   analysis, and cross-tool semantic same-result tracking.
+
+Maintenance evidence for the Policy boundary:
+
+- Fixed refs: upstream `4f22543509d1b91dc45bcb369447126c5eb14fb7`,
+  Fork baseline `63f75f3b6d8c7d54d411e88990b400743d474fc5`, since
+  `2026-05-01`, one touch per non-merge commit per current path, no historical
+  alias collapse.
+- Reproduce each count with
+  `git log --since=2026-05-01 --no-merges --format='%H' <ref-or-range> -- <path> | sort -u | wc -l`.
+- Upstream/Fork-only touches were `125/2` for `tools/approval.py`, `90/3` for
+  `agent/tool_executor.py`, `191/7` for `agent/agent_runtime_helpers.py`, `51/1`
+  for `model_tools.py`, `112/1` for `tools/terminal_tool.py`, `61/1` for
+  `tools/code_execution_tool.py`, `12/1` for `tools/tirith_security.py`, and
+  `157/3` for `agent/conversation_compression.py`.
+- The external decoupling ledger had 13 implementation records and no sync or
+  follow-up records. No measured conflict hunks, semantic decisions, resolution
+  time, rework, defects, or Token savings were available; touch counts show path
+  exposure only.
 
 Why it matters:
 
@@ -2305,6 +2329,8 @@ Verification:
 - 2026-08-30 Git-tracking/oversized-prefix/context correction: focused direct-script and reviewer/context tests `93 passed`; Fork Smart Approval/policy/injection/`execute_code`/retry/latch regression `179 passed`; adjacent Terminal/code-execution/Tirith/approval-mode/i18n/Cron-session regression `280 passed`, `1 deselected`, `7 subtests passed`. The deselected macOS `/tmp` verification-artifact baseline still fails independently and is not part of this change.
 - Before local Git tracking, a live collector probe against `/Users/robot/.hermes/scripts/nc_report.py` from the Ontology cwd returned a `32,000`-byte `truncated` prefix. After a local scripts repository tracked and committed only `nc_report.py`, the same probe returned `skipped_git_tracked` with zero source bytes. Two live `openai-codex / gpt-5.6-luna` review-only probes with missing source returned `approve/low/sufficient` for a visible read-only `/tmp` diagnostic and `deny/critical/none` for visible `--delete-all /Users/robot/Documents` under an explicit no-delete instruction; neither command was executed.
 - `py_compile`, Ruff, and `git diff --check` passed for this correction. No configuration change or Gateway restart was performed, and the Hermes Agent Fork remains uncommitted. The only commit is the local scripts-repository snapshot of `nc_report.py`; nothing was pushed.
+- 2026-08-31 Fork Policy boundary validation: focused Policy/Host coverage `60 passed`; full approval/Gateway command `430 passed, 9 failed`; fresh-process isolation gave `7 passed` for approval-mode parity and `2 passed` for redaction, while the unchanged macOS `/tmp` alias remained `1 failed`; adjacent Terminal/code-execution/Tirith/i18n `167 passed, 7 subtests passed`; compression/real-user provenance `197 passed`.
+- The reviewer, script-evidence, and retry-policy files were byte-identical to baseline `63f75f3b6d8c7d54d411e88990b400743d474fc5`; six fixed context samples matched the baseline builder. Ruff, `py_compile`, and `git diff --check` passed. No paid model replay, configuration change, Gateway restart, commit, or push was performed.
 - The following 2026-08-16 results remain historical evidence for the original
   latest-turn context, Tirith, and language-aware implementation.
 - Approval, terminal, `execute_code`, and Tirith regression coverage:
@@ -2581,6 +2607,7 @@ deltas are expected in these areas:
   - `pyproject.toml`
   - `fork_features/__init__.py`
   - `fork_features/approval/__init__.py`
+  - `fork_features/approval/policy.py`
   - `fork_features/approval/script_evidence.py`
   - `fork_features/approval/smart_review.py`
   - `fork_features/approval/retry_policy.py`
@@ -2592,6 +2619,7 @@ deltas are expected in these areas:
   - `tools/tirith_security.py`
   - `tools/terminal_tool.py`
   - `tools/code_execution_tool.py`
+  - `tests/fork_features/approval/test_policy_boundary.py`
   - `tests/fork_features/approval/test_smart_approval_context.py`
   - `tests/tools/test_denial_retry_escalation.py`
   - `tests/tools/test_denial_circuit_breaker.py`

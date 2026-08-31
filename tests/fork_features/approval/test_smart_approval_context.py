@@ -7,18 +7,23 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.tool_executor import build_smart_approval_context
-from fork_features.approval.script_evidence import MAX_SCRIPT_BYTES
+from fork_features.approval.policy import (
+    get_smart_approval_context,
+    reset_smart_approval_context,
+    set_smart_approval_context,
+)
+from fork_features.approval.script_evidence import (
+    MAX_SCRIPT_BYTES,
+    collect_direct_script_evidence as _collect_direct_script_evidence,
+)
+from fork_features.approval.smart_review import SmartApprovalResult
 from tools.todo_tool import TODO_INJECTION_HEADER
 from tools.approval import (
-    SmartApprovalResult,
-    _collect_direct_script_evidence,
+    _fork_approval_policy,
     _smart_approve,
     check_all_command_guards,
     check_execute_code_guard,
     clear_session,
-    get_smart_approval_context,
-    reset_smart_approval_context,
-    set_smart_approval_context,
 )
 
 
@@ -290,8 +295,6 @@ def test_standard_development_commands_bypass_smart_review_when_baseline_safe(
 
 
 def test_smart_review_display_uses_configured_language(monkeypatch):
-    from tools.approval import _format_smart_review_description
-
     review = SmartApprovalResult(
         decision="escalate",
         risk_level="medium",
@@ -303,7 +306,7 @@ def test_smart_review_display_uses_configured_language(monkeypatch):
         {"latest_user_message": "Run the tests", "clarifications": []}
     )
     try:
-        chinese = _format_smart_review_description(review)
+        chinese = _fork_approval_policy().format_review(review)
     finally:
         reset_smart_approval_context(chinese_token)
 
@@ -312,7 +315,7 @@ def test_smart_review_display_uses_configured_language(monkeypatch):
         {"latest_user_message": "运行测试并验证", "clarifications": []}
     )
     try:
-        english = _format_smart_review_description(review)
+        english = _fork_approval_policy().format_review(review)
     finally:
         reset_smart_approval_context(english_token)
 
@@ -327,14 +330,12 @@ def test_smart_review_display_uses_configured_language(monkeypatch):
 
 
 def test_user_denial_message_uses_configured_language(monkeypatch):
-    from tools.approval import _format_user_denial_message
-
     monkeypatch.setenv("HERMES_LANGUAGE", "zh")
     chinese_token = set_smart_approval_context(
         {"latest_user_message": "Ask me first", "clarifications": []}
     )
     try:
-        chinese = _format_user_denial_message("denied", "范围不对")
+        chinese = _fork_approval_policy().format_repeat_denial("denied", "范围不对")
     finally:
         reset_smart_approval_context(chinese_token)
 
@@ -343,7 +344,7 @@ def test_user_denial_message_uses_configured_language(monkeypatch):
         {"latest_user_message": "请先让我确认", "clarifications": []}
     )
     try:
-        english = _format_user_denial_message("denied", "wrong scope")
+        english = _fork_approval_policy().format_repeat_denial("denied", "wrong scope")
     finally:
         reset_smart_approval_context(english_token)
 
@@ -714,6 +715,36 @@ def test_smart_approval_returns_structured_decision_and_receives_context(tmp_pat
     assert call_llm.call_args.kwargs["max_tokens"] >= 128
 
 
+def test_empty_explicit_context_keeps_bound_request_context():
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "decision": "approve",
+                            "risk_level": "low",
+                            "authorization": "sufficient",
+                            "reason": "safe",
+                        }
+                    )
+                )
+            )
+        ]
+    )
+    token = set_smart_approval_context(
+        {"latest_user_message": "bound request context", "clarifications": []}
+    )
+    try:
+        with patch("agent.auxiliary_client.call_llm", return_value=response) as call_llm:
+            _smart_approve("printf ok", "flagged", approval_context={})
+    finally:
+        reset_smart_approval_context(token)
+
+    prompt = call_llm.call_args.kwargs["messages"][1]["content"]
+    assert "bound request context" in prompt
+
+
 def _approval_response(**payload):
     return SimpleNamespace(
         choices=[
@@ -819,13 +850,11 @@ def test_prompt_requires_reason_in_configured_language(monkeypatch):
 
 
 def test_internal_smart_approval_reasons_use_configured_language(monkeypatch):
-    from tools.approval import _parse_smart_approval_result
-
     monkeypatch.setenv("HERMES_LANGUAGE", "zh")
-    chinese = _parse_smart_approval_result("not valid json")
+    chinese = _fork_approval_policy().parse_review("not valid json")
 
     monkeypatch.setenv("HERMES_LANGUAGE", "en")
-    english = _parse_smart_approval_result("not valid json")
+    english = _fork_approval_policy().parse_review("not valid json")
 
     assert chinese.reason == "审批模型返回格式无效，需要用户判断。"
     assert english.reason == (

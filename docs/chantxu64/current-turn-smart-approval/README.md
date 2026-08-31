@@ -111,17 +111,19 @@ Gateway restart/stop remains an independent deterministic hard block inside the 
 - `agent/conversation_compression.py`
   - real-user classification and runtime-wrapper stripping
 - `agent/tool_executor.py`
-  - request-local Smart Approval context construction and binding
+  - thin adapter that injects the canonical real-user classifiers into the Fork context builder
 - `agent/agent_runtime_helpers.py`, `model_tools.py`
-  - propagation across execution paths
+  - propagation across execution paths; `model_tools.py` binds the request-local Fork context
+- `fork_features/approval/policy.py`
+  - the only public Fork Smart Approval facade: request-local context, context construction, structured reviewer access, direct-script evidence access, and same-turn retry state
 - `fork_features/approval/script_evidence.py`
-  - direct-entry and explicit-path identification, including literal `terminal()` child commands; no import dependency traversal; Git-index tracking decides whether source is skipped, while oversized untracked source returns a bounded prefix
+  - internal Policy implementation for direct-entry and explicit-path identification, including literal `terminal()` child commands; no import dependency traversal; Git-index tracking decides whether source is skipped, while oversized untracked source returns a bounded prefix
 - `fork_features/approval/smart_review.py`
-  - reviewer prompt, structured result parsing, and risk/authorization contract
+  - internal Policy implementation for the reviewer prompt, structured result parsing, and risk/authorization contract
 - `fork_features/approval/retry_policy.py`
-  - same-turn Smart-denial retry state, text-only similarity policy, repeat-card denial latch, and approval descriptions
+  - internal Policy implementation for same-turn Smart-denial retry state, text-only similarity policy, repeat-card denial latch, and approval descriptions
 - `tools/approval.py`
-  - upstream-host integration, request context, shared lock, manual approval transport, and compatibility wrappers
+  - deterministic floors, YOLO/mode/allowlists, Tirith warning keys, shared lock, structured-verdict execution, manual approval transport, persistence, observability, and fail-closed; it imports only the public Fork Policy facade
 - `tools/tirith_security.py`
   - scanner-protocol validation and compatible-path selection
 - `tools/terminal_tool.py`
@@ -129,10 +131,44 @@ Gateway restart/stop remains an independent deterministic hard block inside the 
 - `tools/code_execution_tool.py`
   - complete visible Python-source review path
 - `tests/fork_features/approval/test_smart_approval_context.py`
+- `tests/fork_features/approval/test_policy_boundary.py`
 - `tests/tools/test_denial_retry_escalation.py`
 - `tests/fork_features/approval/`
 - `tests/hermes_cli/test_gateway_restart_loop.py`
 - `tests/tools/test_tirith_security.py`
+
+## Maintenance evidence for this boundary
+
+The responsibility boundary was measured at fixed refs:
+
+- upstream: `4f22543509d1b91dc45bcb369447126c5eb14fb7`;
+- Fork baseline: `63f75f3b6d8c7d54d411e88990b400743d474fc5`;
+- history window: since `2026-05-01`;
+- one touch per non-merge commit per current path, without historical alias collapse.
+
+Reproduce one path with:
+
+```bash
+git log --since=2026-05-01 --no-merges --format='%H' \
+  4f22543509d1b91dc45bcb369447126c5eb14fb7 -- tools/approval.py \
+  | sort -u | wc -l
+git log --since=2026-05-01 --no-merges --format='%H' \
+  4f22543509d1b91dc45bcb369447126c5eb14fb7..63f75f3b6d8c7d54d411e88990b400743d474fc5 \
+  -- tools/approval.py | sort -u | wc -l
+```
+
+The same method reports upstream/Fork-only touches of `125/2` for
+`tools/approval.py`, `90/3` for `agent/tool_executor.py`, `191/7` for
+`agent/agent_runtime_helpers.py`, `51/1` for `model_tools.py`, `112/1` for
+`tools/terminal_tool.py`, `61/1` for `tools/code_execution_tool.py`, `12/1`
+for `tools/tirith_security.py`, and `157/3` for
+`agent/conversation_compression.py`.
+
+`/Users/robot/Documents/Hermes/hermes-fork-decoupling-ledger.jsonl` contained
+13 implementation records but no sync or follow-up records. Therefore no
+measured conflict hunks, semantic decisions, resolution time, rework, defects,
+or Token savings were available. Commit-touch counts show exposure only; they
+do not prove that this extraction has already reduced merge effort or Token use.
 
 ## Non-goals
 
@@ -253,6 +289,15 @@ git diff --check
 - before local Git tracking, a live collector probe against `/Users/robot/.hermes/scripts/nc_report.py` from the Ontology cwd returned `status=truncated` with exactly `32,000` content bytes instead of empty unreadable evidence; after a local scripts repository tracked and committed only `nc_report.py`, the same probe returned `skipped_git_tracked` with zero source bytes;
 - two live `openai-codex / gpt-5.6-luna` review-only probes used missing script source: a visible read-only `/tmp` diagnostic was `approve/low/sufficient`, while `--delete-all /Users/robot/Documents` under an explicit no-delete instruction was `deny/critical/none`; neither command was executed;
 - `py_compile`, Ruff, and `git diff --check` passed; no configuration change or Gateway restart was performed, and the Hermes Agent Fork remains uncommitted. The only commit is the local scripts-repository snapshot of `nc_report.py`; nothing was pushed.
+
+2026-08-31 Fork Policy boundary validation:
+
+- Policy boundary and focused Host integration: `60 passed`; the dedicated Policy boundary file was `4 passed`;
+- full approval/Gateway command: `430 passed`, `9 failed`; in fresh processes the seven approval-mode cases were `7 passed` and the two redaction cases were `2 passed`, while the unchanged macOS `/tmp` alias case remained `1 failed`;
+- Terminal, code-execution, Tirith, and interface-language coverage: `167 passed`, `7 subtests passed`;
+- conversation-compression and real-user provenance coverage: `197 passed`;
+- the reviewer, script-evidence, and retry-policy source files were byte-identical to baseline `63f75f3b6d8c7d54d411e88990b400743d474fc5`; six fixed context samples matched the baseline builder exactly;
+- Ruff, `py_compile`, and `git diff --check` passed. No paid model replay, configuration change, Gateway restart, commit, or push was performed.
 
 ## Runtime activation
 

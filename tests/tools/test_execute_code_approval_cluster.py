@@ -22,6 +22,7 @@ import threading
 
 import pytest
 
+from fork_features.approval.policy import ApprovalPolicy
 from tools import approval as A
 from tools.thread_context import propagate_context_to_thread
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
@@ -118,9 +119,9 @@ def gw_session(monkeypatch):
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
     monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr(
-        A,
-        "_generate_repeat_manual_description",
-        lambda *args, **kwargs: (
+        ApprovalPolicy,
+        "repeat_manual_description",
+        lambda *_args, **_kwargs: (
             "目的：测试一次性审批。\n"
             "实际动作：仅执行当前测试操作一次。\n"
             "预期影响：执行一次。\n"

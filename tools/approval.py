@@ -27,26 +27,11 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from hermes_cli.config import cfg_get
 
-from fork_features.approval.retry_policy import (
-    AutomatedDenialState as _AutomatedDenialState,
-    clear_session as _clear_retry_policy_session,
-    consume_similar_automated_denial as _fork_consume_similar_automated_denial,
-    first_automated_denial_result as _fork_first_automated_denial_result,
-    format_user_denial_message as _fork_format_user_denial_message,
-    generate_repeat_manual_description as _fork_generate_repeat_manual_description,
-    latched_user_denial_result as _fork_latched_user_denial_result,
-    record_user_denial as _fork_record_user_denial,
-)
-from fork_features.approval.script_evidence import (
-    MAX_SCRIPT_BYTES as _MAX_SMART_SCRIPT_BYTES,
-    collect_direct_script_evidence as _collect_direct_script_evidence,
-)
-from fork_features.approval.smart_review import (
+from fork_features.approval.policy import (
+    ApprovalPolicy,
     SmartApprovalResult,
-    enforce_smart_approval_contract as _fork_enforce_smart_approval_contract,
-    format_smart_review_description as _fork_format_smart_review_description,
-    parse_smart_approval_result as _fork_parse_smart_approval_result,
-    review_action as _fork_review_action,
+    clear_retry_session as _clear_retry_policy_session,
+    get_smart_approval_context,
 )
 from tools.interrupt import is_interrupted
 from utils import env_var_enabled, is_truthy_value
@@ -84,26 +69,6 @@ _approval_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_id",
     default="",
 )
-
-# Request-scoped evidence supplied by the tool executor.  It contains only the
-# latest user turn and completed clarify pairs after that turn.  A ContextVar
-# keeps concurrent tool calls from borrowing authorization from one another.
-_smart_approval_context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
-    "smart_approval_context",
-    default={},
-)
-
-
-def set_smart_approval_context(context: Optional[dict[str, Any]]) -> contextvars.Token:
-    return _smart_approval_context.set(dict(context or {}))
-
-
-def reset_smart_approval_context(token: contextvars.Token) -> None:
-    _smart_approval_context.reset(token)
-
-
-def get_smart_approval_context() -> dict[str, Any]:
-    return dict(_smart_approval_context.get() or {})
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -2553,110 +2518,14 @@ def _automated_denial_key() -> Optional[tuple[str, str]]:
     return session_key, turn_id
 
 
-def _first_automated_denial_result(
-    action: str,
-    description: str,
-    *,
-    source_kind: str,
-) -> dict:
-    key = _automated_denial_key()
-    if key is None:
-        message = (
-            f"智能审批已拒绝这项操作。原因：{description}。当前没有可验证的用户回合，"
-            "因此不能提供重复后转人工的路径。不要重试、改写、拆分或换用其他路径。"
-            if _approval_language_prefers_chinese()
-            else (
-                f"Smart approval denied this operation: {description}. No verified "
-                "user turn is available, so repeat-to-human escalation is disabled. "
-                "Do not retry, rewrite, split, or use another route."
-            )
-        )
-        message += _denial_breaker_addendum(get_current_session_key())
-        return {
-            "approved": False,
-            "message": message,
-            "description": description,
-            "smart_denied": True,
-            "outcome": "auto_denied",
-            "retry_escalation_available": False,
-            "user_consent": False,
-        }
-    result = _fork_first_automated_denial_result(
-        key,
-        action,
-        description,
-        source_kind=source_kind,
-        prefers_chinese=_approval_language_prefers_chinese(),
-        lock=_lock,
-        max_entries=_DENIAL_TALLY_MAX_SESSIONS,
-    )
-    result["message"] += _denial_breaker_addendum(get_current_session_key())
-    return result
 
 
-def _record_user_denial(
-    action: str,
-    *,
-    source_kind: str,
-    reason: Optional[str] = None,
-) -> None:
-    key = _automated_denial_key()
-    if key is None:
-        return
-    _fork_record_user_denial(
-        key,
-        action,
-        source_kind=source_kind,
-        reason=reason,
-        lock=_lock,
-        max_entries=_DENIAL_TALLY_MAX_SESSIONS,
-    )
 
 
-def _latched_user_denial_result(action: str, *, source_kind: str) -> Optional[dict]:
-    key = _automated_denial_key()
-    if key is None:
-        return None
-    return _fork_latched_user_denial_result(
-        key,
-        action,
-        source_kind=source_kind,
-        prefers_chinese=_approval_language_prefers_chinese(),
-        lock=_lock,
-    )
 
 
-def _consume_similar_automated_denial(
-    action: str,
-    *,
-    source_kind: str,
-) -> Optional[_AutomatedDenialState]:
-    key = _automated_denial_key()
-    if key is None:
-        return None
-    return _fork_consume_similar_automated_denial(
-        key,
-        action,
-        source_kind=source_kind,
-        lock=_lock,
-    )
 
 
-def _generate_repeat_manual_description(
-    action: str,
-    policy_reason: str,
-    *,
-    source_kind: str = "shell",
-) -> str:
-    context = get_smart_approval_context()
-    return _fork_generate_repeat_manual_description(
-        action,
-        policy_reason,
-        latest_user_message=str(context.get("latest_user_message") or ""),
-        redact_action=_redact_approval_action,
-        call_llm=_call_approval_llm,
-        source_kind=source_kind,
-    )
 
 
 def _request_repeat_manual_approval(
@@ -2665,7 +2534,8 @@ def _request_repeat_manual_approval(
     *,
     source_kind: str,
 ) -> dict:
-    description = _generate_repeat_manual_description(
+    policy = _fork_approval_policy()
+    description = policy.repeat_manual_description(
         action,
         description,
         source_kind=source_kind,
@@ -2696,10 +2566,11 @@ def _request_repeat_manual_approval(
         # The second-attempt state was consumed before entering this gate. With
         # no real human surface, restore it so a later retry can still reach the
         # user once a notify callback is registered.
-        _first_automated_denial_result(
+        policy.first_denial(
             action,
             description,
             source_kind=source_kind,
+            breaker_addendum=_denial_breaker_addendum(get_current_session_key()),
         )
     return result
 
@@ -3410,24 +3281,23 @@ def _redact_approval_action(action: str) -> str:
     return redact_sensitive_text(action, force=True)
 
 
-def _format_smart_review_description(review: SmartApprovalResult) -> str:
-    return _fork_format_smart_review_description(
-        review,
-        prefers_chinese=_approval_language_prefers_chinese(),
+def _fork_approval_policy(*, for_review: bool = False) -> ApprovalPolicy:
+    """Bind current Host capabilities to the concrete Fork policy facade."""
+    return ApprovalPolicy(
+        approval_context=get_smart_approval_context(),
+        interface_language=_approval_language(),
+        operator_policy=_get_smart_policy() if for_review else "",
+        strip_shell_comments=_strip_shell_comments,
+        call_llm=_call_approval_llm,
+        redact_action=_redact_approval_action,
+        retry_key=_automated_denial_key(),
+        lock=_lock,
+        max_retry_entries=_DENIAL_TALLY_MAX_SESSIONS,
     )
 
 
-def _format_user_denial_message(
-    outcome: str,
-    deny_reason: Optional[str] = None,
-    breaker_addendum: str = "",
-) -> str:
-    return _fork_format_user_denial_message(
-        outcome,
-        deny_reason,
-        breaker_addendum,
-        prefers_chinese=_approval_language_prefers_chinese(),
-    )
+
+
 
 
 def _format_baseline_user_denial_message(
@@ -3467,22 +3337,8 @@ def _format_baseline_user_denial_message(
     )
 
 
-def _parse_smart_approval_result(raw: str) -> SmartApprovalResult:
-    return _fork_parse_smart_approval_result(
-        raw,
-        prefers_chinese=_approval_language_prefers_chinese(),
-    )
 
 
-def _enforce_smart_approval_contract(
-    review: SmartApprovalResult,
-    script_evidence: list[dict[str, str]],
-) -> SmartApprovalResult:
-    return _fork_enforce_smart_approval_contract(
-        review,
-        script_evidence,
-        prefers_chinese=_approval_language_prefers_chinese(),
-    )
 
 
 def _smart_approve(
@@ -3495,19 +3351,17 @@ def _smart_approve(
     read_script: Optional[Callable[[str], Optional[str]]] = None,
     script_evidence: Optional[list[dict[str, str]]] = None,
 ) -> SmartApprovalResult:
-    """Assess actual risk and current-turn authorization with the Fork reviewer."""
+    """Assess current risk through the concrete Fork policy facade."""
     try:
-        return _fork_review_action(
+        policy = _fork_approval_policy(for_review=True)
+        if approval_context:
+            policy = policy.with_context(approval_context)
+        return policy.review(
             command,
             description,
-            approval_context=dict(approval_context or get_smart_approval_context()),
             cwd=cwd,
             source_kind=source_kind,
             read_script=read_script,
-            interface_language=_approval_language(),
-            operator_policy=_get_smart_policy(),
-            strip_shell_comments=_strip_shell_comments,
-            call_llm=_call_approval_llm,
             script_evidence=script_evidence,
         )
     except Exception as exc:
@@ -3516,9 +3370,10 @@ def _smart_approve(
             "escalate",
             "high",
             "unclear",
-            _approval_text(
-                "The approval model is unavailable; user review is required.",
-                "审批模型不可用，需要用户判断。",
+            (
+                "审批模型不可用，需要用户判断。"
+                if _approval_language_prefers_chinese()
+                else "The approval model is unavailable; user review is required."
             ),
         )
 
@@ -3591,7 +3446,7 @@ def _run_approval_gate(
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
     denial_formatter = (
-        _format_user_denial_message
+        _fork_approval_policy().format_repeat_denial
         if denial_source_kind is not None
         else _format_baseline_user_denial_message
     )
@@ -3696,7 +3551,7 @@ def _run_approval_gate(
             if not resolved or choice is None or choice == "deny":
                 outcome = "timeout" if not resolved else "denied"
                 if denial_source_kind is not None:
-                    _record_user_denial(
+                    _fork_approval_policy().record_user_denial(
                         display_target,
                         source_kind=denial_source_kind,
                         reason=deny_reason,
@@ -3809,7 +3664,7 @@ def _run_approval_gate(
 
     if choice == "timeout":
         if denial_source_kind is not None:
-            _record_user_denial(
+            _fork_approval_policy().record_user_denial(
                 display_target,
                 source_kind=denial_source_kind,
             )
@@ -3824,7 +3679,7 @@ def _run_approval_gate(
 
     if choice == "deny":
         if denial_source_kind is not None:
-            _record_user_denial(
+            _fork_approval_policy().record_user_denial(
                 display_target,
                 source_kind=denial_source_kind,
             )
@@ -3901,7 +3756,7 @@ def check_dangerous_command(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    latched_denial = _latched_user_denial_result(
+    latched_denial = _fork_approval_policy().latched_user_denial(
         command,
         source_kind="shell",
     )
@@ -4397,7 +4252,7 @@ def check_all_command_guards(command: str, env_type: str,
 
     # A user denial or timeout on the repeat one-shot card is also a same-turn
     # non-bypassable floor. Ordinary manual approvals never write this state.
-    latched_denial = _latched_user_denial_result(command, source_kind="shell")
+    latched_denial = _fork_approval_policy().latched_user_denial(command, source_kind="shell")
     if latched_denial is not None:
         return latched_denial
 
@@ -4559,7 +4414,7 @@ def check_all_command_guards(command: str, env_type: str,
     # itself did not match a dangerous-command pattern.
     direct_scripts: list[dict[str, str]] = []
     if approval_mode == "smart":
-        direct_scripts = _collect_direct_script_evidence(
+        direct_scripts = _fork_approval_policy().collect_script_evidence(
             command,
             cwd=cwd,
             source_kind="shell",
@@ -4640,7 +4495,7 @@ def check_all_command_guards(command: str, env_type: str,
                 if smart_review is not None and smart_review.reason
                 else combined_desc_for_llm
             )
-            repeat_state = _consume_similar_automated_denial(
+            repeat_state = _fork_approval_policy().consume_similar_denial(
                 command,
                 source_kind="shell",
             )
@@ -4650,10 +4505,11 @@ def check_all_command_guards(command: str, env_type: str,
                     denial_description or repeat_state.description,
                     source_kind="shell",
                 )
-            return _first_automated_denial_result(
+            return _fork_approval_policy().first_denial(
                 command,
                 denial_description,
                 source_kind="shell",
+                breaker_addendum=_denial_breaker_addendum(session_key),
             )
         # An interactive owner may override DENY for this operation only.
         # ESCALATE follows the normal, potentially persistent manual behavior.
@@ -4664,7 +4520,7 @@ def check_all_command_guards(command: str, env_type: str,
     # result is safe to show; exact detectors and rule identifiers stay hidden.
     combined_desc = "; ".join(desc for _, desc, _ in warnings)
     if smart_review is not None:
-        review_description = _format_smart_review_description(smart_review)
+        review_description = _fork_approval_policy().format_review(smart_review)
         combined_desc = (
             review_description
             if _approval_language_prefers_chinese()
@@ -4970,7 +4826,7 @@ def check_execute_code_guard(code: str, env_type: str,
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
-    latched_denial = _latched_user_denial_result(code, source_kind="python")
+    latched_denial = _fork_approval_policy().latched_user_denial(code, source_kind="python")
     if latched_denial is not None:
         return latched_denial
 
@@ -5077,7 +4933,7 @@ def check_execute_code_guard(code: str, env_type: str,
                 if smart_review is not None and smart_review.reason
                 else description
             )
-            repeat_state = _consume_similar_automated_denial(
+            repeat_state = _fork_approval_policy().consume_similar_denial(
                 code,
                 source_kind="python",
             )
@@ -5087,16 +4943,17 @@ def check_execute_code_guard(code: str, env_type: str,
                     denial_description or repeat_state.description,
                     source_kind="python",
                 )
-            return _first_automated_denial_result(
+            return _fork_approval_policy().first_denial(
                 code,
                 denial_description,
                 source_kind="python",
+                breaker_addendum=_denial_breaker_addendum(session_key),
             )
         # Interactive DENY follows the repeat-to-human path above;
         # ESCALATE retains the normal manual approval behavior.
 
     if smart_review is not None:
-        review_description = _format_smart_review_description(smart_review)
+        review_description = _fork_approval_policy().format_review(smart_review)
         description = (
             review_description
             if _approval_language_prefers_chinese()

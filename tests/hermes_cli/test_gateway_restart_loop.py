@@ -297,6 +297,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert "Blocked" in result["error"]
 
     def test_repeated_lifecycle_attempt_remains_hard_blocked(self, monkeypatch):
+        from fork_features.approval.policy import ApprovalPolicy
         import tools.approval as approval
         import tools.terminal_tool as tt
 
@@ -314,10 +315,9 @@ class TestTerminalToolGatewayLifecycleGuard:
         self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
         monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
         monkeypatch.setattr(
-            approval,
-            "_generate_repeat_manual_description",
-            lambda *args, **kwargs: "unreachable lifecycle approval",
-            raising=False,
+            ApprovalPolicy,
+            "repeat_manual_description",
+            lambda *_args, **_kwargs: "unreachable lifecycle approval",
         )
         session_key = "terminal-lifecycle-repeat"
         session_token = approval.set_current_session_key(session_key)

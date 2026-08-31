@@ -1459,8 +1459,10 @@ def handle_function_call(
         try:
             from tools.approval import (
                 reset_current_observability_context,
-                reset_smart_approval_context,
                 set_current_observability_context,
+            )
+            from fork_features.approval.policy import (
+                reset_smart_approval_context,
                 set_smart_approval_context,
             )
             _approval_tokens = set_current_observability_context(

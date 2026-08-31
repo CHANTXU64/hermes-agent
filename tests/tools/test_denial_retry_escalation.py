@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from fork_features.approval.policy import ApprovalPolicy
 from tools import approval as A
 
 
@@ -23,9 +24,9 @@ def _configure_smart_deny(monkeypatch, *, session_key: str, turn_id: str = "turn
         ),
     )
     monkeypatch.setattr(
-        A,
-        "_generate_repeat_manual_description",
-        lambda action, policy_reason, **_kwargs: (
+        ApprovalPolicy,
+        "repeat_manual_description",
+        lambda _self, action, policy_reason, **_kwargs: (
             "目的：完成当前用户任务。\n"
             f"实际动作：仅执行一次：{action}\n"
             "预期影响：该操作会实际执行一次。\n"
@@ -568,10 +569,9 @@ def test_second_retry_uses_approval_ai_generated_chinese_description(monkeypatch
         "转人工原因：自动策略首次拒绝后，AI 判断仍有必要由用户决定。"
     )
     monkeypatch.setattr(
-        A,
-        "_generate_repeat_manual_description",
-        lambda *args, **kwargs: generated,
-        raising=False,
+        ApprovalPolicy,
+        "repeat_manual_description",
+        lambda *_args, **_kwargs: generated,
     )
     try:
         A.check_all_command_guards("hermes gateway restart", "local")
@@ -703,21 +703,22 @@ def test_repeat_without_live_callback_fails_closed_without_pending(monkeypatch):
 def test_no_turn_id_disables_same_turn_denial_state(monkeypatch):
     session_token = A.set_current_session_key("missing-turn-id")
     try:
-        first = A._first_automated_denial_result(
+        policy = A._fork_approval_policy()
+        first = policy.first_denial(
             "rm -rf /tmp/no-turn",
             "test denial",
             source_kind="shell",
         )
-        A._record_user_denial(
+        policy.record_user_denial(
             "rm -rf /tmp/no-turn",
             source_kind="shell",
         )
 
         assert first["retry_escalation_available"] is False
-        assert A._consume_similar_automated_denial(
+        assert policy.consume_similar_denial(
             "rm -rf /tmp/no-turn", source_kind="shell"
         ) is None
-        assert A._latched_user_denial_result(
+        assert policy.latched_user_denial(
             "rm -rf /tmp/no-turn", source_kind="shell"
         ) is None
     finally:
@@ -740,7 +741,7 @@ def test_cron_policy_block_never_enters_repeat_escalation(monkeypatch):
     try:
         first = A.check_all_command_guards("rm -rf /tmp/cron-target", "local")
         second = A.check_all_command_guards("rm -rf /tmp/cron-target", "local")
-        retry_state = A._consume_similar_automated_denial(
+        retry_state = A._fork_approval_policy().consume_similar_denial(
             "rm -rf /tmp/cron-target",
             source_kind="shell",
         )
