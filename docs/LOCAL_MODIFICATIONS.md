@@ -227,6 +227,7 @@ Files:
 - `tests/fork/test_hindsight_manual_retain_removed.py`
 - `tests/plugins/memory/test_hindsight_provider.py`
 - `tests/agent/test_memory_session_switch.py`
+- `tests/run_agent/test_memory_sync_interrupted.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
 What changed:
@@ -280,6 +281,14 @@ Feature docs: `docs/chantxu64/hindsight-sync-cache-miss-recall/README.md`
 
 Verification after the 2026-08-30 boundary migration:
 
+Canonical focused gate, rerun on 2026-08-31:
+
+```bash
+scripts/run_tests.sh tests/fork_features/test_hindsight_recall_cache.py tests/fork/test_hindsight_provider_regressions.py tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/run_agent/test_memory_sync_interrupted.py -q
+```
+
+- Current canonical result: `84 passed`, `0 failed` across `5` files.
+
 - Seven Fork state contracts were observed RED before each capability existed,
   then GREEN for Session-scoped consume, stale-generation carry rejection,
   matching-turn timeout invalidation, Session rotation, non-invalidating Session
@@ -288,9 +297,13 @@ Verification after the 2026-08-30 boundary migration:
   properties on the Provider.
 - Hindsight/Fork/provider/MemoryManager/Session/Request-only/compression/Gateway
   memory regression set: `384 passed` with `7` third-party deprecation warnings.
-- Fixed-SHA three-way merge simulation remained `2 → 2` text conflict regions;
-  no conflict-count reduction is claimed. The high-frequency Provider file
-  changed by `+56/-99`, moving the concrete state policy behind one Fork object.
+- One historical fixed-SHA helper simulation reported `2 → 2` text conflict
+  regions. A later fresh review using raw `merge-file` conflict-marker counting
+  reported `0 → 0` for the same Provider snapshots and could not reproduce that
+  exact count. These method-specific figures are not a stable maintenance
+  metric; no conflict-count reduction is claimed. The high-frequency Provider
+  file changed by `+56/-99`, moving the concrete state policy behind one Fork
+  object.
 - Independent `xai-oauth/grok-4.6` `xhigh` review returned `PASS` with `0`
   blocking findings. Its applicable findings were closed before commit:
   `sync_turn` now rebinds the cache Session without clearing carried Recall,
@@ -465,11 +478,13 @@ Verification after the 2026-08-30 orchestration migration:
   warnings.
 - Prompt SHA-256 remained
   `b9b182478b41ab593398bb1649b8a318ab7f59464cd4abe5681a7add6481106f`.
-- Fixed-SHA three-way simulation remained `2 → 2` text conflict regions; both
-  are unrelated retain/observation conflicts, so no conflict-count reduction is
-  claimed. The high-frequency Provider changed by `+17/-61`, the Fork-only P5
-  module by `+76/-1`, and no `agent/`, `hermes_cli/`, or generic memory-plugin
-  bridge file changed in this unit.
+- The historical helper simulation reported `2 → 2` text conflict regions and
+  attributed both to unrelated retain/observation areas. A later raw
+  `merge-file` marker count reported `0 → 0` and could not reproduce that exact
+  count. The figures are method-specific and are not used as a stable metric;
+  no conflict-count reduction is claimed. The high-frequency Provider changed
+  by `+17/-61`, the Fork-only P5 module by `+76/-1`, and no `agent/`,
+  `hermes_cli/`, or generic memory-plugin bridge file changed in this unit.
 - Independent `xai-oauth/grok-4.6` `xhigh` review returned `PASS` with `0`
   blocking findings. Its two applicable findings were closed before commit:
   Runtime Flow now assigns filtering/recall/outcome work to the P5 module, and
@@ -482,6 +497,10 @@ Verification after the 2026-08-30 orchestration migration:
 - Canonical `scripts/run_tests.sh` follow-up on 2026-08-31 passed all three
   focused gates: request-only/cache routing `345`, cache-miss lifecycle `84`,
   and P5 integration `480`, with `0` failures.
+- A fresh final-state `xai-oauth/grok-4.6` `xhigh` review independently returned
+  `PASS` with `0` blocking findings and recommended retaining all four commits.
+  It did not rerun the canonical tests or perform Gateway/external-API runtime
+  validation.
 
 Feature docs: `docs/chantxu64/hindsight-p5-recall-preprocessor/README.md`
 
@@ -1087,12 +1106,20 @@ Verification after the 2026-07-22 restoration:
   `fork_features.prompt_cache_routing`). After migration, direct old/new
   comparisons matched for 720 request-placement combinations, 16 content
   combinations, 24 logical-scope cases, and 8 Codex body/header routing cases.
-- The final pre-review focused request-only, Codex, Gateway replay, app-server,
-  long-task request-context, transport, and summary suite reported `382 passed`
-  with `7` third-party deprecation warnings. The adjacent MoA, Fork, compression,
-  replay, Session/branch/Undo, lineage, and state suite reported `1155 passed`
-  plus `4` existing failures; a detached clean `HEAD` reproduced all four
-  failures exactly, so they are not part of this maintenance unit.
+- Current canonical focused command, rerun on 2026-08-31:
+
+  ```bash
+  scripts/run_tests.sh tests/fork_features/test_request_context_policy.py tests/fork_features/test_long_task_continuity_recovery.py tests/agent/test_api_content_sidecar.py tests/agent/test_model_metadata.py tests/agent/test_gateway_turn_sidecar.py tests/agent/transports/test_codex_transport.py tests/gateway/test_replay_entry_fields.py tests/run_agent/test_run_agent_codex_responses.py tests/run_agent/test_codex_app_server_integration.py tests/agent/test_codex_request_only_memory_context.py -q
+  ```
+
+  Result: `345 passed`, `0 failed` across `10` files.
+- The historical direct-pytest pre-review focused request-only, Codex, Gateway
+  replay, app-server, long-task request-context, transport, and summary suite
+  reported `382 passed` with `7` third-party deprecation warnings. The adjacent
+  MoA, Fork, compression, replay, Session/branch/Undo, lineage, and state suite
+  reported `1155 passed` plus `4` existing failures; a detached clean `HEAD`
+  reproduced all four failures exactly, so they are not part of this maintenance
+  unit.
 - Independent `xai-oauth/grok-4.6` `xhigh` read-only review returned `PASS`
   with `0` blocking findings. Its only applicable non-blocking finding was the
   missing boundary-test entries in this section's Primary files; both entries

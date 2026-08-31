@@ -266,6 +266,11 @@ Current canonical follow-up on 2026-08-31:
 runner: scripts/run_tests.sh (clean environment, per-file subprocess isolation)
 ```
 
+A later fresh final-state `xai-oauth/grok-4.6` `xhigh` review returned `PASS`
+with `0` blocking findings and recommended retaining all four fourth-batch
+commits. That review did not rerun these tests or perform Gateway/external-API
+runtime validation.
+
 Historical direct-pytest implementation evidence from 2026-08-30:
 
 ```text
@@ -277,8 +282,10 @@ Ruff: All checks passed
 py_compile: passed
 git diff --check: passed
 P5 prompt SHA-256: b9b182478b41ab593398bb1649b8a318ab7f59464cd4abe5681a7add6481106f
-fixed-SHA Provider merge simulation: 2 conflict regions before and after;
-  both remaining regions are unrelated retain/observation conflicts
+historical fixed-SHA helper simulation: 2 conflict regions before and after;
+  both were attributed to unrelated retain/observation areas
+later raw merge-file marker count: 0 before and after; it did not reproduce
+  the helper's exact count, so neither figure is a stable maintenance metric
 ```
 
 Implementation verification on 2026-07-17:
