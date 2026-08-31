@@ -1558,51 +1558,80 @@ Upstream status: upstream-equivalent accepted at upstream `main`
 Status: active fork maintenance
 
 Date: 2026-07-29
+Refactored: 2026-08-31
 
 Files:
 
+- `fork_features/delivery_session_boundary.py`
 - `gateway/delivery_ledger.py`
-- `gateway/slash_commands.py`
+- `gateway/slash_commands.py` (stable host seam only)
+- `tests/fork_features/test_delivery_session_boundary.py`
 - `tests/gateway/test_delivery_ledger.py`
 - `tests/gateway/test_session_model_reset.py`
+- `tests/fork/test_multi_telegram_accounts.py`
 - `website/docs/user-guide/messaging/index.md`
 - `docs/LOCAL_MODIFICATIONS.md`
 
 Summary:
 
-- A successful explicit `/new` or `/reset` now transitions undelivered final
+- A successful explicit `/new` or `/reset` transitions undelivered final
   responses for the replaced conversation route to terminal `superseded`
   state. Gateway startup recovery cannot inject those old answers into the
   fresh Hermes session.
 - Normal same-session crash/restart redelivery remains unchanged. The boundary
-  update is route-scoped, leaves other chats untouched, and is terminal against
-  late send acknowledgements or failures from the old turn.
+  update uses the complete route-qualified `session_key`, leaves other chats
+  and Telegram Bot accounts untouched, and is terminal against late send
+  acknowledgements or failures from the old turn.
+
+Responsibility boundary:
+
+- `fork_features/delivery_session_boundary.py` owns the Fork policy entry
+  point, event-loop offload, best-effort failure handling, and boundary logs.
+- `gateway/delivery_ledger.py` continues to own the SQL state transition and
+  terminal-state protection. Moving private connections or SQL into
+  `fork_features` would only hide data-layer coupling and is not allowed.
+- The high-churn reset implementation calls the Fork policy once, only after a
+  replacement Session exists. It has no direct Delivery Ledger dependency.
 
 Why it matters:
 
 - Upstream's delivery ledger persists `session_key`, which identifies a stable
-  platform route, but not the Hermes session generation behind that route.
+  platform route, but not the Hermes Session generation behind that route.
   `/new` intentionally reuses the route, so a failed old response could be
   recovered after restart even though the user had explicitly started fresh.
+- At upstream SHA `4f22543509d1b91dc45bcb369447126c5eb14fb7`, the
+  maintenance profile counted one path touch per commit from
+  `git log --since=2026-05-01 --name-status --find-renames`: 178 touches to
+  `gateway/slash_commands.py` versus 6 to `gateway/delivery_ledger.py`. No
+  structured sync-conflict records exist for this unit, so the refactor is
+  justified as churn isolation rather than a measured conflict reduction.
 
 Merge protection:
 
-- Preserve the explicit session-boundary transition until upstream associates
-  delivery obligations with the originating Hermes session or provides an
-  equivalent terminal supersession mechanism.
+- Preserve the one host call after successful replacement-Session creation
+  until upstream associates delivery obligations with the originating Hermes
+  Session or provides an equivalent terminal supersession mechanism.
 - Do not disable ordinary startup redelivery or remove the recovered-reply
   ambiguity marker as a substitute for this boundary check.
+- Do not reduce the boundary key to platform or chat id. Named Telegram Bots
+  require the existing `:account:<id>` suffix so `/new` on one Bot cannot
+  supersede another Bot's pending reply.
 
 Verification:
 
-- Regression tests cover route-scoped supersession, both `/new` and `/reset`,
-  startup-sweep exclusion, and late-state-update terminality.
+- TDD RED established three missing-policy-module failures, followed by two
+  host-boundary failures while the reset path still called the Ledger directly.
+- Canonical focused and adjacent suite: `70 passed, 0 failed`, covering Fork
+  policy, exact account-qualified Bot isolation, both `/new` and `/reset`,
+  route-scoped supersession, startup-sweep exclusion, late-state terminality,
+  reset cleanup, title handling, async delegation, and streaming.
+- Python compilation and `git diff --check` passed.
 
 Feature docs: none — this is a narrow lifecycle invariant covered by the
-delivery documentation, regression tests, and this merge note.
+Delivery documentation, regression tests, and this merge note.
 
 Upstream status: the durable delivery ledger is upstream; the explicit
-session-reset boundary is fork-only.
+Session-reset boundary remains fork-only.
 
 
 ### 22. Transport disconnect classification stays out of context compression
@@ -2562,10 +2591,13 @@ deltas are expected in these areas:
   - `tests/run_agent/test_codex_app_server_integration.py`
   - `tests/agent/test_codex_request_only_memory_context.py`
 - Delivery-ledger session-reset boundary:
+  - `fork_features/delivery_session_boundary.py`
   - `gateway/delivery_ledger.py`
   - `gateway/slash_commands.py`
+  - `tests/fork_features/test_delivery_session_boundary.py`
   - `tests/gateway/test_delivery_ledger.py`
   - `tests/gateway/test_session_model_reset.py`
+  - `tests/fork/test_multi_telegram_accounts.py`
   - `website/docs/user-guide/messaging/index.md`
 - Transport disconnect classification:
   - `agent/error_classifier.py`

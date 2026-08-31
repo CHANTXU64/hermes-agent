@@ -109,14 +109,35 @@ async def test_new_command_only_clears_own_session():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("command", ["/new", "/reset"])
-async def test_new_command_supersedes_old_delivery_obligations(command):
+async def test_new_command_routes_delivery_retirement_through_fork_boundary(command):
     runner = _make_runner()
     session_key = build_session_key(_make_source())
+    session_entry = runner.session_store._entries[session_key]
+    boundary_order = []
 
-    with patch(
-        "gateway.delivery_ledger.supersede_session_obligations",
-        return_value=1,
-    ) as supersede:
+    def _reset_session(_session_key):
+        boundary_order.append("reset_session")
+        return session_entry
+
+    async def _retire_session_deliveries(_session_key):
+        boundary_order.append("retire_session_deliveries")
+        return 1
+
+    cast(MagicMock, runner.session_store.reset_session).side_effect = _reset_session
+
+    with (
+        patch(
+            "fork_features.delivery_session_boundary.retire_session_deliveries",
+            new_callable=AsyncMock,
+            side_effect=_retire_session_deliveries,
+        ) as retire,
+        patch(
+            "gateway.delivery_ledger.supersede_session_obligations",
+            return_value=1,
+        ) as direct_ledger_call,
+    ):
         await runner._handle_reset_command(_make_event(command))
 
-    supersede.assert_called_once_with(session_key)
+    retire.assert_awaited_once_with(session_key)
+    direct_ledger_call.assert_not_called()
+    assert boundary_order == ["reset_session", "retire_session_deliveries"]
