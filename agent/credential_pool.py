@@ -124,7 +124,6 @@ SUPPORTED_POOL_STRATEGIES = {
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
-OPENAI_CODEX_EXHAUSTED_PROBE_INTERVAL_SECONDS = 30 * 60
 # When a pool has no other credential to rotate to (the offending key is the
 # sole non-DEAD entry), a 1-hour bench means an hour of hard failures with
 # nothing to fall back to. Throttles (429/403/5xx) are transient and reset in
@@ -199,7 +198,6 @@ class PooledCredential:
     last_error_reason: Optional[str] = None
     last_error_message: Optional[str] = None
     last_error_reset_at: Optional[float] = None
-    codex_probe_at: Optional[float] = None
     base_url: Optional[str] = None
     expires_at: Optional[str] = None
     expires_at_ms: Optional[int] = None
@@ -435,70 +433,6 @@ def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) 
             failure_reason=getattr(entry, "failure_reason", None),
         )
     return None
-
-
-def _is_openai_codex_usage_limit_exhaustion(entry: PooledCredential) -> bool:
-    if entry.provider != "openai-codex" or entry.last_status != STATUS_EXHAUSTED:
-        return False
-    if entry.last_error_code != 429:
-        return False
-    haystack = " ".join(
-        str(value or "").lower()
-        for value in (entry.last_error_reason, entry.last_error_message)
-    )
-    return (
-        "usage_limit_reached" in haystack
-        or "gousagelimit" in haystack
-        or "usage limit reached" in haystack
-        or "usage limit has been reached" in haystack
-    )
-
-
-def _probe_openai_codex_entry_available(entry: PooledCredential) -> bool:
-    """Return True when a previously 429-limited Codex account appears usable.
-
-    The usage endpoint is cheaper than sending an actual model request and lets
-    us detect early quota resets without waiting for the provider-supplied
-    resets_at timestamp.  A successful payload with at least one under-100%
-    window means the account can be retried.  If the endpoint shape changes but
-    still returns 2xx, treat that as available rather than pinning the local
-    exhausted bit forever.
-    """
-    token = (entry.runtime_api_key or "").strip()
-    if not token:
-        return False
-    try:
-        import httpx
-        from agent.account_usage import _resolve_codex_usage_url
-
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "User-Agent": "codex-cli",
-        }
-        account_id = str(entry.extra.get("account_id") or "").strip()
-        if account_id:
-            headers["ChatGPT-Account-Id"] = account_id
-        with httpx.Client(timeout=15.0) as client:
-            response = client.get(
-                _resolve_codex_usage_url(entry.runtime_base_url or ""),
-                headers=headers,
-            )
-            response.raise_for_status()
-        payload = response.json() or {}
-        rate_limit = payload.get("rate_limit") or {}
-        used_values: List[float] = []
-        for key in ("primary_window", "secondary_window"):
-            window = rate_limit.get(key) or {}
-            used = window.get("used_percent")
-            if isinstance(used, (int, float)):
-                used_values.append(float(used))
-        if used_values:
-            return all(value < 100.0 for value in used_values)
-        return True
-    except Exception as exc:
-        logger.debug("Codex exhausted credential probe failed for %s: %s", entry.label or entry.id, exc)
-        return False
 
 
 def _normalize_custom_pool_name(name: str) -> str:
@@ -823,12 +757,7 @@ class CredentialPool:
                     self._entries[idx] = new
                     return
 
-    def _persist(
-        self,
-        *,
-        removed_ids: Optional[List[str]] = None,
-        status_clear_preconditions: Optional[Dict[str, Dict[str, Any]]] = None,
-    ) -> None:
+    def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
         with self._lock:
@@ -836,7 +765,6 @@ class CredentialPool:
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=removed_ids,
-                status_clear_preconditions=status_clear_preconditions,
             )
 
     def _is_terminal_auth_failure(
@@ -901,7 +829,6 @@ class CredentialPool:
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
             last_error_reset_at=normalized_error.get("reset_at"),
-            codex_probe_at=now if self.provider == "openai-codex" and status_code == 429 else entry.codex_probe_at,
             extra=updated_extra,
         )
         self._replace_entry(entry, updated)
@@ -1892,7 +1819,6 @@ class CredentialPool:
         """
         now = time.time()
         cleared_any = False
-        status_clear_preconditions: Dict[str, Dict[str, Any]] = {}
         entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
         # Entries that need an OAuth refresh via a single-use token provider
@@ -1986,35 +1912,6 @@ class CredentialPool:
                 # the re-auth case for OAuth singletons.
                 continue
             if entry.last_status == STATUS_EXHAUSTED:
-                status_clear_precondition = {
-                    "last_status": entry.last_status,
-                    "last_status_at": entry.last_status_at,
-                }
-                if _is_openai_codex_usage_limit_exhaustion(entry):
-                    last_probe_at = _parse_absolute_timestamp(entry.codex_probe_at) or 0.0
-                    if entry.codex_probe_at is not None and now - last_probe_at >= OPENAI_CODEX_EXHAUSTED_PROBE_INTERVAL_SECONDS:
-                        if _probe_openai_codex_entry_available(entry):
-                            cleared = replace(
-                                entry,
-                                last_status=STATUS_OK,
-                                last_status_at=None,
-                                last_error_code=None,
-                                last_error_reason=None,
-                                last_error_message=None,
-                                last_error_reset_at=None,
-                                codex_probe_at=now,
-                            )
-                            self._replace_entry(entry, cleared)
-                            entry = cleared
-                            cleared_any = True
-                            status_clear_preconditions.setdefault(
-                                entry.id, status_clear_precondition
-                            )
-                        else:
-                            probed = replace(entry, codex_probe_at=now)
-                            self._replace_entry(entry, probed)
-                            entry = probed
-                            cleared_any = True
                 exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
                 if exhausted_until is not None and now < exhausted_until:
                     # Codex quota windows can reopen EARLY: the user redeems a
@@ -2042,9 +1939,6 @@ class CredentialPool:
                     self._replace_entry(entry, cleared)
                     entry = cleared
                     cleared_any = True
-                    status_clear_preconditions.setdefault(
-                        entry.id, status_clear_precondition
-                    )
             if refresh and self._entry_needs_refresh(entry):
                 if self.provider in ("openai-codex", "xai-oauth"):
                     # Defer single-use-token refresh to avoid holding the
@@ -2065,10 +1959,7 @@ class CredentialPool:
             pruned_ids = set(entries_to_prune)
             self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
-            self._persist(
-                removed_ids=entries_to_prune,
-                status_clear_preconditions=status_clear_preconditions,
-            )
+            self._persist(removed_ids=entries_to_prune)
         return available, pending_refresh
 
     def _log_no_available_entries(self) -> None:
