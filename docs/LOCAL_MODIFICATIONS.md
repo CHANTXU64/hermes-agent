@@ -792,6 +792,9 @@ What changed:
 - Removed the custom STT schema/default block from core `DEFAULT_CONFIG`; the
   plugin owns mode-aware defaults while `load_config()` continues to preserve
   the user's `stt.custom_api` mapping.
+- Core `DEFAULT_CONFIG` also follows upstream's strict selection behavior and
+  does not seed `stt.provider`. Existing explicit `stt.provider: custom_api`
+  remains authoritative and continues through the bundled plugin.
 - Preserved generic multipart uploads, DashScope-style chat completions and
   `dashscope_multimodal`. The latter sends an ordered, de-duplicated keyword list
   and optional Prompt as an `input_text` context message immediately before the
@@ -1360,6 +1363,7 @@ Files:
 
 - `fork_features/clarify_decision_card.py`
 - `tools/clarify_tool.py`
+- `tests/fork_features/test_clarify_decision_card.py`
 - `tests/tools/test_clarify_tool.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
@@ -1375,6 +1379,9 @@ What changed:
 - `tools/clarify_tool.py` keeps the current single-question base Schema and one
   pure `apply_decision_card_policy` call. Its callback, result shape,
   `question`/`choices`/`multi_select` parameters, and registry path are unchanged.
+- Direct policy transformation tests live with `fork_features`; the Host test
+  file retains rendered Schema, callback and registry integration coverage.
+  Moving the policy tests does not replace Host integration with policy-only tests.
 - Applying the policy returns a deep copy and preserves the complete pre-refactor
   rendered Schema byte-for-byte. The policy also extends upstream's newer
   `questions[]` shape additively without changing that API, reducing future
@@ -1410,8 +1417,8 @@ Merge protection:
 Verification:
 
 ```bash
-.venv/bin/python -m pytest tests/tools/test_clarify_tool.py -q -o 'addopts='
-.venv/bin/python -m py_compile fork_features/clarify_decision_card.py tools/clarify_tool.py tests/tools/test_clarify_tool.py
+.venv/bin/python -m pytest tests/fork_features/test_clarify_decision_card.py tests/tools/test_clarify_tool.py -q -o 'addopts='
+.venv/bin/python -m py_compile fork_features/clarify_decision_card.py tools/clarify_tool.py tests/fork_features/test_clarify_decision_card.py tests/tools/test_clarify_tool.py
 git diff --check
 ```
 
@@ -2830,6 +2837,7 @@ deltas are expected in these areas:
 - Self-contained Clarify decision cards:
   - `fork_features/clarify_decision_card.py`
   - `tools/clarify_tool.py`
+  - `tests/fork_features/test_clarify_decision_card.py`
   - `tests/tools/test_clarify_tool.py`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Launchd Gateway open-file ceiling (superseded by upstream configurable

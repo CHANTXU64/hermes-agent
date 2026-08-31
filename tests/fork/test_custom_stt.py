@@ -165,6 +165,7 @@ def test_default_config_recognizes_and_resolves_latest_qwen_custom_stt(monkeypat
     ):
         monkeypatch.delenv(name, raising=False)
 
+    assert "provider" not in DEFAULT_CONFIG["stt"]
     assert "custom_api" not in DEFAULT_CONFIG["stt"]
 
     cfg = _resolve_custom_api_config({})
