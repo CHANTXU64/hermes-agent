@@ -17,6 +17,8 @@ import types
 import unittest
 from unittest.mock import MagicMock, patch
 
+import fork_features.delegation_routing as delegation_routing
+
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -920,7 +922,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
     @patch(
-        "tools.delegate_tool._recent_delegation_route_usage",
+        "fork_features.delegation_routing._recent_delegation_route_usage",
         create=True,
         return_value=[
             {
@@ -1056,7 +1058,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             conn.close()
 
             with patch("hermes_constants.get_hermes_home", return_value=home):
-                usage = delegate_module._recent_delegation_route_usage(days=30)
+                usage = delegation_routing._recent_delegation_route_usage(days=30)
 
         self.assertEqual(
             [(row["provider"], row["model"]) for row in usage],
@@ -1092,10 +1094,10 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         )
 
         with patch(
-            "tools.delegate_tool._recent_delegation_route_usage",
+            "fork_features.delegation_routing._recent_delegation_route_usage",
             return_value=usage,
         ):
-            markdown = delegate_module._route_suggestion_markdown(
+            markdown = delegation_routing._route_suggestion_markdown(
                 payload, requested_model="wanted-model"
             )
 
@@ -1261,7 +1263,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         )
 
     @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
-    @patch("tools.delegate_tool._explicit_reasoning_effort_is_exact", return_value=True)
+    @patch("fork_features.delegation_routing._explicit_reasoning_effort_is_exact", return_value=True)
     @patch("hermes_cli.inventory.load_picker_context")
     @patch("hermes_cli.inventory.build_models_payload")
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
@@ -1374,7 +1376,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
     @patch(
-        "tools.delegate_tool._recent_delegation_route_usage",
+        "fork_features.delegation_routing._recent_delegation_route_usage",
         return_value=[
             {"provider": "deepseek", "model": "deepseek-v4-pro", "api_calls": 20},
             {"provider": "opencode-go", "model": "glm-5", "api_calls": 10},
@@ -1412,7 +1414,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
     @patch(
-        "tools.delegate_tool._recent_delegation_route_usage",
+        "fork_features.delegation_routing._recent_delegation_route_usage",
         return_value=[
             {"provider": "opencode-go", "model": "glm-5", "api_calls": 10},
             {"provider": "deepseek", "model": "deepseek-v4-pro", "api_calls": 20},
@@ -1637,9 +1639,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         )
 
     def test_anthropic_messages_reports_only_exact_wire_efforts(self):
-        from tools.delegate_tool import _exact_reasoning_efforts_for_route
-
-        exact = _exact_reasoning_efforts_for_route(
+        exact = delegation_routing._exact_reasoning_efforts_for_route(
             provider="custom:anthropic-proxy",
             model="claude-sonnet-5",
             api_mode="anthropic_messages",
@@ -1709,7 +1709,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         return_value={"agent": {"reasoning_effort": "medium"}},
     )
     @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 45})
-    @patch("tools.delegate_tool._exact_reasoning_efforts_for_route", return_value=[])
+    @patch("fork_features.delegation_routing._exact_reasoning_efforts_for_route", return_value=[])
     @patch("hermes_cli.inventory.load_picker_context")
     @patch("hermes_cli.inventory.build_models_payload")
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")

@@ -78,19 +78,46 @@ API keys, credential IDs, request overrides, and base URLs are not included in r
 
 ## Main implementation seams
 
+- `fork_features/delegation_routing.py`
+  - provider inference and explicit provider/model catalog validation
+  - current-route suggestion lookup, ranking, and bounded Markdown rendering
+  - target-route reasoning exactness and normal/default reasoning resolution
+  - top-level/per-task route precedence, repeated-route caching, and full-batch
+    prevalidation before child construction
+  - safe route errors and public child route metadata
 - `tools/delegate_tool.py`
   - model-facing schema and dispatch handler
-  - provider inference and explicit route validation
-  - target-model reasoning resolution
-  - per-task route normalization before any child is constructed
-  - result metadata
+  - host-owned generic delegation config and credential/runtime resolution
+  - one call into the Fork route policy, followed by child construction and
+    result aggregation
 - `run_agent.py`
   - live model-tool dispatch forwarding
 - `tools/async_delegation.py`
   - per-task route persistence and completion-event metadata
+- `tests/fork_features/test_delegation_routing.py`
+  - Fork ownership seam and pre-spawn route-failure contract
 - `tests/tools/test_delegate.py`
 - `tests/tools/test_delegate_control_actions.py`
 - `tests/tools/test_async_delegation.py`
+
+The Fork policy receives `_resolve_delegation_credentials` as a callback. It
+does not import `tools.delegate_tool`, copy runtime-provider credential logic,
+or own child lifecycle and async task storage.
+
+## Maintenance exposure
+
+At fixed local upstream SHA
+`4f22543509d1b91dc45bcb369447126c5eb14fb7` and Fork baseline
+`6eea4460484f499622e718684bc7e986da4f436f`, the maintenance-profile script
+counted one path touch per commit since 2026-05-01 using `git log
+--name-status --find-renames`: `tools/delegate_tool.py` had 119 upstream touches
+and two Fork-only non-merge touches; `tools/async_delegation.py` had 31 and one.
+The repository-local `docs/FORK_SYNC_HISTORY.jsonl` was absent. The external
+decoupling ledger supplied to the maintenance profile existed with 13
+implementation records but zero sync or follow-up records. Sync-outcome
+coverage is therefore missing: no measured conflict hunks, resolution time,
+rework, defects, or Token evidence was available. These figures show
+path-change exposure only; they do not prove conflict or Token reduction.
 
 ## Merge protection
 
@@ -112,24 +139,36 @@ If upstream adds a similar but behaviorally different interface, stop and compar
 Run at minimum:
 
 ```bash
-./venv/bin/python -m pytest \
-  tests/tools/test_delegate.py \
-  tests/tools/test_delegate_control_actions.py \
-  tests/tools/test_async_delegation.py \
-  -q -o 'addopts='
-
-./venv/bin/ruff check \
-  tools/delegate_tool.py \
-  tools/async_delegation.py \
-  run_agent.py \
+scripts/run_tests.sh \
+  tests/fork_features/test_delegation_routing.py \
   tests/tools/test_delegate.py \
   tests/tools/test_delegate_control_actions.py \
   tests/tools/test_async_delegation.py
 
-./venv/bin/python -m py_compile \
+scripts/run_tests.sh \
+  tests/plugins/model_providers/test_deepseek_profile.py \
+  tests/plugins/model_providers/test_opencode_go_profile.py \
+  tests/agent/transports/test_codex_transport.py \
+  tests/agent/test_codex_request_transport_diagnostics.py \
+  tests/agent/test_anthropic_adapter.py \
+  tests/agent/test_message_sanitization_policy.py
+
+python -m ruff check \
+  fork_features/delegation_routing.py \
   tools/delegate_tool.py \
   tools/async_delegation.py \
   run_agent.py \
+  tests/fork_features/test_delegation_routing.py \
+  tests/tools/test_delegate.py \
+  tests/tools/test_delegate_control_actions.py \
+  tests/tools/test_async_delegation.py
+
+python -m py_compile \
+  fork_features/delegation_routing.py \
+  tools/delegate_tool.py \
+  tools/async_delegation.py \
+  run_agent.py \
+  tests/fork_features/test_delegation_routing.py \
   tests/tools/test_delegate.py \
   tests/tools/test_delegate_control_actions.py \
   tests/tools/test_async_delegation.py
@@ -145,4 +184,14 @@ git diff --check
 - Ruff, `py_compile`, and `git diff --check`: passed;
 - a read-only live-profile candidate render excluded stale historical `openai-codex` routes and returned only routes present in the current authenticated curated inventory.
 
-No paid inference, commit, push, or Gateway restart was performed.
+2026-08-31 route-policy extraction validation results:
+
+- Fork boundary plus core delegation/control/async suite: `129 passed`;
+- adjacent DeepSeek/OpenCode Go/Codex/Anthropic request-builder suite:
+  `302 passed`;
+- Ruff, `py_compile`, and `git diff --check`: passed.
+
+Functional validation did not launch a live child or call a target route. One
+model subagent performed a separate read-only code review. No push or Gateway
+restart was performed, and the extraction was not committed as part of this
+validation.

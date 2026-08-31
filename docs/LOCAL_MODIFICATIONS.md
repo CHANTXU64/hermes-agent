@@ -2000,13 +2000,16 @@ Upstream status: fork-only.
 
 Status: active
 
-Date: 2026-08-15; native Anthropic reasoning probe fixed 2026-08-28
+Date: 2026-08-15; native Anthropic reasoning probe fixed 2026-08-28;
+route-policy boundary refactored 2026-08-31
 
 Files:
 
+- `fork_features/delegation_routing.py`
 - `tools/delegate_tool.py`
 - `tools/async_delegation.py`
 - `run_agent.py`
+- `tests/fork_features/test_delegation_routing.py`
 - `tests/tools/test_delegate.py`
 - `tests/tools/test_delegate_control_actions.py`
 - `tests/tools/test_async_delegation.py`
@@ -2022,6 +2025,7 @@ Summary:
 What changed:
 
 - Top-level and per-task `provider`, `model`, and `reasoning_effort` fields are exposed and forwarded through both model dispatch paths.
+- Fork-specific route policy now lives in `fork_features/delegation_routing.py`: model/provider inference and catalog validation, bounded current-route suggestions, exact reasoning capability checks, target-route fallback, top-level/per-task precedence, repeated-route caching, full-batch prevalidation, safe route errors, and public child route metadata. `tools/delegate_tool.py` keeps model-facing input normalization, the single Fork resolver call, host-owned generic delegation config and credential/runtime resolution, child construction, execution, and aggregation. The Fork module receives `_resolve_delegation_credentials` through a callback; it does not import the host or duplicate provider credentials. `tools/async_delegation.py` continues owning async task persistence, recovery, and completion delivery.
 - Model-only calls infer a provider only when the authenticated curated inventory has one unique match; explicit provider/model calls resolve the target-model runtime route and reject known catalog mismatches before spawning.
 - Routed children resolve reasoning configuration against the target model. An explicit effort is used only when the production request builder preserves it exactly; otherwise Hermes keeps the selected provider/model and applies that target model's normal override/global/provider reasoning configuration without claiming that the requested value took effect.
 - Exact reasoning probes cover Chat Completions, Responses, and native Anthropic Messages routes. Anthropic Messages reuses the production request builder: `low`, `medium`, `high`, `xhigh`, and `max` are exact; `minimal -> low`, `ultra -> max`, and omission for `none` are not reported as exact and therefore keep the same-model automatic/default fallback contract.
@@ -2031,10 +2035,12 @@ What changed:
 Why it matters:
 
 - The parent can deliberately use a different provider/model for one subtask without changing global configuration, while model-only calls remain convenient and ambiguous routes fail closed. Errors contain enough bounded current information to retry without a separate model-directory tool call or permanent prompt bloat.
+- At fixed local upstream SHA `4f22543509d1b91dc45bcb369447126c5eb14fb7` and Fork baseline `6eea4460484f499622e718684bc7e986da4f436f`, the maintenance-profile script counted one path touch per commit since 2026-05-01 using `git log --name-status --find-renames`: `tools/delegate_tool.py` had 119 upstream touches and two Fork-only non-merge touches; `tools/async_delegation.py` had 31 and one. The repository-local `docs/FORK_SYNC_HISTORY.jsonl` was absent. The external decoupling ledger supplied to the profile existed with 13 implementation records but zero sync or follow-up records. Sync-outcome coverage is therefore missing: no measured conflict hunks, resolution time, rework, defects, or Token evidence was available. This is path-change exposure, not a measured conflict- or Token-reduction claim.
 
 Merge protection:
 
 - Preserve when upstream does not provide the combined contract of per-invocation/per-task cross-provider routing, target-model reasoning resolution, truthful same-model automatic/default fallback for unsupported explicit effort, all-task prevalidation, durable safe route metadata, and bounded current-availability Markdown suggestions.
+- Preserve the narrow host/Fork boundary: the Fork module owns route policy, while the host owns credential/runtime resolution and child lifecycle and the async module owns durable task storage/recovery. Do not move provider credentials, child execution, or async Ledger state into `fork_features` merely to reduce host line count.
 - Drop when upstream provides an equivalent public schema, routing precedence, validation behavior, persistence/recovery metadata, and error-result budget with matching regressions.
 - Ask user when upstream offers a similar interface but silently chooses ambiguous providers, claims a clamped/mapped reasoning value was honored, switches models for reasoning, omits durable per-task routes, injects a full catalog into the schema, or uses materially different precedence/fallback semantics.
 
@@ -2042,25 +2048,31 @@ Verification:
 
 - 2026-08-16 revised-contract validation: core delegate/control/async tests reported `125 passed in 16.72s`; adjacent DeepSeek/OpenCode Go/Codex request-builder tests reported `158 passed in 1.82s`; restoration, API Server, Gateway binding, CLI delivery, TUI lifecycle, batch/output-schema, and FD-leak tests reported `65 passed in 7.77s` with seven pre-existing third-party deprecation warnings. Ruff, `py_compile`, and `git diff --check` passed. A read-only live-profile candidate render excluded stale historical `openai-codex` routes and returned only current authenticated picker-inventory routes.
 - 2026-08-28 native Anthropic regression validation: delegate/control/async tests reported `127 passed`; Anthropic adapter/sanitization tests reported `98 passed`; Ruff, `py_compile`, and `git diff --check` passed. After Gateway restart, a live `custom:cloudflare-claude` / `claude-fable-5` child completed one API call with the requested effective `low` effort instead of falling back to the model's `high` default.
+- 2026-08-31 route-policy boundary validation: Fork boundary plus delegate/control/async tests reported `129 passed`; adjacent DeepSeek/OpenCode Go/Codex/Anthropic request-builder tests reported `302 passed`; Ruff, `py_compile`, the structural ownership check, and `git diff --check` passed. Functional validation did not launch a live child or call a target route; one model subagent performed a separate read-only code review. No Gateway restart, commit, or Push was performed.
 
 ```bash
-./venv/bin/python -m pytest \
+scripts/run_tests.sh \
+  tests/fork_features/test_delegation_routing.py \
   tests/tools/test_delegate.py \
   tests/tools/test_delegate_control_actions.py \
-  tests/tools/test_async_delegation.py \
-  -q -o 'addopts='
-./venv/bin/python -m pytest \
+  tests/tools/test_async_delegation.py
+scripts/run_tests.sh \
   tests/plugins/model_providers/test_deepseek_profile.py \
   tests/plugins/model_providers/test_opencode_go_profile.py \
   tests/agent/transports/test_codex_transport.py \
   tests/agent/test_codex_request_transport_diagnostics.py \
-  -q -o 'addopts='
-./venv/bin/ruff check tools/delegate_tool.py tools/async_delegation.py \
+  tests/agent/test_anthropic_adapter.py \
+  tests/agent/test_message_sanitization_policy.py
+python -m ruff check fork_features/delegation_routing.py \
+  tools/delegate_tool.py tools/async_delegation.py \
   run_agent.py tests/tools/test_delegate.py \
+  tests/fork_features/test_delegation_routing.py \
   tests/tools/test_delegate_control_actions.py \
   tests/tools/test_async_delegation.py
-./venv/bin/python -m py_compile tools/delegate_tool.py \
+python -m py_compile fork_features/delegation_routing.py \
+  tools/delegate_tool.py \
   tools/async_delegation.py run_agent.py tests/tools/test_delegate.py \
+  tests/fork_features/test_delegation_routing.py \
   tests/tools/test_delegate_control_actions.py \
   tests/tools/test_async_delegation.py
 git diff --check
