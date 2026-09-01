@@ -357,8 +357,19 @@ def freeze_codex_request_for_compression(
 
     if not compression_request_fork_enabled(agent):
         return None
+    canonical_body = copy.deepcopy(dict(body))
+    extra_body = canonical_body.get("extra_body")
+    if isinstance(extra_body, Mapping):
+        remaining_extra_body = dict(extra_body)
+        for field_name in ("input", "tools"):
+            if field_name in remaining_extra_body:
+                canonical_body[field_name] = remaining_extra_body.pop(field_name)
+        if remaining_extra_body:
+            canonical_body["extra_body"] = remaining_extra_body
+        else:
+            canonical_body.pop("extra_body", None)
     return FrozenCodexRequest(
-        body=body,
+        body=canonical_body,
         fidelity=fidelity,
         captured_session_id=str(getattr(agent, "session_id", "") or ""),
     )

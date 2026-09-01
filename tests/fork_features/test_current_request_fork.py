@@ -17,6 +17,7 @@ from fork_features.request_fork import (
     rematerialize_codex_request_after_adopt,
     compression_request_fork_enabled,
     current_request_fork_scope,
+    freeze_codex_request_for_compression,
 )
 
 
@@ -106,6 +107,42 @@ def _fake_scope(agent, frozen):
         ),
         normalize_response=agent._get_transport().normalize_response,
     )
+
+
+def test_freeze_accepts_sdk_transform_bypassed_physical_request(monkeypatch):
+    from agent.codex_runtime import _bypass_sdk_request_transform
+
+    monkeypatch.setattr(
+        "fork_features.request_fork.compression_request_fork_enabled",
+        lambda _agent: True,
+    )
+    physical = _bypass_sdk_request_transform(
+        {
+            "model": "gpt-test",
+            "input": [{"role": "user", "content": "FULL PREFIX"}],
+            "tools": [{"name": "terminal"}],
+            "extra_body": {"trace_marker": "keep"},
+            "stream": True,
+        }
+    )
+    assert "input" not in physical
+    assert isinstance(physical["extra_body"]["input"], list)
+
+    frozen = freeze_codex_request_for_compression(
+        SimpleNamespace(session_id="physical-session"),
+        physical,
+        fidelity="failed_wire",
+    )
+    assert frozen is not None
+
+    body = frozen.clone_body()
+    assert body["input"] == [{"role": "user", "content": "FULL PREFIX"}]
+    assert body["tools"] == [{"name": "terminal"}]
+    assert body["extra_body"] == {"trace_marker": "keep"}
+
+    body["input"].append({"role": "user", "content": "CHECKPOINT"})
+    resend = _bypass_sdk_request_transform(body)
+    assert resend["extra_body"]["input"][-1]["content"] == "CHECKPOINT"
 
 
 def test_frozen_responses_request_reaches_transport_without_second_conversion(
