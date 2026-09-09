@@ -242,29 +242,9 @@ def test_high_churn_hosts_consume_fork_memory_policy_seams() -> None:
         for node in ast.walk(context_builder)
     )
 
-    for relative_path in (
-        "agent/tool_executor.py",
-        "agent/agent_runtime_helpers.py",
-    ):
-        source = (repo / relative_path).read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        memory_calls = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_memory_tool"
-        ]
-        assert memory_calls
-        assert all(
-            any(
-                keyword.arg is None
-                and isinstance(keyword.value, ast.Call)
-                and ast.unparse(keyword.value.func) == "forwarded_memory_kwargs"
-                for keyword in call.keywords
-            )
-            for call in memory_calls
-        )
+    inline_source = (repo / "agent/inline_tool_executors.py").read_text(encoding="utf-8")
+    assert "forwarded_memory_kwargs" in inline_source
+    assert "store=agent._memory_store" in inline_source
 
     for relative_path in (
         "fork_features/memory_audit.py",

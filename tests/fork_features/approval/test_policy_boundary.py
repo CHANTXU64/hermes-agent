@@ -194,7 +194,6 @@ def test_high_churn_hosts_consume_only_public_policy_facade() -> None:
     }
     assert forbidden_policy_imports.isdisjoint(policy_imports)
 
-    model_tools_source = (repo / "model_tools.py").read_text(encoding="utf-8")
-    assert "fork_features.approval.policy" in model_tools_source
-    assert "reset_smart_approval_context" in model_tools_source
-    assert "set_smart_approval_context" in model_tools_source
+    assert "fork_features.approval.policy" in executor_source
+    assert "reset_smart_approval_context" in executor_source
+    assert "set_smart_approval_context" in executor_source

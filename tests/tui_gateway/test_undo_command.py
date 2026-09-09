@@ -161,6 +161,7 @@ def test_undo_notifies_memory_provider(server, session_with_history):
         session_key,
         turns_undone=1,
     )
+    agent._memory_manager.on_session_switch.assert_not_called()
 
 
 def test_undo_refuses_when_session_busy(server, session_with_history):

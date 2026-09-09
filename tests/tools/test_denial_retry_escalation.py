@@ -6,6 +6,7 @@ import pytest
 
 from fork_features.approval.policy import ApprovalPolicy
 from tools import approval as A
+from tools import approval_context
 
 
 def _configure_smart_deny(monkeypatch, *, session_key: str, turn_id: str = "turn-1"):
@@ -14,7 +15,7 @@ def _configure_smart_deny(monkeypatch, *, session_key: str, turn_id: str = "turn
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
     monkeypatch.setenv("HERMES_LANGUAGE", "zh")
-    monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
+    monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr(
         A,
@@ -45,14 +46,14 @@ def _configure_smart_deny(monkeypatch, *, session_key: str, turn_id: str = "turn
         lambda _command: {"action": "allow", "findings": [], "summary": ""},
         raising=False,
     )
-    session_token = A.set_current_session_key(session_key)
-    context_tokens = A.set_current_observability_context(turn_id=turn_id)
+    session_token = approval_context.set_current_session_key(session_key)
+    context_tokens = approval_context.set_current_observability_context(turn_id=turn_id)
     return session_token, context_tokens
 
 
 def _reset_context(session_token, context_tokens):
-    A.reset_current_observability_context(context_tokens)
-    A.reset_current_session_key(session_token)
+    approval_context.reset_current_observability_context(context_tokens)
+    approval_context.reset_current_session_key(session_token)
 
 
 def _register_resolver(
@@ -125,7 +126,7 @@ def test_repeat_one_shot_cli_offers_only_once_or_deny(monkeypatch):
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
-    session_token = A.set_current_session_key("repeat-cli-one-shot")
+    session_token = approval_context.set_current_session_key("repeat-cli-one-shot")
     captured: dict = {}
 
     def approval_callback(command, description, **kwargs):
@@ -148,7 +149,7 @@ def test_repeat_one_shot_cli_offers_only_once_or_deny(monkeypatch):
         )
     finally:
         A.clear_session("repeat-cli-one-shot")
-        A.reset_current_session_key(session_token)
+        approval_context.reset_current_session_key(session_token)
 
     assert result["approved"] is True
     assert captured["allow_permanent"] is False
@@ -175,7 +176,7 @@ def test_terminal_repeat_respects_existing_legal_bypass(monkeypatch, bypass):
         if bypass == "yolo":
             monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", True)
         elif bypass == "mode_off":
-            monkeypatch.setattr(A, "_get_approval_mode", lambda: "off")
+            monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "off")
         else:
             allowlisted["enabled"] = True
         second = A.check_all_command_guards(command, "local")
@@ -206,7 +207,7 @@ def test_execute_code_repeat_respects_existing_legal_bypass(monkeypatch, bypass)
         if bypass == "yolo":
             monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", True)
         elif bypass == "mode_off":
-            monkeypatch.setattr(A, "_get_approval_mode", lambda: "off")
+            monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "off")
         else:
             A.approve_session(session_key, "execute_code")
         second = A.check_execute_code_guard(code, "local")
@@ -628,19 +629,19 @@ def test_new_user_turn_does_not_inherit_previous_user_denial(monkeypatch):
         A.check_all_command_guards(command, "local")
         _register_resolver(session_key, "deny", captured)
         denied = A.check_all_command_guards(command, "local")
-        A.reset_current_observability_context(context_tokens)
+        approval_context.reset_current_observability_context(context_tokens)
         context_tokens = None
-        new_turn_tokens = A.set_current_observability_context(turn_id="turn-new")
+        new_turn_tokens = approval_context.set_current_observability_context(turn_id="turn-new")
         new_turn = A.check_all_command_guards(command, "local")
     finally:
         with A._lock:
             A._gateway_notify_cbs.pop(session_key, None)
             A._gateway_queues.pop(session_key, None)
         if new_turn_tokens is not None:
-            A.reset_current_observability_context(new_turn_tokens)
+            approval_context.reset_current_observability_context(new_turn_tokens)
         if context_tokens is not None:
-            A.reset_current_observability_context(context_tokens)
-        A.reset_current_session_key(session_token)
+            approval_context.reset_current_observability_context(context_tokens)
+        approval_context.reset_current_session_key(session_token)
 
     assert denied["outcome"] == "denied"
     assert new_turn["outcome"] == "auto_denied"
@@ -702,7 +703,7 @@ def test_repeat_without_live_callback_fails_closed_without_pending(monkeypatch):
 
 
 def test_no_turn_id_disables_same_turn_denial_state(monkeypatch):
-    session_token = A.set_current_session_key("missing-turn-id")
+    session_token = approval_context.set_current_session_key("missing-turn-id")
     try:
         policy = A._fork_approval_policy()
         first = policy.first_denial(
@@ -723,22 +724,24 @@ def test_no_turn_id_disables_same_turn_denial_state(monkeypatch):
             "rm -rf /tmp/no-turn", source_kind="shell"
         ) is None
     finally:
-        A.reset_current_session_key(session_token)
+        approval_context.reset_current_session_key(session_token)
 
 
 def test_cron_policy_block_never_enters_repeat_escalation(monkeypatch):
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-    monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
-    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
+    monkeypatch.setattr(
+        A.approval_context, "_get_cron_approval_mode", lambda: "deny"
+    )
     monkeypatch.setattr(
         A,
         "detect_dangerous_command",
         lambda command: (True, "cron-danger", f"risk:{command}"),
     )
-    session_token = A.set_current_session_key("repeat-cron")
-    context_tokens = A.set_current_observability_context(turn_id="turn-cron")
+    session_token = approval_context.set_current_session_key("repeat-cron")
+    context_tokens = approval_context.set_current_observability_context(turn_id="turn-cron")
     try:
         first = A.check_all_command_guards("rm -rf /tmp/cron-target", "local")
         second = A.check_all_command_guards("rm -rf /tmp/cron-target", "local")

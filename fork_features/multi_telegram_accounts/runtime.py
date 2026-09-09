@@ -144,12 +144,10 @@ class TelegramAccountRuntime:
     def queue_retryable(self, adapter: BasePlatformAdapter) -> bool:
         """Queue a named retryable adapter before any potentially wedged close."""
         account = self.account_id_for(adapter)
-        if (
-            not account
-            or not getattr(adapter, "fatal_error_retryable", False)
-            or account in self.failed
-        ):
+        if not account or not getattr(adapter, "fatal_error_retryable", False):
             return False
+        if account in self.failed:
+            return True
         account_config = getattr(adapter, "config", None)
         if account_config is None:
             account_config = self._fallback_account_config(account)

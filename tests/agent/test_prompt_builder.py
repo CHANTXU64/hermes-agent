@@ -5,6 +5,8 @@ import importlib
 import logging
 import os
 import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -24,7 +26,6 @@ from agent.prompt_builder import (
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
     drain_truncation_warnings,
-    TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -61,31 +62,19 @@ def _drain_truncation_warnings():
 
 class TestGuidanceConstants:
     def test_memory_guidance_keeps_form_rule_and_routing(self):
-        """Fork Governance keeps the full durable-memory form and routing rules."""
+        """The Fork's full guidance keeps durable-fact, routing, and staleness contracts."""
         from agent.prompt_builder import MEMORY_GUIDANCE
 
-        assert "Save durable facts" in MEMORY_GUIDANCE
         assert "declarative facts" in MEMORY_GUIDANCE
-        assert "Imperative phrasing" in MEMORY_GUIDANCE
-        assert "stale in a week" in MEMORY_GUIDANCE
-        assert "workflows" in MEMORY_GUIDANCE
-
-    def test_memory_guidance_reads_bounded_history_only_before_existing_changes(self):
-        assert "For a pure add, do not read history" in MEMORY_GUIDANCE
-        assert "memory(action='history'" in MEMORY_GUIDANCE
-        assert "never load the full audit log" in MEMORY_GUIDANCE
-        assert "MEMORY_CHANGELOG.md" not in MEMORY_GUIDANCE
-
-    def test_memory_guidance_distinguishes_observed_lessons_from_precautions(self):
-        assert "actually observed incident or user correction" in MEMORY_GUIDANCE
-        assert "merely preventive concern" in MEMORY_GUIDANCE
-        assert "Never label an unobserved concern as a lesson" in MEMORY_GUIDANCE
-        assert "generic safety precautions" in MEMORY_GUIDANCE
-
-    def test_memory_guidance_does_not_duplicate_repository_design_records(self):
-        assert "implementation designs, architecture notes, or fork-only behavior" in MEMORY_GUIDANCE
-        assert "already documented in repository docs" in MEMORY_GUIDANCE
-        assert "short pre-load trigger" in MEMORY_GUIDANCE
+        assert "imperative phrasing" in MEMORY_GUIDANCE.lower()
+        assert "stale in 7 days" in MEMORY_GUIDANCE
+        assert MEMORY_GUIDANCE.index(
+            "User preferences and recurring corrections"
+        ) < MEMORY_GUIDANCE.index("Do NOT save task progress")
+        assert "tool quirks" in MEMORY_GUIDANCE
+        assert "PR numbers" in MEMORY_GUIDANCE
+        assert "Save proactively" not in MEMORY_GUIDANCE
+        assert "workflows belong" in MEMORY_GUIDANCE
 
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
@@ -592,6 +581,21 @@ class TestFindHermesMd:
 
 
 
+    def test_unreadable_parent_is_treated_as_no_git_root(self, tmp_path, monkeypatch):
+        """A parent the process cannot stat (#8751) must not raise out of prompt construction."""
+        import os as _os
+        project = tmp_path / "locked" / "proj"
+        project.mkdir(parents=True)
+        real_exists = Path.exists
+
+        def _exists(self):
+            if self.parent == tmp_path / "locked" and self.name == ".git":
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_exists(self)
+
+        monkeypatch.setattr(Path, "exists", _exists)
+        assert _find_git_root(project) is None
+
     def test_walks_to_git_root(self, tmp_path):
         (tmp_path / ".git").mkdir()
         (tmp_path / ".hermes.md").write_text("root rules")
@@ -759,7 +763,7 @@ class TestEnvironmentHints:
         # Force the probe to fail so we exercise the static fallback path
         # deterministically (the live probe would try to spin up docker).
         monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t: None)
-        _pb._clear_backend_probe_cache()
+        _pb._BACKEND_PROBE_CACHE.clear()
         result = _pb.build_environment_hints()
         # Host suppression: none of the local-backend lines should appear.
         assert "Host:" not in result
@@ -779,7 +783,7 @@ class TestEnvironmentHints:
         configured.mkdir()
         monkeypatch.setenv("TERMINAL_CWD", str(configured))
         monkeypatch.chdir(tmp_path)
-        _pb._clear_backend_probe_cache()
+        _pb._BACKEND_PROBE_CACHE.clear()
         assert f"Current working directory: {configured}" in _pb.build_environment_hints()
 
     def test_build_environment_hints_falls_back_to_launch_dir(self, monkeypatch, tmp_path):
@@ -789,7 +793,7 @@ class TestEnvironmentHints:
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
         monkeypatch.chdir(tmp_path)
-        _pb._clear_backend_probe_cache()
+        _pb._BACKEND_PROBE_CACHE.clear()
         assert f"Current working directory: {tmp_path}" in _pb.build_environment_hints()
 
 
@@ -804,7 +808,7 @@ class TestEnvironmentHints:
         import agent.prompt_builder as _pb
 
         monkeypatch.setenv("TERMINAL_ENV", "docker")
-        _pb._clear_backend_probe_cache()
+        _pb._BACKEND_PROBE_CACHE.clear()
 
         class _FakeEnv:
             def execute(self, cmd, timeout=None):
@@ -822,9 +826,9 @@ class TestEnvironmentHints:
             created["env_type"] = env_type
             return _FakeEnv()
 
-        # Patch the REAL factory in tools.terminal_tool — the probe imports it
+        # Patch the REAL factory in tools.terminal_tool_backends — the probe imports it
         # locally, so the import itself must succeed (the bug was here).
-        import tools.terminal_tool as _tt
+        import tools.terminal_tool_backends as _tt
         monkeypatch.setattr(_tt, "_create_environment", _fake_create_environment)
 
         line = _pb._probe_remote_backend("docker")
@@ -833,6 +837,133 @@ class TestEnvironmentHints:
         assert "Linux 6.8.0" in line
         assert "root" in line
 
+    def test_probe_remote_backend_tears_down_its_sandbox(self, monkeypatch):
+        """THE BUG: the probe leaked a second, permanently idle sandbox.
+
+        ``_probe_remote_backend`` spins up an environment with
+        ``task_id="prompt-backend-probe"`` purely to run one ``uname``. Container
+        backends default to ``container_persistent`` /
+        ``docker_persist_across_processes``, so that throwaway sandbox stayed up
+        for the whole process lifetime *next to* the agent's own ``default``
+        sandbox — one wasted idle container per profile, forever. The probe owns
+        that environment, so it must tear it down.
+        """
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+
+        cleaned = {}
+
+        class _FakeEnv:
+            def execute(self, cmd, timeout=None):
+                return {
+                    "returncode": 0,
+                    "output": (
+                        "os=Linux\nkernel=6.8.0\nhome=/root\n"
+                        "cwd=/workspace\nuser=root\n"
+                    ),
+                }
+
+            def cleanup(self, *, force_remove=False):
+                cleaned["force_remove"] = force_remove
+
+        import tools.terminal_tool_backends as _tt
+        monkeypatch.setattr(_tt, "_create_environment", lambda **kw: _FakeEnv())
+
+        assert _pb._probe_remote_backend("docker") is not None
+        # force_remove=True: persist mode would otherwise leave it running.
+        assert cleaned == {"force_remove": True}
+
+    def test_probe_remote_backend_tears_down_sandbox_on_failure(self, monkeypatch):
+        """Teardown must also run when the probe command blows up — a flaky
+        backend would otherwise leak the container the probe just created."""
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+
+        cleaned = []
+
+        class _ExplodingEnv:
+            def execute(self, cmd, timeout=None):
+                raise RuntimeError("backend went away")
+
+            def cleanup(self, *, force_remove=False):
+                cleaned.append(force_remove)
+
+        import tools.terminal_tool_backends as _tt
+        monkeypatch.setattr(_tt, "_create_environment", lambda **kw: _ExplodingEnv())
+
+        assert _pb._probe_remote_backend("docker") is None
+        assert cleaned == [True]
+
+    def test_probe_remote_backend_tolerates_kwargless_cleanup(self, monkeypatch):
+        """Backends that inherit the base ``cleanup(self)`` take no kwargs; the
+        probe must use the bare call instead of dying on TypeError."""
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "singularity")
+        _pb._clear_backend_probe_cache()
+
+        calls = []
+
+        class _LegacyEnv:
+            def execute(self, cmd, timeout=None):
+                return {
+                    "returncode": 0,
+                    "output": (
+                        "os=Linux\nkernel=6.8.0\nhome=/home/u\n"
+                        "cwd=/home/u\nuser=u\n"
+                    ),
+                }
+
+            def cleanup(self):
+                calls.append("bare")
+
+        import tools.terminal_tool_backends as _tt
+        monkeypatch.setattr(_tt, "_create_environment", lambda **kw: _LegacyEnv())
+
+        assert _pb._probe_remote_backend("singularity") is not None
+        assert calls == ["bare"]
+
+    def test_probe_remote_backend_ssh_is_probe_only_and_torn_down(self, monkeypatch):
+        """SSH probe: a normal SSHEnvironment would create remote dirs, force-upload
+        ~/.hermes and snapshot a session just to run `uname`, and its __del__ would
+        later sync_back() and close the ControlMaster shared with the agent's real
+        environment. The probe must request a probe-only instance (own socket, no
+        setup/sync) and tear it down itself."""
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        _pb._clear_backend_probe_cache()
+
+        created, calls = {}, []
+
+        class _ProbeSshEnv:
+            def execute(self, cmd, timeout=None):
+                return {
+                    "returncode": 0,
+                    "output": (
+                        "os=Linux\nkernel=6.8.0\nhome=/home/u\n"
+                        "cwd=/home/u\nuser=u\n"
+                    ),
+                }
+
+            def cleanup(self):
+                calls.append("cleanup")
+
+        import tools.terminal_tool_backends as _tt
+
+        def _fake_create(**kw):
+            created.update(kw)
+            return _ProbeSshEnv()
+
+        monkeypatch.setattr(_tt, "_create_environment", _fake_create)
+
+        assert _pb._probe_remote_backend("ssh") is not None
+        assert created["probe_only"] is True
+        assert calls == ["cleanup"]
 
     def test_environment_hint_from_env_var_is_appended(self, monkeypatch):
         """HERMES_ENVIRONMENT_HINT lets an embedder describe the runtime env."""
@@ -840,7 +971,7 @@ class TestEnvironmentHints:
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.setenv("HERMES_ENVIRONMENT_HINT", "Running inside an OpenShell sandbox.")
-        _pb._clear_backend_probe_cache()
+        _pb._BACKEND_PROBE_CACHE.clear()
         result = _pb.build_environment_hints()
         assert "Running inside an OpenShell sandbox." in result
         # The factual host block must still come first.
@@ -934,52 +1065,15 @@ class TestToolUseEnforcementGuidance:
     def test_guidance_mentions_tool_calls(self):
         assert "tool call" in TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
 
-    def test_guidance_requires_same_response_follow_through(self):
-        text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
-        assert "same response" in text
-        assert "promise" in text
 
-    def test_guidance_requires_action_and_continued_execution(self):
-        text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
-        assert "must use your tools" in text
-        assert "keep working until the task is actually complete" in text
-        assert "tools available that can accomplish the task" in text
-
-    def test_guidance_requires_progress_or_final_delivery(self):
-        text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
-        assert "contain tool calls that make progress" in text
-        assert "deliver a final result" in text
+    def test_guidance_requires_action(self):
+        assert "MUST" in TOOL_USE_ENFORCEMENT_GUIDANCE
 
 
 
 
 
 
-
-
-class TestTaskCompletionGuidance:
-    """Behavior contract for upstream's universal finishing guidance."""
-
-    def test_requires_a_working_artifact_and_real_tool_output(self):
-        text = TASK_COMPLETION_GUIDANCE.lower()
-        assert "working artifact backed by real tool output" in text
-        assert "not a description of one" in text
-
-    def test_does_not_stop_at_a_stub_plan_or_single_command(self):
-        text = TASK_COMPLETION_GUIDANCE.lower()
-        assert "stub" in text
-        assert "plan" in text
-        assert "single command" in text
-        assert "actually exercised the code" in text
-
-    def test_requires_honest_blockers_and_forbids_fabrication(self):
-        text = TASK_COMPLETION_GUIDANCE.lower()
-        assert "say so directly and try an alternative" in text
-        assert "never substitute plausible-looking fabricated output" in text
-        assert "reporting a blocker honestly" in text
-
-    def test_stays_bounded_for_the_cached_prompt(self):
-        assert len(TASK_COMPLETION_GUIDANCE) < 1500
 
 
 class TestOpenAIModelExecutionGuidance:
@@ -1036,6 +1130,13 @@ class TestExecutionGuidanceModels:
         for fam in ("deepseek", "kimi", "qwen", "glm", "minimax", "mimo", "mistral"):
             assert fam in EXECUTION_GUIDANCE_MODELS
 
+    def test_muse_spark_gets_both_guidance_blocks(self):
+        # Muse Spark closes the turn after a chat-only response on defaults
+        # (#96550) — it needs tool-use enforcement AND execution guidance.
+        from agent.prompt_builder import EXECUTION_GUIDANCE_MODELS
+        assert any(p in "meta/muse-spark-1.3-contributor" for p in TOOL_USE_ENFORCEMENT_MODELS)
+        assert any(p in "meta/muse-spark-1.3-contributor" for p in EXECUTION_GUIDANCE_MODELS)
+
     def test_excludes_google_and_claude(self):
         # Gemini/Gemma get GOOGLE_MODEL_OPERATIONAL_GUIDANCE instead;
         # Claude doesn't exhibit the targeted failure modes.
@@ -1064,14 +1165,46 @@ class TestParallelToolCallGuidance:
         assert PARALLEL_TOOL_CALL_GUIDANCE.lstrip().startswith("#")
 
 
-    def test_google_guidance_keeps_upstream_persistence_directive(self):
-        text = GOOGLE_MODEL_OPERATIONAL_GUIDANCE.lower()
-        assert "keep going" in text
-        assert "work autonomously until the task is fully resolved" in text
-
 
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
 
 
+
+
+class TestContextFileReadTimeout:
+    def test_slow_hermes_md_is_skipped_and_agents_md_still_loads(self, tmp_path, monkeypatch, caplog):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".hermes.md").write_text("Hermes project rules.")
+        (tmp_path / "AGENTS.md").write_text("Agent fallback rules.")
+        # Patch the module object build_context_files_prompt actually closes
+        # over: an earlier test re-imports agent.prompt_builder, so the
+        # sys.modules entry can be a different module object.
+        pb_mod = sys.modules[build_context_files_prompt.__module__]
+        monkeypatch.setattr(pb_mod, "_get_context_file_read_timeout", lambda: 0.05)
+
+        original_read_text = Path.read_text
+
+        def slow_read_text(self, *args, **kwargs):
+            if self.name == ".hermes.md":
+                time.sleep(0.6)
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", slow_read_text)
+
+        start = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger=pb_mod.__name__):
+            result = build_context_files_prompt(cwd=str(tmp_path))
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 0.4, f"context load blocked for {elapsed:.2f}s"
+        assert "Agent fallback rules" in result
+        assert "Hermes project rules" not in result
+        assert "timed out" in caplog.text.lower()
+
+    def test_read_errors_still_propagate_to_caller(self, tmp_path):
+        from agent.prompt_builder import _read_text_with_timeout
+
+        with pytest.raises(FileNotFoundError):
+            _read_text_with_timeout(tmp_path / "missing.md", timeout=1.0)

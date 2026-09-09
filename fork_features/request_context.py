@@ -140,3 +140,17 @@ def apply_request_only_turn_context(
 def strip_legacy_api_content(api_msg: Dict[str, Any]) -> None:
     """Remove an old persisted sidecar without replacing clean history."""
     api_msg.pop("api_content", None)
+    api_msg.pop("_request_only_api_content", None)
+
+
+def consume_request_only_api_content(api_msg: Dict[str, Any]) -> None:
+    """Project an explicitly marked active-turn sidecar, dropping every legacy sidecar."""
+    sidecar = api_msg.pop("api_content", None)
+    request_only = api_msg.pop("_request_only_api_content", False) is True
+    if (
+        request_only
+        and isinstance(sidecar, str)
+        and bool(sidecar)
+        and api_msg.get("role") in ("user", "assistant")
+    ):
+        api_msg["content"] = sidecar

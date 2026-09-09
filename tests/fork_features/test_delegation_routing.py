@@ -104,3 +104,66 @@ def test_delegate_tool_host_does_not_define_fork_route_policy():
     }
 
     assert not (_HOST_POLICY_DEFINITIONS & top_level_names)
+
+
+def test_background_public_entry_dispatches_only_safe_effective_routes():
+    routing = importlib.import_module("fork_features.delegation_routing")
+    import tools.async_delegation as async_delegation
+    import tools.delegate_tool as delegate_module
+    import tools.delegate_tool_dispatch as dispatch_module
+    import tools.delegation_live_log as live_log
+
+    route = routing.ResolvedDelegationRoute(
+        credentials={
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "base_url": "https://api.example.invalid/v1",
+            "api_key": "must-not-leak",
+            "api_mode": "chat_completions",
+        },
+        reasoning_config={"enabled": True, "effort": "high"},
+    )
+    child = MagicMock()
+    child.provider = "deepseek"
+    child.model = "deepseek-v4-pro"
+    child.reasoning_config = {"enabled": True, "effort": "high"}
+    child.tool_progress_callback = None
+    child._delegate_saved_tool_names = []
+    child._credential_pool = None
+    captured = {}
+
+    def dispatch(**kwargs):
+        captured.update(kwargs)
+        return {"status": "dispatched", "delegation_id": "deleg-safe-route"}
+
+    parent = _parent_agent()
+    parent.session_id = "parent-session"
+    with (
+        patch.object(routing, "resolve_delegation_task_routes", return_value=[route]),
+        patch.object(delegate_module, "_build_child_preserving_parent_tools", return_value=child),
+        patch.object(delegate_module, "_load_config", return_value={"max_iterations": 45}),
+        patch.object(delegate_module, "_capture_origin", return_value=("wake-session", "ui-session", None, None)),
+        patch.object(live_log, "create_live_transcripts", return_value=(None, [], [])),
+        patch.object(dispatch_module, "_resolve_async_wake_sid", return_value="wake-session"),
+        patch.object(dispatch_module, "_resolve_async_session_key", return_value=("owner-session", "ui-session")),
+        patch.object(async_delegation, "dispatch_async_delegation_batch", side_effect=dispatch),
+    ):
+        result = json.loads(
+            delegate_module.delegate_task(
+                tasks=[{"goal": "Inspect the selected route"}],
+                background=True,
+                parent_agent=parent,
+            )
+        )
+
+    assert result["status"] == "dispatched"
+    assert captured["routes"] == [
+        {
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "reasoning_effort": "high",
+        }
+    ]
+    serialized = json.dumps(captured["routes"], ensure_ascii=False)
+    assert "api_key" not in serialized
+    assert "base_url" not in serialized

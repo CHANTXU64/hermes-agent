@@ -1018,25 +1018,14 @@ def test_direct_script_is_smart_reviewed_even_when_shell_text_is_not_flagged(
 
 
 def test_model_dispatch_binds_and_resets_request_approval_context():
-    import model_tools
+    from agent.tool_executor import _fork_smart_approval_scope
 
-    context = {
-        "latest_user_message": "删除 /tmp/cache-a",
-        "clarifications": [],
-    }
+    context_messages = [
+        {"role": "user", "content": "删除 /tmp/cache-a"},
+    ]
 
-    def fake_dispatch(*_args, **_kwargs):
-        return json.dumps(get_smart_approval_context(), ensure_ascii=False)
+    with _fork_smart_approval_scope(context_messages):
+        bound = get_smart_approval_context()
 
-    with patch.object(model_tools.registry, "dispatch", side_effect=fake_dispatch):
-        result = model_tools.handle_function_call(
-            "terminal",
-            {"command": "echo ok"},
-            approval_context=context,
-            skip_pre_tool_call_hook=True,
-            skip_tool_request_middleware=True,
-            skip_tool_execution_middleware=True,
-        )
-
-    assert json.loads(result) == context
+    assert bound["latest_user_message"] == "删除 /tmp/cache-a"
     assert get_smart_approval_context() == {}

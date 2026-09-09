@@ -67,6 +67,21 @@ class TestClarifyToolChoicesValidation:
         clarify_tool("Pick", choices=[1, 2, 3], callback=mock_callback)  # type: ignore
         assert choices_received == ["1", "2", "3"]
 
+    def test_recommendation_is_separate_callback_metadata(self):
+        seen = {}
+
+        def callback(question, choices, recommended_index=None):
+            seen["choices"] = choices
+            seen["recommended_index"] = recommended_index
+            return choices[recommended_index]
+
+        result = json.loads(clarify_tool(
+            "Pick", choices=["Best", "Other"], callback=callback,
+        ))
+
+        assert seen == {"choices": ["Best", "Other"], "recommended_index": 0}
+        assert result["user_response"] == "Best"
+
 
 class TestClarifyToolCallbackHandling:
     """Tests for callback error handling."""
@@ -436,8 +451,8 @@ class TestClarifyBatchValidation:
         assert result["user_response"] == "yes"
         assert "responses" not in result
 
-    def test_batch_choices_flattened_capped_and_labelled_per_question(self):
-        """Each question gets the full choice pipeline: flatten, cap, label."""
+    def test_batch_choices_flattened_capped_with_separate_recommendation_metadata(self):
+        """Choice values stay canonical while first-choice recommendation stays display metadata."""
         seen = {}
 
         def cb(question, choices, multi_select=False, questions=None):
@@ -456,8 +471,9 @@ class TestClarifyBatchValidation:
         )
         q0, q1 = seen["questions"]
         assert len(q0["choices"]) == MAX_CHOICES
-        assert q0["choices"][0] == "a (Recommended)"
-        assert q1["choices"] == ["Loose layout (Recommended)", "Tight"]
+        assert q0["choices"][0] == "a"
+        assert q1["choices"] == ["Loose layout", "Tight"]
+        assert q0["recommended_index"] == q1["recommended_index"] == 0
 
     def test_batch_internal_ids_are_stable_and_model_id_echoed(self):
         """Wire ids are q0..qN. A model-supplied id only shows in results."""
@@ -592,7 +608,7 @@ class TestClarifyBatchDispatch:
             callback=legacy_cb,
         ))
         assert [c[0] for c in calls] == ["One?", "Two?"]
-        assert calls[0][1] == ("a (Recommended)", "b")
+        assert calls[0][1] == ("a", "b")
         assert calls[1][1] is None
         assert [r["user_response"] for r in result["responses"]] == [
             "answer to One?", "answer to Two?",

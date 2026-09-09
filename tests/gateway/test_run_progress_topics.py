@@ -11,7 +11,8 @@ import pytest
 
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 
 
@@ -215,7 +216,7 @@ class FakeAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         cb = self.tool_progress_callback
         if cb is not None:
             cb("tool.started", "terminal", "pwd", {})
@@ -290,7 +291,7 @@ class DuplicateNativeToolsAgent:
         self.tool_complete_callback = kwargs.get("tool_complete_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         self.tool_start_callback("call-a", "web_search", {"query": "alpha"})
         time.sleep(0.15)
         self.tool_start_callback("call-b", "web_search", {"query": "beta"})
@@ -319,7 +320,7 @@ class ThinkingAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         cb = self.tool_progress_callback
         if cb is not None:
             cb("_thinking", "weighing the options here")
@@ -339,7 +340,7 @@ class LongPreviewAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         self.tool_progress_callback("tool.started", "terminal", self.LONG_CMD, {})
         time.sleep(0.35)
         return {
@@ -356,7 +357,7 @@ class UrlPreviewAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         self.tool_progress_callback(
             "tool.started",
             "web_extract",
@@ -376,7 +377,7 @@ class DelayedProgressAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         self.tool_progress_callback("tool.started", "terminal", "first command", {})
         time.sleep(0.45)
         self.tool_progress_callback("tool.started", "terminal", "second command", {})
@@ -395,7 +396,7 @@ class RetryableEditProgressAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         callback = self.tool_progress_callback
         assert callback is not None
         callback("tool.started", "terminal", "first command", {})
@@ -420,7 +421,7 @@ class ManyProgressLinesAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         cb = self.tool_progress_callback
         assert cb is not None
         cb("tool.started", "terminal", "first-short", {})
@@ -443,7 +444,7 @@ class DelayedInterimAgent:
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         self.interim_assistant_callback("first interim")
         time.sleep(0.45)
         self.interim_assistant_callback("second interim")
@@ -659,10 +660,9 @@ async def test_progress_no_anchor_for_native_discord_thread_event(monkeypatch, t
 def _extract_progress_preview(content: str) -> str | None:
     """Extract the argument-preview portion from a tool-progress message.
 
-    Handles all supported render styles:
+    Handles both render styles:
     - Legacy / custom tools:  ``🔧 tool_name: "<preview>"`` (quoted)
     - Friendly built-in verb: ``💻 Running <preview>`` (verb prefix, no quotes)
-    - Telegram literal form: ``💻 terminal: <preview>``
     """
     import re
 
@@ -672,10 +672,6 @@ def _extract_progress_preview(content: str) -> str | None:
         return match.group(1)
     # Friendly form: "<emoji> <verb> <preview>". The terminal verb is "Running".
     marker = " Running "
-    idx = content.find(marker)
-    if idx != -1:
-        return content[idx + len(marker):].strip()
-    marker = " terminal: "
     idx = content.find(marker)
     if idx != -1:
         return content[idx + len(marker):].strip()
@@ -807,7 +803,7 @@ class CommentaryAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.interim_assistant_callback:
             self.interim_assistant_callback("I'll inspect the repo first.", already_streamed=False)
         time.sleep(0.1)
@@ -825,7 +821,7 @@ class PreviewedResponseAgent:
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.interim_assistant_callback:
             self.interim_assistant_callback("You're welcome.", already_streamed=False)
         return {
@@ -842,7 +838,7 @@ class PreviewedSplitAfterCommentaryAgent:
         self.session_id = kwargs.get("session_id")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.interim_assistant_callback:
             self.interim_assistant_callback("I'll inspect the repo first.", already_streamed=False)
         self.session_id = f"{self.session_id}-child"
@@ -859,7 +855,7 @@ class StreamingRefineAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.stream_delta_callback:
             self.stream_delta_callback("Continuing to refine:")
         time.sleep(0.1)
@@ -880,7 +876,7 @@ class QueuedCommentaryAgent:
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None, **_kwargs):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         type(self).calls += 1
         if type(self).calls == 1 and self.interim_assistant_callback:
             self.interim_assistant_callback("I'll inspect the repo first.", already_streamed=False)
@@ -901,7 +897,7 @@ class QueuedMediaAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None, **_kwargs):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         type(self).calls += 1
         if type(self).calls == 1:
             final_response = f"first response\nMEDIA:{type(self).media_path}"
@@ -926,7 +922,7 @@ class QueuedSilenceAgent:
     def __init__(self, **kwargs):
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None, **_kwargs):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         type(self).calls += 1
         return {
             "final_response": "NO_REPLY" if type(self).calls == 1 else "follow-up processed",
@@ -943,7 +939,7 @@ class QueuedFailedEmptyAgent:
     def __init__(self, **kwargs):
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None, **_kwargs):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         type(self).calls += 1
         if type(self).calls == 1:
             return {
@@ -965,7 +961,7 @@ class BackgroundReviewAgent:
         self.background_review_callback = kwargs.get("background_review_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.background_review_callback:
             self.background_review_callback("💾 Skill 'prospect-scanner' created.")
         return {
@@ -983,7 +979,7 @@ class VerboseAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         self.tool_progress_callback(
             "tool.started", "execute_code", None,
             {"code": self.LONG_CODE},
@@ -1199,7 +1195,7 @@ class TransformedStreamAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         if self.stream_delta_callback:
             self.stream_delta_callback("original answer")
         return {
@@ -1691,7 +1687,7 @@ class TerminalCommandAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         self.tool_progress_callback(
             "tool.started", "terminal", self.CMD, {"command": self.CMD}
         )
@@ -1700,6 +1696,59 @@ class TerminalCommandAgent:
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
+@pytest.mark.asyncio
+async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path):
+    """Terminal progress on a markdown-capable (supports_code_blocks) gateway
+    renders a bare fenced code block — no language tag (Slack mrkdwn would print
+    'bash' as a literal first code line).  In non-verbose ("all"/"new") mode the
+    command is collapsed to a single line capped at tool_preview_length so a long
+    or multi-line command doesn't render as a huge block (#42634)."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TerminalCommandAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji
+
+    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-terminal-code-block",
+        session_key="agent:main:telegram:dm:12345",
+    )
+
+    assert result["final_response"] == "done"
+    all_content = " ".join(call["content"] for call in adapter.sent)
+    all_content += " ".join(call["content"] for call in adapter.edits)
+    # Bare fenced block, no language tag (no '```bash').
+    assert "```" in all_content
+    assert "```bash" not in all_content
+    # Non-verbose collapses to the first line + truncation marker — the later
+    # command lines must NOT appear (this was the "huge block" regression).
+    assert "set -euo pipefail" in all_content
+    assert "npm install -g hyperframes@latest" not in all_content
+    assert "node --version" not in all_content
+    # No truncated quoted preview for the terminal command.
+    assert 'terminal: "' not in all_content
 
 
 @pytest.mark.asyncio
@@ -1718,14 +1767,14 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
-    adapter = CodeBlockProgressAdapter(platform=Platform.DISCORD)
+    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     source = SessionSource(
-        platform=Platform.DISCORD,
+        platform=Platform.TELEGRAM,
         chat_id="12345",
         chat_type="dm",
         thread_id=None,
@@ -1736,8 +1785,8 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
         context_prompt="",
         history=[],
         source=source,
-        session_id="sess-terminal-code-block-verbose-discord",
-        session_key="agent:main:discord:dm:12345",
+        session_id="sess-terminal-code-block-verbose",
+        session_key="agent:main:telegram:dm:12345",
     )
 
     assert result["final_response"] == "done"
@@ -1750,6 +1799,48 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
     assert "node --version" in all_content
 
 
+@pytest.mark.asyncio
+async def test_terminal_progress_no_bash_block_in_verbose_mode(monkeypatch, tmp_path):
+    """#41215 also rendered the bash block in verbose mode. The revert removed it
+    from both branches, so verbose progress must not emit a fenced ```bash block
+    either (verbose still shows args by opt-in, just not as a code block)."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "verbose")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TerminalCommandAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji
+
+    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-terminal-verbose-no-bash",
+        session_key="agent:main:telegram:dm:12345",
+    )
+
+    assert result["final_response"] == "done"
+    all_content = " ".join(call["content"] for call in adapter.sent)
+    all_content += " ".join(call["content"] for call in adapter.edits)
+    assert "```bash" not in all_content
 
 class MultiTerminalCommandAgent:
     """Emits several consecutive terminal tool.started events, then a
@@ -1759,7 +1850,7 @@ class MultiTerminalCommandAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         cb = self.tool_progress_callback
         cb("tool.started", "terminal", "echo one", {"command": "echo one"})
         cb("tool.started", "terminal", "echo two", {"command": "echo two"})
@@ -1786,14 +1877,14 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
-    adapter = CodeBlockProgressAdapter(platform=Platform.DISCORD)
+    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     source = SessionSource(
-        platform=Platform.DISCORD,
+        platform=Platform.TELEGRAM,
         chat_id="12345",
         chat_type="dm",
         thread_id=None,
@@ -1804,8 +1895,8 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
         context_prompt="",
         history=[],
         source=source,
-        session_id="sess-terminal-consecutive-discord",
-        session_key="agent:main:discord:dm:12345",
+        session_id="sess-terminal-consecutive",
+        session_key="agent:main:telegram:dm:12345",
     )
 
     assert result["final_response"] == "done"
@@ -1846,314 +1937,3 @@ class TestSlackReplyInThreadProgressRouting:
             event_message_id="evt-trigger-001",
             reply_in_thread=True,
         ) == "evt-trigger-001"
-
-
-class MarkdownPreviewAgent:
-    """Emits a tool preview containing Telegram Markdown control characters."""
-
-    PREVIEW = "```|code block|code_block ||hidden||"
-
-    def __init__(self, **kwargs):
-        self.tool_progress_callback = kwargs.get("tool_progress_callback")
-        self.tools = []
-
-    def run_conversation(self, message, conversation_history=None, task_id=None):
-        self.tool_progress_callback(
-            "tool.started", "search_files", self.PREVIEW, {"pattern": self.PREVIEW}
-        )
-        time.sleep(0.35)
-        return {"final_response": "done", "messages": [], "api_calls": 1}
-
-
-@pytest.mark.asyncio
-async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
-
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = FakeAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-    import tools.terminal_tool  # noqa: F401 - register terminal emoji for this fake-agent test
-
-    adapter = ProgressCaptureAdapter()
-    runner = _make_runner(adapter)
-    gateway_run = importlib.import_module("gateway.run")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="-1001",
-        chat_type="group",
-        thread_id="17585",
-    )
-
-    result = await runner._run_agent(
-        message="hello",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="sess-1",
-        session_key="agent:main:telegram:group:-1001:17585",
-    )
-
-    assert result["final_response"] == "done"
-    assert adapter.sent == [
-        {
-            "chat_id": "-1001",
-            "content": '💻 terminal: pwd',
-            "reply_to": None,
-            "metadata": {"thread_id": "17585", "plain_text": True},
-        }
-    ]
-    assert adapter.edits
-    assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.typing)
-
-
-@pytest.mark.asyncio
-async def test_run_agent_progress_edits_keep_originating_topic_metadata(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
-
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = FakeAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-
-    adapter = MetadataEditProgressCaptureAdapter()
-    runner = _make_runner(adapter)
-    gateway_run = importlib.import_module("gateway.run")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="-1001",
-        chat_type="group",
-        thread_id="17585",
-    )
-
-    result = await runner._run_agent(
-        message="hello",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="sess-progress-edit-topic",
-        session_key="agent:main:telegram:group:-1001:17585",
-    )
-
-    assert result["final_response"] == "done"
-    assert adapter.edits
-    assert all(
-        call["metadata"] == {"thread_id": "17585", "plain_text": True}
-        for call in adapter.edits
-    )
-
-
-@pytest.mark.asyncio
-async def test_run_agent_progress_does_not_use_event_message_id_for_telegram_dm(monkeypatch, tmp_path):
-    """Telegram DM progress must not reuse event message id as thread metadata."""
-    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
-
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = FakeAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-
-    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
-    gateway_run = importlib.import_module("gateway.run")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
-
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        thread_id=None,
-    )
-
-    result = await runner._run_agent(
-        message="hello",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="sess-2",
-        session_key="agent:main:telegram:dm:12345",
-        event_message_id="777",
-    )
-
-    assert result["final_response"] == "done"
-    assert adapter.sent
-    assert adapter.sent[0]["metadata"] == {"plain_text": True}
-    assert all(call["metadata"] is None for call in adapter.typing)
-
-
-@pytest.mark.asyncio
-async def test_telegram_tool_progress_marks_dynamic_previews_plain_text(monkeypatch, tmp_path):
-    """Telegram progress sends tool arguments as literal text, not Markdown."""
-    adapter, result = await _run_with_agent(
-        monkeypatch,
-        tmp_path,
-        MarkdownPreviewAgent,
-        session_id="sess-progress-plain-text",
-        config_data={"display": {"tool_progress": "all"}},
-    )
-
-    assert result["final_response"] == "done"
-    assert adapter.sent
-    assert adapter.sent[0]["metadata"] == {
-        "thread_id": "17585",
-        "plain_text": True,
-    }
-
-
-@pytest.mark.asyncio
-async def test_terminal_progress_renders_fenced_code_block_off_telegram(monkeypatch, tmp_path):
-    """Terminal progress on a non-Telegram markdown gateway renders a bare
-    fenced code block — no language tag (Slack mrkdwn would print 'bash' as a
-    literal first code line). In non-verbose ("all"/"new") mode the command is
-    collapsed to a single line capped at tool_preview_length so a long or
-    multi-line command doesn't render as a huge block (#42634)."""
-    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
-
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = TerminalCommandAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-    import tools.terminal_tool  # noqa: F401 - register terminal emoji
-
-    adapter = CodeBlockProgressAdapter(platform=Platform.DISCORD)
-    runner = _make_runner(adapter)
-    gateway_run = importlib.import_module("gateway.run")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
-
-    source = SessionSource(
-        platform=Platform.DISCORD,
-        chat_id="12345",
-        chat_type="dm",
-        thread_id=None,
-    )
-
-    result = await runner._run_agent(
-        message="hello",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="sess-terminal-code-block-discord",
-        session_key="agent:main:discord:dm:12345",
-    )
-
-    assert result["final_response"] == "done"
-    all_content = " ".join(call["content"] for call in adapter.sent)
-    all_content += " ".join(call["content"] for call in adapter.edits)
-    # Bare fenced block, no language tag (no '```bash').
-    assert "```" in all_content
-    assert "```bash" not in all_content
-    # Non-verbose collapses to the first line + truncation marker — the later
-    # command lines must NOT appear (this was the "huge block" regression).
-    assert "set -euo pipefail" in all_content
-    assert "npm install -g hyperframes@latest" not in all_content
-    assert "node --version" not in all_content
-    # No truncated quoted preview for the terminal command.
-    assert 'terminal: "' not in all_content
-
-
-@pytest.mark.asyncio
-async def test_telegram_terminal_progress_uses_single_plain_text_line(monkeypatch, tmp_path):
-    """Telegram terminal progress stays in the same compact text form as other tools."""
-    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
-
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = TerminalCommandAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-    import tools.terminal_tool  # noqa: F401 - register terminal emoji
-
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
-    gateway_run = importlib.import_module("gateway.run")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
-
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        thread_id=None,
-    )
-
-    result = await runner._run_agent(
-        message="hello",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="sess-terminal-plain-text-telegram",
-        session_key="agent:main:telegram:dm:12345",
-    )
-
-    assert result["final_response"] == "done"
-    progress = next(
-        call["content"]
-        for call in [*adapter.sent, *adapter.edits]
-        if "set -euo pipefail" in call["content"]
-    )
-    assert progress.startswith("💻 terminal: set -euo pipefail")
-    assert "```" not in progress
-    assert "\n" not in progress
-    assert "npm install -g hyperframes@latest" not in progress
-
-
-@pytest.mark.asyncio
-async def test_telegram_terminal_progress_verbose_uses_no_code_block(monkeypatch, tmp_path):
-    """Telegram keeps terminal progress out of a Markdown code block in verbose mode."""
-    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "verbose")
-
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = TerminalCommandAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-    import tools.terminal_tool  # noqa: F401 - register terminal emoji
-
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
-    gateway_run = importlib.import_module("gateway.run")
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
-
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="12345",
-        chat_type="dm",
-        thread_id=None,
-    )
-
-    result = await runner._run_agent(
-        message="hello",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="sess-terminal-verbose-no-bash",
-        session_key="agent:main:telegram:dm:12345",
-    )
-
-    assert result["final_response"] == "done"
-    all_content = " ".join(call["content"] for call in adapter.sent)
-    all_content += " ".join(call["content"] for call in adapter.edits)
-    assert "```" not in all_content

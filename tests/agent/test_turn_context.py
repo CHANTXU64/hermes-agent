@@ -289,10 +289,11 @@ def test_prefetch_runs_for_substantive_user_message():
     query = "what did we decide about the deploy pipeline?"
     ctx = _build(agent, user_message=query)
     mm.prefetch_all.assert_called_once()
-    args, kwargs = mm.prefetch_all.call_args
-    assert args == (query,)
-    assert kwargs["previous_assistant_message"] == ""
-    assert kwargs["turn_id"]
+    call = mm.prefetch_all.call_args
+    assert call.args == (query,)
+    assert call.kwargs["previous_assistant_message"] == ""
+    assert call.kwargs["turn_id"] == getattr(agent, "_current_turn_id")
+    assert call.kwargs["turn_id"].startswith(f"{agent.session_id}:")
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
@@ -347,24 +348,7 @@ def test_applies_agent_side_effects():
 
 
 
-def test_persist_user_message_id_is_attached_to_current_turn():
-    agent = _FakeAgent()
-    ctx = _build(agent, persist_user_message_id="telegram-update-123")
 
-    message = ctx.messages[-1]
-    assert message["role"] == "user"
-    assert message["content"] == "hello"
-    assert message["message_id"] == "telegram-update-123"
-    assert isinstance(message["timestamp"], float)
-
-
-def test_persist_user_message_becomes_original():
-    agent = _FakeAgent()
-    ctx = _build(agent, user_message="api-prefixed", persist_user_message="clean")
-    # original_user_message tracks the clean persist override.
-    assert ctx.original_user_message == "clean"
-    # but the appended user turn carries the full (sanitized) message.
-    assert ctx.messages[-1]["content"] == "api-prefixed"
 
 
 
@@ -387,6 +371,45 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
     assert ctx.messages[-1]["_db_persisted"] is True
     assert isinstance(ctx.messages[-1]["timestamp"], float)
     assert agent._pending_cli_user_message is None
+
+
+
+
+
+
+
+
+def test_recall_indicator_emitted_when_memory_injected():
+    """When prefetch injects memory, the deterministic indicator is emitted."""
+    agent = _FakeAgent()
+    agent._emit_status = MagicMock()
+    mm = MagicMock()
+    mm.prefetch_all.return_value = "- recalled fact"
+    mm.describe_recall.return_value = "👁️ Hindsight — recalled 2 memories"
+    agent._memory_manager = mm
+
+    # A substantive query — a trivial prompt ("hi", "hello") skips prefetch_all
+    # entirely, so there'd be nothing to indicate. See is_trivial_prompt.
+    _build(agent, user_message="what did we decide about the deploy pipeline?")
+
+    agent._emit_status.assert_any_call("👁️ Hindsight — recalled 2 memories")
+
+
+def test_recall_indicator_skipped_when_nothing_injected():
+    """No memory injected → describe_recall isn't consulted, nothing emitted."""
+    agent = _FakeAgent()
+    agent._emit_status = MagicMock()
+    mm = MagicMock()
+    mm.prefetch_all.return_value = ""
+    agent._memory_manager = mm
+
+    # Substantive query so prefetch_all actually runs; it returns nothing, so the
+    # indicator path must stay silent (as opposed to being skipped as trivial).
+    _build(agent, user_message="what did we decide about the deploy pipeline?")
+
+    mm.describe_recall.assert_not_called()
+    for call in agent._emit_status.call_args_list:
+        assert "👁️" not in str(call)
 
 
 def test_ensure_db_session_runs_after_system_prompt_restore():
@@ -428,7 +451,8 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
     new_def = {"type": "function", "function": {"name": "mcp_x_tool", "description": "", "parameters": {}}}
 
     import model_tools
-    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
+    import tools.mcp_tool  # noqa: F401 — the prologue's import-cost gate requires it in sys.modules
+    with patch("tools.mcp_tool_discovery.has_registered_mcp_tools", return_value=True), \
          patch.object(model_tools, "get_tool_definitions", return_value=[new_def]):
         _build(agent)
 

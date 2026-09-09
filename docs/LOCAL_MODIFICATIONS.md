@@ -1004,24 +1004,32 @@ Primary files:
 
 - `fork_features/request_context.py` (Fork placement and sidecar policy)
 - `fork_features/prompt_cache_routing.py` (Fork scope/header policy)
-- `agent/turn_context.py` (collection only; no Fork placement policy)
-- `agent/conversation_loop.py` (request-copy application seam)
+- `agent/turn_context.py` (`build_turn_context` collection and
+  `build_api_messages` request-copy application seam)
+- `agent/conversation_loop.py` (active-redirect request marker, turn-state
+  propagation, and early-return cleanup)
+- `agent/turn_iteration_prep.py` (current-user index re-anchoring after repair)
+- `agent/turn_request_assembly.py` (MoA reference/aggregator request view)
 - `agent/codex_responses_adapter.py`
 - `agent/chat_completion_helpers.py` (summary/cache seam)
 - `agent/model_metadata.py`
+- `agent/session_persistence.py`
 - `agent/turn_finalizer.py`
 - `agent/transports/codex.py` (one routing-policy call)
 - `run_agent.py`
 - `gateway/run.py`
-- `gateway/session.py`
+- `gateway/session_transcript.py`
 - `gateway/slash_commands.py`
 - `hermes_cli/cli_commands_mixin.py`
-- `hermes_state.py` (schema compatibility only)
+- `hermes_state.py` / `hermes_state_messages.py` (schema compatibility and
+  rewrite-time sidecar exclusion)
 - `tests/agent/test_api_content_sidecar.py`
 - `tests/agent/test_model_metadata.py`
 - `tests/agent/test_gateway_turn_sidecar.py`
 - `tests/agent/transports/test_codex_transport.py`
 - `tests/gateway/test_replay_entry_fields.py`
+- `tests/run_agent/test_steer.py`
+- `tests/agent/test_turn_finalizer_iteration_limit_exit.py`
 - `tests/run_agent/test_run_agent_codex_responses.py`
 - `tests/run_agent/test_codex_app_server_integration.py`
 - `tests/agent/test_codex_request_only_memory_context.py`
@@ -1363,6 +1371,10 @@ Files:
 
 - `fork_features/clarify_decision_card.py`
 - `tools/clarify_tool.py`
+- `gateway/run_turn_runner.py`
+- `hermes_cli/cli_modal_mixin.py`
+- `tui_gateway/agent_callbacks.py`
+- `tui_gateway/server.py`
 - `tests/fork_features/test_clarify_decision_card.py`
 - `tests/tools/test_clarify_tool.py`
 - `docs/LOCAL_MODIFICATIONS.md`
@@ -1376,23 +1388,22 @@ What changed:
 
 - `fork_features/clarify_decision_card.py` owns the self-contained,
   decision-first, scope/impact/recommendation, and standalone-choice guidance.
-- `tools/clarify_tool.py` keeps the current single-question base Schema and one
-  pure `apply_decision_card_policy` call. Its callback, result shape,
-  `question`/`choices`/`multi_select` parameters, and registry path are unchanged.
+- `tools/clarify_tool.py` keeps the official batch Schema and one pure
+  `apply_decision_card_policy` call. Canonical choices remain unchanged strings;
+  the first-choice recommendation is separate callback metadata.
 - Direct policy transformation tests live with `fork_features`; the Host test
   file retains rendered Schema, callback and registry integration coverage.
   Moving the policy tests does not replace Host integration with policy-only tests.
-- Applying the policy returns a deep copy and preserves the complete pre-refactor
-  rendered Schema byte-for-byte. The policy also extends upstream's newer
-  `questions[]` shape additively without changing that API, reducing future
-  merge work; this commit does not adopt the batch API.
+- Applying the policy returns a deep copy and extends the official
+  `questions[]` shape additively without changing that API.
 - Action and approval questions must briefly state the current situation,
   proposed action and scope, material impact or trade-off, and a recommendation
   when one exists.
 - References such as `above`, `earlier`, or `the recommended scope` cannot stand
   in for the omitted context.
-- Selectable answers remain separate `choices`; the tool parameters, callback,
-  Gateway flow, and platform adapters are unchanged.
+- Selectable answers remain separate `choices`. Gateway, CLI and TUI callbacks
+  receive the recommendation index separately and add the display label only at
+  their rendering boundary, so callback values and returned answers stay clean.
 
 Why it matters:
 
@@ -1502,7 +1513,7 @@ Date: 2026-07-28; boundary refactored 2026-08-30
 Files:
 
 - `fork_features/clarify_attachment_reply.py`
-- `gateway/run.py`
+- `gateway/run_inbound.py`
 - `tools/clarify_gateway.py`
 - `tools/clarify_tool.py`
 - `tests/fork/test_clarify_attachment_reply.py`
@@ -1550,7 +1561,7 @@ Merge protection:
 
 - Keep empty-audio retention, slash bypass, attachment-aware resolution, and
   response-context wrapping in `fork_features/clarify_attachment_reply.py`;
-  do not move those Fork decisions back into `gateway/run.py` or concatenate
+  do not move those Fork decisions back into `gateway/run_inbound.py` or concatenate
   media context before `tools/clarify_gateway.py` normalizes the response.
 - Preserve until upstream's pending-Clarify interception carries agent-visible
   attachment paths in a field separate from canonical choice/text responses.
@@ -1564,7 +1575,7 @@ Verification:
 
 ```bash
 .venv/bin/python -m pytest tests/fork/test_clarify_attachment_reply.py tests/gateway/test_clarify_active_session_bypass.py tests/tools/test_clarify_gateway.py tests/tools/test_clarify_tool.py -q -o 'addopts='
-.venv/bin/python -m py_compile fork_features/clarify_attachment_reply.py gateway/run.py tools/clarify_gateway.py tests/fork/test_clarify_attachment_reply.py tests/gateway/test_clarify_active_session_bypass.py tests/tools/test_clarify_gateway.py
+.venv/bin/python -m py_compile fork_features/clarify_attachment_reply.py gateway/run_inbound.py tools/clarify_gateway.py tests/fork/test_clarify_attachment_reply.py tests/gateway/test_clarify_active_session_bypass.py tests/tools/test_clarify_gateway.py
 git diff --check
 ```
 
@@ -2105,12 +2116,18 @@ Files:
 
 - `fork_features/delegation_routing.py`
 - `tools/delegate_tool.py`
+- `tools/delegate_tool_config.py`
+- `tools/delegate_tool_dispatch.py`
+- `tools/delegate_tool_child_run.py`
 - `tools/async_delegation.py`
 - `run_agent.py`
 - `tests/fork_features/test_delegation_routing.py`
 - `tests/tools/test_delegate.py`
 - `tests/tools/test_delegate_control_actions.py`
 - `tests/tools/test_async_delegation.py`
+- `tests/tools/test_delegate_request_overrides.py`
+- `tests/tools/test_delegate_output_schema.py`
+- `tests/tools/test_delegate_task_native_args.py`
 - `website/docs/user-guide/features/delegation.md`
 - `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features/delegation.md`
 - `docs/chantxu64/delegate-per-call-routing/README.md`
@@ -2122,7 +2139,10 @@ Summary:
 
 What changed:
 
-- Top-level and per-task `provider`, `model`, and `reasoning_effort` fields are exposed and forwarded through both model dispatch paths.
+- Top-level and per-task `provider`, `model`, and `reasoning_effort` fields are
+  exposed by the public dispatcher, normalized by `delegate_tool_config`,
+  resolved before child construction, and forwarded through synchronous and
+  background child-run paths.
 - Fork-specific route policy now lives in `fork_features/delegation_routing.py`: model/provider inference and catalog validation, bounded current-route suggestions, exact reasoning capability checks, target-route fallback, top-level/per-task precedence, repeated-route caching, full-batch prevalidation, safe route errors, and public child route metadata. `tools/delegate_tool.py` keeps model-facing input normalization, the single Fork resolver call, host-owned generic delegation config and credential/runtime resolution, child construction, execution, and aggregation. The Fork module receives `_resolve_delegation_credentials` through a callback; it does not import the host or duplicate provider credentials. `tools/async_delegation.py` continues owning async task persistence, recovery, and completion delivery.
 - Model-only calls infer a provider only when the authenticated curated inventory has one unique match; explicit provider/model calls resolve the target-model runtime route and reject known catalog mismatches before spawning.
 - Routed children resolve reasoning configuration against the target model. An explicit effort is used only when the production request builder preserves it exactly; otherwise Hermes keeps the selected provider/model and applies that target model's normal override/global/provider reasoning configuration without claiming that the requested value took effect.
@@ -2200,6 +2220,8 @@ Files:
 - `agent/tool_executor.py`
 - `model_tools.py`
 - `tools/approval.py`
+- `tools/approval_context.py`
+- `tools/approval_smart.py`
 - `tools/tirith_security.py`
 - `tools/terminal_tool.py`
 - `tools/code_execution_tool.py`
@@ -2297,9 +2319,12 @@ What changed:
 - `agent/tool_executor.py` now keeps only a thin adapter that injects the
   conversation subsystem's canonical real-user classifiers into the Fork context
   builder. `model_tools.py` binds that Fork request context directly.
-  `tools/approval.py` imports only the public Policy facade and keeps deterministic
+- `tools/approval.py` imports only the public Policy facade and keeps deterministic
   floors, YOLO/mode/allowlists, Tirith warning keys, the shared lock, verdict
   execution, human approval transport, persistence, observability, and fail-closed.
+- Official split runtime state is read from `tools/approval_context.py`, while
+  `tools/approval_smart.py` owns the structured model-call adapter; tests patch
+  these live seams rather than retired exports.
 - On the first Smart denial, the agent is told it may submit the same or a
   textually similar operation again only when it remains necessary. Candidates
   are scoped to the same session, verified user turn, and tool kind. Exact
@@ -2443,6 +2468,13 @@ Files:
 - `fork_features/request_fork/__init__.py`
 - `agent/conversation_loop.py`
 - `agent/conversation_compression.py`
+- `agent/turn_api_call.py`
+- `agent/turn_api_error.py`
+- `agent/turn_context_compaction.py`
+- `agent/turn_overflow.py`
+- `agent/turn_preflight.py`
+- `agent/turn_request_assembly.py`
+- `agent/turn_finalizer.py`
 - `agent/context_compressor.py`
 - `agent/agent_runtime_helpers.py`
 - `agent/turn_context.py`
@@ -2460,12 +2492,16 @@ Files:
 - `tests/agent/test_compression_adoption_preserves_live_tail.py`
 - `tests/agent/test_compression_concurrent_fork.py`
 - `tests/agent/test_reference_handoff_active_turn.py`
+- `tests/agent/test_turn_context.py`
 - `tests/agent/test_turn_retry_state.py`
 - `tests/run_agent/test_message_sequence_repair.py`
 - `tests/run_agent/test_thinking_only_sanitizer.py`
 - `tests/run_agent/test_413_compression.py`
+- `tests/run_agent/test_compression_budget_rearm.py`
 - `tests/run_agent/test_compression_boundary_hook.py`
 - `tests/run_agent/test_run_agent_codex_responses.py`
+- `tests/agent/test_api_content_sidecar.py`
+- `tests/agent/test_turn_finalizer_iteration_limit_exit.py`
 - `tests/gateway/test_compress_command.py`
 - `tests/gateway/test_auto_voice_reply_format.py`
 - `tests/gateway/test_history_media_current_turn.py`
@@ -2474,6 +2510,26 @@ Files:
 - `docs/LOCAL_MODIFICATIONS.md`
 
 What changed:
+
+- After the official turn-loop split, the production call graph is explicit:
+  `turn_preflight` and `turn_context_compaction` initiate ordinary compression;
+  `turn_api_call` freezes the physically attempted request;
+  `turn_api_error` and `turn_overflow` route provider overflow recovery;
+  `conversation_compression` owns the prepare/commit boundary; and
+  `turn_finalizer` owns terminal cleanup and forced-summary fallback. Tests drive
+  these public turn entries so a preserved Fork module with a missing host call
+  fails the maintenance gate.
+
+- `context_compressor.is_non_user_runtime_context_message()` remains the stable
+  envelope recognizer used by `conversation_compression._run_summary_phase()`.
+  The live transcript is retained for rollback and Request Fork fidelity, while
+  a private copy without persisted runtime context is the only input sent to the
+  context engine, pre-compress memory checkpoint, and memory extraction commit.
+- The obsolete `restart_after_prepared_compression` retry flag is intentionally
+  absent after the split: `turn_preflight.run_preflight_compression()` now returns
+  a direct `continue` verdict and refunds the unsent call before any provider
+  attempt. Adjacent turn-state tests pin the new host contract instead of keeping
+  the dead pre-split field.
 
 - A scoped `FrozenCodexRequest` carries a deep-copied, provider-native Codex
   Responses request body and fidelity metadata. The private checkpoint Fork
@@ -2655,6 +2711,9 @@ deltas are expected in these areas:
   - `docs/LOCAL_MODIFICATIONS.md`
 - Per-invocation delegation provider/model/reasoning routing:
   - `tools/delegate_tool.py`
+  - `tools/delegate_tool_config.py`
+  - `tools/delegate_tool_dispatch.py`
+  - `tools/delegate_tool_child_run.py`
   - `tools/async_delegation.py`
   - `run_agent.py`
   - `tests/tools/test_delegate.py`
@@ -2676,7 +2735,9 @@ deltas are expected in these areas:
   - `agent/conversation_compression.py`
   - `agent/tool_executor.py`
   - `model_tools.py`
+  - `tools/approval_context.py`
   - `tools/approval.py`
+  - `tools/approval_smart.py`
   - `tools/tirith_security.py`
   - `tools/terminal_tool.py`
   - `tools/code_execution_tool.py`
@@ -2713,18 +2774,27 @@ deltas are expected in these areas:
   - `agent/chat_completion_helpers.py`
   - `agent/transports/codex.py`
   - `agent/conversation_loop.py`
-  - `agent/codex_responses_adapter.py`
   - `agent/turn_context.py`
+  - `agent/turn_iteration_prep.py`
+  - `agent/turn_request_assembly.py`
+  - `agent/turn_finalizer.py`
+  - `agent/session_persistence.py`
+  - `agent/model_metadata.py`
+  - `agent/codex_responses_adapter.py`
   - `run_agent.py`
   - `gateway/run.py`
-  - `gateway/session.py`
+  - `gateway/session_transcript.py`
+  - `hermes_state_messages.py`
   - `gateway/slash_commands.py`
   - `hermes_cli/cli_commands_mixin.py`
   - `tests/fork_features/test_request_context_policy.py`
   - `tests/agent/test_api_content_sidecar.py`
+  - `tests/agent/test_model_metadata.py`
   - `tests/agent/test_gateway_turn_sidecar.py`
+  - `tests/agent/test_turn_finalizer_iteration_limit_exit.py`
   - `tests/agent/transports/test_codex_transport.py`
   - `tests/gateway/test_replay_entry_fields.py`
+  - `tests/run_agent/test_steer.py`
   - `tests/run_agent/test_run_agent_codex_responses.py`
   - `tests/run_agent/test_codex_app_server_integration.py`
   - `tests/agent/test_codex_request_only_memory_context.py`
@@ -2746,7 +2816,7 @@ deltas are expected in these areas:
   - `docs/LOCAL_MODIFICATIONS.md`
 - Clarify attachment reply context:
   - `fork_features/clarify_attachment_reply.py`
-  - `gateway/run.py`
+  - `gateway/run_inbound.py`
   - `tools/clarify_gateway.py`
   - `tools/clarify_tool.py`
   - `tests/fork/test_clarify_attachment_reply.py`
@@ -2837,6 +2907,10 @@ deltas are expected in these areas:
 - Self-contained Clarify decision cards:
   - `fork_features/clarify_decision_card.py`
   - `tools/clarify_tool.py`
+  - `gateway/run_turn_runner.py`
+  - `hermes_cli/cli_modal_mixin.py`
+  - `tui_gateway/agent_callbacks.py`
+  - `tui_gateway/server.py`
   - `tests/fork_features/test_clarify_decision_card.py`
   - `tests/tools/test_clarify_tool.py`
   - `docs/LOCAL_MODIFICATIONS.md`

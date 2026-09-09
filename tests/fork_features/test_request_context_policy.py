@@ -28,30 +28,18 @@ def _codex_agent(**extra):
 
 
 def test_core_hosts_use_fork_policy_without_turn_context_reexports():
-    from agent import chat_completion_helpers, conversation_loop, turn_context
+    import inspect
+
+    from agent import turn_context
     from agent.transports import codex
 
-    assert conversation_loop.compose_user_api_content is compose_user_api_content
-    assert (
-        conversation_loop.apply_request_only_turn_context
-        is apply_request_only_turn_context
+    assert "apply_request_only_turn_context" in inspect.getsource(
+        turn_context.build_api_messages
     )
-    assert (
-        chat_completion_helpers.apply_request_only_turn_context
-        is apply_request_only_turn_context
+    assert "apply_codex_backend_cache_routing" in inspect.getsource(
+        codex.ResponsesApiTransport.build_kwargs
     )
-    assert chat_completion_helpers.strip_legacy_api_content is strip_legacy_api_content
-    assert (
-        chat_completion_helpers.resolve_codex_prompt_cache_scope
-        is resolve_codex_prompt_cache_scope
-    )
-    assert (
-        codex.apply_codex_backend_cache_routing
-        is apply_codex_backend_cache_routing
-    )
-    assert "compose_user_api_content" not in vars(turn_context)
     assert "apply_request_only_turn_context" not in vars(turn_context)
-    assert "strip_legacy_api_content" not in vars(turn_context)
 
 
 def test_codex_request_context_is_after_clean_user_and_does_not_mutate_history():

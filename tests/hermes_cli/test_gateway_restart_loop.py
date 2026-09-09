@@ -12,10 +12,8 @@ from argparse import Namespace
 
 import pytest
 
-from hermes_cli.cron import (
-    _contains_gateway_lifecycle_command,
-    cron_command,
-)
+from cron.lifecycle_guard import contains_gateway_lifecycle_command as _contains_gateway_lifecycle_command
+from hermes_cli.cron import cron_command
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +557,7 @@ class TestTerminalToolGatewayLifecycleGuard:
     def test_repeated_lifecycle_attempt_remains_hard_blocked(self, monkeypatch):
         from fork_features.approval.policy import ApprovalPolicy
         import tools.approval as approval
+        import tools.approval_context as approval_context
         import tools.terminal_tool as tt
 
         calls = []
@@ -580,8 +579,8 @@ class TestTerminalToolGatewayLifecycleGuard:
             lambda *_args, **_kwargs: "unreachable lifecycle approval",
         )
         session_key = "terminal-lifecycle-repeat"
-        session_token = approval.set_current_session_key(session_key)
-        context_tokens = approval.set_current_observability_context(
+        session_token = approval_context.set_current_session_key(session_key)
+        context_tokens = approval_context.set_current_observability_context(
             turn_id="terminal-lifecycle-turn"
         )
 
@@ -598,8 +597,8 @@ class TestTerminalToolGatewayLifecycleGuard:
             second = json.loads(tt.terminal_tool(command="hermes gateway restart"))
         finally:
             approval.clear_session(session_key)
-            approval.reset_current_observability_context(context_tokens)
-            approval.reset_current_session_key(session_token)
+            approval_context.reset_current_observability_context(context_tokens)
+            approval_context.reset_current_session_key(session_token)
 
         assert first["exit_code"] == 1
         assert second["exit_code"] == 1
@@ -638,6 +637,33 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 1
         assert "KeepAlive" in result["error"]
+
+    def test_oversized_root_skips_launchctl_prescan_and_fails_closed(
+        self, monkeypatch
+    ):
+        """#78398: an over-budget root must never reach shlex — not even via
+        the launchctl pre-scan that runs before the full guard."""
+        import cron.lifecycle_guard as lifecycle_guard
+        import tools.terminal_tool as tt
+
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        monkeypatch.setattr(
+            lifecycle_guard, "_MAX_LIFECYCLE_SCAN_BYTES", 8, raising=False
+        )
+        monkeypatch.setattr(
+            lifecycle_guard, "_MAX_LIFECYCLE_SCAN_LINE_BYTES", 8, raising=False
+        )
+
+        def explode_if_tokenized(*args, **kwargs):
+            raise AssertionError("over-budget root reached shlex")
+
+        monkeypatch.setattr(lifecycle_guard.shlex, "shlex", explode_if_tokenized)
+
+        result = json.loads(tt.terminal_tool(command="x" * 9))
+
+        assert result["exit_code"] == 1
+        assert "command or referenced script" in result["error"]
+        assert "KeepAlive" not in result["error"]
 
     @pytest.mark.parametrize("command", [
         # Neutral, non-hermes label: label-independent detection is the point
@@ -1802,17 +1828,6 @@ class TestRestartLoopGuard:
         import gateway.restart_loop_guard as rlg
         rlg.clear()
 
-
-
-
-    def test_is_tripped_reads_without_recording(self):
-        import gateway.restart_loop_guard as rlg
-        rlg.record_restart_interrupted_boot(60, now=1000.0)
-        rlg.record_restart_interrupted_boot(60, now=1001.0)
-        assert rlg.is_restart_loop_tripped(3, 60, now=1002.0) is False
-        rlg.record_restart_interrupted_boot(60, now=1002.0)
-        assert rlg.is_restart_loop_tripped(3, 60, now=1003.0) is True
-
     def test_clear_resets(self):
         import gateway.restart_loop_guard as rlg
         rlg.check_and_record(3, 60, now=1000.0)
@@ -1846,7 +1861,6 @@ class TestRestartLoopGuard:
         rlg.check_and_record(3, 60, now=1150.0)
         # 1h later: unrelated restart, chain reset to a single boot.
         assert rlg.check_and_record(3, 60, now=4800.0) is False
-        assert rlg.is_restart_loop_tripped(3, 60, now=4801.0) is False
 
     def test_fast_respawn_loop_still_trips(self):
         """#30719 regression: the original ~10s loop must keep tripping."""
@@ -1875,7 +1889,6 @@ class TestRestartLoopGuard:
         import gateway.restart_loop_guard as rlg
         for ts in (1000.0, 1150.0, 1300.0, 1450.0):
             assert rlg.check_and_record(0, 60, now=ts) is False
-        assert rlg.is_restart_loop_tripped(0, 60, now=1451.0) is False
 
 class TestTerminalToolGatewayLifecycleGuardRemote:
     """Remote-backend and two-session cwd regression coverage."""

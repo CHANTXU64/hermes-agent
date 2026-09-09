@@ -34,20 +34,18 @@ def _install_navigation_harness(monkeypatch):
             }
         return {"success": True, "data": {}}
 
-    monkeypatch.setattr(browser_tool, "_run_browser_command", fake_run)
-    # Return a fresh backend session on every invocation, matching per-turn
-    # browser cleanup while keeping the Hermes conversation task_id stable.
+    monkeypatch.setattr(browser_tool._session, "_run_browser_command", fake_run)
     monkeypatch.setattr(
-        browser_tool,
+        browser_tool._session,
         "_get_session_info",
         lambda _key: {"_first_nav": True, "features": {"local": True, "proxies": True}},
     )
     monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
-    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
     monkeypatch.setattr(browser_tool, "_is_local_sidecar_key", lambda _key: False)
     monkeypatch.setattr(browser_tool, "_navigation_session_key", lambda task_id, _url: task_id)
     monkeypatch.setattr(browser_tool, "_maybe_start_recording", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(browser_tool, "check_website_access", lambda _url: None)
+    monkeypatch.setattr(browser_tool, "_secret_url_error_normalized", lambda url: (url, None))
+    monkeypatch.setattr(browser_tool, "_url_policy_error", lambda url, auto_local=False: None)
     return calls
 
 
@@ -163,7 +161,7 @@ def test_same_conversation_navigations_do_not_overlap(monkeypatch):
             }
         return {"success": True, "data": {}}
 
-    monkeypatch.setattr(browser_tool, "_run_browser_command", fake_run)
+    monkeypatch.setattr(browser_tool._session, "_run_browser_command", fake_run)
 
     def navigate(url):
         try:
@@ -231,7 +229,7 @@ def test_failed_tab_creation_does_not_open_or_mark_conversation(monkeypatch):
             }
         return {"success": True, "data": {}}
 
-    monkeypatch.setattr(browser_tool, "_run_browser_command", fake_run)
+    monkeypatch.setattr(browser_tool._session, "_run_browser_command", fake_run)
 
     failed = json.loads(
         browser_tool.browser_navigate("https://example.com/first", task_id=task_id)
