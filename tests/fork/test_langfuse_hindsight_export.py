@@ -1275,12 +1275,11 @@ def test_undo_filter_keeps_active_resend_when_rewound_trace_is_missing(tmp_path)
     assert candidate["audit"]["undo_filtered_message_count"] == 0
 
 
-def test_export_langfuse_fetches_core_trace_and_paginates_observations(
+def test_export_langfuse_fetches_v4_session_observations_with_cursor(
     tmp_path, monkeypatch
 ):
     module = load_script_module(tmp_path)
-    session_id = "session-large-trace"
-    trace_get_calls = []
+    session_id = "session-v4"
     observation_calls = []
     shutdown_calls = []
 
@@ -1288,37 +1287,64 @@ def test_export_langfuse_fetches_core_trace_and_paginates_observations(
         def __init__(self, **values):
             self.__dict__.update(values)
 
-    class TraceApi:
-        def list(self, **kwargs):
-            assert kwargs["session_id"] == session_id
-            return Row(data=[Row(id="trace-large")])
-
-        def get(self, trace_id, *, fields):
-            trace_get_calls.append((trace_id, fields))
-            return {
-                "id": trace_id,
-                "metadata": {"task_id": session_id},
-                "name": "Hermes trace",
-            }
-
     class ObservationsApi:
-        def get_many(self, *, page, limit, trace_id):
-            observation_calls.append((page, limit, trace_id))
-            pages = {
-                1: [Row(id="observation-1", type="CHAIN")],
-                2: [Row(id="observation-2", type="GENERATION")],
-            }
+        def get_many(self, **kwargs):
+            observation_calls.append(kwargs)
+            if kwargs["cursor"] is None:
+                return Row(
+                    data=[
+                        Row(
+                            id="turn-1",
+                            traceId="trace-1",
+                            sessionId=session_id,
+                            isRootObservation=True,
+                            parentObservationId="session-root",
+                            type="CHAIN",
+                            name="Hermes turn",
+                            traceName="Hermes trace",
+                            startTime="2026-09-02T01:00:00Z",
+                            endTime="2026-09-02T01:01:00Z",
+                            input=json.dumps(
+                                {"role": "user", "content": "v4 request"}
+                            ),
+                            output=json.dumps(
+                                {"content": "v4 answer", "tool_calls": []}
+                            ),
+                            metadata={
+                                "task_id": session_id,
+                                "capture_mode": "sanitized",
+                            },
+                        )
+                    ],
+                    meta=Row(cursor="next-page"),
+                )
+            assert kwargs["cursor"] == "next-page"
             return Row(
-                data=pages.get(page, []),
-                meta=Row(totalItems=2),
+                data=[
+                    Row(
+                        id="generation-1",
+                        traceId="trace-1",
+                        sessionId=session_id,
+                        isRootObservation=False,
+                        parentObservationId="turn-1",
+                        type="GENERATION",
+                        name="LLM call 1",
+                        traceName="Hermes trace",
+                        startTime="2026-09-02T01:00:10Z",
+                        endTime="2026-09-02T01:00:20Z",
+                        input=json.dumps(
+                            [{"role": "user", "content": "v4 request"}]
+                        ),
+                        output=json.dumps({"role": "assistant", "content": "draft"}),
+                        metadata={"task_id": session_id},
+                    )
+                ],
+                meta=Row(cursor=None),
             )
 
     class Client:
         def __init__(self, **kwargs):
-            self.api = Row(
-                trace=TraceApi(),
-                legacy=Row(observations_v1=ObservationsApi()),
-            )
+            self.api = Row(observations=ObservationsApi())
 
         def shutdown(self):
             shutdown_calls.append(True)
@@ -1332,105 +1358,32 @@ def test_export_langfuse_fetches_core_trace_and_paginates_observations(
 
     exported = module.export_langfuse(session_id, tmp_path / "env")
 
-    assert trace_get_calls == [("trace-large", "core,io")]
-    assert observation_calls == [
-        (1, 100, "trace-large"),
-        (2, 100, "trace-large"),
-    ]
-    assert exported["traces"] == [
-        {
-            "id": "trace-large",
-            "metadata": {"task_id": session_id},
-            "name": "Hermes trace",
-            "observations": [
-                {"id": "observation-1", "type": "CHAIN"},
-                {"id": "observation-2", "type": "GENERATION"},
-            ],
-        }
+    assert [call["cursor"] for call in observation_calls] == [None, "next-page"]
+    assert all(call["limit"] == 100 for call in observation_calls)
+    assert all(
+        json.loads(call["filter"])
+        == [
+            {
+                "type": "string",
+                "column": "sessionId",
+                "operator": "=",
+                "value": session_id,
+            }
+        ]
+        for call in observation_calls
+    )
+    assert all("parse_io_as_json" not in call for call in observation_calls)
+    assert exported["trace_count"] == 1
+    assert exported["traces"][0]["id"] == "trace-1"
+    assert exported["traces"][0]["metadata"] == {
+        "task_id": session_id,
+        "capture_mode": "sanitized",
+    }
+    assert exported["traces"][0]["observations"][0]["input"] == {
+        "role": "user",
+        "content": "v4 request",
+    }
+    assert exported["traces"][0]["observations"][1]["input"] == [
+        {"role": "user", "content": "v4 request"}
     ]
     assert shutdown_calls == [True]
-
-
-def test_fetch_trace_observations_rejects_duplicate_ids(tmp_path):
-    module = load_script_module(tmp_path)
-
-    class Row:
-        def __init__(self, **values):
-            self.__dict__.update(values)
-
-    class ObservationsApi:
-        def get_many(self, *, page, limit, trace_id):
-            return Row(
-                data=[Row(id="observation-1", type="CHAIN")],
-                meta=Row(totalItems=2),
-            )
-
-    client = Row(api=Row(legacy=Row(observations_v1=ObservationsApi())))
-
-    with pytest.raises(RuntimeError, match="duplicate observation ID"):
-        module._fetch_trace_observations(client, "trace-duplicate")
-
-
-def test_fetch_trace_observations_rejects_missing_total_items(tmp_path):
-    module = load_script_module(tmp_path)
-
-    class Row:
-        def __init__(self, **values):
-            self.__dict__.update(values)
-
-    class ObservationsApi:
-        def get_many(self, *, page, limit, trace_id):
-            return Row(
-                data=[Row(id="observation-1", type="CHAIN")],
-                meta=Row(),
-            )
-
-    client = Row(api=Row(legacy=Row(observations_v1=ObservationsApi())))
-
-    with pytest.raises(RuntimeError, match="missing valid totalItems"):
-        module._fetch_trace_observations(client, "trace-missing-total")
-
-
-def test_fetch_trace_observations_rejects_non_integral_total_items(tmp_path):
-    module = load_script_module(tmp_path)
-
-    class Row:
-        def __init__(self, **values):
-            self.__dict__.update(values)
-
-    class ObservationsApi:
-        def get_many(self, *, page, limit, trace_id):
-            return Row(
-                data=[Row(id="observation-1", type="CHAIN")],
-                meta=Row(totalItems=2.5),
-            )
-
-    client = Row(api=Row(legacy=Row(observations_v1=ObservationsApi())))
-
-    with pytest.raises(RuntimeError, match="missing valid totalItems"):
-        module._fetch_trace_observations(client, "trace-non-integral-total")
-
-
-def test_fetch_trace_observations_rejects_total_items_changes(tmp_path):
-    module = load_script_module(tmp_path)
-
-    class Row:
-        def __init__(self, **values):
-            self.__dict__.update(values)
-
-    class ObservationsApi:
-        def get_many(self, *, page, limit, trace_id):
-            if page == 1:
-                return Row(
-                    data=[Row(id="observation-1", type="CHAIN")],
-                    meta=Row(totalItems=2),
-                )
-            return Row(
-                data=[Row(id="observation-2", type="GENERATION")],
-                meta=Row(totalItems=3),
-            )
-
-    client = Row(api=Row(legacy=Row(observations_v1=ObservationsApi())))
-
-    with pytest.raises(RuntimeError, match="totalItems changed"):
-        module._fetch_trace_observations(client, "trace-changing-total")

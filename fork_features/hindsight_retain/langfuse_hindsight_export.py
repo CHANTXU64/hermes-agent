@@ -123,95 +123,6 @@ def get_langfuse_credentials(env_file: Path) -> tuple[str, str]:
     return public_key, secret_key
 
 
-LEGACY_OBSERVATIONS_PAGE_SIZE = 100
-LEGACY_OBSERVATIONS_MAX_PAGES = 10_000
-
-
-def _pagination_total(response) -> int | None:
-    metadata = jsonable(getattr(response, "meta", None))
-    if not isinstance(metadata, dict):
-        return None
-    for key in ("totalItems", "total_items", "total"):
-        value = metadata.get(key)
-        if type(value) is int and value >= 0:
-            return value
-    return None
-
-
-def _fetch_trace_observations(client, trace_id: str) -> list:
-    """Read observations through the paginated legacy API."""
-    observations = []
-    observation_ids: set[str] = set()
-    total_items = None
-    for page in range(1, LEGACY_OBSERVATIONS_MAX_PAGES + 1):
-        response = client.api.legacy.observations_v1.get_many(
-            page=page,
-            limit=LEGACY_OBSERVATIONS_PAGE_SIZE,
-            trace_id=trace_id,
-        )
-        page_total = _pagination_total(response)
-        if page_total is None:
-            raise RuntimeError(
-                f"Langfuse observations missing valid totalItems for trace {trace_id}"
-            )
-        if total_items is None:
-            total_items = page_total
-        elif page_total != total_items:
-            raise RuntimeError(
-                f"Langfuse observations totalItems changed for trace {trace_id}: "
-                f"{total_items} to {page_total}"
-            )
-
-        rows = list(getattr(response, "data", None) or [])
-        serialized_rows = jsonable(rows)
-        if not isinstance(serialized_rows, list):
-            raise RuntimeError(
-                f"Langfuse observations response is not a list for trace {trace_id}"
-            )
-        page_observations: list[dict] = []
-        for observation in serialized_rows:
-            if not isinstance(observation, dict):
-                raise RuntimeError(
-                    f"Langfuse observation row is not an object for trace {trace_id}"
-                )
-            observation_id = observation.get("id")
-            if not isinstance(observation_id, str) or not observation_id.strip():
-                raise RuntimeError(
-                    f"Langfuse observation has invalid ID for trace {trace_id}"
-                )
-            if observation_id in observation_ids:
-                raise RuntimeError(
-                    f"Langfuse observations contain duplicate observation ID "
-                    f"{observation_id} for trace {trace_id}"
-                )
-            observation_ids.add(observation_id)
-            page_observations.append(observation)
-        observations.extend(page_observations)
-
-        if len(observation_ids) > total_items:
-            raise RuntimeError(
-                f"Langfuse observations exceeded totalItems for trace {trace_id}: "
-                f"{len(observation_ids)} of {total_items}"
-            )
-        if len(observation_ids) == total_items:
-            break
-        if not rows:
-            break
-    else:
-        raise RuntimeError(
-            f"Langfuse observations exceeded {LEGACY_OBSERVATIONS_MAX_PAGES} pages"
-        )
-
-    if total_items is None or len(observation_ids) != total_items:
-        received = len(observation_ids)
-        expected = total_items if total_items is not None else "unknown"
-        raise RuntimeError(
-            f"Langfuse observations incomplete for trace {trace_id}: "
-            f"{received} of {expected} unique observations"
-        )
-    return observations
-
-
 def load_hindsight_bank_id(config_path: Path) -> str:
     try:
         payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
@@ -232,8 +143,154 @@ def load_hindsight_bank_id(config_path: Path) -> str:
     return bank_id
 
 
+V4_OBSERVATIONS_PAGE_SIZE = 100
+V4_OBSERVATIONS_MAX_PAGES = 10_000
+V4_OBSERVATION_FIELDS = "core,basic,time,io,metadata,trace_context"
+V4_EXPANDED_METADATA_KEYS = "task_id,turn_id,capture_mode"
+
+
+def _decode_v4_io(value):
+    """Decode the raw JSON strings returned by the v4 Observations API."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _fetch_session_observations(client, session_id: str) -> list[dict]:
+    session_filter = json.dumps(
+        [
+            {
+                "type": "string",
+                "column": "sessionId",
+                "operator": "=",
+                "value": session_id,
+            }
+        ],
+        separators=(",", ":"),
+    )
+    observations: list[dict] = []
+    observation_ids: set[str] = set()
+    seen_cursors: set[str] = set()
+    cursor = None
+
+    for _ in range(V4_OBSERVATIONS_MAX_PAGES):
+        response = client.api.observations.get_many(
+            fields=V4_OBSERVATION_FIELDS,
+            expand_metadata=V4_EXPANDED_METADATA_KEYS,
+            limit=V4_OBSERVATIONS_PAGE_SIZE,
+            cursor=cursor,
+            filter=session_filter,
+        )
+        payload = jsonable(response)
+        if not isinstance(payload, dict):
+            raise RuntimeError("Langfuse v4 observations response has invalid data")
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            raise RuntimeError("Langfuse v4 observations response has invalid data")
+
+        for row in rows:
+            if not isinstance(row, dict):
+                raise RuntimeError("Langfuse v4 observation row is not an object")
+            observation_id = row.get("id")
+            trace_id = row.get("traceId")
+            returned_session_id = row.get("sessionId")
+            if not isinstance(observation_id, str) or not observation_id.strip():
+                raise RuntimeError("Langfuse v4 observation has invalid ID")
+            if observation_id in observation_ids:
+                raise RuntimeError(
+                    f"Langfuse v4 observations contain duplicate ID {observation_id}"
+                )
+            if not isinstance(trace_id, str) or not trace_id.strip():
+                raise RuntimeError(
+                    f"Langfuse v4 observation {observation_id} has invalid trace ID"
+                )
+            if returned_session_id != session_id:
+                raise RuntimeError(
+                    f"Langfuse v4 observation {observation_id} crossed session boundary"
+                )
+            observation_ids.add(observation_id)
+            row["input"] = _decode_v4_io(row.get("input"))
+            row["output"] = _decode_v4_io(row.get("output"))
+            observations.append(row)
+
+        metadata = payload.get("meta") or {}
+        if not isinstance(metadata, dict):
+            raise RuntimeError("Langfuse v4 observations response has invalid metadata")
+        next_cursor = metadata.get("cursor")
+        if next_cursor in (None, ""):
+            break
+        if not isinstance(next_cursor, str):
+            raise RuntimeError("Langfuse v4 observations response has invalid cursor")
+        if next_cursor in seen_cursors:
+            raise RuntimeError("Langfuse v4 observations cursor repeated")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    else:
+        raise RuntimeError(
+            f"Langfuse v4 observations exceeded {V4_OBSERVATIONS_MAX_PAGES} pages"
+        )
+
+    return observations
+
+
+def _session_observations_to_traces(
+    observations: list[dict], session_id: str
+) -> list[dict]:
+    observations_by_trace: dict[str, list[dict]] = {}
+    for observation in observations:
+        trace_id = str(observation["traceId"])
+        observations_by_trace.setdefault(trace_id, []).append(observation)
+
+    traces = []
+    for trace_id, trace_observations in observations_by_trace.items():
+        ordered = sorted(
+            trace_observations,
+            key=lambda item: (
+                str(item.get("startTime") or ""),
+                str(item.get("id") or ""),
+            ),
+        )
+        logical_roots = [
+            observation
+            for observation in ordered
+            if observation.get("isRootObservation") is True
+        ]
+        root = logical_roots[0] if logical_roots else ordered[0]
+        capture_modes = {
+            str((observation.get("metadata") or {}).get("capture_mode"))
+            for observation in ordered
+            if isinstance(observation.get("metadata"), dict)
+            and (observation.get("metadata") or {}).get("capture_mode")
+        }
+        trace_metadata = {"task_id": session_id}
+        if "sanitized" in capture_modes:
+            trace_metadata["capture_mode"] = "sanitized"
+        elif len(capture_modes) == 1:
+            trace_metadata["capture_mode"] = next(iter(capture_modes))
+        traces.append(
+            {
+                "id": trace_id,
+                "sessionId": session_id,
+                "timestamp": str(ordered[0].get("startTime") or ""),
+                "name": root.get("traceName") or root.get("name"),
+                "input": root.get("input"),
+                "output": root.get("output"),
+                "metadata": trace_metadata,
+                "observations": ordered,
+            }
+        )
+
+    return sorted(
+        traces,
+        key=lambda trace: (str(trace.get("timestamp") or ""), str(trace.get("id") or "")),
+    )
+
+
 def export_langfuse(session_id: str, env_file: Path) -> dict:
-    """List traces and fetch each trace without exceeding the Trace size limit."""
+    """Read one Hermes session through the Langfuse v4 Observations API."""
     if Langfuse is None:
         raise SystemExit(
             "缺少 langfuse Python 包；请在 Hermes 使用的 Python 环境中运行。"
@@ -245,37 +302,9 @@ def export_langfuse(session_id: str, env_file: Path) -> dict:
         base_url=LANGFUSE_BASE_URL,
         tracing_enabled=False,
     )
-    listed = []
     try:
-        # The SDK uses one-based pages. Stop when a short page is returned.
-        for page in range(1, 101):
-            response = client.api.trace.list(
-                page=page,
-                limit=100,
-                session_id=session_id,
-                order_by="timestamp.asc",
-            )
-            rows = list(getattr(response, "data", None) or [])
-            listed.extend(rows)
-            if len(rows) < 100:
-                break
-        trace_ids: list[str] = []
-        seen: set[str] = set()
-        for row in listed:
-            trace_id = getattr(row, "id", None)
-            if trace_id and trace_id not in seen:
-                seen.add(trace_id)
-                trace_ids.append(trace_id)
-
-        traces = []
-        for trace_id in trace_ids:
-            # Fetch only the root fields; the full observations payload can exceed
-            # Langfuse's 80 MB response limit and is read through the paginated v1 API.
-            trace = jsonable(client.api.trace.get(trace_id, fields="core,io"))
-            if not isinstance(trace, dict):
-                raise RuntimeError(f"Langfuse trace {trace_id} is not an object")
-            trace["observations"] = _fetch_trace_observations(client, trace_id)
-            traces.append(trace)
+        observations = _fetch_session_observations(client, session_id)
+        traces = _session_observations_to_traces(observations, session_id)
     finally:
         client.shutdown()
     return {
