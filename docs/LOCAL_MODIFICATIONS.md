@@ -1636,7 +1636,7 @@ Files:
 
 - `fork_features/delivery_session_boundary.py`
 - `gateway/delivery_ledger.py`
-- `gateway/slash_commands.py` (stable host seam only)
+- `gateway/slash_commands_session.py` (stable host seam only)
 - `tests/fork_features/test_delivery_session_boundary.py`
 - `tests/gateway/test_delivery_ledger.py`
 - `tests/gateway/test_session_model_reset.py`
@@ -2237,6 +2237,7 @@ Files:
 - `tests/fork_features/approval/test_smart_review.py`
 - `tests/fork_features/approval/test_retry_policy.py`
 - `tests/hermes_cli/test_gateway_restart_loop.py`
+- `tests/run_agent/test_run_agent.py`
 - `docs/chantxu64/current-turn-smart-approval/README.md`
 - `docs/LOCAL_MODIFICATIONS.md`
 
@@ -2316,9 +2317,12 @@ What changed:
   structured reviewer access, bounded direct-script evidence access, and same-turn
   retry state. The evidence, reviewer, and retry modules remain internal Policy
   implementation and do not import approval/Terminal/`execute_code` hosts.
-- `agent/tool_executor.py` now keeps only a thin adapter that injects the
-  conversation subsystem's canonical real-user classifiers into the Fork context
-  builder. `model_tools.py` binds that Fork request context directly.
+- `agent/tool_executor.py` keeps the thin adapter that injects the conversation
+  subsystem's canonical real-user classifiers into the Fork context builder, and
+  binds that context around both the sequential and concurrent production tool
+  dispatchers. Worker-thread propagation and final cleanup are exercised through
+  those production entries; `model_tools.py` retains only official approval
+  observability wiring.
 - `tools/approval.py` imports only the public Policy facade and keeps deterministic
   floors, YOLO/mode/allowlists, Tirith warning keys, the shared lock, verdict
   execution, human approval transport, persistence, observability, and fail-closed.
@@ -2753,6 +2757,7 @@ deltas are expected in these areas:
   - `tests/fork_features/approval/test_smart_review.py`
   - `tests/fork_features/approval/test_retry_policy.py`
   - `tests/hermes_cli/test_gateway_restart_loop.py`
+  - `tests/run_agent/test_run_agent.py`
   - `docs/chantxu64/current-turn-smart-approval/README.md`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Safe command rewrite:
@@ -2801,7 +2806,7 @@ deltas are expected in these areas:
 - Delivery-ledger session-reset boundary:
   - `fork_features/delivery_session_boundary.py`
   - `gateway/delivery_ledger.py`
-  - `gateway/slash_commands.py`
+  - `gateway/slash_commands_session.py`
   - `tests/fork_features/test_delivery_session_boundary.py`
   - `tests/gateway/test_delivery_ledger.py`
   - `tests/gateway/test_session_model_reset.py`
@@ -2844,6 +2849,15 @@ deltas are expected in these areas:
   - `fork_features/request_fork/__init__.py`
   - `agent/conversation_loop.py`
   - `agent/conversation_compression.py`
+  - `agent/turn_api_call.py`
+  - `agent/turn_api_error.py`
+  - `agent/turn_context_compaction.py`
+  - `agent/turn_overflow.py`
+  - `agent/turn_preflight.py`
+  - `agent/turn_request_assembly.py`
+  - `agent/turn_finalizer.py`
+  - `agent/context_compressor.py`
+  - `agent/agent_runtime_helpers.py`
   - `agent/turn_context.py`
   - `agent/turn_retry_state.py`
   - `run_agent.py`

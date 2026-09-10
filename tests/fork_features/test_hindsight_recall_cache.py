@@ -14,6 +14,16 @@ def test_hindsight_provider_uses_fork_cache_without_legacy_state_fields():
     provider = HindsightMemoryProvider()
 
     assert isinstance(provider._recall_cache, HindsightRecallCache)
+    legacy_names = {
+        "_prefetch_result",
+        "_prefetch_snapshot",
+        "_prefetch_count",
+        "_prefetch_lock",
+        "_prefetch_thread",
+        "_prefetch_generation",
+        "_active_prefetch_turn",
+    }
+    assert not any(hasattr(provider, name) for name in legacy_names)
 
 
 def test_matching_session_consumes_cache_but_stale_session_preserves_it():

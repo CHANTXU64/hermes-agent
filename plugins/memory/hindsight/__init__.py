@@ -351,10 +351,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_ops_bank_id = ""
         self._apply_retain_policy({})
 
-        # Recall: pending prefetch block + count, and the indicator state (recall_status()).
-        self._prefetch_result, self._prefetch_count = "", 0
-        self._prefetch_lock = threading.Lock()
-        self._prefetch_thread = None
+        # Recall indicator state; snapshot/generation lifecycle is Fork-owned.
         self._last_recall_returned, self._last_recall_count = False, 0
         self._apply_recall_settings({})
         self._recall_cache = HindsightRecallCache()
@@ -923,13 +920,6 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
-    def _join_prefetch(self, timeout: float, *, log: bool = False) -> None:
-        thread = getattr(self, "_prefetch_thread", None)
-        if not (thread and thread.is_alive()):
-            return
-        if log:
-            logger.debug("Prefetch: waiting for background thread to complete")
-        thread.join(timeout=timeout)
 
     @staticmethod
     def _recall_snapshot_text(snapshot: RecallSnapshot) -> str:
@@ -1310,16 +1300,7 @@ class HindsightMemoryProvider(MemoryProvider):
             if not self._shutting_down.is_set():
                 self._enqueue_retain(_flush)
 
-        # 2. Drain the old session's in-flight prefetch and drop its result.
-        self._join_prefetch(3.0)
-        prefetch_lock = getattr(self, "_prefetch_lock", None)
-        if prefetch_lock is None:
-            self._prefetch_result = ""
-        else:
-            with prefetch_lock:
-                self._prefetch_result = ""
-
-        # 3. Rotate to the new session.
+        # 2. Rotate the Fork-owned recall lifecycle to the new session.
         if parent_session_id:
             self._parent_session_id = str(parent_session_id).strip()
         self._session_id, self._document_id = new_id, _mint_document_id(new_id)
@@ -1356,7 +1337,6 @@ class HindsightMemoryProvider(MemoryProvider):
             if writer.is_alive():
                 logger.warning("Hindsight writer did not stop within 10s; abandoning %d pending retain(s)",
                                self._retain_queue.qsize())
-        self._join_prefetch(5.0)
         if self._client is not None:
             with contextlib.suppress(Exception):
                 self._close_client()

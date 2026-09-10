@@ -3217,7 +3217,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _send_chunk_with_retries(
         self, chat_id: str, chunk: str, index: int, reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
-        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple):
+        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple, *, plain_text: bool = False):
         """Deliver one chunk: routing, up to 3 attempts, thread-not-found / deleted-anchor / flood handling.
 
         Returns ``(msg, used_thread_fallback)`` on success or a ``SendResult`` to return verbatim (fail-loud DM-topic
@@ -3238,7 +3238,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 send_kwargs = {
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
                     **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs), used_thread_fallback
+                msg = (
+                    await self._bot.send_message(text=chunk, parse_mode=None, **send_kwargs)
+                    if plain_text
+                    else await self._send_chunk_markdown_or_plain(chunk, send_kwargs)
+                )
+                return msg, used_thread_fallback
             except _NetErr as send_err:
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
                 if _BadReq and isinstance(send_err, _BadReq):
@@ -3347,29 +3352,23 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        if bool((metadata or {}).get("plain_text")):
-            thread_id = self._metadata_thread_id(metadata)
-            send_kwargs = {
-                "chat_id": normalize_telegram_chat_id(chat_id),
-                "reply_to_message_id": reply_to,
-                **self._thread_kwargs_for_send(chat_id, thread_id, metadata, reply_to_message_id=reply_to, reply_to_mode=self._reply_to_mode),
-                **self._link_preview_kwargs(),
-                **self._notification_kwargs(metadata),
-            }
-            msg = await self._bot.send_message(text=content, parse_mode=None, **send_kwargs)
-            return SendResult(success=True, message_id=str(msg.message_id))
+        plain_text = bool((metadata or {}).get("plain_text"))
         error_types = self._telegram_error_types()
         try:
             # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
             # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if not plain_text and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
-            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
-            if len(chunks) > 1:
+            chunks = (
+                self._truncate_plain_text_literal(content)
+                if plain_text
+                else self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+            )
+            if len(chunks) > 1 and not plain_text:
                 # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
                 chunks = [
                     _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
@@ -3381,7 +3380,8 @@ class TelegramAdapter(BasePlatformAdapter):
             used_thread_fallback = False
             for i, chunk in enumerate(chunks):
                 outcome = await self._send_chunk_with_retries(
-                    chat_id, chunk, i, reply_to, metadata, thread_id, used_thread_fallback, error_types)
+                    chat_id, chunk, i, reply_to, metadata, thread_id, used_thread_fallback, error_types,
+                    plain_text=plain_text)
                 if isinstance(outcome, SendResult):
                     return outcome
                 msg, used_thread_fallback = outcome

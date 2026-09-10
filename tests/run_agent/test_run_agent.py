@@ -1656,6 +1656,54 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
+    def test_sequential_tool_calls_expose_current_user_context_to_smart_approval(self, agent):
+        """The production sequential dispatcher binds and clears Fork approval context."""
+        from fork_features.approval.policy import get_smart_approval_context
+
+        tool_call = _mock_tool_call(name="web_search", arguments="{}", call_id="ctx-seq")
+        assistant_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = [{"role": "user", "content": "授权发送本次报告"}]
+        observed = []
+
+        def fake_handle(*_args, **_kwargs):
+            observed.append(get_smart_approval_context())
+            return "ok"
+
+        with patch("model_tools.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_sequential(assistant_msg, messages, "task-seq")
+
+        assert observed == [
+            {"latest_user_message": "授权发送本次报告", "clarifications": []}
+        ]
+        assert get_smart_approval_context() == {}
+
+    def test_concurrent_tool_workers_receive_current_user_context_for_smart_approval(self, agent):
+        """The production concurrent dispatcher propagates and clears Fork approval context."""
+        from fork_features.approval.policy import get_smart_approval_context
+
+        tool_calls = [
+            _mock_tool_call(name="web_search", arguments="{}", call_id="ctx-concurrent-1"),
+            _mock_tool_call(name="web_search", arguments="{}", call_id="ctx-concurrent-2"),
+        ]
+        assistant_msg = _mock_assistant_msg(content="", tool_calls=tool_calls)
+        messages = [{"role": "user", "content": "授权并行查询当前资料"}]
+        observed = []
+        observed_lock = threading.Lock()
+
+        def fake_handle(*_args, **_kwargs):
+            with observed_lock:
+                observed.append(get_smart_approval_context())
+            return "ok"
+
+        with patch("model_tools.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(assistant_msg, messages, "task-concurrent")
+
+        assert observed == [
+            {"latest_user_message": "授权并行查询当前资料", "clarifications": []},
+            {"latest_user_message": "授权并行查询当前资料", "clarifications": []},
+        ]
+        assert get_smart_approval_context() == {}
+
     def test_sequential_tool_calls_run_without_delay(self, agent):
         """Two sequential tool calls execute back-to-back with no sleep between them."""
         tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -4026,12 +4074,14 @@ class TestRunConversation:
         agent.reasoning_callback = lambda _text: None
         entered = threading.Event()
         results = {}
+        requests = []
         calls = 0
         final = _mock_response(content="Corrected answer.", finish_reason="stop")
 
-        def _fake_api_call(_api_kwargs):
+        def _fake_api_call(api_kwargs):
             nonlocal calls
             calls += 1
+            requests.append(api_kwargs)
             if calls == 1:
                 agent._fire_reasoning_delta("Following the original approach.")
                 entered.set()
@@ -4061,21 +4111,22 @@ class TestRunConversation:
         assert calls == 2
         assert results["result"]["completed"] is True
         assert results["result"]["final_response"] == "Corrected answer."
+        assert len(requests) == 2
         placeholder = results["result"]["messages"][-3]
         correction = results["result"]["messages"][-2]
         assert placeholder["role"] == "assistant"
         assert "interrupted by a user correction" not in (
             placeholder.get("content") or ""
         )
-        assert "interrupted by a user correction" in (
-            correction.get("api_content") or ""
-        )
+        # The retry request sees the correction scaffold, but the durable/result
+        # transcript is clean after the request-only sidecar is consumed.
+        api_correction = requests[1]["messages"][-1]["content"]
+        assert "interrupted by a user correction" in api_correction
         # Displayed reasoning is display-only — replaying it as assistant
         # content trips Anthropic's output classifier (July 2026 brickings).
-        assert "Following the original approach." not in (
-            correction.get("api_content") or ""
-        )
+        assert "Following the original approach." not in api_correction
         assert correction["content"] == "Use the corrected approach."
+        assert "api_content" not in correction
 
     def test_legacy_interrupt_scaffold_ghost_dropped_from_api_replay(self, agent):
         """Pre-#81841 hidden assistant rows with the interrupt scaffold must

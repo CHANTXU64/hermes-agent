@@ -1017,7 +1017,7 @@ def test_direct_script_is_smart_reviewed_even_when_shell_text_is_not_flagged(
     assert smart_review.call_count == 1
 
 
-def test_model_dispatch_binds_and_resets_request_approval_context():
+def test_smart_approval_scope_binds_and_resets_request_context():
     from agent.tool_executor import _fork_smart_approval_scope
 
     context_messages = [

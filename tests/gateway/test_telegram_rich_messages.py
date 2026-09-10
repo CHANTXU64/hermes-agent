@@ -851,6 +851,25 @@ async def test_plain_text_metadata_bypasses_rich_and_markdown_rendering():
 
 
 @pytest.mark.asyncio
+async def test_plain_text_metadata_chunks_initial_send_by_utf16_limit():
+    """Long literal status sends must split before reaching Telegram."""
+    adapter = _make_adapter()
+    adapter.MAX_MESSAGE_LENGTH = 50
+    raw = "🔎 " + "```|code_block ||hidden|| " * 8
+
+    result = await adapter.send("12345", raw, metadata={"plain_text": True})
+
+    assert result.success is True
+    calls = list(adapter._bot.send_message.call_args_list)
+    assert len(calls) > 1
+    texts = [call.kwargs["text"] for call in calls]
+    assert all(call.kwargs["parse_mode"] is None for call in calls)
+    assert all(len(text.encode("utf-16-le")) // 2 <= adapter.MAX_MESSAGE_LENGTH for text in texts)
+    assert all("\\`\\`\\`" not in text for text in texts)
+    assert "".join(re.sub(r" \(\d+/\d+\)$", "", text) for text in texts) == raw
+
+
+@pytest.mark.asyncio
 async def test_plain_text_metadata_bypasses_markdown_when_editing():
     """Accumulated status bubbles must stay literal on their final edit."""
     adapter = _make_adapter()
