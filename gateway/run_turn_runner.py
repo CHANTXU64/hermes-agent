@@ -213,7 +213,8 @@ class TurnRunner:
         terminal calls drop the repeated header so back-to-back commands render as adjacent blocks.
         """
         if not (
-            getattr(adapter, "supports_code_blocks", False) and tool_name == "terminal" and isinstance(args, dict)
+            self._ctx.source.platform != Platform.TELEGRAM
+            and getattr(adapter, "supports_code_blocks", False) and tool_name == "terminal" and isinstance(args, dict)
             and isinstance(args.get("command"), str) and args["command"].strip()
         ):
             return None, None
@@ -257,6 +258,16 @@ class TurnRunner:
             return None
         if code is not None:
             return code
+        if ctx.source.platform == Platform.TELEGRAM and tool_name == "terminal":
+            command = args.get("command") if isinstance(args, dict) else None
+            compact = " ".join(command.split()) if isinstance(command, str) else ""
+            if not compact and preview:
+                compact = " ".join(str(preview).split())
+            if compact:
+                cap = self._preview_cap()
+                if len(compact) > cap:
+                    compact = compact[:cap - 3] + "..."
+                return f"{emoji} {tool_name}: {compact}"
         if not preview:
             return f"{emoji} {tool_name}..."
         from agent.display import get_tool_verb, prepare_tool_preview, tool_verb_connector, verb_drops_preview

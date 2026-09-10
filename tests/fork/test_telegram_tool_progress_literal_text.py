@@ -1,5 +1,8 @@
 """Fork protection: Telegram tool-progress keeps literal delivery semantics."""
 
+import queue
+from typing import Any, cast
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,7 +12,9 @@ from fork_features import telegram_tool_progress
 import gateway.run as gateway_run
 from gateway.config import Platform, PlatformConfig
 from gateway.run import _tool_progress_delivery_metadata
+from gateway.run_turn_runner import TurnRunner
 from plugins.platforms.telegram.adapter import TelegramAdapter
+import tools.terminal_tool  # noqa: F401 - register the terminal progress emoji
 
 
 RAW_PROGRESS = "```|code_block ||hidden||"
@@ -27,6 +32,41 @@ def _make_adapter() -> TelegramAdapter:
     bot.edit_message_text = AsyncMock(return_value=MagicMock(message_id=1))
     adapter._bot = bot
     return adapter
+
+
+def _build_terminal_progress(command: str, *, mode: str = "all"):
+    adapter = _make_adapter()
+    context = SimpleNamespace(
+        source=SimpleNamespace(platform=Platform.TELEGRAM),
+        last_was_terminal_block=[False],
+        progress_mode=mode,
+        progress_queue=queue.Queue(),
+    )
+    runner = SimpleNamespace(_adapter_for_source=lambda _source: adapter)
+    turn_runner = TurnRunner(cast(Any, runner), cast(Any, context))
+    message = turn_runner._progress_build_message(
+        "terminal", command, {"command": command}
+    )
+    return message, context
+
+
+def test_telegram_terminal_progress_is_one_compact_literal_line():
+    message, context = _build_terminal_progress("printf one\nprintf two")
+
+    assert message == "💻 terminal: printf one printf two"
+    assert "```" not in message
+    assert "\n" not in message
+    assert context.last_was_terminal_block == [False]
+
+
+def test_telegram_terminal_progress_verbose_does_not_generate_a_fenced_block():
+    message, context = _build_terminal_progress(
+        "printf one\nprintf two", mode="verbose"
+    )
+
+    assert message is None
+    queued = context.progress_queue.get_nowait()
+    assert "```" not in queued
 
 
 def test_telegram_progress_metadata_preserves_topic_and_marks_literal_text():

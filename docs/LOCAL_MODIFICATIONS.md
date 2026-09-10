@@ -1292,6 +1292,7 @@ Files:
 
 - `fork_features/telegram_tool_progress.py`
 - `gateway/run.py`
+- `gateway/run_turn_runner.py`
 - `plugins/platforms/telegram/adapter.py`
 - `tests/fork/test_telegram_tool_progress_literal_text.py`
 - `tests/gateway/test_run_progress_topics.py`
@@ -1309,17 +1310,18 @@ What changed:
 - `fork_features/telegram_tool_progress.py` owns the Telegram-only metadata
   decision. It copies Telegram metadata before adding `plain_text=True` and
   returns every non-Telegram metadata object unchanged.
-- `GatewayRunner` keeps progress creation, accumulation, topics, reply metadata,
-  edits, rollover, typing, approvals, and final replies. Its sole progress
-  delivery call uses a thin alias imported from the Fork policy module; the
-  core no longer contains a Telegram platform branch for this behavior.
+- `GatewayRunner` and `TurnRunner` keep progress creation, accumulation, topics,
+  reply metadata, edits, rollover, typing, approvals, and final replies. The
+  progress delivery call uses a thin alias imported from the Fork policy module;
+  the core no longer contains a Telegram platform branch for this behavior.
 - The Telegram adapter bypasses both rich-message delivery and MarkdownV2
   conversion for that marker, including finalized accumulated bubbles and
   overflow continuations. Regexes, code fragments, URLs, backticks, pipes, and
   spoiler-like tokens therefore display literally.
 - A fork-protection test keeps the Telegram-only metadata contract and literal
   send/edit behavior visible during future upstream merges.
-- Telegram terminal command previews normalize whitespace while retaining the
+- `TurnRunner` excludes Telegram from the generic fenced terminal-block path.
+  Telegram terminal command previews normalize whitespace while retaining the
   `terminal` tool label, so multi-line shell commands remain one persistent
   status line (for example, `💻 terminal: set -euo pipefail ...`).
 - Other Markdown-capable platforms retain their existing fenced terminal
@@ -1339,6 +1341,9 @@ Merge protection:
   `fork_features/telegram_tool_progress.py`; do not move the platform branch
   back into `gateway/run.py`. Keep generic `plain_text` rendering in the
   Telegram adapter.
+- Keep the Fork-owned behavior tests that pass Terminal progress through
+  `TurnRunner` and assert Telegram emits no fenced block in normal or verbose
+  mode. Generic fenced-block tests must use a non-Telegram Markdown platform.
 - Preserve when: Telegram tool-progress still routes dynamic arguments through
   a Markdown or rich-message parser without an equivalent literal-text guard.
 - Drop when: upstream supplies equivalent all-tool Telegram literal delivery
@@ -1349,10 +1354,8 @@ Merge protection:
 Verification:
 
 ```bash
-.venv/bin/python -m pytest tests/fork/test_telegram_tool_progress_literal_text.py -q -o 'addopts='
-.venv/bin/python -m pytest tests/gateway/test_run_progress_topics.py -q -o 'addopts='
-.venv/bin/python -m pytest tests/gateway/test_telegram_rich_messages.py -q -o 'addopts='
-.venv/bin/python -m py_compile fork_features/telegram_tool_progress.py gateway/run.py plugins/platforms/telegram/adapter.py tests/fork/test_telegram_tool_progress_literal_text.py tests/gateway/test_run_progress_topics.py tests/gateway/test_telegram_rich_messages.py
+scripts/run_tests.sh tests/fork/test_telegram_tool_progress_literal_text.py tests/gateway/test_run_progress_topics.py tests/gateway/test_telegram_rich_messages.py
+.venv/bin/python -m py_compile fork_features/telegram_tool_progress.py gateway/run.py gateway/run_turn_runner.py plugins/platforms/telegram/adapter.py tests/fork/test_telegram_tool_progress_literal_text.py tests/gateway/test_run_progress_topics.py tests/gateway/test_telegram_rich_messages.py
 git diff --check
 ```
 

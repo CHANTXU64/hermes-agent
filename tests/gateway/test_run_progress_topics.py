@@ -660,9 +660,10 @@ async def test_progress_no_anchor_for_native_discord_thread_event(monkeypatch, t
 def _extract_progress_preview(content: str) -> str | None:
     """Extract the argument-preview portion from a tool-progress message.
 
-    Handles both render styles:
+    Handles all supported render styles:
     - Legacy / custom tools:  ``🔧 tool_name: "<preview>"`` (quoted)
     - Friendly built-in verb: ``💻 Running <preview>`` (verb prefix, no quotes)
+    - Telegram literal form: ``💻 terminal: <preview>``
     """
     import re
 
@@ -672,6 +673,10 @@ def _extract_progress_preview(content: str) -> str | None:
         return match.group(1)
     # Friendly form: "<emoji> <verb> <preview>". The terminal verb is "Running".
     marker = " Running "
+    idx = content.find(marker)
+    if idx != -1:
+        return content[idx + len(marker):].strip()
+    marker = " terminal: "
     idx = content.find(marker)
     if idx != -1:
         return content[idx + len(marker):].strip()
@@ -1697,8 +1702,8 @@ class TerminalCommandAgent:
 
 
 @pytest.mark.asyncio
-async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path):
-    """Terminal progress on a markdown-capable (supports_code_blocks) gateway
+async def test_terminal_progress_renders_fenced_code_block_off_telegram(monkeypatch, tmp_path):
+    """Terminal progress on a non-Telegram markdown-capable gateway
     renders a bare fenced code block — no language tag (Slack mrkdwn would print
     'bash' as a literal first code line).  In non-verbose ("all"/"new") mode the
     command is collapsed to a single line capped at tool_preview_length so a long
@@ -1714,14 +1719,14 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    adapter = CodeBlockProgressAdapter(platform=Platform.DISCORD)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     source = SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=Platform.DISCORD,
         chat_id="12345",
         chat_type="dm",
         thread_id=None,
@@ -1732,8 +1737,8 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
         context_prompt="",
         history=[],
         source=source,
-        session_id="sess-terminal-code-block",
-        session_key="agent:main:telegram:dm:12345",
+        session_id="sess-terminal-code-block-discord",
+        session_key="agent:main:discord:dm:12345",
     )
 
     assert result["final_response"] == "done"
@@ -1767,14 +1772,14 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    adapter = CodeBlockProgressAdapter(platform=Platform.DISCORD)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     source = SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=Platform.DISCORD,
         chat_id="12345",
         chat_type="dm",
         thread_id=None,
@@ -1785,8 +1790,8 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
         context_prompt="",
         history=[],
         source=source,
-        session_id="sess-terminal-code-block-verbose",
-        session_key="agent:main:telegram:dm:12345",
+        session_id="sess-terminal-code-block-verbose-discord",
+        session_key="agent:main:discord:dm:12345",
     )
 
     assert result["final_response"] == "done"
@@ -1815,14 +1820,14 @@ async def test_terminal_progress_no_bash_block_in_verbose_mode(monkeypatch, tmp_
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    adapter = CodeBlockProgressAdapter(platform=Platform.DISCORD)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     source = SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=Platform.DISCORD,
         chat_id="12345",
         chat_type="dm",
         thread_id=None,
@@ -1833,8 +1838,8 @@ async def test_terminal_progress_no_bash_block_in_verbose_mode(monkeypatch, tmp_
         context_prompt="",
         history=[],
         source=source,
-        session_id="sess-terminal-verbose-no-bash",
-        session_key="agent:main:telegram:dm:12345",
+        session_id="sess-terminal-verbose-no-bash-discord",
+        session_key="agent:main:discord:dm:12345",
     )
 
     assert result["final_response"] == "done"
@@ -1877,14 +1882,14 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
-    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    adapter = CodeBlockProgressAdapter(platform=Platform.DISCORD)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     source = SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=Platform.DISCORD,
         chat_id="12345",
         chat_type="dm",
         thread_id=None,
@@ -1895,8 +1900,8 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
         context_prompt="",
         history=[],
         source=source,
-        session_id="sess-terminal-consecutive",
-        session_key="agent:main:telegram:dm:12345",
+        session_id="sess-terminal-consecutive-discord",
+        session_key="agent:main:discord:dm:12345",
     )
 
     assert result["final_response"] == "done"
