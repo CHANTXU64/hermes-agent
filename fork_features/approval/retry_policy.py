@@ -291,10 +291,13 @@ def format_user_denial_message(
             f"{silence}{breaker_addendum}"
         )
     lead = (
-        "BLOCKED: The approval request timed out; the user does not permit this "
-        "operation without an explicit reply."
+        "BLOCKED: The approval request timed out without user response; the user "
+        "does not permit this operation without an explicit reply."
         if timed_out
-        else "BLOCKED: The user does not permit this operation."
+        else (
+            "BLOCKED: The user does not permit this operation. "
+            "The action was denied by user."
+        )
     )
     reason = (
         f' Reason given by the user: "{deny_reason}".'
@@ -303,9 +306,11 @@ def format_user_denial_message(
     )
     silence = " Silence is not consent." if timed_out else ""
     return (
-        f"{lead}{reason} Stop the current workflow or ask the user directly in "
-        "chat. Do not retry, rewrite, split, or use another route to obtain the "
-        f"same result.{silence}{breaker_addendum}"
+        f"{lead}{reason} The user has NOT consented to this action. Stop the "
+        "current workflow or ask the user directly in chat. Do not retry, rephrase, "
+        "rewrite, or split the operation, and do not attempt the same result through "
+        "a different command or route."
+        f"{silence}{breaker_addendum}"
     )
 
 

@@ -136,6 +136,7 @@ def _current_session_profile() -> str:
 
 from tools.approval import (
     _read_local_script_for_approval,
+    _read_remote_script_for_approval,
     check_all_command_guards as _check_all_guards_impl,
 )
 
@@ -1243,7 +1244,9 @@ def terminal_tool(
             command, env_type, plan.config, force=force,
             cwd=approval_cwd,
             read_script=(
-                _read_local_script_for_approval if env_type == "local" else None
+                _read_local_script_for_approval
+                if env_type == "local"
+                else lambda path: _read_remote_script_for_approval(env, path)
             ),
         )
 

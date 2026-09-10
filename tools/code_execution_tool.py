@@ -708,21 +708,33 @@ def execute_code(
     # See #30882.
     from tools.approval import (
         _read_local_script_for_approval,
+        _read_remote_script_for_approval,
         check_execute_code_guard,
     )
     _mode = _get_execution_mode()
     _child_cwd = _resolve_child_cwd(
         _mode, "", task_id=task_id or "",
     )
-    _approval_cwd = (
-        _child_cwd if env_type == "local" else str(_env_config.get("cwd") or "")
+    _approval_env = None
+    if env_type != "local":
+        from tools.terminal_tool_lifecycle import get_active_env
+
+        _approval_env = get_active_env(task_id or "default")
+    _approval_cwd = _child_cwd if env_type == "local" else str(
+        getattr(_approval_env, "cwd", None) or _env_config.get("cwd") or ""
     )
     _guard = check_execute_code_guard(
         code, env_type,
         has_host_access=_docker_has_host_access(_env_config),
         cwd=_approval_cwd,
         read_script=(
-            _read_local_script_for_approval if env_type == "local" else None
+            _read_local_script_for_approval
+            if env_type == "local"
+            else (
+                lambda path: _read_remote_script_for_approval(_approval_env, path)
+                if _approval_env is not None
+                else None
+            )
         ),
     )
     if not _guard.get("approved", False):

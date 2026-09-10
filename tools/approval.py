@@ -38,8 +38,13 @@ from tools.approval_floors import (
 )
 from tools.approval_gateway_wait import _await_gateway_decision
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
-from tools.approval_smart import _smart_verdict, _get_smart_policy
-from fork_features.approval.policy import SmartApprovalResult
+from tools.approval_smart import (
+    _get_smart_policy,
+    _observe_smart_approval_verdict,
+    _prepare_smart_approval_observer,
+    _smart_verdict,
+)
+from fork_features.approval.policy import MAX_SCRIPT_BYTES, SmartApprovalResult
 
 logger = logging.getLogger(__name__)
 
@@ -127,9 +132,29 @@ def _read_local_script_for_approval(path: str) -> Optional[str]:
         if not os.path.isfile(real_path):
             return None
         with open(real_path, "rb") as handle:
-            data = handle.read(32_001)
+            data = handle.read(MAX_SCRIPT_BYTES + 1)
         return data.decode("utf-8", errors="replace")
     except (OSError, ValueError):
+        return None
+
+
+def _read_remote_script_for_approval(env: Any, path: str) -> Optional[str]:
+    """Return a bounded source prefix from the backend that will execute it."""
+    if env is None:
+        return None
+    try:
+        import shlex
+
+        result = env.execute(
+            f"head -c {MAX_SCRIPT_BYTES + 1} < {shlex.quote(path)}"
+        )
+        if result.get("returncode", -1) != 0:
+            return None
+        output = result.get("output", "")
+        if not isinstance(output, str) or "\x00" in output:
+            return None
+        return output
+    except Exception:
         return None
 
 
@@ -812,13 +837,24 @@ _ACTION_GATE = _GateSpec(
 )
 
 
-def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: str,
-                pattern_keys: list[str], session_key: str, *,
-                human_present: bool, cwd: Optional[str] = None,
-                source_kind: str = "shell",
-                read_script: Optional[Callable[[str], Optional[str]]] = None,
-                script_evidence: Optional[list[dict[str, str]]] = None) -> tuple[dict | None, bool]:
-    """Guardian-LLM step -> ``(result, smart_denied_for_owner)``."""
+def _smart_gate(
+    spec: _GateSpec,
+    command: str,
+    description: str,
+    pattern_key: str,
+    pattern_keys: list[str],
+    session_key: str,
+    *,
+    human_present: bool,
+    cwd: Optional[str] = None,
+    source_kind: str = "shell",
+    read_script: Optional[Callable[[str], Optional[str]]] = None,
+    script_evidence: Optional[list[dict[str, str]]] = None,
+) -> tuple[dict | None, bool, Optional[SmartApprovalResult]]:
+    """Guardian step -> result, denial state, and review for manual escalation."""
+    observer_payload = _prepare_smart_approval_observer(
+        command, description, pattern_key, pattern_keys, session_key,
+    )
     review = None
     try:
         review = _invoke_smart_approve(
@@ -831,21 +867,46 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
         )
     except Exception:
         logger.debug("Fork current-turn smart approval overlay failed", exc_info=True)
+    if review is not None:
+        _observe_smart_approval_verdict(observer_payload, review)
     verdict = (
         review
         if isinstance(review, str)
         else getattr(review, "decision", None)
     ) or _smart_verdict(
-        command, description, pattern_key, pattern_keys, session_key
+        command,
+        description,
+        pattern_key,
+        pattern_keys,
+        session_key,
+        observer_payload=observer_payload,
     )
-    if getattr(review, "reason", None):
-        description = f"{description}. {review.reason}"
+    structured_review = review if isinstance(review, SmartApprovalResult) else None
     if verdict == "approve":
         _reset_denials(session_key)
-        logger.debug(spec.smart_log.format(command=command[:60], description=description, session_key=session_key))
-        return {"approved": True, "message": None, "smart_approved": True, "description": description}, False
+        logger.debug(
+            spec.smart_log.format(
+                command=command[:60],
+                description=description,
+                session_key=session_key,
+            )
+        )
+        result = {
+            "approved": True,
+            "message": None,
+            "smart_approved": True,
+            "description": description,
+        }
+        if structured_review is not None:
+            result["smart_review"] = {
+                "decision": structured_review.decision,
+                "risk_level": structured_review.risk_level,
+                "authorization": structured_review.authorization,
+                "reason": structured_review.reason,
+            }
+        return result, False, None
     if verdict != "deny":
-        return None, False
+        return None, False, structured_review
     _record_denial(session_key)
     denial_description = getattr(review, "reason", None) or description
     if human_present:
@@ -854,25 +915,39 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
             source_kind=source_kind,
         )
         if repeat_state is not None:
-            return _request_repeat_manual_approval(
+            return (
+                _request_repeat_manual_approval(
+                    command,
+                    denial_description or repeat_state.description,
+                    source_kind=source_kind,
+                ),
+                True,
+                None,
+            )
+        return (
+            _fork_approval_policy().first_denial(
                 command,
-                denial_description or repeat_state.description,
+                denial_description,
                 source_kind=source_kind,
-            ), True
-        return _fork_approval_policy().first_denial(
-            command,
-            denial_description,
-            source_kind=source_kind,
-            breaker_addendum=_denial_breaker_addendum(session_key),
-        ), True
-    return {
-        # Unattended programmatic platforms (webhook/msgraph_webhook/ api_server): respect unattended_mode
-        # config. Resolves instantly — never a pending approval nobody can answer (#37284, #87509).
-        "approved": False,
-        "message": (f"BLOCKED by smart approval: {description}. The command was assessed as genuinely "
-                    f"dangerous. Do NOT retry.{_denial_breaker_addendum(session_key)}"),
-        "smart_denied": True,
-    }, True
+                breaker_addendum=_denial_breaker_addendum(session_key),
+            ),
+            True,
+            None,
+        )
+    return (
+        {
+            # Unattended programmatic platforms resolve instantly.
+            "approved": False,
+            "message": (
+                f"BLOCKED by smart approval: {description}. The command was assessed "
+                f"as genuinely dangerous. Do NOT retry."
+                f"{_denial_breaker_addendum(session_key)}"
+            ),
+            "smart_denied": True,
+        },
+        True,
+        None,
+    )
 
 
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
@@ -897,7 +972,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
 
     smart_denied = False
     if smart:
-        result, smart_denied = _smart_gate(
+        result, smart_denied, smart_review = _smart_gate(
             spec, command, description, pattern_key, pattern_keys,
             session_key, human_present=is_cli or is_gateway or is_ask,
             cwd=cwd, source_kind=source_kind, read_script=read_script,
@@ -905,6 +980,13 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         )
         if result is not None:
             return result
+        if smart_review is not None:
+            formatted_review = _fork_approval_policy().format_review(smart_review)
+            description = (
+                formatted_review
+                if _approval_language_prefers_chinese()
+                else f"{description}; {formatted_review}"
+            )
     pending_body = pending_body() if pending_body else None
     effective_smart_denied = smart_denied or one_shot_only
     allow_permanent = permanent_capable and not effective_smart_denied
@@ -915,7 +997,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             breaker = _denial_breaker_addendum(session_key)
         deny_reason = fmt.pop("deny_reason", None)
         extra = {"deny_reason": deny_reason} if "reason" in fmt else {}
-        if denial_source_kind is not None:
+        if denial_source_kind is not None or spec in {_COMMAND_GATE, _EXECUTE_CODE_GATE}:
             message = _fork_approval_policy().format_repeat_denial(
                 outcome,
                 deny_reason,

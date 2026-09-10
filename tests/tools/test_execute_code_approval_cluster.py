@@ -489,6 +489,45 @@ def test_terminal_public_entry_passes_effective_cwd_and_script_reader_to_guard(
     assert captured["read_script"](str(script)) == "print('terminal evidence')\n"
 
 
+def test_terminal_remote_entry_reads_script_from_execution_environment(monkeypatch):
+    """Remote approval evidence must come from the backend that will execute it."""
+    from tools import terminal_tool as terminal_module
+
+    captured = {}
+    executed = []
+    plan = SimpleNamespace(
+        config={"env_type": "ssh"},
+        env_type="ssh",
+        cwd="/remote/session",
+        effective_task_id="task",
+        promoted_from_foreground_timeout=None,
+    )
+
+    class RemoteEnv:
+        cwd = "/remote/live"
+
+        def execute(self, command, **_kwargs):
+            executed.append(command)
+            return {"returncode": 0, "output": "echo remote\n"}
+
+    monkeypatch.setattr(terminal_module, "_plan_execution", lambda *a, **k: plan)
+    monkeypatch.setattr(terminal_module, "_acquire_env", lambda *a, **k: RemoteEnv())
+    monkeypatch.setattr(terminal_module, "_pre_exec_block", lambda *a, **k: None)
+
+    def reject(command, env_type, **kwargs):
+        captured.update(command=command, env_type=env_type, **kwargs)
+        return {"approved": False, "message": "captured"}
+
+    monkeypatch.setattr(terminal_module, "_check_all_guards_impl", reject)
+    result = json.loads(terminal_module.terminal_tool("bash deploy.sh"))
+
+    assert result["status"] == "blocked"
+    assert captured["cwd"] == "/remote/session"
+    assert callable(captured["read_script"])
+    assert captured["read_script"]("/remote/session/deploy.sh") == "echo remote\n"
+    assert executed and "head -c 32001" in executed[0]
+
+
 def test_execute_code_public_entry_passes_effective_cwd_and_script_reader_to_guard(
     monkeypatch, tmp_path,
 ):
@@ -528,6 +567,54 @@ def test_execute_code_public_entry_passes_effective_cwd_and_script_reader_to_gua
     assert captured["cwd"] == str(tmp_path)
     assert callable(captured["read_script"])
     assert captured["read_script"](str(helper)) == "VALUE = 'execute evidence'\n"
+
+
+def test_execute_code_remote_entry_uses_active_environment_for_script_evidence(
+    monkeypatch,
+):
+    """Remote execute_code must review files from its active backend, not the host."""
+    from tools import code_execution_tool as code_module
+    from tools import terminal_tool as terminal_module
+    from tools import terminal_tool_lifecycle as lifecycle_module
+
+    captured = {}
+    executed = []
+
+    class RemoteEnv:
+        cwd = "/remote/live"
+
+        def execute(self, command, **_kwargs):
+            executed.append(command)
+            return {"returncode": 0, "output": "VALUE = 'remote evidence'\n"}
+
+    monkeypatch.setattr(code_module, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(
+        terminal_module,
+        "_get_env_config",
+        lambda: {"env_type": "ssh", "cwd": "/remote/config", "docker_volumes": []},
+    )
+    monkeypatch.setattr(
+        "tools.process_registry._is_supervised_gateway_process", lambda: False,
+    )
+    monkeypatch.setattr(code_module, "_get_execution_mode", lambda: "project")
+    monkeypatch.setattr(code_module, "_resolve_child_cwd", lambda *a, **k: "/host/unused")
+    monkeypatch.setattr(lifecycle_module, "get_active_env", lambda _task_id: RemoteEnv())
+
+    def reject(code, env_type, **kwargs):
+        captured.update(code=code, env_type=env_type, **kwargs)
+        return {"approved": False, "message": "captured"}
+
+    monkeypatch.setattr("tools.approval.check_execute_code_guard", reject)
+    code = "import runpy\nrunpy.run_path('helper.py')\n"
+    result = json.loads(code_module.execute_code(code, task_id="task"))
+
+    assert "captured" in result["error"]
+    assert captured["cwd"] == "/remote/live"
+    assert callable(captured["read_script"])
+    assert captured["read_script"]("/remote/live/helper.py") == (
+        "VALUE = 'remote evidence'\n"
+    )
+    assert executed and "head -c 32001" in executed[0]
 
 
 def test_guard_session_yolo_bypasses(gw_session):

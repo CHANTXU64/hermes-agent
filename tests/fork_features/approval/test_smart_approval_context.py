@@ -380,6 +380,115 @@ def test_terminal_auto_approval_note_uses_configured_language(monkeypatch):
     )
 
 
+def test_command_guard_preserves_structured_review_and_observer_fields(monkeypatch):
+    from tools import approval_context
+
+    review = SmartApprovalResult(
+        decision="approve",
+        risk_level="medium",
+        authorization="exact",
+        reason="用户已明确批准这次远端变更。",
+    )
+    events = []
+
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+    monkeypatch.setattr("tools.approval._YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "smart")
+    monkeypatch.setattr("tools.approval.is_approved", lambda *_args: False)
+    monkeypatch.setattr(
+        "tools.approval._tirith_scan",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+    )
+    monkeypatch.setattr(
+        "tools.approval.detect_dangerous_command",
+        lambda _command: (True, "remote-write", "remote mutation"),
+    )
+    monkeypatch.setattr(
+        "tools.approval._invoke_smart_approve",
+        lambda *_args, **_kwargs: review,
+    )
+    monkeypatch.setattr(
+        approval_context,
+        "_fire_approval_hook",
+        lambda hook_name, **payload: events.append((hook_name, payload)),
+    )
+
+    result = check_all_command_guards("deploy --apply", "local")
+
+    assert result["approved"] is True
+    assert result["smart_review"] == {
+        "decision": "approve",
+        "risk_level": "medium",
+        "authorization": "exact",
+        "reason": "用户已明确批准这次远端变更。",
+    }
+    assert [name for name, _payload in events] == [
+        "pre_approval_request",
+        "post_approval_response",
+    ]
+    post = events[1][1]
+    assert post["choice"] == "smart_approve"
+    assert post["risk_level"] == "medium"
+    assert post["authorization"] == "exact"
+    assert post["reason"] == "用户已明确批准这次远端变更。"
+
+
+def test_smart_escalation_reaches_human_with_localized_review_and_denial(
+    monkeypatch,
+):
+    review = SmartApprovalResult(
+        decision="escalate",
+        risk_level="medium",
+        authorization="unclear",
+        reason="需要用户确认远端写入范围。",
+    )
+    prompted = {}
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+    monkeypatch.setattr("tools.approval._YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "smart")
+    monkeypatch.setattr("tools.approval.is_approved", lambda *_args: False)
+    monkeypatch.setattr(
+        "tools.approval._presence",
+        lambda _callback=None: (lambda *_args, **_kwargs: "deny", True, False, False),
+    )
+    monkeypatch.setattr(
+        "tools.approval._tirith_scan",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+    )
+    monkeypatch.setattr(
+        "tools.approval.detect_dangerous_command",
+        lambda _command: (True, "remote-write", "remote mutation"),
+    )
+    monkeypatch.setattr(
+        "tools.approval._invoke_smart_approve",
+        lambda *_args, **_kwargs: review,
+    )
+    monkeypatch.setattr(
+        "tools.approval._present_with_selected_transport",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "tools.approval._transport_choice",
+        lambda *_args, **_kwargs: (None, None),
+    )
+
+    def deny_prompt(_command, description, **_kwargs):
+        prompted["description"] = description
+        return "deny"
+
+    monkeypatch.setattr("tools.approval.prompt_dangerous_approval", deny_prompt)
+
+    result = check_all_command_guards("deploy --apply", "local")
+
+    assert prompted["description"] == (
+        "智能审批：风险等级=中，授权状态=不明确。需要用户确认远端写入范围。"
+    )
+    assert result["approved"] is False
+    assert result["message"].startswith("已阻止：用户不允许执行这项操作。")
+
+
 def test_shell_heredoc_is_inline_code_not_external_script_evidence(tmp_path: Path):
     python_evidence = _collect_direct_script_evidence(
         "python - <<'PY'\nprint('ok')\nPY",

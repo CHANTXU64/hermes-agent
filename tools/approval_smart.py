@@ -31,6 +31,7 @@ _SYSTEM_PROMPT = (
     "Respond with exactly one word: APPROVE, DENY, or ESCALATE"
 )
 _VERDICTS = {"APPROVE": "approve", "DENY": "deny"}
+_OBSERVER_UNSET = object()
 
 
 def _strip_line_comment(line: str) -> str:
@@ -121,25 +122,78 @@ def _smart_approve(command: str, description: str) -> str:
         return "escalate"
 
 
-def _smart_verdict(command: str, description: str, pattern_key: str,
-                   pattern_keys: list[str], session_key: str) -> str:
-    """Run the guardian LLM with observer hooks; 'approve' | 'deny' | 'escalate'.
-    Redaction is observer-payload preparation, not approval policy: if it fails,
-    skip observability rather than leak raw data or block the LLM decision."""
+def _prepare_smart_approval_observer(
+    command: str,
+    description: str,
+    pattern_key: str,
+    pattern_keys: list[str],
+    session_key: str,
+) -> dict | None:
+    """Emit a redacted pre-review event and return its reusable payload."""
     try:
         from agent.redact import redact_sensitive_text
+
         payload = {
             "command": redact_sensitive_text(command, force=True),
             "description": redact_sensitive_text(description, force=True),
-            "pattern_key": pattern_key, "pattern_keys": list(pattern_keys),
-            "session_key": session_key, "surface": "smart",
+            "pattern_key": pattern_key,
+            "pattern_keys": list(pattern_keys),
+            "session_key": session_key,
+            "surface": "smart",
         }
     except Exception as exc:
         logger.debug("Smart approval hook redaction failed: %s", exc)
-        payload = None
+        return None
+    _ctx._fire_approval_hook("pre_approval_request", **payload)
+    return payload
+
+
+def _observe_smart_approval_verdict(payload: dict | None, verdict) -> None:
+    """Emit one structured post-review event without exposing unredacted reason text."""
+    decision = getattr(verdict, "decision", verdict)
+    if payload is None or decision not in {"approve", "deny"}:
+        return
+    review_fields = {}
+    if hasattr(verdict, "risk_level"):
+        try:
+            from agent.redact import redact_sensitive_text
+
+            reason = redact_sensitive_text(str(verdict.reason), force=True)
+        except Exception as exc:
+            logger.debug("Smart approval review-field redaction failed: %s", exc)
+            reason = ""
+        review_fields = {
+            "risk_level": verdict.risk_level,
+            "authorization": verdict.authorization,
+            "reason": reason,
+        }
+    _ctx._fire_approval_hook(
+        "post_approval_response",
+        **payload,
+        choice=f"smart_{decision}",
+        decided_by="aux_llm",
+        **review_fields,
+    )
+
+
+def _smart_verdict(
+    command: str,
+    description: str,
+    pattern_key: str,
+    pattern_keys: list[str],
+    session_key: str,
+    *,
+    observer_payload=_OBSERVER_UNSET,
+) -> str:
+    """Run the guardian LLM with observer hooks; 'approve' | 'deny' | 'escalate'.
+    Redaction is observer-payload preparation, not approval policy: if it fails,
+    skip observability rather than leak raw data or block the LLM decision."""
+    if observer_payload is _OBSERVER_UNSET:
+        payload: dict | None = _prepare_smart_approval_observer(
+            command, description, pattern_key, pattern_keys, session_key,
+        )
     else:
-        _ctx._fire_approval_hook("pre_approval_request", **payload)
+        payload = observer_payload if isinstance(observer_payload, dict) else None
     verdict = _smart_approve(command, description)
-    if payload is not None and verdict in {"approve", "deny"}:
-        _ctx._fire_approval_hook("post_approval_response", **payload, choice=f"smart_{verdict}", decided_by="aux_llm")
+    _observe_smart_approval_verdict(payload, verdict)
     return verdict
