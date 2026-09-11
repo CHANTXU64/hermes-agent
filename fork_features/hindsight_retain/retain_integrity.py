@@ -346,18 +346,43 @@ def _load_events(
     return events, torn_tail
 
 
+def _state_db_candidates(state_db_path: Path) -> tuple[Path, ...]:
+    """Return the configured StateDB plus default/profile siblings."""
+    configured = Path(state_db_path).expanduser()
+    candidates = [configured]
+    if configured.name == "state.db":
+        parent = configured.parent
+        hermes_home = (
+            parent.parent.parent
+            if parent.parent.name == "profiles"
+            else parent
+        )
+        candidates.append(hermes_home / "state.db")
+        profiles_dir = hermes_home / "profiles"
+        if profiles_dir.is_dir():
+            candidates.extend(sorted(profiles_dir.glob("*/state.db")))
+    return tuple(dict.fromkeys(candidates))
+
+
+def _state_db_for_session(state_db_path: Path, session_id: str) -> Path | None:
+    for candidate in _state_db_candidates(state_db_path):
+        if not candidate.exists():
+            continue
+        try:
+            with sqlite3.connect(f"file:{candidate}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+        except sqlite3.Error:
+            continue
+        if row is not None:
+            return candidate
+    return None
+
+
 def _session_exists(state_db_path: Path, session_id: str) -> bool:
-    if not state_db_path.exists():
-        return False
-    try:
-        with sqlite3.connect(f"file:{state_db_path}?mode=ro", uri=True) as conn:
-            row = conn.execute(
-                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
-                (session_id,),
-            ).fetchone()
-    except sqlite3.Error:
-        return False
-    return row is not None
+    return _state_db_for_session(state_db_path, session_id) is not None
 
 
 def _state_snapshot(
@@ -373,10 +398,13 @@ def _state_snapshot(
         "active_message_count": 0,
         "max_message_id": None,
     }
-    if not state_db_path.exists():
+    resolved_state_db_path = _state_db_for_session(state_db_path, session_id)
+    if resolved_state_db_path is None:
         return empty
     try:
-        with sqlite3.connect(f"file:{state_db_path}?mode=ro", uri=True) as conn:
+        with sqlite3.connect(
+            f"file:{resolved_state_db_path}?mode=ro", uri=True
+        ) as conn:
             conn.row_factory = sqlite3.Row
             session_found = conn.execute(
                 "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
@@ -1298,6 +1326,27 @@ def scan_attempts(
         session_id = str(started.get("session_id") or "").strip()
         document_id = str(started.get("document_id") or session_id).strip()
         state_session_found = _session_exists(Path(state_db_path), session_id)
+        state_snapshot = started.get("state_snapshot")
+        if (
+            state_session_found
+            and isinstance(state_snapshot, dict)
+            and not state_snapshot.get("session_found")
+        ):
+            cutoff_value = started.get("cutoff_at")
+            if cutoff_value is None and scheduled is not None:
+                cutoff_value = scheduled.get("cutoff_at")
+            try:
+                cutoff_at = _parse_time(cutoff_value)
+            except (TypeError, ValueError):
+                cutoff_at = None
+            if cutoff_at is not None:
+                recovered_snapshot = _state_snapshot(
+                    Path(state_db_path),
+                    session_id,
+                    cutoff_at=cutoff_at,
+                )
+                if recovered_snapshot.get("session_found"):
+                    state_snapshot = recovered_snapshot
         if not terminal:
             alerts.append(
                 {
@@ -1379,7 +1428,6 @@ def scan_attempts(
                     "message": "Retain 有本地记录，但 StateDB 中找不到对应会话，无法完成独立内容交叉验证",
                 }
             )
-        state_snapshot = started.get("state_snapshot")
         if succeeded is not None and isinstance(state_snapshot, dict):
             counts = candidate_material["counts"] if candidate_material is not None else None
             if counts is not None and _candidate_gap_is_severe(state_snapshot, counts):

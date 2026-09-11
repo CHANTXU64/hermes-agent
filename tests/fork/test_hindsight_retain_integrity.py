@@ -936,6 +936,127 @@ def test_success_without_state_db_session_is_unresolved_alert(tmp_path: Path) ->
     ]
 
 
+def test_retain_resolves_session_from_profile_state_db_family(tmp_path: Path) -> None:
+    module = load_module()
+    session_id = "session-profile-only"
+    started_at = datetime(2026, 9, 10, 13, 23, tzinfo=timezone.utc)
+    default_state_db = tmp_path / "state.db"
+    profile_state_db = tmp_path / "profiles" / "evaluator" / "state.db"
+    profile_state_db.parent.mkdir(parents=True)
+    create_state_db(profile_state_db, session_id)
+    journal = tmp_path / "retain-attempts.jsonl"
+    exporter = tmp_path / "fake_exporter.py"
+    write_valid_exporter(exporter)
+
+    module.run_export(
+        session_id=session_id,
+        output_root=tmp_path / "runs",
+        journal_path=journal,
+        state_db_path=default_state_db,
+        export_script=exporter,
+        python_executable=sys.executable,
+        remote_expectation="not_expected_export_only",
+        attempt_id="attempt-profile-state",
+        now=started_at,
+        cutoff_at=started_at,
+    )
+
+    events = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert events[0]["state_snapshot"] == {
+        "session_found": True,
+        "active_user_count": 1,
+        "active_assistant_count": 1,
+        "active_message_count": 2,
+        "max_message_id": 2,
+    }
+
+    result = module.scan_attempts(
+        journal_path=journal,
+        state_db_path=default_state_db,
+        now=started_at + timedelta(minutes=10),
+    )
+
+    assert result["alerts"] == []
+
+
+def test_scan_rechecks_profile_state_when_old_snapshot_used_wrong_db(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    session_id = "session-profile-old-receipt"
+    attempt_id = "attempt-profile-old-receipt"
+    started_at = datetime(2026, 9, 10, 13, 23, tzinfo=timezone.utc)
+    default_state_db = tmp_path / "state.db"
+    profile_state_db = tmp_path / "profiles" / "evaluator" / "state.db"
+    profile_state_db.parent.mkdir(parents=True)
+    create_state_db(profile_state_db, session_id)
+    with sqlite3.connect(profile_state_db) as conn:
+        conn.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, 1, 0, NULL)",
+            [
+                (message_id, session_id, role, f"message {message_id}", 1000.0 + message_id)
+                for message_id, role in [
+                    (3, "user"),
+                    (4, "assistant"),
+                    (5, "user"),
+                    (6, "assistant"),
+                    (7, "user"),
+                    (8, "assistant"),
+                ]
+            ],
+        )
+    journal = tmp_path / "retain-attempts.jsonl"
+    exporter = tmp_path / "fake_exporter.py"
+    write_valid_exporter(exporter)
+    module.run_export(
+        session_id=session_id,
+        output_root=tmp_path / "runs",
+        journal_path=journal,
+        state_db_path=default_state_db,
+        export_script=exporter,
+        python_executable=sys.executable,
+        remote_expectation="not_expected_export_only",
+        attempt_id=attempt_id,
+        now=started_at,
+        cutoff_at=started_at,
+    )
+    events = [json.loads(line) for line in journal.read_text().splitlines()]
+    events[0]["state_snapshot"] = {
+        "session_found": False,
+        "active_user_count": 0,
+        "active_assistant_count": 0,
+        "active_message_count": 0,
+        "max_message_id": None,
+    }
+    journal.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    result = module.scan_attempts(
+        journal_path=journal,
+        state_db_path=default_state_db,
+        now=started_at + timedelta(minutes=10),
+    )
+
+    assert result["alerts"] == [
+        {
+            "alert_key": f"retain:{attempt_id}:candidate_severely_incomplete",
+            "type": "retain_candidate_severely_incomplete",
+            "severity": "high",
+            "attempt_id": attempt_id,
+            "session_id": session_id,
+            "document_id": session_id,
+            "started_at": started_at.isoformat(),
+            "state_session_found": True,
+            "state_active_message_count": 8,
+            "candidate_message_count": 2,
+            "missing_message_count": 6,
+            "message": "Retain 候选相对开始时的 StateDB 会话少了一大块有效用户或 AI 消息",
+        }
+    ]
+
+
 def test_remote_unavailable_is_unresolved_not_missing(tmp_path: Path) -> None:
     module = load_module()
     now = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
