@@ -11,7 +11,6 @@ import pytest
 
 import tools.approval as approval_module
 from tools import approval_context
-from tools import approval_smart
 from hermes_constants import get_hermes_home
 from tools.approval import approve_session, detect_dangerous_command, detect_hardline_command, is_approved, load_permanent, prompt_dangerous_approval
 from tools.approval_context import _get_approval_mode
@@ -62,7 +61,7 @@ class TestSmartApproval:
             lambda: {"mode": "smart"},
         )
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
-        monkeypatch.setattr(approval_smart, "_smart_approve", lambda *_: "approve")
+        monkeypatch.setattr(approval_module, "_smart_approve", lambda *_, **__: "approve")
         monkeypatch.setattr(
             "tools.tirith_security.check_command_security",
             lambda _command: {"action": "allow", "findings": [], "summary": ""},

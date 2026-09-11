@@ -196,3 +196,82 @@ def test_critical_model_approval_is_forced_to_deny(tmp_path):
     )
 
     assert result == SmartApprovalResult("deny", "critical", "exact", "严重破坏操作。")
+
+
+def test_safe_assessment_does_not_require_task_authorization(tmp_path):
+    import json
+
+    for decision in ("approve", "escalate"):
+        for authorization in ("none", "unclear", "sufficient"):
+            result = _review(
+                tmp_path,
+                command="python update_progress.py",
+                context={"latest_user_message": "", "clarifications": []},
+                response=_response(json.dumps({
+                    "decision": decision, "risk_level": "low",
+                    "authorization": authorization, "reason": "普通本地进度写入，未见具体危险。",
+                    "risk_evidence": "", "prohibition": "",
+                })),
+            )
+            assert result.decision == "approve", (decision, authorization, result)
+
+
+def test_risky_actions_and_explicit_prohibitions_keep_their_gate(tmp_path):
+    import json
+
+    cases = [
+        ("approve", "low", "exact", "", "用户说‘只查，不要修改’，当前命令修改文件。", "deny"),
+        ("approve", "critical", "exact", "rm -rf / 删除系统", "", "deny"),
+        ("approve", "medium", "none", "send_mail 向外部收件人发送内容", "", "escalate"),
+        ("escalate", "medium", "exact", "send_mail 向外部收件人发送内容", "", "approve"),
+        ("approve", "medium", "exact", "", "", "escalate"),
+        ("approve", "low", "sufficient", "删除重要数据", "", "escalate"),
+    ]
+    for decision, risk, authorization, evidence, prohibition, expected in cases:
+        result = _review(tmp_path, response=_response(json.dumps({
+            "decision": decision, "risk_level": risk, "authorization": authorization,
+            "reason": prohibition or evidence or "风险结论缺乏证据。",
+            "risk_evidence": evidence, "prohibition": prohibition,
+        })))
+        assert result.decision == expected, (decision, risk, authorization, result)
+
+
+def test_real_guard_paths_use_separate_safety_findings(tmp_path, monkeypatch):
+    import json
+    from tools import approval, approval_context
+    from fork_features.approval.policy import set_smart_approval_context, reset_smart_approval_context
+
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(approval_context, "_get_approval_config", lambda: {"mode": "smart"})
+    monkeypatch.setattr("tools.tirith_security.check_command_security",
+                        lambda _: {"action": "allow", "findings": [], "summary": ""})
+    calls = []
+    response = {}
+
+    def model(**kwargs):
+        calls.append(kwargs)
+        return _response(json.dumps(response))
+
+    monkeypatch.setattr(approval, "_call_approval_llm", model)
+    token = set_smart_approval_context({"latest_user_message": "", "clarifications": []})
+    try:
+        for guard, command in [
+            (approval.check_all_command_guards, "python -c \"print('hello')\""),
+            (approval.check_execute_code_guard, "print('hello')"),
+        ]:
+            for prohibition in ("", "用户明确禁止执行该操作。"):
+                key = f"safety-findings-{guard.__name__}-{bool(prohibition)}"
+                approval.clear_session(key)
+                monkeypatch.setenv("HERMES_SESSION_KEY", key)
+                response.update(decision="approve", risk_level="low", authorization="none",
+                                reason="普通操作。", risk_evidence="", prohibition=prohibition)
+                before = len(calls)
+                result = guard(command, "local")
+                assert result["approved"] is (not prohibition)
+                assert len(calls) == before + 1
+                approval.clear_session(key)
+    finally:
+        reset_smart_approval_context(token)

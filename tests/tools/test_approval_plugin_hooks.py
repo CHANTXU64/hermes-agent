@@ -12,7 +12,6 @@ import pytest
 
 import tools.approval as approval_module
 from tools import approval_context
-from tools import approval_smart
 from tools.approval import check_all_command_guards, check_execute_code_guard, clear_session
 from tools.approval_context import set_current_session_key
 
@@ -158,7 +157,7 @@ class TestSmartModeFiresHooks:
         monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
         monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
-        monkeypatch.setattr(approval_smart, "_smart_approve", lambda *_: verdict)
+        monkeypatch.setattr(approval_module, "_smart_approve", lambda *_, **__: verdict)
         monkeypatch.setattr(
             "tools.tirith_security.check_command_security",
             lambda _: {"action": "allow", "findings": [], "summary": ""},
@@ -216,11 +215,11 @@ class TestSmartModeFiresHooks:
         self._configure(monkeypatch, "approve")
         events = []
 
-        def decide(*_):
+        def decide(*_, **__):
             events.append("smart_approve")
             return "approve"
 
-        monkeypatch.setattr(approval_smart, "_smart_approve", decide)
+        monkeypatch.setattr(approval_module, "_smart_approve", decide)
         with patch(
             "hermes_cli.plugins.invoke_hook",
             side_effect=lambda name, **kwargs: events.append(name),
@@ -321,7 +320,7 @@ class TestSmartModeFiresHooks:
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
         monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
-        monkeypatch.setattr(approval_smart, "_smart_approve", lambda *_: next(verdicts))
+        monkeypatch.setattr(approval_module, "_smart_approve", lambda *_, **__: next(verdicts))
         monkeypatch.setattr(
             "tools.tirith_security.check_command_security",
             lambda _: {"action": "allow", "findings": [], "summary": ""},
