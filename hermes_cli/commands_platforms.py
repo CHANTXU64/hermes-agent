@@ -264,17 +264,49 @@ def _collect_gateway_skill_entries(
     return (plugin_entries + skill_entries[:remaining])[:max_slots], hidden_count
 
 
+def _telegram_quick_command_entries() -> list[tuple[str, str]]:
+    """Expose only names Telegram can send verbatim to the quick-command dispatcher."""
+    from hermes_cli.config import read_raw_config
+
+    config = read_raw_config() or {}
+    quick = config.get("quick_commands", {}) if isinstance(config, Mapping) else {}
+    if not isinstance(quick, Mapping):
+        return []
+    # Built-in aliases also win at dispatch, even though they are absent from the menu.
+    reserved = {name for cmd in _gateway_available_commands()
+                for name in (cmd.name, *cmd.aliases)}
+    entries = []
+    for name, meta in quick.items():
+        # Do not sanitize/truncate a quick name: unlike skills, its execution lookup is exact.
+        if (not isinstance(name, str) or not re.fullmatch(r"[a-z0-9_]{1,32}", name)
+                or name in reserved or not isinstance(meta, Mapping)):
+            continue
+        kind = meta.get("type")
+        field = {"exec": "command", "alias": "target"}.get(kind) if isinstance(kind, str) else None
+        body = meta.get(field) if field else None
+        if not isinstance(body, str) or not body.strip():
+            continue
+        desc = meta.get("description")
+        desc = " ".join(desc.split()) if isinstance(desc, str) else ""
+        entries.append((name, _truncate_desc(desc or "Custom quick command", 40)))
+    return entries
+
+
 def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str]], int]:
-    """``(menu_commands, hidden_count)`` for Telegram, capped to the Bot API limit. Tier order:
-    core CommandDefs, plugin slash commands, skill commands (alphabetical; hub and
-    telegram-disabled skills excluded). Tiers keep relative order unless named in
-    ``platforms.telegram.extra.command_menu.priority`` — applied *before* the cap, so a
-    prioritized dynamic command can displace an unprioritized core command."""
+    """``(menu_commands, hidden_count)`` for Telegram, capped to the Bot API limit.
+
+    After explicit/default priorities: quick commands, remaining core, plugins, skills.
+    Built-ins win duplicate names; quick commands win over plugins/skills as at dispatch.
+    """
     core_commands = list(telegram_bot_commands(include_plugins=False))
+    reserved = {n for n, _ in core_commands}
+    quick_commands = [(n, d) for n, d in _telegram_quick_command_entries() if n not in reserved]
+    reserved.update(n for n, _ in quick_commands)
     entries, hidden_count = _collect_gateway_skill_entries(
-        platform="telegram", max_slots=None, reserved_names={n for n, _ in core_commands},
+        platform="telegram", max_slots=None, reserved_names=reserved,
         desc_limit=40, sanitize_name=_sanitize_telegram_name)
-    candidates = [(name, desc, "core", name) for name, desc in core_commands]
+    candidates = [(name, desc, "quick", name) for name, desc in quick_commands]
+    candidates += [(name, desc, "core", name) for name, desc in core_commands]
     candidates += [(name, desc, "skill" if cmd_key else "plugin", raw)
                    for name, desc, cmd_key, raw in entries]
     candidates = _prioritize_telegram_menu_candidates(candidates)

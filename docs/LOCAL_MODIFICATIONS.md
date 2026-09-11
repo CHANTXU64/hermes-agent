@@ -760,6 +760,35 @@ git diff --check
 - Last validated: upstream `64a6f42cb38def7ad6524bdfe640a16997c88760`; Fork working tree based on `4e00fb68f5fe583cb7c44a124fa59c91bf40aa0f` (uncommitted)
 - Feature docs: this maintenance entry; Fork-owned scripts expose `schedule`, internal `execute-scheduled`, legacy immediate `export`, and read-only `scan`
 
+### Telegram quick-command menu discovery
+
+- ID: `telegram-quick-command-menu`
+- Status: active
+- Depends on: none — uses upstream config-defined Quick Commands and Telegram menu pipeline
+- Source boundary: logical-only
+
+Files / touchpoints:
+- `hermes_cli/commands_platforms.py` — menu discovery and candidate composition only
+- `tests/fork/test_telegram_quick_command_menu.py` — config-to-menu and real adapter registration seam
+
+Intent / invariants:
+- Telegram menus include valid config-defined `exec` and `alias` Quick Commands without executing them. Only literal `[a-z0-9_]{1,32}` names are published: no sanitization/truncation that would break exact execution lookup. Malformed entries are skipped; descriptions use the configured text or a generic fallback, never the shell command or alias target.
+- Built-in names and aliases retain precedence; same-name quick commands do not duplicate or replace their menu entry. Quick Commands precede colliding plugins/skills, matching dispatch. Explicit menu priorities and upstream common-command priorities remain first, then configured Quick Commands before unprioritized built-ins/plugins/skills. Existing menu cap and hidden-count behavior remain shared.
+- Default/private/group/forum registration all use the same generator. Discovery uses the current Hermes home's read-only config loader; no global bot registration, command execution, permission, restart, Retain, CLI/TUI/Desktop or other-platform behavior is changed. Menu refresh follows the existing adapter registration lifecycle, not a new hot-reload mechanism.
+
+Merge decision:
+- Preserve when: upstream Telegram discovery omits config-defined Quick Commands.
+- Drop when: upstream covers the same names, precedence, priority and adapter-level behavior and the user accepts replacement.
+- Ask user when: changing dispatch, adding name rewriting or automatic menu refresh, or changing which commands win collisions.
+
+Verification:
+```bash
+scripts/run_tests.sh tests/fork/test_telegram_quick_command_menu.py tests/hermes_cli/test_commands.py tests/gateway/test_telegram_forum_commands.py tests/cli/test_quick_commands.py tests/fork/test_gateway_quick_command_session_env.py tests/fork/test_multi_telegram_accounts.py
+```
+- Upstream status: fork-only
+- Last validated: upstream `72a3277cd7937fd0f0a2a3e3fddbed21d7b1c8bd` (local reference, no fetch); Fork based on `85dcb613d4` plus this change. After the user restarted Gateway, Telegram `getMyCommands` confirmed `retain`, `doctor`, `disk` and exactly one built-in `restart` in the default/private menus of all four configured bots; no live command execution was triggered.
+- Feature docs: none — small menu-only change; this entry is the complete maintenance contract
+
 ### 10. Custom hosted STT provider
 
 Status: active; plugin-owned boundary (2026-08-30)
