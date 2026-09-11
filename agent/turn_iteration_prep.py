@@ -1,7 +1,7 @@
 """Outer-iteration bookkeeping for the conversation turn loop, in call order:
 ``begin_iteration`` (pending redirect, interrupt / review-budget / iteration-budget exits),
-``prepare_iteration`` (``agent:step`` callback, skill-nudge counter, pre-API ``/steer`` drain
-into the newest tool result — never a user message —, run-budget wrap-up notice, tool_call
+``prepare_iteration`` (``agent:step`` callback, skill-nudge counter, pre-API ``/steer`` drain onto
+the newest tool result, run-budget wrap-up notice, tool_call
 argument sanitization, interrupt-scaffold ghost-row drop, role-alternation repair),
 ``announce_api_call`` (verbose summary / quiet spinner) and, after the retry loop,
 ``apply_retry_restarts`` (consumes the ``TurnRetryState`` restart flags). Nothing here
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from agent.display import KawaiiSpinner
-from agent.turn_context import reanchor_current_turn_user_idx
+from agent.turn_context_compaction import _reanchor
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -101,7 +101,7 @@ def prepare_iteration(
     user_message: Any = None,
 ) -> IterationPrep:
     """Prepare ``messages`` for this iteration in the original order. Every mutation here is
-    cache-safe by construction: steer text lands in the newest tool result, the ghost-row
+    cache-safe by construction: pre-API /steer is attached to the newest tool result, the ghost-row
     filter only drops hidden scaffold placeholders, and repair runs BEFORE the request build."""
     from agent.conversation_loop import (
         _INTERRUPT_SCAFFOLD_MARKER, _maybe_inject_run_budget_wrapup
@@ -133,18 +133,18 @@ def prepare_iteration(
     except Exception:
         logger.debug("Nous key pre-expiry adoption failed", exc_info=True)
 
-    # Drain a /steer sent during the last API call into the newest tool message so
-    # it lands THIS iteration. Never put in a user message (breaks alternation).
+    # Drain a /steer sent during the last API call so it lands THIS iteration. Fork attaches
+    # the marker to the newest tool result plus OOB memory provenance (not a durable user row).
     _pre_api_steer = agent._drain_pending_steer()
     if _pre_api_steer:
-        _inject_steer_into_newest_tool_result(agent, messages, _pre_api_steer)
+        _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer)
 
-    # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, via the
-    # same cache-safe channel as /steer (newest tool result); off with no budget.
+    # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, appended to the
+    # newest tool result; off with no budget.
     if getattr(agent, "run_budget_seconds", None):
         _maybe_inject_run_budget_wrapup(agent, messages)
 
-    # Use the same cache-safe channel as /steer; never add a synthetic user/system row.
+    # Appended to the newest tool result; never a synthetic user/system row.
     _maybe_inject_iteration_budget_warning(agent, messages)
 
     request_logger = getattr(agent, "logger", None) or logger  # same name as the origin module
@@ -194,9 +194,13 @@ def prepare_iteration(
     # Keep the current-turn anchor aligned so both the ordinary request and a later
     # iteration-limit summary attach volatile context to the user's actual ask.
     if user_message is not None:
-        current_turn_user_idx = reanchor_current_turn_user_idx(messages, user_message)
-        if current_turn_user_idx >= 0:
-            agent._persist_user_message_idx = current_turn_user_idx
+        _reanchored_idx = _reanchor(agent, messages, user_message)
+        if _reanchored_idx != current_turn_user_idx:
+            request_logger.info(
+                "Re-anchored current_turn_user_idx %s -> %s after iteration prep (session=%s)",
+                current_turn_user_idx, _reanchored_idx, agent.session_id or "-",
+            )
+            current_turn_user_idx = _reanchored_idx
     return IterationPrep(
         action="fallthrough",
         messages=messages,
@@ -228,37 +232,17 @@ def _previous_tool_round(messages: Any) -> list:
     return []
 
 
-def _inject_steer_into_newest_tool_result(agent: Any, messages: Any, steer_text: str) -> None:
-    """Append the steer marker to the newest tool message; with no tool message, put the
-    text back so the post-tool-execution drain delivers it later."""
+def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str) -> None:
+    """Attach pre-API /steer to the newest tool result; requeue if none exists yet."""
     for _si in range(len(messages) - 1, -1, -1):
         _sm = messages[_si]
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
-            from agent.prompt_builder import format_steer_marker
-            marker = format_steer_marker(steer_text)
-            existing = _sm.get("content", "")
-            if isinstance(existing, str):
-                _sm["content"] = existing + marker
-            else:
-                # Multimodal content blocks — append a text block.
-                with suppress(Exception):
-                    blocks = list(existing) if existing else []
-                    blocks.append({"type": "text", "text": marker})
-                    _sm["content"] = blocks
-            logger.debug(
-                "Pre-API-call steer drain: injected into tool msg at index %d", _si
-            )
+            from agent.agent_runtime_helpers import _append_steer_marker_to_tool_result
+            _append_steer_marker_to_tool_result(agent, _sm, steer_text)
+            logger.debug("Pre-API-call steer drain: attached marker to tool msg at index %d", _si)
             return
-    _lock = getattr(agent, "_pending_steer_lock", None)
-    if _lock is not None:
-        with _lock:
-            if agent._pending_steer:
-                agent._pending_steer = agent._pending_steer + "\n" + steer_text
-            else:
-                agent._pending_steer = steer_text
-    else:
-        existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+    from agent.agent_runtime_helpers import _requeue_pending_steer
+    _requeue_pending_steer(agent, steer_text)
 
 
 @dataclass
@@ -393,6 +377,7 @@ class RetryRestartVerdict:
     current_turn_user_idx: Any
     final_response: Any
     retry_count: Any
+    restart_count: Any
     api_call_count: Any
     _preflight_compression_blocked: Any
     _last_preflight_pressure: Any
@@ -402,14 +387,21 @@ class RetryRestartVerdict:
 def apply_retry_restarts(
     agent: Any, *, _retry: Any, response: Any, interrupted: Any, messages: Any,
     conversation_history: Any, user_message: Any, api_kwargs: Any, current_turn_user_idx: Any,
-    final_response: Any, retry_count: Any, api_call_count: Any, length_continue_retries: Any,
-    _preflight_compression_blocked: Any, _last_preflight_pressure: Any,
-    _turn_exit_reason: Any,
+    final_response: Any, retry_count: Any, max_retries: Any, api_call_count: Any,
+    restart_count: Any, length_continue_retries: Any,
+    _preflight_compression_blocked: Any, _turn_exit_reason: Any,
+    _last_preflight_pressure: Any = None,
 ) -> RetryRestartVerdict:
     """Consume the ``TurnRetryState`` restart flags after the retry loop, in the original
     priority order. Refunds the iteration budget/count for restarts that produced no valid
     assistant item; ``restart_with_rebuilt_messages`` is the single consumer that clears
-    ``_preflight_compression_blocked`` so the fallback gets a fresh preflight (#84733)."""
+    ``_preflight_compression_blocked`` so the fallback gets a fresh preflight (#84733).
+
+    The two refunding restart paths (redirect and rebuilt-for-fallback) are bounded by
+    ``max_retries`` via ``restart_count`` (a per-turn accumulator) so a runaway
+    interrupt/redirect that keeps re-arming a restart flag cannot refund the budget
+    forever and hold the turn lease indefinitely."""
+
     from agent.conversation_loop import (
         _HANDOFF_SKIP_FINAL_RESPONSE, _should_skip_model_call_for_reference_handoff
     )
@@ -417,13 +409,31 @@ def apply_retry_restarts(
     def _verdict(action: str) -> RetryRestartVerdict:
         return RetryRestartVerdict(
             action=action, current_turn_user_idx=current_turn_user_idx,
-            final_response=final_response, retry_count=retry_count, api_call_count=api_call_count,
+            final_response=final_response, retry_count=retry_count, restart_count=restart_count,
+            api_call_count=api_call_count,
             _preflight_compression_blocked=_preflight_compression_blocked,
             _last_preflight_pressure=_last_preflight_pressure,
             _turn_exit_reason=_turn_exit_reason,
         )
 
     if _retry.restart_with_redirected_messages:
+        restart_count += 1
+        if restart_count > max_retries:
+            # A redirect/interrupt keeps re-arming this flag: stop refunding the iteration
+            # budget and re-issuing the same logical iteration, or a runaway turn holds the
+            # turn lease indefinitely (redirect restarts previously had no bound).
+            _turn_exit_reason = "redirect_restart_limit_exceeded"
+            logger.warning(
+                "Redirected-message restart limit (%s) exceeded; ending turn instead of "
+                "refunding the iteration budget indefinitely.",
+                max_retries,
+            )
+            # The correction that tripped the cap was never applied; hand it back as the
+            # next user turn (result["pending_steer"]) instead of losing it to clear_interrupt().
+            _unapplied = agent._drain_pending_redirect()
+            if _unapplied:
+                agent.steer(_unapplied)
+            return _verdict("break")
         # Cancelled request produced no valid assistant item: reuse the same logical
         # iteration after the outer loop appends partial context + correction.
         api_call_count -= 1
@@ -461,11 +471,22 @@ def apply_retry_restarts(
         # In-loop compression rebuilt `messages`; re-anchor the current-turn index
         # like the prologue, AFTER the handoff guard (it may re-append this turn's
         # ask). A stale anchor injects prefetch into a historical row.
-        current_turn_user_idx = reanchor_current_turn_user_idx(messages, user_message)
-        agent._persist_user_message_idx = current_turn_user_idx
+        current_turn_user_idx = _reanchor(agent, messages, user_message)
         return _verdict("continue")
 
     if _retry.restart_with_rebuilt_messages:
+        restart_count += 1
+        if restart_count > max_retries:
+            # A stall/failure keeps re-escalating to the fallback chain: stop refunding the
+            # iteration budget and re-issuing, or a runaway turn holds the turn lease
+            # indefinitely (rebuilt restarts previously had no bound).
+            _turn_exit_reason = "rebuilt_restart_limit_exceeded"
+            logger.warning(
+                "Rebuilt-message restart limit (%s) exceeded; ending turn instead of "
+                "refunding the iteration budget indefinitely.",
+                max_retries,
+            )
+            return _verdict("break")
         # A stall/failure escalated to the fallback chain: re-issue against the
         # active fallback provider, refunding budget/count for the stalled attempt.
         api_call_count -= 1

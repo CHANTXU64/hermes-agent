@@ -219,6 +219,13 @@ Date: 2026-05-22; cache lifecycle boundary migrated 2026-08-30
 
 Files:
 
+- `agent/memory_manager.py`
+- `agent/memory_provider.py`
+- `hermes_state.py`
+- `tui_gateway/methods_tools.py`
+- `tests/fork/test_hindsight_rewind.py`
+- `tests/gateway/test_undo_rewind_session.py`
+- `tests/tui_gateway/test_undo_command.py`
 - `fork_features/hindsight_recall_cache.py`
 - `plugins/memory/hindsight/__init__.py`
 - `tests/fork_features/test_hindsight_recall_cache.py`
@@ -1002,6 +1009,10 @@ Codex Responses cache routing:
 
 Primary files:
 
+- `agent/agent_init.py`
+- `hermes_state_messages.py`
+- `tests/agent/test_turn_finalizer_cleanup_guard.py`
+- `tests/test_hermes_state.py`
 - `fork_features/request_context.py` (Fork placement and sidecar policy)
 - `fork_features/prompt_cache_routing.py` (Fork scope/header policy)
 - `agent/turn_context.py` (`build_turn_context` collection and
@@ -1193,6 +1204,9 @@ True upstream host seams:
 
 Primary files:
 
+- `gateway/config_env.py`
+- `gateway/run_startup.py`
+- `gateway/run_notifications.py`
 - `fork_features/multi_telegram_accounts/__init__.py`
 - `fork_features/multi_telegram_accounts/identity.py`
 - `fork_features/multi_telegram_accounts/runtime.py`
@@ -1290,6 +1304,7 @@ Date: 2026-07-16; boundary refactored 2026-08-30
 
 Files:
 
+- `gateway/run_turn.py`
 - `fork_features/telegram_tool_progress.py`
 - `gateway/run.py`
 - `gateway/run_turn_runner.py`
@@ -2057,7 +2072,7 @@ Date: 2026-08-15
 
 Files:
 
-- `gateway/run.py`
+- `gateway/run_inbound.py`
 - `tests/gateway/test_stt_config.py`
 - `tests/gateway/test_telegram_audio_vs_voice.py`
 - `tests/gateway/test_telegram_voice_v0_regressions.py`
@@ -2093,11 +2108,11 @@ Verification:
   tests/gateway/test_telegram_audio_vs_voice.py \
   tests/gateway/test_telegram_voice_v0_regressions.py \
   -q -o 'addopts='
-./venv/bin/python -m py_compile gateway/run.py \
+./venv/bin/python -m py_compile gateway/run_inbound.py \
   tests/gateway/test_stt_config.py \
   tests/gateway/test_telegram_audio_vs_voice.py \
   tests/gateway/test_telegram_voice_v0_regressions.py
-./venv/bin/ruff check gateway/run.py \
+./venv/bin/ruff check gateway/run_inbound.py \
   tests/gateway/test_stt_config.py \
   tests/gateway/test_telegram_audio_vs_voice.py \
   tests/gateway/test_telegram_voice_v0_regressions.py
@@ -2130,7 +2145,9 @@ Files:
 - `tests/tools/test_async_delegation.py`
 - `tests/tools/test_delegate_request_overrides.py`
 - `tests/tools/test_delegate_output_schema.py`
-- `tests/tools/test_delegate_task_native_args.py`
+- Native argument forwarding is covered by `tests/tools/test_delegate.py` and
+  `tests/tools/test_delegate_request_overrides.py`; the formerly listed
+  `tests/tools/test_delegate_task_native_args.py` does not exist and is not a runnable gate.
 - `website/docs/user-guide/features/delegation.md`
 - `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features/delegation.md`
 - `docs/chantxu64/delegate-per-call-routing/README.md`
@@ -2479,6 +2496,9 @@ Date: 2026-08-28; persistent delivery redesign 2026-08-30
 
 Files:
 
+- `gateway/run_voice.py`
+- `tests/fork_features/test_runtime_context_boundaries.py`
+- `tests/fork_features/test_pre_llm_context_contract.py`
 - `fork_features/request_fork/__init__.py`
 - `fork_features/request_fork/compression_lifecycle.py`
 - `fork_features/request_fork/prepared_request.py`
@@ -2732,7 +2752,7 @@ deltas are expected in these areas:
   - `tests/fork/test_custom_tts_removed.py`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Successful STT voice-origin enrichment:
-  - `gateway/run.py`
+  - `gateway/run_inbound.py`
   - `tests/gateway/test_stt_config.py`
   - `tests/gateway/test_telegram_audio_vs_voice.py`
   - `tests/gateway/test_telegram_voice_v0_regressions.py`

@@ -233,6 +233,9 @@ async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
 async def test_telegram_video_size_gate_rejects_oversized_media_before_download():
     adapter = object.__new__(TelegramAdapter)
     adapter._max_doc_bytes = 1024
+    # Authorization has its own entrypoint coverage; this fixture isolates the
+    # size gate and must enter it as an already-authorized media message.
+    adapter._is_user_authorized_from_message = lambda message: True
     adapter._should_process_message = lambda _message: True
     adapter._build_message_event = lambda _message, _type, update_id=None: SimpleNamespace(
         text="caption",

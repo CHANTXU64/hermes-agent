@@ -142,7 +142,7 @@ def test_background_public_entry_dispatches_only_safe_effective_routes():
         patch.object(routing, "resolve_delegation_task_routes", return_value=[route]),
         patch.object(delegate_module, "_build_child_preserving_parent_tools", return_value=child),
         patch.object(delegate_module, "_load_config", return_value={"max_iterations": 45}),
-        patch.object(delegate_module, "_capture_origin", return_value=("wake-session", "ui-session", None, None)),
+        patch.object(delegate_module, "_capture_origin", return_value=("wake-session", "ui-session", None, None, False)),
         patch.object(live_log, "create_live_transcripts", return_value=(None, [], [])),
         patch.object(dispatch_module, "_resolve_async_wake_sid", return_value="wake-session"),
         patch.object(dispatch_module, "_resolve_async_session_key", return_value=("owner-session", "ui-session")),

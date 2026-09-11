@@ -300,9 +300,11 @@ class GatewayVoiceMixin:
                 "Auto voice reply skipped: mode=%s adapter_auto_tts=%s chat=%s platform=%s",
                 voice_mode, adapter_auto_tts, chat_id, event.source.platform.value)
             return False
-        # Dedup: agent already called the TTS tool in THIS turn (from the last user message on).
+        # Recovery context is not a new user request and must not reset TTS dedup.
+        from agent.context_compressor import is_non_user_runtime_context_message
+
         start = next((i for i, m in reversed(list(enumerate(agent_messages)))
-                      if m.get("role") == "user"), 0)
+                      if m.get("role") == "user" and not is_non_user_runtime_context_message(m)), 0)
         if any((tc.get("function") or {}).get("name") == "text_to_speech"
                for msg in agent_messages[start:] if msg.get("role") == "assistant"
                for tc in (msg.get("tool_calls") or [])):

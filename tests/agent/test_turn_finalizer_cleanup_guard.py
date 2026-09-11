@@ -8,6 +8,8 @@ for must still be returned.  Previously any of those raised straight out of
 traceback and lost the whole turn.
 """
 
+from unittest.mock import patch
+
 import pytest
 
 from agent.turn_finalizer import finalize_turn
@@ -201,5 +203,34 @@ def test_request_only_sidecars_are_stripped_before_post_turn_surfaces():
         assert all(
             "_request_only_api_content" not in message for message in surface
         )
+
+
+@pytest.mark.parametrize(
+    ("persist_disabled", "expected_calls"),
+    [
+        (True, ["transform_llm_output"]),
+        (False, ["transform_llm_output", "post_llm_call", "on_session_end"]),
+    ],
+)
+def test_persist_disabled_turn_skips_session_end_hook(
+    persist_disabled, expected_calls
+):
+    agent = _StubAgent(raise_in=())
+    agent._persist_disabled = persist_disabled
+    calls = []
+
+    def capture(name, _logger, **_kwargs):
+        calls.append(name)
+        return []
+
+    with patch("agent.turn_finalizer._invoke_hook_safely", side_effect=capture):
+        _run(
+            agent,
+            final_response="done",
+            api_call_count=1,
+            turn_exit_reason="text_response(stop)",
+        )
+
+    assert calls == expected_calls
 
 

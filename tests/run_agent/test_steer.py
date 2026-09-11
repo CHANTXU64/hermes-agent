@@ -589,7 +589,7 @@ class TestEmptyHiddenAssistantRehealRegression:
 
 
 class TestSteerInjection:
-    def test_appends_to_last_tool_result(self):
+    def test_appends_standalone_user_message_after_tool_results(self):
         agent = _bare_agent()
         agent.steer("please also check auth.log")
         messages = [
@@ -599,7 +599,7 @@ class TestSteerInjection:
             {"role": "tool", "content": "ls output B", "tool_call_id": "b"},
         ]
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=2)
-        # The LAST tool result is modified; earlier ones are untouched.
+        # Fork attaches the marker to the last tool result and records OOB memory provenance.
         assert messages[2]["content"] == "ls output A"
         assert "ls output B" in messages[3]["content"]
         assert STEER_MARKER_OPEN in messages[3]["content"]
@@ -658,20 +658,45 @@ class TestSteerInjection:
         """The injection marker must attribute the appended text to the user
         via the explicit out-of-band marker (which the system prompt tells the
         model to trust) — otherwise the model reads it as untrusted tool output
-        and refuses it as suspected prompt injection.  Cache-safe: it only
-        rewrites existing tool content, never the message-role sequence.
+        and refuses it as suspected prompt injection.
+
+        Fork request-only isolation attaches that marker to the tool result and
+        records OOB memory provenance instead of persisting a new user turn.
         """
         agent = _bare_agent()
         agent.steer("stop after next step")
         messages = [{"role": "tool", "content": "x", "tool_call_id": "1"}]
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        assert messages[-1]["role"] == "tool"
         content = messages[-1]["content"]
         assert STEER_MARKER_OPEN in content
         assert "stop after next step" in content
+        assert agent._memory_oob_user_events == [
+            {
+                "message_object_id": id(messages[0]),
+                "tool_call_id": "1",
+                "user_text": "stop after next step",
+            }
+        ]
 
-    def test_multimodal_content_list_preserved(self):
-        """Anthropic-style list content should be preserved, with the steer
-        appended as a text block."""
+    def test_persisted_steer_row_is_never_merged_with_the_next_prompt(self):
+        """A run that ends right after a steered batch leaves user(steer) as the persisted tail.
+        The next real prompt makes two consecutive user rows; the alternation repair must leave
+        the steer row byte-identical (append-only persistence cannot follow an in-place merge)."""
+        from agent.agent_runtime_helpers import _merge_consecutive_users
+        from agent.prompt_builder import steer_user_row
+
+        steer = steer_user_row("focus on error handling")
+        before = dict(steer)
+        merged, repairs = _merge_consecutive_users([steer, {"role": "user", "content": "next question"}])
+        assert steer == before
+        assert repairs == 0
+        assert [m["role"] for m in merged] == ["user", "user"]
+        assert merged[-1]["content"] == "next question"
+
+    def test_multimodal_tool_content_untouched_steer_lands_as_user_row(self):
+        """Anthropic-style list content keeps existing blocks and appends one
+        marker text block; no extra durable user row is created."""
         agent = _bare_agent()
         agent.steer("extra note")
         original_blocks = [{"type": "text", "text": "existing output"}]
@@ -679,12 +704,12 @@ class TestSteerInjection:
             {"role": "tool", "content": list(original_blocks), "tool_call_id": "1"}
         ]
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
-        new_content = messages[-1]["content"]
-        assert isinstance(new_content, list)
-        assert len(new_content) == 2
-        assert new_content[0] == {"type": "text", "text": "existing output"}
-        assert new_content[1]["type"] == "text"
-        assert "extra note" in new_content[1]["text"]
+        assert messages[-1]["role"] == "tool"
+        content = messages[0]["content"]
+        assert content[0] == original_blocks[0]
+        assert content[-1]["type"] == "text"
+        assert "extra note" in content[-1]["text"]
+        assert STEER_MARKER_OPEN in content[-1]["text"]
 
 
 
@@ -739,31 +764,33 @@ class TestPreApiCallSteerDrain:
     fix for the scenario where /steer sent during model thinking only lands
     after the agent is completely done."""
 
-    def test_pre_api_drain_injects_into_last_tool_result(self):
-        """If a steer is pending when the main loop starts building
-        api_messages, it should be injected into the last tool result
-        in the messages list."""
+    def test_pre_api_drain_appends_user_row_and_leaves_tool_row_untouched(self):
+        """A steer pending when the loop builds api_messages lands THIS iteration
+        on the newest tool result with OOB memory provenance, not as a new user row."""
+        from agent.turn_iteration_prep import _inject_steer_after_newest_tool_result
+
         agent = _bare_agent()
-        # Simulate messages after a tool batch completed
+        tool_row = {"role": "tool", "content": "output here", "tool_call_id": "tc1"}
         messages = [
             {"role": "user", "content": "do something"},
             {"role": "assistant", "content": "ok", "tool_calls": [
                 {"id": "tc1", "function": {"name": "terminal", "arguments": "{}"}}
             ]},
-            {"role": "tool", "content": "output here", "tool_call_id": "tc1"},
+            tool_row,
         ]
-        # Steer arrives during API call (set after tool execution)
         agent.steer("focus on error handling")
-        # Simulate what the pre-API-call drain does:
-        _pre_api_steer = agent._drain_pending_steer()
-        assert _pre_api_steer == "focus on error handling"
-        # Inject into last tool msg (mirrors the new code in run_conversation)
-        for _si in range(len(messages) - 1, -1, -1):
-            if messages[_si].get("role") == "tool":
-                messages[_si]["content"] += format_steer_marker(_pre_api_steer)
-                break
+        _inject_steer_after_newest_tool_result(agent, messages, agent._drain_pending_steer())
+        assert messages[-1] is tool_row
+        assert messages[-1]["role"] == "tool"
         assert STEER_MARKER_OPEN in messages[-1]["content"]
         assert "focus on error handling" in messages[-1]["content"]
+        assert agent._memory_oob_user_events == [
+            {
+                "message_object_id": id(tool_row),
+                "tool_call_id": "tc1",
+                "user_text": "focus on error handling",
+            }
+        ]
         assert agent._pending_steer is None
 
     def test_pre_api_drain_restashes_when_no_tool_message(self):
@@ -824,6 +851,33 @@ class TestSteerMarkerContract:
         """Regression: the bare 'User guidance:' line read as tool content and
         got refused as injection — it must not come back."""
         assert "User guidance:" not in format_steer_marker("hi")
+
+
+class TestSteerRowIsHumanInput:
+    def test_steer_row_counts_as_a_user_originated_turn(self, tmp_path):
+        """The steer row is typed (renderer label, alternation-repair guard) but it carries full user
+        authority: every "is this human input" predicate — in memory and the DB pick /undo uses — must
+        agree with the anchor-restoration predicate that already accepts it."""
+        from agent.context_compressor import ContextCompressor, is_user_originated_turn
+        from agent.conversation_compression import _is_real_user_message
+        from agent.prompt_builder import steer_user_row
+        from hermes_state import SessionDB
+
+        row = steer_user_row("focus on the error handling")
+        assert _is_real_user_message(row)
+        assert is_user_originated_turn(row)
+        assert ContextCompressor._is_actionable_user_turn(row)
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="first question")
+            db.append_message("s1", role="assistant", content="first answer")
+            db.append_message("s1", role="user", content=row["content"], display_kind=row["display_kind"])
+            recents = db.list_recent_user_messages("s1", limit=5)
+            assert [r["preview"][:5] for r in recents] == ["[OUT-", "first"]
+        finally:
+            db.close()
 
 
 class TestSteerCommandRegistry:
