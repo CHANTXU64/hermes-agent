@@ -186,17 +186,19 @@ def handle_api_error(
         # request observer could run. Normal provider errors use the exact
         # post-middleware capture above.
         try:
-            from agent.conversation_loop import _build_codex_adopt_rematerializer
+            from agent.conversation_loop import _canonicalize_api_tool_calls
+            from fork_features.request_fork.prepared_request import build_adopt_rematerializer
             from fork_features.request_fork import freeze_codex_request_for_compression
 
             request_fork = freeze_codex_request_for_compression(
                 agent, api_kwargs or {}, fidelity="failed_wire"
             )
-            request_fork_rematerializer = _build_codex_adopt_rematerializer(
+            request_fork_rematerializer = build_adopt_rematerializer(
                 agent,
                 prepared_request=request_fork,
                 original_messages=messages,
                 current_turn_user_idx=current_turn_user_idx,
+                canonicalize_tool_calls=_canonicalize_api_tool_calls,
             )
         except Exception:
             request_fork = request_fork_rematerializer = None

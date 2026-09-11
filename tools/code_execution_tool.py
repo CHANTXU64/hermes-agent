@@ -706,9 +706,8 @@ def execute_code(
     # script before either dispatch path spawns it — in this (tool-executor) thread, which holds
     # the session context. A Docker sandbox with host bind mounts gets no container fast-path.
     # See #30882.
+    from fork_features.approval.runtime import read_local_script, read_remote_script
     from tools.approval import (
-        _read_local_script_for_approval,
-        _read_remote_script_for_approval,
         check_execute_code_guard,
     )
     _mode = _get_execution_mode()
@@ -728,10 +727,10 @@ def execute_code(
         has_host_access=_docker_has_host_access(_env_config),
         cwd=_approval_cwd,
         read_script=(
-            _read_local_script_for_approval
+            read_local_script
             if env_type == "local"
             else (
-                lambda path: _read_remote_script_for_approval(_approval_env, path)
+                lambda path: read_remote_script(_approval_env, path)
                 if _approval_env is not None
                 else None
             )

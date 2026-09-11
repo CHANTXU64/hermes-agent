@@ -255,7 +255,7 @@ def test_real_guard_paths_use_separate_safety_findings(tmp_path, monkeypatch):
         calls.append(kwargs)
         return _response(json.dumps(response))
 
-    monkeypatch.setattr(approval, "_call_approval_llm", model)
+    monkeypatch.setattr("fork_features.approval.runtime.call_approval_llm", model)
     token = set_smart_approval_context({"latest_user_message": "", "clarifications": []})
     try:
         for guard, command in [

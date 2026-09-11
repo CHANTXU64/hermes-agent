@@ -688,7 +688,7 @@ def test_terminal_smart_review_reads_direct_script_once(monkeypatch, tmp_path: P
     monkeypatch.setattr(
         "tools.approval._command_matches_permanent_allowlist", lambda _command: False
     )
-    monkeypatch.setattr("tools.approval._call_approval_llm", call_llm)
+    monkeypatch.setattr("fork_features.approval.runtime.call_approval_llm", call_llm)
 
     with patch(
         "tools.tirith_security.check_command_security",
@@ -753,7 +753,7 @@ result = terminal({command!r}, timeout=180, workdir={str(outer)!r})
     monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "smart")
     monkeypatch.setattr("tools.approval._YOLO_MODE_FROZEN", False)
     monkeypatch.setattr("tools.approval.is_approved", lambda *args: False)
-    monkeypatch.setattr("tools.approval._call_approval_llm", call_llm)
+    monkeypatch.setattr("fork_features.approval.runtime.call_approval_llm", call_llm)
 
     result = check_execute_code_guard(
         code,

@@ -2215,6 +2215,7 @@ Files:
 - `fork_features/__init__.py`
 - `fork_features/approval/__init__.py`
 - `fork_features/approval/policy.py`
+- `fork_features/approval/runtime.py`
 - `fork_features/approval/script_evidence.py`
 - `fork_features/approval/smart_review.py`
 - `fork_features/approval/retry_policy.py`
@@ -2229,6 +2230,7 @@ Files:
 - `tools/terminal_tool.py`
 - `tools/code_execution_tool.py`
 - `tests/fork_features/approval/test_policy_boundary.py`
+- `tests/fork_features/approval/test_runtime.py`
 - `tests/fork_features/approval/test_smart_approval_context.py`
 - `tests/tools/test_denial_retry_escalation.py`
 - `tests/tools/test_denial_circuit_breaker.py`
@@ -2326,12 +2328,17 @@ What changed:
   dispatchers. Worker-thread propagation and final cleanup are exercised through
   those production entries; `model_tools.py` retains only official approval
   observability wiring.
-- `tools/approval.py` imports only the public Policy facade and keeps deterministic
-  floors, YOLO/mode/allowlists, Tirith warning keys, the shared lock, verdict
+- `fork_features/approval/runtime.py` owns bounded local/remote script reads,
+  structured auxiliary-client invocation, language selection and policy assembly.
+  It reads official auxiliary/config interfaces but never imports the approval gate.
+  Terminal and `execute_code` import evidence readers from this defining module.
+- `tools/approval.py` binds gate-owned retry identity/locking to that runtime and
+  retains deterministic floors, YOLO/mode/allowlists, Tirith warning keys, verdict
   execution, human approval transport, persistence, observability, and fail-closed.
-- Official split runtime state is read from `tools/approval_context.py`, while
-  `tools/approval_smart.py` owns the structured model-call adapter; tests patch
-  these live seams rather than retired exports.
+- Official split runtime state is read from `tools/approval_context.py`;
+  `tools/approval_smart.py` retains official fallback/observer behavior. Structured
+  model-call tests patch `fork_features.approval.runtime.call_approval_llm`, while
+  gate tests still exercise the live sequential/concurrent production entries.
 - On the first Smart denial, the agent is told it may submit the same or a
   textually similar operation again only when it remains necessary. Candidates
   are scoped to the same session, verified user turn, and tool kind. Exact
@@ -2473,6 +2480,8 @@ Date: 2026-08-28; persistent delivery redesign 2026-08-30
 Files:
 
 - `fork_features/request_fork/__init__.py`
+- `fork_features/request_fork/compression_lifecycle.py`
+- `fork_features/request_fork/prepared_request.py`
 - `agent/conversation_loop.py`
 - `agent/conversation_compression.py`
 - `agent/turn_api_call.py`
@@ -2493,6 +2502,8 @@ Files:
 - `hermes_cli/plugins.py`
 - `fork_features/hindsight_retain/langfuse_hindsight_export.py`
 - `tests/fork_features/test_current_request_fork.py`
+- `tests/fork_features/test_compression_lifecycle.py`
+- `tests/fork_features/test_prepared_request.py`
 - `tests/fork_features/test_long_task_continuity_hooks.py`
 - `tests/fork_features/test_long_task_continuity_recovery.py`
 - `tests/fork_features/test_plugin_state_cas.py`
@@ -2518,6 +2529,16 @@ Files:
 
 What changed:
 
+- `fork_features/request_fork/compression_lifecycle.py` owns the request snapshot,
+  hook payload validation and pending outer-commit notification as one lifecycle.
+  The host reports adoption/start/outcome and consumes the pending finish once;
+  locks, memory checkpoint ordering, summary dispatch and durable commit remain
+  upstream-owned. Preserve both committed and aborted outer-transaction paths.
+- `fork_features/request_fork/prepared_request.py` owns the adoption reconstruction
+  shared by proactive and failed-wire compression. Its only loop-specific input
+  is the explicit tool-call canonicalizer; it never imports the conversation loop.
+  Callers in the loop, physical request capture and pre-capture error fallback must
+  all retain this binding. Manual out-of-turn reconstruction is unchanged.
 - After the official turn-loop split, the production call graph is explicit:
   `turn_preflight` and `turn_context_compaction` initiate ordinary compression;
   `turn_api_call` freezes the physically attempted request;
@@ -2560,7 +2581,7 @@ What changed:
   schemas, cache identity, and final headers therefore survive the Fork without
   a second conversion.
 - A longer durable parent adopted under the compression lease invalidates the
-  earlier prepared request. A host-owned pure rematerializer preserves the frozen
+  earlier prepared request. The Fork-owned pure rematerializer preserves the frozen
   request-only body and inserts only a proven concurrent durable append before
   the complete live tail as `rematerialized_after_adopt`; it does not rerun
   middleware, context selection, vision, or provider calls. Gateway `/compress`
@@ -2735,6 +2756,7 @@ deltas are expected in these areas:
   - `fork_features/__init__.py`
   - `fork_features/approval/__init__.py`
   - `fork_features/approval/policy.py`
+  - `fork_features/approval/runtime.py`
   - `fork_features/approval/script_evidence.py`
   - `fork_features/approval/smart_review.py`
   - `fork_features/approval/retry_policy.py`
@@ -2749,6 +2771,7 @@ deltas are expected in these areas:
   - `tools/terminal_tool.py`
   - `tools/code_execution_tool.py`
   - `tests/fork_features/approval/test_policy_boundary.py`
+  - `tests/fork_features/approval/test_runtime.py`
   - `tests/fork_features/approval/test_smart_approval_context.py`
   - `tests/tools/test_denial_retry_escalation.py`
   - `tests/tools/test_denial_circuit_breaker.py`
@@ -2850,6 +2873,8 @@ deltas are expected in these areas:
   - `docs/LOCAL_MODIFICATIONS.md`
 - Provider-native long-task continuity Request Fork:
   - `fork_features/request_fork/__init__.py`
+  - `fork_features/request_fork/compression_lifecycle.py`
+  - `fork_features/request_fork/prepared_request.py`
   - `agent/conversation_loop.py`
   - `agent/conversation_compression.py`
   - `agent/turn_api_call.py`
@@ -2868,6 +2893,8 @@ deltas are expected in these areas:
   - `hermes_cli/plugins.py`
   - `fork_features/hindsight_retain/langfuse_hindsight_export.py`
   - `tests/fork_features/test_current_request_fork.py`
+  - `tests/fork_features/test_compression_lifecycle.py`
+  - `tests/fork_features/test_prepared_request.py`
   - `tests/fork_features/test_long_task_continuity_hooks.py`
   - `tests/fork_features/test_long_task_continuity_recovery.py`
   - `tests/fork_features/test_plugin_state_cas.py`

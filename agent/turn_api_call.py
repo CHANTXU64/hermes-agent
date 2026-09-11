@@ -86,17 +86,19 @@ def perform_api_call(
     def _capture_physical_request(physical_api_kwargs):
         """Keep the exact post-middleware provider request for overflow recovery."""
         try:
-            from agent.conversation_loop import _build_codex_adopt_rematerializer
+            from agent.conversation_loop import _canonicalize_api_tool_calls
+            from fork_features.request_fork.prepared_request import build_adopt_rematerializer
             from fork_features.request_fork import freeze_codex_request_for_compression
 
             frozen = freeze_codex_request_for_compression(
                 agent, physical_api_kwargs, fidelity="failed_wire"
             )
-            rematerializer = _build_codex_adopt_rematerializer(
+            rematerializer = build_adopt_rematerializer(
                 agent,
                 prepared_request=frozen,
                 original_messages=messages,
                 current_turn_user_idx=current_turn_user_idx,
+                canonicalize_tool_calls=_canonicalize_api_tool_calls,
             )
             _physical_request_capture.clear()
             _physical_request_capture.update(

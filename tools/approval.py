@@ -17,7 +17,6 @@ import importlib
 import logging
 import os
 import threading
-import time
 from typing import Any, Callable, Optional
 
 from utils import env_var_enabled, is_truthy_value
@@ -44,7 +43,8 @@ from tools.approval_smart import (
     _prepare_smart_approval_observer,
     _smart_verdict,
 )
-from fork_features.approval.policy import MAX_SCRIPT_BYTES, SmartApprovalResult
+from fork_features.approval.policy import SmartApprovalResult
+from fork_features.approval import runtime as fork_approval
 
 logger = logging.getLogger(__name__)
 
@@ -71,91 +71,16 @@ _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
 
-def _call_approval_llm(**kwargs: Any) -> Any:
-    """Call the structured guardian with an explicit bounded timeout."""
-    from agent.auxiliary_client import _get_task_timeout, call_llm
-
-    timeout = _get_task_timeout("approval")
-    kwargs.setdefault("timeout", timeout)
-    kwargs.setdefault("task", "approval")
-    kwargs.setdefault("temperature", 0)
-    kwargs.setdefault("max_tokens", 256)
-    started = time.monotonic()
-    logger.debug("Smart approvals: assessing structured risk (timeout=%ss)", timeout)
-    try:
-        result = call_llm(**kwargs)
-    except Exception as exc:
-        logger.warning(
-            "Smart approvals: structured LLM call failed after %.1fs (%s: %s)",
-            time.monotonic() - started,
-            type(exc).__name__,
-            exc,
-        )
-        raise
-    logger.debug(
-        "Smart approvals: structured LLM call completed in %.1fs",
-        time.monotonic() - started,
-    )
-    return result
-
 
 def _fork_approval_policy(*, for_review: bool = False):
-    """Bind current Host capabilities to the concrete Fork policy facade."""
-    from agent.i18n import get_language
-    from agent.redact import redact_sensitive_text
-    from fork_features.approval.policy import ApprovalPolicy, get_smart_approval_context
-    from tools.approval_smart import _get_smart_policy, _strip_shell_comments
-
-    return ApprovalPolicy(
-        approval_context=get_smart_approval_context(),
-        interface_language=str(get_language() or ""),
-        operator_policy=_get_smart_policy() if for_review else "",
-        strip_shell_comments=_strip_shell_comments,
-        call_llm=_call_approval_llm,
-        redact_action=lambda action: redact_sensitive_text(action, force=True),
-        retry_key=_automated_denial_key(),
-        lock=_lock,
-        max_retry_entries=_DENIAL_TALLY_MAX_SESSIONS,
+    """Bind only gate-owned retry identity and locking to the Fork runtime."""
+    return fork_approval.build_policy(
+        retry_key=_automated_denial_key(), lock=_lock,
+        max_retry_entries=_DENIAL_TALLY_MAX_SESSIONS, for_review=for_review,
     )
 
 
-def _approval_language_prefers_chinese() -> bool:
-    from agent.i18n import get_language
 
-    return str(get_language() or "") in {"zh", "zh-hant"}
-
-
-def _read_local_script_for_approval(path: str) -> Optional[str]:
-    """Return a bounded local source prefix for Smart Approval evidence."""
-    try:
-        real_path = os.path.realpath(path)
-        if not os.path.isfile(real_path):
-            return None
-        with open(real_path, "rb") as handle:
-            data = handle.read(MAX_SCRIPT_BYTES + 1)
-        return data.decode("utf-8", errors="replace")
-    except (OSError, ValueError):
-        return None
-
-
-def _read_remote_script_for_approval(env: Any, path: str) -> Optional[str]:
-    """Return a bounded source prefix from the backend that will execute it."""
-    if env is None:
-        return None
-    try:
-        import shlex
-
-        result = env.execute(
-            f"head -c {MAX_SCRIPT_BYTES + 1} < {shlex.quote(path)}"
-        )
-        if result.get("returncode", -1) != 0:
-            return None
-        output = result.get("output", "")
-        if not isinstance(output, str) or "\x00" in output:
-            return None
-        return output
-    except Exception:
-        return None
 
 
 def _smart_approve(
@@ -191,7 +116,7 @@ def _smart_approve(
             "unclear",
             (
                 "审批模型不可用，需要用户判断。"
-                if _approval_language_prefers_chinese()
+                if fork_approval.language_prefers_chinese()
                 else "The approval model is unavailable; user review is required."
             ),
         )
@@ -984,7 +909,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             formatted_review = _fork_approval_policy().format_review(smart_review)
             description = (
                 formatted_review
-                if _approval_language_prefers_chinese()
+                if fork_approval.language_prefers_chinese()
                 else f"{description}; {formatted_review}"
             )
     pending_body = pending_body() if pending_body else None

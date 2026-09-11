@@ -122,8 +122,10 @@ Gateway restart/stop remains an independent deterministic hard block inside the 
   - internal Policy implementation for the reviewer prompt, structured result parsing, and risk/authorization contract
 - `fork_features/approval/retry_policy.py`
   - internal Policy implementation for same-turn Smart-denial retry state, text-only similarity policy, repeat-card denial latch, and approval descriptions
+- `fork_features/approval/runtime.py`
+  - concrete bounded script readers, structured auxiliary-client call, language selection and policy construction; no import of the approval gate; Terminal and `execute_code` share these readers directly
 - `tools/approval.py`
-  - deterministic floors, YOLO/mode/allowlists, Tirith warning keys, shared lock, structured-verdict execution, manual approval transport, persistence, observability, and fail-closed; it imports only the public Fork Policy facade
+  - gate-owned retry identity and shared lock are passed to the Fork runtime; deterministic floors, YOLO/mode/allowlists, Tirith warning keys, structured-verdict execution, manual approval transport, persistence, observability, and fail-closed stay here
 - `tools/tirith_security.py`
   - scanner-protocol validation and compatible-path selection
 - `tools/terminal_tool.py`
