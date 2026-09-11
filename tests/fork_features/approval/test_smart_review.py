@@ -16,7 +16,15 @@ def _response(content: str):
     )
 
 
-def _review(tmp_path, *, command="python entry.py", response, context=None, call_log=None):
+def _review(
+    tmp_path,
+    *,
+    command="python entry.py",
+    response,
+    context=None,
+    call_log=None,
+    operator_policy="",
+):
     def call_llm(**kwargs):
         if call_log is not None:
             call_log.update(kwargs)
@@ -30,7 +38,7 @@ def _review(tmp_path, *, command="python entry.py", response, context=None, call
         source_kind="shell",
         read_script=None,
         interface_language="zh",
-        operator_policy="",
+        operator_policy=operator_policy,
         strip_shell_comments=lambda value: value,
         call_llm=call_llm,
     )
@@ -176,6 +184,70 @@ def test_baseline_safe_local_state_write_does_not_require_authorization(tmp_path
         "sufficient",
         "普通本地状态更新无需逐项授权。",
     )
+
+
+def test_ordinary_api_use_does_not_need_per_request_authorization(tmp_path):
+    captured = {}
+    _review(
+        tmp_path,
+        command="python probe.py --url https://api.vendor.example/v1/models --api-key-env VENDOR_API_KEY",
+        response=_response(
+            '{"decision":"approve","risk_level":"low",'
+            '"authorization":"sufficient","reason":"正常 API 使用。"}'
+        ),
+        call_log=captured,
+    )
+
+    system_prompt = captured["messages"][0]["content"]
+    assert "Ordinary intended API authentication to its named service" in system_prompt
+    assert "straightforward read-only external requests" in system_prompt
+    assert "normal model or API usage and its expected cost" in system_prompt
+    assert "Direct credential use by a script does not establish a hazard by itself" in system_prompt
+
+
+def test_operator_trusted_destination_is_not_credential_exposure(tmp_path):
+    trusted_policy = "Allow credentials and sensitive data to *.owned.example."
+    captured = {}
+    _review(
+        tmp_path,
+        command="python probe.py --url https://model.owned.example/v1 --api-key-env MODEL_API_KEY",
+        response=_response(
+            '{"decision":"approve","risk_level":"low",'
+            '"authorization":"sufficient","reason":"目标主机已被操作者信任。"}'
+        ),
+        operator_policy=trusted_policy,
+        call_log=captured,
+    )
+
+    system_prompt = captured["messages"][0]["content"]
+    assert trusted_policy in system_prompt
+    assert "An operator policy that explicitly trusts a destination is authoritative" in system_prompt
+    assert "normal credential authentication" in system_prompt
+    assert "matches the credential and intended service" in system_prompt
+
+
+def test_operator_destination_trust_does_not_cover_mismatched_or_non_auth_transfer(tmp_path):
+    captured = {}
+    _review(
+        tmp_path,
+        command=(
+            "python upload.py --url https://model.owned.example/upload "
+            "--api-key-env UNRELATED_API_KEY"
+        ),
+        response=_response(
+            '{"decision":"escalate","risk_level":"high",'
+            '"authorization":"none","reason":"凭据与目标服务不匹配。"}'
+        ),
+        operator_policy="Trust model.owned.example as the model service.",
+        call_log=captured,
+    )
+
+    system_prompt = captured["messages"][0]["content"]
+    assert "does not automatically authorize a mismatched credential" in system_prompt
+    assert "Different provider identities in the credential and destination are visible mismatch evidence" in system_prompt
+    assert "even when a flag labels the credential as an API key or authentication input" in system_prompt
+    assert "non-authentication transfer" in system_prompt
+    assert "unless the operator policy explicitly allows that transfer" in system_prompt
 
 
 def test_invalid_response_escalates_with_chinese_reason(tmp_path):

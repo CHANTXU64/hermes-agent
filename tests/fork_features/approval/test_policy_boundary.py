@@ -66,6 +66,32 @@ def test_policy_builds_latest_real_user_and_scoped_clarify_context() -> None:
     }
 
 
+def test_policy_ignores_persisted_non_user_runtime_context() -> None:
+    messages = [
+        {"role": "user", "content": "比较 DeepSeek 和 Terra"},
+        {
+            "role": "user",
+            "content": (
+                '<hermes-runtime-context user-authored="false" '
+                'source="long-task-continuity">旧任务禁止调用模型'
+                "</hermes-runtime-context>"
+            ),
+        },
+    ]
+
+    context = build_policy_context(
+        messages,
+        is_real_user_message=lambda message: message.get("role") == "user",
+        real_user_message_text=lambda message: str(message.get("content") or ""),
+        strip_stale_todo_snapshot=lambda content: content,
+    )
+
+    assert context == {
+        "latest_user_message": "比较 DeepSeek 和 Terra",
+        "clarifications": [],
+    }
+
+
 def test_policy_context_binding_is_request_local() -> None:
     original = get_smart_approval_context()
     token = set_smart_approval_context(

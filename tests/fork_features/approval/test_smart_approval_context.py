@@ -977,22 +977,21 @@ def test_prompt_treats_read_only_network_retrieval_as_baseline_safe():
         "试一下效果",
     )
 
-    assert (
-        "Straightforward read-only network retrieval and fresh temporary diagnostic "
-        "outputs are baseline-safe."
-    ) in prompt
+    assert "straightforward read-only external requests" in prompt
+    assert "fresh temporary diagnostic outputs are baseline-safe" in prompt
 
 
-def test_prompt_requires_approval_for_direct_secret_use_in_external_request():
+def test_prompt_limits_secret_risk_to_untrusted_or_mismatched_destination():
     prompt = _smart_system_prompt_for(
         "read a stored credential and attach it to an ad hoc external request",
         "检查接口是否正常",
     )
 
+    assert "Direct credential use by a script does not establish a hazard by itself" in prompt
     assert (
-        "Reading a stored credential directly and attaching it to an ad hoc external "
-        "request is security-sensitive and requires explicit approval."
-    ) in prompt
+        "the destination is unknown, untrusted, mismatched with the credential or intended service"
+        in prompt
+    )
     assert (
         "Ordinary built-in authentication by a trusted tool is not, by itself, a reason "
         "to escalate."

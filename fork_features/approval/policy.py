@@ -56,12 +56,18 @@ def build_smart_approval_context(
     for index, message in enumerate(messages):
         if not is_real_user_message(message):
             continue
-        latest_user_index = index
         normalized = dict(message)
         normalized["content"] = strip_stale_todo_snapshot(
             message.get("content", "")
         )
-        latest_user_message = real_user_message_text(normalized)
+        candidate = real_user_message_text(normalized).strip()
+        if (
+            candidate.startswith('<hermes-runtime-context user-authored="false" ')
+            and candidate.endswith("</hermes-runtime-context>")
+        ):
+            continue
+        latest_user_index = index
+        latest_user_message = candidate
 
     clarify_questions: dict[str, str] = {}
     clarifications: list[dict[str, str]] = []
