@@ -2151,7 +2151,6 @@ class CLICommandsMixin:
         """Dispatch /heartbeat: set / status / pause / resume / clear. ``/heartbeat every 10m <prompt>``
         sets the session's one recurring instruction, injected as a normal user turn when due.
         Session-scoped and in-process — use `hermes cron` for durable schedules."""
-        from hermes_cli.heartbeat import format_interval
         arg = _command_arg(cmd)
         lower = arg.lower()
         mgr = self._session_manager(self._get_heartbeat_manager, "Heartbeats")
@@ -2168,7 +2167,7 @@ class CLICommandsMixin:
                 _cp(_dim_line('No heartbeat to resume.'))
             else:
                 self._start_heartbeat_watchdog()
-                _cp(f"  ▶ Heartbeat resumed (every {format_interval(state.interval_seconds)}): {state.prompt}")
+                _cp(f"  ▶ Heartbeat resumed ({state.schedule_label()}): {state.prompt}")
         elif lower in {"clear", "stop", "off"}:
             _cp("  ✓ Heartbeat cleared." if mgr.clear() else _dim_line('No heartbeat set.'))
         else:
@@ -2176,6 +2175,13 @@ class CLICommandsMixin:
 
     def _heartbeat_set(self, mgr, arg: str) -> None:
         """Set: ``/heartbeat every 10m <prompt>`` (also accepts ``10m <prompt>``)."""
+        from fork_features.daily_heartbeat import configure_daily
+        daily = _attempt("Invalid heartbeat", ValueError, configure_daily, mgr, arg)
+        if daily is _FAILED:
+            return
+        if daily is not None:
+            self._start_heartbeat_watchdog()
+            return _cp(f"  {mgr.status_line()}")
         from hermes_cli.heartbeat import parse_interval, format_interval
         tokens = arg.split(None, 2)
         interval = None

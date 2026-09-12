@@ -121,12 +121,20 @@ class GatewayGoalCommandsMixin:
             if state is None:
                 return "No heartbeat to resume."
             _watch()
-            return f"▶ Heartbeat resumed (every {format_interval(state.interval_seconds)}): {state.prompt}"
+            return f"▶ Heartbeat resumed ({state.schedule_label()}): {state.prompt}"
         if lower in {"clear", "stop", "off"}:
             had = mgr.clear()
             if quick_key:
                 self._unregister_heartbeat_watch(quick_key)
             return "✓ Heartbeat cleared." if had else "No heartbeat set."
+
+        from fork_features.daily_heartbeat import configure_daily
+        daily, err = _mgr_call("Invalid heartbeat", configure_daily, mgr, args, errors=(ValueError,))
+        if err:
+            return err
+        if daily is not None:
+            _watch()
+            return mgr.status_line()
 
         # Set: `/heartbeat every 10m <prompt>` (also accepts `10m <prompt>`).
         tokens = args.split(None, 2)

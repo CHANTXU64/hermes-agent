@@ -36,6 +36,41 @@ Validation after a merge:
 
 ## Active modifications
 
+### Fixed-clock session heartbeats and incremental inbox scanner
+
+- ID: `daily-session-heartbeat`
+- Status: active
+- Depends on: none (uses upstream heartbeat persistence, ownership and adapter admission)
+- Source boundary: logical-only
+
+Files / touchpoints:
+- `fork_features/daily_heartbeat.py` — Fork wall-clock validation, next occurrence, shared daily-command parser.
+- `hermes_cli/heartbeat.py` — native state serialization, due/status calculation and manager daily setter; existing interval mode remains valid.
+- `gateway/slash_commands_goals.py`, `hermes_cli/cli_commands_mixin.py` — thin command entry points; existing pollers own scheduling and session execution.
+- `scripts/todo_file_watch.py` — standalone local inbox discovery/acknowledgement, no scheduler or model; writes state outside business files.
+- `tests/fork/test_daily_heartbeat.py`, `tests/fork/test_todo_file_watch.py` — behaviour and real temporary storage/adapter tests.
+
+Intent / invariants:
+- `/heartbeat daily HH:MM,HH:MM IANA-timezone <prompt>` runs at named local times in the original session/model; it is not an isolated judge or a cron delivery. Dates/timezones are independent of host TZ. Repeated identical active setup preserves timing; pause/resume reanchors; missed ticks coalesce. Existing reset/suspend/compression ownership rules remain authoritative.
+- `/heartbeat weekly <Mon-Fri times> <Sat-Sun times> IANA-timezone <prompt>` uses separate weekday/weekend times without a holiday calendar or make-up-workday rules. Weekly mode does not replay a previous day's missed tick before today's first slot; same-day delayed ticks still coalesce under native idle-session admission.
+- Daily/weekend fields must survive JSON reload and compression migration. Never use zero interval as a periodic fallback for daily state. Old interval-only state still loads and executes unchanged.
+- Inbox initialization is explicit and idempotent. Only first-seen paths become pending, with local unchanged renames recognized; acknowledged ordinary edits are not new arrivals. Pending content changes invalidate old acknowledgement IDs. Discovery is not business completion: pending survives read/analysis/recording failure until an explicit durable record reference is provided. Missing/corrupt state never silently rebaselines. Ignore temporary files and symlinks; business files are never changed.
+- Gateway/CLI text commands are the supported daily entry points; no Desktop daily-schedule editor or new external wake API is provided. Profile shortcuts and business prompt are deployment configuration, not global defaults.
+
+Merge decision:
+- Preserve when: upstream only supports elapsed intervals, or its replacement loses original-session execution, timezone, repeated-enable or pending/ack contracts.
+- Drop when: an upstream replacement is behaviour-tested against these invariants and the user accepts it.
+- Ask user when: upstream introduces a different schedule/session lifecycle or a second-model heartbeat design; PR #92656 only changes heartbeat model routing and is not equivalent.
+
+Verification:
+```bash
+scripts/run_tests.sh tests/fork/test_daily_heartbeat.py tests/fork/test_todo_file_watch.py tests/hermes_cli/test_heartbeat.py tests/gateway/test_heartbeat_poller.py tests/gateway/test_heartbeat_watch_restore.py tests/gateway/test_heartbeat_execution_ownership.py tests/gateway/test_heartbeat_acceptance.py tests/gateway/test_heartbeat_session_boundaries.py tests/gateway/test_heartbeat_watch_lifecycle.py
+```
+
+- Upstream status: fork-only; related non-equivalent candidate https://github.com/NousResearch/hermes-agent/pull/92656
+- Last validated: upstream inspected `2f21d29f4446134b51b7e6b1d2f515502bc0ae5e`; Fork base `694d9251cd17ece85cdb758c9adb64ea6434385b` plus working changes. Local validation only; running Gateway requires user-controlled restart.
+- Feature docs: none — focused contracts and deployment-specific task instructions suffice.
+
 ### 1. Hindsight Chinese / Unicode support
 
 Status: production boundary decoupled; fork contract only (2026-08-30)

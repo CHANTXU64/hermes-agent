@@ -71,6 +71,9 @@ class HeartbeatState:
     created_at: float = 0.0
     last_fired_at: float = 0.0
     fire_count: int = 0
+    daily_times: tuple[str, ...] = ()
+    timezone: str = ""
+    weekend_times: Optional[tuple[str, ...]] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -78,14 +81,41 @@ class HeartbeatState:
     @classmethod
     def from_json(cls, raw: str) -> "HeartbeatState":
         data = json.loads(raw)
-        return cls(**{name: coerce(data.get(name) or default) for name, (coerce, default) in _STATE_FIELDS.items()})
+        state = cls(**{name: coerce(data.get(name) or default) for name, (coerce, default) in _STATE_FIELDS.items()})
+        if data.get("daily_times"):
+            from fork_features.daily_heartbeat import validate_daily
+            state.timezone = data.get("timezone", "")
+            state.daily_times = validate_daily(data["daily_times"], state.timezone)
+            if data.get("weekend_times") is not None:
+                state.weekend_times = validate_daily(data["weekend_times"], state.timezone)
+        return state
+
+    def schedule_label(self) -> str:
+        if self.daily_times:
+            if self.weekend_times is not None:
+                return (f"Mon-Fri {','.join(self.daily_times)}; "
+                        f"Sat-Sun {','.join(self.weekend_times)} ({self.timezone})")
+            return f"daily {','.join(self.daily_times)} ({self.timezone})"
+        return f"every {format_interval(self.interval_seconds)}"
+
+    def next_fire_at(self, now: Optional[float] = None) -> float:
+        anchor = self.last_fired_at or self.created_at
+        if self.daily_times:
+            from fork_features.daily_heartbeat import next_daily_after
+            return next_daily_after(anchor, self.daily_times, self.timezone, self.weekend_times,
+                                    time.time() if now is None else now)
+        return anchor + self.interval_seconds
 
     def is_due(self, now: Optional[float] = None) -> bool:
-        if self.status != "active" or not self.prompt or self.interval_seconds <= 0:
+        if self.status != "active" or not self.prompt or (not self.daily_times and self.interval_seconds <= 0):
             return False
-        return (time.time() if now is None else now) - (self.last_fired_at or self.created_at) >= self.interval_seconds
+        now = time.time() if now is None else now
+        return now >= self.next_fire_at(now)
 
     def render_prompt(self) -> str:
+        if self.daily_times:
+            return HEARTBEAT_PROMPT_TEMPLATE.replace("fires every {interval}", "fires {interval}").format(
+                interval=self.schedule_label(), prompt=self.prompt)
         return HEARTBEAT_PROMPT_TEMPLATE.format(interval=format_interval(self.interval_seconds), prompt=self.prompt)
 
 
@@ -156,13 +186,30 @@ class HeartbeatManager:
         s = self._state
         if s is None:
             return "No heartbeat. Set one with /heartbeat every <interval> <prompt>."
-        every = format_interval(s.interval_seconds)
+        schedule = s.schedule_label()
         fired = f", fired {s.fire_count}×" if s.fire_count else ""
         if s.status == "active":
-            next_in = max(0, int((s.last_fired_at or s.created_at) + s.interval_seconds - time.time()))
-            return f"♥ Heartbeat (every {every}, next in ~{next_in}s{fired}): {s.prompt}"
+            next_in = max(0, int(s.next_fire_at() - time.time()))
+            return f"♥ Heartbeat ({schedule}, next in ~{next_in}s{fired}): {s.prompt}"
         icon = "⏸ " if s.status == "paused" else ""
-        return f"{icon}Heartbeat ({s.status}, every {every}{fired}): {s.prompt}"
+        return f"{icon}Heartbeat ({s.status}, {schedule}{fired}): {s.prompt}"
+
+    def set_daily(self, prompt: str, daily_times, timezone: str, *, weekend_times=None) -> HeartbeatState:
+        from fork_features.daily_heartbeat import validate_daily
+        times = validate_daily(daily_times, timezone)
+        weekends = validate_daily(weekend_times, timezone) if weekend_times is not None else None
+        prompt = (prompt or "").strip()
+        if not prompt:
+            raise ValueError("heartbeat prompt is empty")
+        current = self._state
+        if (current and current.status == "active" and current.prompt == prompt
+                and current.daily_times == times and current.timezone == timezone
+                and current.weekend_times == weekends):
+            return current  # Repeated quick-enable must not reset an already-due tick.
+        self._state = HeartbeatState(prompt=prompt, interval_seconds=0, daily_times=times,
+                                     timezone=timezone, weekend_times=weekends, created_at=time.time())
+        save_heartbeat(self.session_id, self._state)
+        return self._state
 
     def set(self, prompt: str, interval_seconds: int) -> HeartbeatState:
         prompt = (prompt or "").strip()
