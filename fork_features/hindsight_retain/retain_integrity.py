@@ -187,6 +187,7 @@ def _validate_candidate(
         "schema_version": schema_version,
         "turn_count": turn_count,
         "message_count": message_count,
+        "audit": audit,
         "counts": {
             "user": counts["user"],
             "assistant": counts["assistant"],
@@ -429,7 +430,7 @@ def _state_snapshot(
                        {optional['finish_reason']},
                        {optional['display_kind']}
                 FROM messages
-                WHERE session_id = ? AND active = 1
+                WHERE session_id = ? AND (active = 1 OR compacted = 1)
                   AND role IN ('user', 'assistant')
                 ORDER BY id
                 """,
@@ -462,7 +463,12 @@ def _state_snapshot(
         "[ASYNC DELEGATION COMPLETE —",
         "[ASYNC DELEGATION BATCH COMPLETE —",
         "Operation interrupted: waiting for model response",
+        "Operation interrupted: retrying API call after error",
         "You just executed tool calls but returned an empty response.",
+        "[IMPORTANT: Background process ",
+        "[IMPORTANT: Background task ",
+        "[kanban] ",
+        "[System: Your previous response contained only internal reasoning and never produced a visible answer or tool call.",
     )
     compression_prefixes = (
         "[Session Arc Summary ",
@@ -470,6 +476,7 @@ def _state_snapshot(
         "[Current user objective preserved from compacted history]",
         "[Recent Summary (",
         "[CONTEXT COMPACTION —",
+        "[Durable Summary (",
     )
     visible: list[tuple[str, str, Any]] = []
     for row in rows:
@@ -489,8 +496,8 @@ def _state_snapshot(
         )
         if not content or any(content.startswith(prefix) for prefix in runtime_prefixes):
             continue
-        if role == "user" and any(
-            content.startswith(prefix) for prefix in compression_prefixes
+        if any(content.startswith(prefix) for prefix in compression_prefixes) or bool(
+            re.match(r"\[Depth-\d+ Summary \(", content)
         ):
             continue
         visible.append((role, content, row["timestamp"]))
@@ -742,6 +749,11 @@ def run_export(
     recorded_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     output_root = Path(output_root)
     output_dir = output_root / session_id / attempt_id
+    requested_state_db_path = Path(state_db_path)
+    resolved_state_db_path = (
+        _state_db_for_session(requested_state_db_path, session_id)
+        or requested_state_db_path
+    )
     started = {
         "schema_version": 1,
         "attempt_id": attempt_id,
@@ -752,7 +764,7 @@ def run_export(
         "remote_expectation": remote_expectation,
         "output_dir": str(output_dir),
         "state_snapshot": _state_snapshot(
-            Path(state_db_path),
+            resolved_state_db_path,
             session_id,
             cutoff_at=cutoff_at,
         ),
@@ -769,6 +781,8 @@ def run_export(
         "--skip-hindsight",
         "--output-dir",
         str(output_dir),
+        "--state-db-path",
+        str(resolved_state_db_path),
     ]
     if cutoff_iso is not None:
         command.extend(["--cutoff-at", cutoff_iso])
@@ -851,6 +865,80 @@ def run_export(
         "manifest": manifest,
     }
     if remote_expectation != "expected":
+        return result
+
+    reconciliation = material["audit"].get("state_reconciliation")
+    if not _state_reconciliation_is_verified(material["audit"]):
+        reconciliation_status = (
+            str(reconciliation.get("status") or "invalid")
+            if isinstance(reconciliation, dict)
+            else "missing"
+        )
+        append_event_durable(
+            Path(journal_path),
+            {
+                "schema_version": 1,
+                "attempt_id": attempt_id,
+                "event": "remote_write_blocked_unverified_candidate",
+                "recorded_at": (now or datetime.now(timezone.utc))
+                .astimezone(timezone.utc)
+                .isoformat(),
+                "session_id": session_id,
+                "document_id": session_id,
+                "state_reconciliation_status": reconciliation_status,
+            },
+        )
+        result["status"] = "blocked_unverified_candidate"
+        return result
+
+    state_snapshot = started.get("state_snapshot")
+    if isinstance(state_snapshot, dict) and _candidate_gap_is_severe(
+        state_snapshot, material["counts"]
+    ):
+        state_total = int(state_snapshot.get("active_message_count") or 0)
+        candidate_total = material["counts"]["total"]
+        append_event_durable(
+            Path(journal_path),
+            {
+                "schema_version": 1,
+                "attempt_id": attempt_id,
+                "event": "remote_write_blocked_incomplete_candidate",
+                "recorded_at": (now or datetime.now(timezone.utc))
+                .astimezone(timezone.utc)
+                .isoformat(),
+                "session_id": session_id,
+                "document_id": session_id,
+                "state_active_message_count": state_total,
+                "candidate_message_count": candidate_total,
+                "missing_message_count": max(0, state_total - candidate_total),
+            },
+        )
+        result["status"] = "blocked_incomplete_candidate"
+        return result
+
+    visible_event_gap = (
+        _candidate_visible_event_gap(state_snapshot, material["counts"], material["audit"])
+        if isinstance(state_snapshot, dict)
+        else None
+    )
+    if visible_event_gap is not None:
+        append_event_durable(
+            Path(journal_path),
+            {
+                "schema_version": 1,
+                "attempt_id": attempt_id,
+                "event": "remote_write_blocked_visible_event_gap",
+                "recorded_at": (now or datetime.now(timezone.utc))
+                .astimezone(timezone.utc)
+                .isoformat(),
+                "session_id": session_id,
+                "document_id": session_id,
+                "candidate_user_count": material["counts"]["user"],
+                "candidate_assistant_count": material["counts"]["assistant"],
+                **visible_event_gap,
+            },
+        )
+        result["status"] = "blocked_visible_event_gap"
         return result
 
     operation_id = attempt_id
@@ -1160,6 +1248,117 @@ def _candidate_gap_is_severe(state_snapshot: dict[str, Any], counts: dict[str, i
     return missing >= 6 and candidate_total < state_total * 0.85
 
 
+def _candidate_visible_event_gap(
+    state_snapshot: dict[str, Any],
+    counts: dict[str, int],
+    audit: dict[str, Any],
+) -> dict[str, int] | None:
+    reconciliation = audit.get("state_reconciliation")
+    if not isinstance(reconciliation, dict):
+        return None
+    try:
+        state_user = _strict_nonnegative_int(
+            int(state_snapshot.get("active_user_count") or 0), "state user count"
+        )
+        state_assistant = _strict_nonnegative_int(
+            int(state_snapshot.get("active_assistant_count") or 0),
+            "state assistant count",
+        )
+        clarify_questions = _strict_nonnegative_int(
+            int(reconciliation.get("clarify_question_event_count") or 0),
+            "clarify question count",
+        )
+        clarify_responses = _strict_nonnegative_int(
+            int(reconciliation.get("clarify_response_event_count") or 0),
+            "clarify response count",
+        )
+    except (TypeError, ValueError):
+        return None
+    required_user = state_user + clarify_responses
+    required_assistant = state_assistant + clarify_questions
+    missing_user = max(0, required_user - counts["user"])
+    missing_assistant = max(0, required_assistant - counts["assistant"])
+    if missing_user == 0 and missing_assistant == 0:
+        return None
+    return {
+        "required_user_count": required_user,
+        "required_assistant_count": required_assistant,
+        "missing_user_count": missing_user,
+        "missing_assistant_count": missing_assistant,
+    }
+
+
+def _confirmed_only_repair_scope_is_verified(
+    started: dict[str, Any],
+    succeeded: dict[str, Any],
+    material: dict[str, Any],
+) -> bool:
+    if (
+        started.get("repair_scope") != "confirmed_missing_only"
+        or succeeded.get("repair_scope") != "confirmed_missing_only"
+    ):
+        return False
+    repair = material.get("audit", {}).get("repair_scope")
+    if not isinstance(repair, dict):
+        return False
+    base_sha256 = str(repair.get("base_remote_sha256") or "")
+    if (
+        repair.get("status") != "confirmed_missing_only_verified"
+        or repair.get("old_messages_preserved_as_ordered_subsequence") is not True
+        or len(base_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in base_sha256)
+        or str(started.get("base_remote_sha256") or "") != base_sha256
+        or material.get("sha256") == base_sha256
+    ):
+        return False
+    try:
+        old_message_count = _strict_nonnegative_int(
+            repair.get("old_message_count"), "repair old message count"
+        )
+        inserted_message_count = _strict_nonnegative_int(
+            repair.get("inserted_message_count"), "repair inserted message count"
+        )
+        _strict_nonnegative_int(
+            repair.get("excluded_review_candidate_count"),
+            "repair excluded review candidate count",
+        )
+    except ValueError:
+        return False
+    selected_occurrence_ids = repair.get("selected_occurrence_ids")
+    if (
+        inserted_message_count == 0
+        or not isinstance(selected_occurrence_ids, list)
+        or len(selected_occurrence_ids) != inserted_message_count
+        or len({str(value) for value in selected_occurrence_ids})
+        != inserted_message_count
+        or any(not str(value).strip() for value in selected_occurrence_ids)
+    ):
+        return False
+    return material.get("message_count") == old_message_count + inserted_message_count
+
+
+def _state_reconciliation_is_verified(audit: dict[str, Any]) -> bool:
+    reconciliation = audit.get("state_reconciliation")
+    if not isinstance(reconciliation, dict) or reconciliation.get("status") != "verified":
+        return False
+    try:
+        source_count = _strict_nonnegative_int(
+            reconciliation.get("source_event_count"), "state source event count"
+        )
+        matched_count = _strict_nonnegative_int(
+            reconciliation.get("matched_event_count"), "state matched event count"
+        )
+        added_count = _strict_nonnegative_int(
+            reconciliation.get("added_event_count"), "state added event count"
+        )
+        uncovered_count = _strict_nonnegative_int(
+            reconciliation.get("uncovered_event_count"), "state uncovered event count"
+        )
+    except ValueError:
+        return False
+    return uncovered_count == 0 and matched_count + added_count == source_count
+
+
 def _document_content_and_counts(
     candidate_path: Path,
     session_id: str,
@@ -1414,6 +1613,35 @@ def scan_attempts(
                 }
             )
             continue
+        repair_scope_requested = (
+            started.get("repair_scope") == "confirmed_missing_only"
+            or (
+                succeeded is not None
+                and succeeded.get("repair_scope") == "confirmed_missing_only"
+            )
+        )
+        repair_scope_verified = (
+            succeeded is not None
+            and candidate_material is not None
+            and _confirmed_only_repair_scope_is_verified(
+                started, succeeded, candidate_material
+            )
+        )
+        if repair_scope_requested and not repair_scope_verified:
+            alerts.append(
+                {
+                    "alert_key": f"retain:{attempt_id}:repair_scope_invalid",
+                    "type": "retain_repair_scope_invalid",
+                    "severity": "high",
+                    "attempt_id": attempt_id,
+                    "session_id": session_id,
+                    "document_id": document_id,
+                    "started_at": started_at.isoformat(),
+                    "state_session_found": state_session_found,
+                    "message": "Retain 历史修复候选缺少可验证的确认缺项范围凭证",
+                }
+            )
+            continue
         if succeeded is not None and not state_session_found:
             alerts.append(
                 {
@@ -1428,27 +1656,116 @@ def scan_attempts(
                     "message": "Retain 有本地记录，但 StateDB 中找不到对应会话，无法完成独立内容交叉验证",
                 }
             )
-        if succeeded is not None and isinstance(state_snapshot, dict):
+        unverified_block = next(
+            (
+                event
+                for event in reversed(attempt_events)
+                if event.get("event") == "remote_write_blocked_unverified_candidate"
+            ),
+            None,
+        )
+        if unverified_block is not None:
+            reconciliation_status = str(
+                unverified_block.get("state_reconciliation_status") or "unknown"
+            )
+            alerts.append(
+                {
+                    "alert_key": (
+                        f"retain:{attempt_id}:candidate_reconciliation_unverified"
+                    ),
+                    "type": "retain_candidate_reconciliation_unverified",
+                    "severity": "high",
+                    "attempt_id": attempt_id,
+                    "session_id": session_id,
+                    "document_id": document_id,
+                    "started_at": started_at.isoformat(),
+                    "state_session_found": state_session_found,
+                    "state_reconciliation_status": reconciliation_status,
+                    "remote_write_status": "blocked_before_submit",
+                    "message": "Retain 候选未完成 StateDB 可见事件对账，已在提交远端前拦截",
+                }
+            )
+            continue
+        visible_event_gap_block = next(
+            (
+                event
+                for event in reversed(attempt_events)
+                if event.get("event") == "remote_write_blocked_visible_event_gap"
+            ),
+            None,
+        )
+        if visible_event_gap_block is not None:
+            alerts.append(
+                {
+                    "alert_key": f"retain:{attempt_id}:candidate_visible_event_gap",
+                    "type": "retain_candidate_visible_event_gap",
+                    "severity": "high",
+                    "attempt_id": attempt_id,
+                    "session_id": session_id,
+                    "document_id": document_id,
+                    "started_at": started_at.isoformat(),
+                    "state_session_found": state_session_found,
+                    "required_user_count": int(
+                        visible_event_gap_block.get("required_user_count") or 0
+                    ),
+                    "required_assistant_count": int(
+                        visible_event_gap_block.get("required_assistant_count") or 0
+                    ),
+                    "candidate_user_count": int(
+                        visible_event_gap_block.get("candidate_user_count") or 0
+                    ),
+                    "candidate_assistant_count": int(
+                        visible_event_gap_block.get("candidate_assistant_count") or 0
+                    ),
+                    "missing_user_count": int(
+                        visible_event_gap_block.get("missing_user_count") or 0
+                    ),
+                    "missing_assistant_count": int(
+                        visible_event_gap_block.get("missing_assistant_count") or 0
+                    ),
+                    "remote_write_status": "blocked_before_submit",
+                    "message": "Retain 候选少了可见用户或 AI 对话，已在提交远端前拦截",
+                }
+            )
+            continue
+        candidate_gap_alert: dict[str, Any] | None = None
+        if (
+            succeeded is not None
+            and isinstance(state_snapshot, dict)
+            and not repair_scope_verified
+        ):
             counts = candidate_material["counts"] if candidate_material is not None else None
             if counts is not None and _candidate_gap_is_severe(state_snapshot, counts):
                 state_total = int(state_snapshot.get("active_message_count") or 0)
                 candidate_total = counts["total"]
-                alerts.append(
-                    {
-                        "alert_key": f"retain:{attempt_id}:candidate_severely_incomplete",
-                        "type": "retain_candidate_severely_incomplete",
-                        "severity": "high",
-                        "attempt_id": attempt_id,
-                        "session_id": session_id,
-                        "document_id": document_id,
-                        "started_at": started_at.isoformat(),
-                        "state_session_found": state_session_found,
-                        "state_active_message_count": state_total,
-                        "candidate_message_count": candidate_total,
-                        "missing_message_count": max(0, state_total - candidate_total),
-                        "message": "Retain 候选相对开始时的 StateDB 会话少了一大块有效用户或 AI 消息",
-                    }
-                )
+                candidate_gap_alert = {
+                    "alert_key": f"retain:{attempt_id}:candidate_severely_incomplete",
+                    "type": "retain_candidate_severely_incomplete",
+                    "severity": "high",
+                    "attempt_id": attempt_id,
+                    "session_id": session_id,
+                    "document_id": document_id,
+                    "started_at": started_at.isoformat(),
+                    "state_session_found": state_session_found,
+                    "state_active_message_count": state_total,
+                    "candidate_message_count": candidate_total,
+                    "missing_message_count": max(0, state_total - candidate_total),
+                    "message": "Retain 候选相对开始时的 StateDB 会话少了一大块有效用户或 AI 消息",
+                }
+                alerts.append(candidate_gap_alert)
+        remote_write_blocked = next(
+            (
+                event
+                for event in reversed(attempt_events)
+                if event.get("event")
+                == "remote_write_blocked_incomplete_candidate"
+            ),
+            None,
+        )
+        if remote_write_blocked is not None:
+            if candidate_gap_alert is not None:
+                candidate_gap_alert["remote_write_status"] = "blocked_before_submit"
+            continue
         if (
             succeeded is not None
             and started.get("remote_expectation") == "expected"
@@ -1829,6 +2146,14 @@ def scan_attempts(
                     and candidate_material["content"] == remote_content
                     and completed_operation_id is not None
                 ):
+                    if candidate_gap_alert is not None:
+                        candidate_gap_alert.update(
+                            {
+                                "remote_write_status": "completed_exact_candidate",
+                                "operation_id": completed_operation_id,
+                                "remote_document_matches_candidate": True,
+                            }
+                        )
                     remote_confirmed_attempts.append(
                         {
                             "attempt_id": attempt_id,

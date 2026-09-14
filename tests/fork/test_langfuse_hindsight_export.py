@@ -1387,3 +1387,564 @@ def test_export_langfuse_fetches_v4_session_observations_with_cursor(
         {"role": "user", "content": "v4 request"}
     ]
     assert shutdown_calls == [True]
+
+
+def _create_reconciliation_state_db(path: Path, session_id: str) -> None:
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                rewind_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_name TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                finish_reason TEXT,
+                timestamp REAL,
+                active INTEGER NOT NULL DEFAULT 1,
+                compacted INTEGER NOT NULL DEFAULT 0,
+                display_kind TEXT,
+                platform_message_id TEXT,
+                display_order INTEGER
+            );
+            """
+        )
+        conn.execute("INSERT INTO sessions (id) VALUES (?)", (session_id,))
+
+
+def test_state_reconciliation_restores_real_user_before_continuity_answer(tmp_path):
+    module = load_script_module(tmp_path)
+    session_id = "session-continuity-opening"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, timestamp, platform_message_id,
+                display_order
+            ) VALUES (1, ?, 'user', '真实第一条用户消息', 1000, 'telegram-1', 1)
+            """,
+            (session_id,),
+        )
+    continuity = hermes_turn(
+        "turn-1",
+        "1970-01-01T00:16:41Z",
+        "1970-01-01T00:16:42Z",
+        (
+            '<hermes-runtime-context user-authored="false" '
+            'source="long-task-continuity">内部恢复内容</hermes-runtime-context>'
+        ),
+        "针对真实问题的回答",
+    )
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id, "capture_mode": "sanitized"},
+                "observations": [continuity],
+            }
+        ],
+    }
+
+    state_reconciliation = module.load_state_reconciliation(
+        session_id,
+        state_db,
+        cutoff_at=datetime.fromtimestamp(1003, tz=timezone.utc),
+    )
+    candidate = module.build_candidate_document(
+        export,
+        session_id,
+        state_reconciliation=state_reconciliation,
+        cutoff_at=datetime.fromtimestamp(1003, tz=timezone.utc),
+    )
+
+    assert candidate["turns"] == [
+        [
+            {
+                "role": "user",
+                "content": "User: 真实第一条用户消息",
+                "timestamp": "1970-01-01T00:16:40+00:00",
+            },
+            {
+                "role": "assistant",
+                "content": "Assistant: 针对真实问题的回答",
+                "timestamp": "1970-01-01T00:16:42Z",
+            },
+        ]
+    ]
+    assert candidate["audit"]["state_reconciliation"] == {
+        "status": "verified",
+        "source_event_count": 1,
+        "matched_event_count": 0,
+        "added_event_count": 1,
+        "uncovered_event_count": 0,
+        "platform_user_event_count": 1,
+        "visible_assistant_event_count": 0,
+        "clarify_question_event_count": 0,
+        "clarify_response_event_count": 0,
+    }
+
+
+def test_state_reconciliation_restores_visible_assistant_missing_from_langfuse(tmp_path):
+    module = load_script_module(tmp_path)
+    session_id = "session-missing-visible-assistant"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, finish_reason, timestamp,
+                active, compacted, platform_message_id, display_order
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, session_id, "user", "请继续处理", None, 1000, 1, 0, "telegram-1", 1),
+                (2, session_id, "assistant", "被 Langfuse 漏掉的正式回复", "stop", 1001, 1, 0, None, 2),
+                (3, session_id, "assistant", "压缩前已有的最终回复", "stop", 1002, 0, 1, None, 3),
+            ],
+        )
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id, "capture_mode": "sanitized"},
+                "observations": [
+                    hermes_turn(
+                        "turn-1",
+                        "1970-01-01T00:16:40Z",
+                        "1970-01-01T00:16:42Z",
+                        "请继续处理",
+                        "压缩前已有的最终回复",
+                    )
+                ],
+            }
+        ],
+    }
+
+    state_reconciliation = module.load_state_reconciliation(
+        session_id,
+        state_db,
+        cutoff_at=datetime.fromtimestamp(1003, tz=timezone.utc),
+    )
+    candidate = module.build_candidate_document(
+        export,
+        session_id,
+        state_reconciliation=state_reconciliation,
+        cutoff_at=datetime.fromtimestamp(1003, tz=timezone.utc),
+    )
+
+    assert [
+        message["content"]
+        for turn in candidate["turns"]
+        for message in turn
+    ] == [
+        "User: 请继续处理",
+        "Assistant: 被 Langfuse 漏掉的正式回复",
+        "Assistant: 压缩前已有的最终回复",
+    ]
+    assert candidate["audit"]["state_reconciliation"] == {
+        "status": "verified",
+        "source_event_count": 3,
+        "matched_event_count": 2,
+        "added_event_count": 1,
+        "uncovered_event_count": 0,
+        "platform_user_event_count": 1,
+        "visible_assistant_event_count": 2,
+        "clarify_question_event_count": 0,
+        "clarify_response_event_count": 0,
+    }
+
+
+def test_state_reconciliation_excludes_nonvisible_assistant_rows(tmp_path):
+    module = load_script_module(tmp_path)
+    session_id = "session-assistant-visibility"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    tool_calls = json.dumps(
+        [{"id": "tool-1", "function": {"name": "terminal", "arguments": "{}"}}]
+    )
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, tool_calls, finish_reason,
+                timestamp, active, compacted, display_kind, display_order
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+            """,
+            [
+                (1, session_id, "assistant", "真实可见回复", None, "stop", 1000, None, 1),
+                (2, session_id, "assistant", "内部通知", None, "stop", 1001, "internal_notification", 2),
+                (3, session_id, "assistant", "隐藏内容", None, "stop", 1002, "hidden", 3),
+                (4, session_id, "assistant", "工具调用", tool_calls, "tool_calls", 1003, None, 4),
+                (5, session_id, "assistant", "[kanban] internal state", None, "stop", 1004, None, 5),
+                (6, session_id, "assistant", "[CONTEXT COMPACTION — internal]", None, "stop", 1005, None, 6),
+            ],
+        )
+
+    reconciliation = module.load_state_reconciliation(
+        session_id,
+        state_db,
+        cutoff_at=datetime.fromtimestamp(1006, tz=timezone.utc),
+    )
+
+    assistant_events = [
+        event
+        for event in reconciliation["events"]
+        if event["source_kind"] == "visible_assistant"
+    ]
+    assert [event["content"] for event in assistant_events] == ["真实可见回复"]
+
+
+def test_state_reconciliation_deduplicates_physical_assistant_copies(tmp_path):
+    module = load_script_module(tmp_path)
+    session_id = "session-assistant-physical-copies"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, finish_reason, timestamp,
+                active, compacted, display_order
+            ) VALUES (?, ?, 'assistant', ?, 'stop', ?, ?, ?, ?)
+            """,
+            [
+                (1, session_id, "同一条正式回复", 1000, 1, 0, 1),
+                (2, session_id, "同一条正式回复", 1000, 0, 1, 2),
+            ],
+        )
+
+    reconciliation = module.load_state_reconciliation(
+        session_id,
+        state_db,
+        cutoff_at=datetime.fromtimestamp(1001, tz=timezone.utc),
+    )
+
+    assistant_events = [
+        event
+        for event in reconciliation["events"]
+        if event["source_kind"] == "visible_assistant"
+    ]
+    assert len(assistant_events) == 1
+    assert assistant_events[0]["content"] == "同一条正式回复"
+
+
+def test_state_reconciliation_projects_clarify_when_v4_has_only_chain(tmp_path):
+    module = load_script_module(tmp_path)
+    session_id = "session-v4-clarify"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    tool_call_id = "call-clarify-1"
+    tool_calls = json.dumps(
+        [
+            {
+                "id": tool_call_id,
+                "call_id": tool_call_id,
+                "function": {
+                    "name": "clarify",
+                    "arguments": json.dumps(
+                        {
+                            "questions": [
+                                {
+                                    "question": "是否执行远端替换？",
+                                    "choices": ["执行替换", "先不执行"],
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+        ],
+        ensure_ascii=False,
+    )
+    tool_result = json.dumps(
+        {
+            "responses": [
+                {
+                    "question": "是否执行远端替换？",
+                    "choices_offered": ["执行替换", "先不执行"],
+                    "user_response": "执行替换",
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, tool_name, tool_call_id,
+                tool_calls, finish_reason, timestamp, platform_message_id,
+                display_order
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, session_id, "user", "请修复文档", None, None, None, None, 1000, "telegram-1", 1),
+                (2, session_id, "assistant", "", None, None, tool_calls, "tool_calls", 1001, None, 2),
+                (3, session_id, "tool", tool_result, "clarify", tool_call_id, None, None, 1002, None, 3),
+            ],
+        )
+    chain = hermes_turn(
+        "turn-1",
+        "1970-01-01T00:16:40Z",
+        "1970-01-01T00:16:43Z",
+        "请修复文档",
+        "已按确认执行。",
+    )
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id, "capture_mode": "sanitized"},
+                "observations": [chain],
+            }
+        ],
+    }
+
+    state_reconciliation = module.load_state_reconciliation(
+        session_id,
+        state_db,
+        cutoff_at=datetime.fromtimestamp(1004, tz=timezone.utc),
+    )
+    candidate = module.build_candidate_document(
+        export,
+        session_id,
+        state_reconciliation=state_reconciliation,
+        cutoff_at=datetime.fromtimestamp(1004, tz=timezone.utc),
+    )
+
+    assert candidate["turns"] == [
+        [
+            {
+                "role": "user",
+                "content": "User: 请修复文档",
+                "timestamp": "1970-01-01T00:16:40Z",
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "Assistant: 是否执行远端替换？\n\n"
+                    "Choices offered:\n- 执行替换\n- 先不执行"
+                ),
+                "timestamp": "1970-01-01T00:16:41+00:00",
+            },
+            {
+                "role": "user",
+                "content": "User: 执行替换",
+                "timestamp": "1970-01-01T00:16:42+00:00",
+            },
+            {
+                "role": "assistant",
+                "content": "Assistant: 已按确认执行。",
+                "timestamp": "1970-01-01T00:16:43Z",
+            },
+        ]
+    ]
+    assert candidate["audit"]["state_reconciliation"] == {
+        "status": "verified",
+        "source_event_count": 3,
+        "matched_event_count": 1,
+        "added_event_count": 2,
+        "uncovered_event_count": 0,
+        "platform_user_event_count": 1,
+        "visible_assistant_event_count": 0,
+        "clarify_question_event_count": 1,
+        "clarify_response_event_count": 1,
+    }
+
+
+def test_cli_applies_state_reconciliation_to_generated_candidate(tmp_path, monkeypatch):
+    module = load_script_module(tmp_path)
+    session_id = "session-cli-reconciliation"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, timestamp, platform_message_id,
+                display_order
+            ) VALUES (1, ?, 'user', 'CLI 真实开场', 1000, 'telegram-cli', 1)
+            """,
+            (session_id,),
+        )
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id, "capture_mode": "sanitized"},
+                "observations": [
+                    hermes_turn(
+                        "turn-1",
+                        "1970-01-01T00:16:41Z",
+                        "1970-01-01T00:16:42Z",
+                        (
+                            '<hermes-runtime-context user-authored="false" '
+                            'source="long-task-continuity">内部恢复</hermes-runtime-context>'
+                        ),
+                        "CLI 最终回答",
+                    )
+                ],
+            }
+        ],
+    }
+    output_dir = tmp_path / "output"
+    monkeypatch.setattr(module, "export_langfuse", lambda *_: export)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "langfuse_hindsight_export.py",
+            "--session-id",
+            session_id,
+            "--output-dir",
+            str(output_dir),
+            "--cutoff-at",
+            "1970-01-01T00:16:43Z",
+            "--skip-hindsight",
+            "--sqlite-path",
+            str(tmp_path / "missing-retain.sqlite3"),
+            "--state-db-path",
+            str(state_db),
+        ],
+    )
+
+    assert module.main() == 0
+
+    candidate = json.loads(
+        (output_dir / f"candidate_document_{session_id}.json").read_text()
+    )
+    assert candidate["turns"][0][0]["content"] == "User: CLI 真实开场"
+    assert candidate["audit"]["state_reconciliation"]["status"] == "verified"
+
+
+def test_state_reconciliation_does_not_treat_quoted_response_as_present(tmp_path):
+    module = load_script_module(tmp_path)
+    turns = [
+        [
+            {
+                "role": "user",
+                "content": "User: 你再漏掉“执行替换”我看看",
+                "timestamp": "1970-01-01T00:16:42Z",
+            }
+        ]
+    ]
+    reconciliation = {
+        "status": "ready",
+        "events": [
+            {
+                "source_kind": "clarify_response",
+                "source_key": "clarify_response:call-1:0",
+                "role": "user",
+                "content": "执行替换",
+                "timestamp": "1970-01-01T00:16:41Z",
+                "display_order": 1,
+            }
+        ],
+    }
+
+    reconciled, audit = module._apply_state_reconciliation(turns, reconciliation)
+
+    assert [message["content"] for message in reconciled[0]] == [
+        "User: 执行替换",
+        "User: 你再漏掉“执行替换”我看看",
+    ]
+    assert audit["matched_event_count"] == 0
+    assert audit["added_event_count"] == 1
+
+
+def test_state_reconciliation_preserves_equal_timestamp_event_order(tmp_path):
+    module = load_script_module(tmp_path)
+    turns = [
+        [
+            {
+                "role": "assistant",
+                "content": "Assistant: 最终回答",
+                "timestamp": "1970-01-01T00:16:43Z",
+            }
+        ]
+    ]
+    reconciliation = {
+        "status": "ready",
+        "events": [
+            {
+                "source_kind": "clarify_question",
+                "source_key": "clarify_question:call-1:0",
+                "role": "assistant",
+                "content": "第一个问题",
+                "timestamp": "1970-01-01T00:16:41Z",
+                "display_order": 1,
+            },
+            {
+                "source_kind": "clarify_question",
+                "source_key": "clarify_question:call-1:1",
+                "role": "assistant",
+                "content": "第二个问题",
+                "timestamp": "1970-01-01T00:16:41Z",
+                "display_order": 1,
+            },
+        ],
+    }
+
+    reconciled, _ = module._apply_state_reconciliation(turns, reconciliation)
+
+    assert [message["content"] for message in reconciled[0]] == [
+        "Assistant: 第一个问题",
+        "Assistant: 第二个问题",
+        "Assistant: 最终回答",
+    ]
+
+
+def test_state_reconciliation_requires_one_candidate_occurrence_per_state_event(tmp_path):
+    module = load_script_module(tmp_path)
+    turns = [
+        [
+            {
+                "role": "user",
+                "content": "User: 继续",
+                "timestamp": "1970-01-01T00:16:41Z",
+            },
+            {
+                "role": "assistant",
+                "content": "Assistant: 已继续一次",
+                "timestamp": "1970-01-01T00:16:42Z",
+            },
+        ]
+    ]
+    reconciliation = {
+        "status": "ready",
+        "events": [
+            {
+                "source_kind": "platform_user",
+                "source_key": "platform_user:100",
+                "role": "user",
+                "content": "继续",
+                "timestamp": "1970-01-01T00:16:41Z",
+                "display_order": 1,
+            },
+            {
+                "source_kind": "platform_user",
+                "source_key": "platform_user:101",
+                "role": "user",
+                "content": "继续",
+                "timestamp": "1970-01-01T00:16:43Z",
+                "display_order": 2,
+            },
+        ],
+    }
+
+    reconciled, audit = module._apply_state_reconciliation(turns, reconciliation)
+    messages = [message for turn in reconciled for message in turn]
+
+    assert [message["content"] for message in messages].count("User: 继续") == 2
+    assert audit["matched_event_count"] == 1
+    assert audit["added_event_count"] == 1

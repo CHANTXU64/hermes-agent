@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import unicodedata
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -33,6 +34,23 @@ DEFAULT_SQLITE_PATH = (
     Path.home() / ".hermes" / "hindsight" / "retain_turns.sqlite3"
 )
 DEFAULT_STATE_DB_PATH = Path.home() / ".hermes" / "state.db"
+_STATE_FRAMEWORK_PREFIXES = (
+    "[Session Arc Summary ",
+    "[Your active task list was preserved across context compression]",
+    "[Current user objective preserved from compacted history]",
+    "[Recent Summary (",
+    "[CONTEXT COMPACTION —",
+    "[Durable Summary (",
+    "[ASYNC DELEGATION COMPLETE —",
+    "[ASYNC DELEGATION BATCH COMPLETE —",
+    "Operation interrupted: waiting for model response",
+    "Operation interrupted: retrying API call after error",
+    "You just executed tool calls but returned an empty response.",
+    "[IMPORTANT: Background process ",
+    "[IMPORTANT: Background task ",
+    "[kanban] ",
+    "[System: Your previous response contained only internal reasoning and never produced a visible answer or tool call.",
+)
 
 
 @contextmanager
@@ -509,6 +527,13 @@ def _decode_state_content(value):
     return value
 
 
+def _is_state_framework_content(value: str) -> bool:
+    normalized = " ".join(unicodedata.normalize("NFKC", str(value)).split())
+    return any(normalized.startswith(prefix) for prefix in _STATE_FRAMEWORK_PREFIXES) or bool(
+        re.match(r"\[Depth-\d+ Summary \(", normalized)
+    )
+
+
 def load_undo_filter(
     session_id: str,
     state_db_path: Path,
@@ -807,6 +832,389 @@ def _document_message(role: str, content: str, timestamp: str) -> dict:
     }
 
 
+def _external_safe_text(value: str) -> str:
+    """Apply the same mandatory redaction used before external Langfuse export."""
+    try:
+        from agent.redact import redact_sensitive_text
+    except Exception as exc:  # pragma: no cover - installation/runtime corruption
+        raise RuntimeError("state reconciliation redactor is unavailable") from exc
+    return redact_sensitive_text(value, force=True)
+
+
+def _utc_timestamp(value) -> str:
+    seconds = _timestamp_seconds(value)
+    if seconds is None:
+        return ""
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+
+
+def _decoded_tool_calls(value) -> list[dict]:
+    if not isinstance(value, str) or not value.strip():
+        return []
+    try:
+        calls = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(calls, list):
+        return []
+    return [call for call in calls if isinstance(call, dict)]
+
+
+def _clarify_call_arguments(call: dict) -> tuple[str, list[dict]] | None:
+    function = call.get("function")
+    if not isinstance(function, dict) or function.get("name") != "clarify":
+        return None
+    call_id = str(call.get("call_id") or call.get("id") or "").strip()
+    if not call_id:
+        return None
+    arguments = function.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    questions = arguments.get("questions")
+    if not isinstance(questions, list):
+        question = arguments.get("question")
+        questions = (
+            [{"question": question, "choices": arguments.get("choices") or []}]
+            if isinstance(question, str) and question.strip()
+            else []
+        )
+    return call_id, [question for question in questions if isinstance(question, dict)]
+
+
+def _clarify_result(content) -> tuple[bool, list[dict]]:
+    text = str(content or "")
+    if "clarify prompt could not be delivered" in text:
+        return False, []
+    if text.startswith("[clarify] asked user a question"):
+        return True, []
+    if text.startswith("[clarify] user responded:"):
+        raw_response = text.split(":", 1)[1].strip()
+        try:
+            parsed = json.loads(raw_response)
+        except json.JSONDecodeError:
+            parsed = raw_response
+        values = parsed if isinstance(parsed, list) else [parsed]
+        return True, [
+            {"user_response": str(value)}
+            for value in values
+            if str(value).strip()
+        ]
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return True, []
+    if not isinstance(payload, dict):
+        return True, []
+    responses = payload.get("responses")
+    if not isinstance(responses, list):
+        return True, []
+    return True, [response for response in responses if isinstance(response, dict)]
+
+
+def _render_clarify_question(question: str, choices) -> str:
+    rendered = question.strip()
+    if isinstance(choices, list):
+        clean_choices = [str(choice).strip() for choice in choices if str(choice).strip()]
+        if clean_choices:
+            rendered += "\n\nChoices offered:\n" + "\n".join(
+                f"- {choice}" for choice in clean_choices
+            )
+    return rendered
+
+
+def load_state_reconciliation(
+    session_id: str,
+    state_db_path: Path,
+    *,
+    cutoff_at: datetime | None = None,
+) -> dict:
+    """Load high-confidence visible events that Langfuse may not contain."""
+    result = {"status": "unavailable", "events": [], "reason": "not_checked"}
+    path = Path(state_db_path).expanduser()
+    if not path.exists():
+        result["reason"] = "state_db_missing"
+        return result
+    cutoff_seconds = None
+    if cutoff_at is not None:
+        if cutoff_at.tzinfo is None:
+            cutoff_at = cutoff_at.replace(tzinfo=timezone.utc)
+        cutoff_seconds = cutoff_at.astimezone(timezone.utc).timestamp()
+    try:
+        with sqlite_query_only(path) as conn:
+            conn.row_factory = sqlite3.Row
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+            }
+            required = {
+                "id",
+                "session_id",
+                "role",
+                "content",
+                "timestamp",
+                "active",
+                "compacted",
+                "display_kind",
+                "platform_message_id",
+                "display_order",
+                "tool_name",
+                "tool_call_id",
+                "tool_calls",
+            }
+            if not required.issubset(columns):
+                result["reason"] = "state_schema_missing_visible_event_columns"
+                return result
+            query = """
+                SELECT id, role, content, timestamp, display_kind,
+                       platform_message_id, display_order, tool_name,
+                       tool_call_id, tool_calls
+                FROM messages
+                WHERE session_id = ?
+                  AND (active = 1 OR compacted = 1)
+            """
+            parameters: list[object] = [session_id]
+            if cutoff_seconds is not None:
+                query += " AND timestamp <= ?"
+                parameters.append(cutoff_seconds)
+            query += " ORDER BY COALESCE(display_order, id), id"
+            rows = conn.execute(query, parameters).fetchall()
+    except (OSError, sqlite3.Error) as exc:
+        result["reason"] = f"state_db_error:{type(exc).__name__}"
+        return result
+
+    events = []
+    seen_platform_messages: set[str] = set()
+    user_rows = [
+        row
+        for row in rows
+        if row["role"] == "user"
+        and row["platform_message_id"] is not None
+        and str(row["platform_message_id"]).strip()
+    ]
+    for row in user_rows:
+        if str(row["display_kind"] or "") in {"hidden", "internal_notification"}:
+            continue
+        platform_message_id = str(row["platform_message_id"] or "").strip()
+        if platform_message_id in seen_platform_messages:
+            continue
+        content = _clean_user_content(_decode_state_content(row["content"]))
+        if not content:
+            continue
+        seen_platform_messages.add(platform_message_id)
+        events.append(
+            {
+                "source_kind": "platform_user",
+                "source_key": f"platform_user:{platform_message_id}",
+                "role": "user",
+                "content": _external_safe_text(content),
+                "timestamp": _utc_timestamp(row["timestamp"]),
+                "display_order": int(row["display_order"] or row["id"]),
+            }
+        )
+
+    seen_visible_assistants: set[tuple[str, str]] = set()
+    for row in rows:
+        if row["role"] != "assistant":
+            continue
+        if str(row["display_kind"] or "") in {"hidden", "internal_notification"}:
+            continue
+        if str(row["tool_calls"] or "").strip():
+            continue
+        content = _decode_state_content(row["content"])
+        if not isinstance(content, str):
+            continue
+        content = content.strip()
+        if not content or _is_state_framework_content(content):
+            continue
+        timestamp = _utc_timestamp(row["timestamp"])
+        logical_key = (
+            " ".join(unicodedata.normalize("NFKC", content).split()),
+            timestamp,
+        )
+        if logical_key in seen_visible_assistants:
+            continue
+        seen_visible_assistants.add(logical_key)
+        events.append(
+            {
+                "source_kind": "visible_assistant",
+                "source_key": f"visible_assistant:{row['id']}",
+                "role": "assistant",
+                "content": _external_safe_text(content),
+                "timestamp": timestamp,
+                "display_order": int(row["display_order"] or row["id"]),
+            }
+        )
+
+    clarify_results = {
+        str(row["tool_call_id"] or ""): row
+        for row in rows
+        if row["role"] == "tool"
+        and row["tool_name"] == "clarify"
+        and str(row["tool_call_id"] or "")
+    }
+    seen_clarify_calls: set[str] = set()
+    for row in rows:
+        if row["role"] != "assistant":
+            continue
+        for call in _decoded_tool_calls(row["tool_calls"]):
+            parsed_call = _clarify_call_arguments(call)
+            if parsed_call is None:
+                continue
+            call_id, questions = parsed_call
+            if call_id in seen_clarify_calls:
+                continue
+            seen_clarify_calls.add(call_id)
+            result_row = clarify_results.get(call_id)
+            delivered, responses = _clarify_result(
+                result_row["content"] if result_row is not None else ""
+            )
+            if not delivered:
+                continue
+            count = max(len(questions), len(responses))
+            for index in range(count):
+                question_record = questions[index] if index < len(questions) else {}
+                response_record = responses[index] if index < len(responses) else {}
+                question = str(
+                    response_record.get("question")
+                    or question_record.get("question")
+                    or ""
+                ).strip()
+                choices = response_record.get("choices_offered")
+                if not isinstance(choices, list):
+                    choices = question_record.get("choices")
+                if question:
+                    events.append(
+                        {
+                            "source_kind": "clarify_question",
+                            "source_key": f"clarify_question:{call_id}:{index}",
+                            "role": "assistant",
+                            "content": _external_safe_text(
+                                _render_clarify_question(question, choices)
+                            ),
+                            "timestamp": _utc_timestamp(row["timestamp"]),
+                            "display_order": int(row["display_order"] or row["id"]),
+                        }
+                    )
+                user_response = response_record.get("user_response")
+                if isinstance(user_response, str) and user_response.strip():
+                    events.append(
+                        {
+                            "source_kind": "clarify_response",
+                            "source_key": f"clarify_response:{call_id}:{index}",
+                            "role": "user",
+                            "content": _external_safe_text(user_response.strip()),
+                            "timestamp": _utc_timestamp(
+                                result_row["timestamp"]
+                                if result_row is not None
+                                else row["timestamp"]
+                            ),
+                            "display_order": int(
+                                (
+                                    result_row["display_order"]
+                                    if result_row is not None
+                                    else None
+                                )
+                                or row["display_order"]
+                                or row["id"]
+                            ),
+                        }
+                    )
+    result.update({"status": "ready", "reason": "state_visible_events_loaded", "events": events})
+    return result
+
+
+def _state_event_key(role, content: str) -> tuple[str, str]:
+    return (
+        str(role or ""),
+        " ".join(unicodedata.normalize("NFKC", str(content)).split()),
+    )
+
+
+def _candidate_state_event_inventory(turns: list[list[dict]]) -> dict[tuple[str, str], int]:
+    inventory: dict[tuple[str, str], int] = {}
+    for turn in turns:
+        for message in turn:
+            key = _state_event_key(
+                message.get("role"), _document_message_body(message)
+            )
+            inventory[key] = inventory.get(key, 0) + 1
+    return inventory
+
+
+def _insert_state_event(turns: list[list[dict]], event: dict) -> None:
+    message = _document_message(event["role"], event["content"], event["timestamp"])
+    event_seconds = _timestamp_seconds(event.get("timestamp"))
+    if not turns:
+        turns.append([message])
+        return
+    for turn in turns:
+        for index, existing in enumerate(turn):
+            existing_seconds = _timestamp_seconds(existing.get("timestamp"))
+            if (
+                event_seconds is not None
+                and existing_seconds is not None
+                and event_seconds < existing_seconds
+            ):
+                turn.insert(index, message)
+                return
+    turns[-1].append(message)
+
+
+def _apply_state_reconciliation(
+    turns: list[list[dict]], state_reconciliation: dict | None
+) -> tuple[list[list[dict]], dict]:
+    evidence = state_reconciliation if isinstance(state_reconciliation, dict) else {}
+    raw_events = evidence.get("events")
+    events = raw_events if isinstance(raw_events, list) else []
+    audit = {
+        "status": "not_requested",
+        "source_event_count": 0,
+        "matched_event_count": 0,
+        "added_event_count": 0,
+        "uncovered_event_count": 0,
+        "platform_user_event_count": 0,
+        "visible_assistant_event_count": 0,
+        "clarify_question_event_count": 0,
+        "clarify_response_event_count": 0,
+    }
+    if evidence:
+        audit["status"] = "verified" if evidence.get("status") == "ready" else "unavailable"
+    ordered_events = sorted(
+        (event for event in events if isinstance(event, dict)),
+        key=lambda event: (
+            _timestamp_seconds(event.get("timestamp")) or float("inf"),
+            int(event.get("display_order") or 0),
+            str(event.get("source_key") or ""),
+        ),
+    )
+    audit["source_event_count"] = len(ordered_events)
+    candidate_inventory = _candidate_state_event_inventory(turns)
+    for event in ordered_events:
+        source_kind = str(event.get("source_kind") or "")
+        count_key = f"{source_kind}_event_count"
+        if count_key in audit:
+            audit[count_key] += 1
+        event_key = _state_event_key(event.get("role"), str(event.get("content") or ""))
+        remaining_matches = candidate_inventory.get(event_key, 0)
+        if remaining_matches > 0:
+            candidate_inventory[event_key] = remaining_matches - 1
+            audit["matched_event_count"] += 1
+            continue
+        _insert_state_event(turns, event)
+        audit["added_event_count"] += 1
+    if audit["matched_event_count"] + audit["added_event_count"] != len(ordered_events):
+        audit["uncovered_event_count"] = len(ordered_events) - (
+            audit["matched_event_count"] + audit["added_event_count"]
+        )
+        audit["status"] = "incomplete"
+    return turns, audit
+
+
 def _clarify_events(observation: dict) -> list[tuple[str, int, dict]]:
     clarify_input = observation.get("input") or {}
     clarify_output = observation.get("output") or {}
@@ -853,6 +1261,7 @@ def build_candidate_document(
     session_id: str,
     *,
     undo_filter: dict | None = None,
+    state_reconciliation: dict | None = None,
     cutoff_at: datetime | None = None,
 ) -> dict:
     """Build a deterministic, read-only conversation document candidate."""
@@ -1027,6 +1436,9 @@ def build_candidate_document(
     ]
     turns, cutoff_audit = _apply_cutoff(turns, cutoff_at)
     turns, undo_audit = _apply_undo_filter(turns, undo_filter)
+    turns, state_reconciliation_audit = _apply_state_reconciliation(
+        turns, state_reconciliation
+    )
 
     document_content = json.dumps(
         turns,
@@ -1063,6 +1475,7 @@ def build_candidate_document(
             "candidate_message_count": sum(len(turn) for turn in turns),
             **cutoff_audit,
             **undo_audit,
+            "state_reconciliation": state_reconciliation_audit,
         },
     }
 
@@ -1182,10 +1595,16 @@ def main() -> int:
         args.state_db_path,
         cutoff_at=args.cutoff_at,
     )
+    state_reconciliation = load_state_reconciliation(
+        sid,
+        args.state_db_path,
+        cutoff_at=args.cutoff_at,
+    )
     candidate_document = build_candidate_document(
         langfuse_export,
         sid,
         undo_filter=undo_filter,
+        state_reconciliation=state_reconciliation,
         cutoff_at=args.cutoff_at,
     )
     candidate_path = output_dir / f"candidate_document_{safe_id(sid)}.json"

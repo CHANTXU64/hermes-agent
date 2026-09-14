@@ -77,9 +77,8 @@ def create_state_db(path: Path, session_id: str) -> None:
         )
 
 
-def write_valid_exporter(path: Path) -> None:
-    path.write_text(
-        """
+def write_valid_exporter(path: Path, *, reconciliation_status: str = "verified") -> None:
+    script = """
 import argparse
 import hashlib
 import json
@@ -88,6 +87,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--session-id", required=True)
 parser.add_argument("--skip-hindsight", action="store_true")
 parser.add_argument("--cutoff-at")
+parser.add_argument("--state-db-path")
 parser.add_argument("--output-dir", type=Path, required=True)
 args = parser.parse_args()
 args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -95,12 +95,12 @@ turns = [[{"role": "user", "content": "User: persist this"}, {"role": "assistant
 content = json.dumps(turns, separators=(",", ":"))
 digest = hashlib.sha256(content.encode()).hexdigest()
 candidate = args.output_dir / f"candidate_document_{args.session_id}.json"
-candidate.write_text(json.dumps({"schema_version": "hindsight-conversation-document-v1", "session_id": args.session_id, "document_id": args.session_id, "turns": turns, "document_content": content, "document_content_sha256": digest, "audit": {"candidate_turn_count": 1, "candidate_message_count": 2}}))
-(args.output_dir / "manifest.json").write_text(json.dumps({"session_id": args.session_id, "read_only": True, "received_cutoff_at": args.cutoff_at, "files": [str(candidate)]}))
+reconciliation = {"status": __RECONCILIATION_STATUS__, "source_event_count": 2, "matched_event_count": 2, "added_event_count": 0, "uncovered_event_count": 0}
+candidate.write_text(json.dumps({"schema_version": "hindsight-conversation-document-v1", "session_id": args.session_id, "document_id": args.session_id, "turns": turns, "document_content": content, "document_content_sha256": digest, "audit": {"candidate_turn_count": 1, "candidate_message_count": 2, "state_reconciliation": reconciliation}}))
+(args.output_dir / "manifest.json").write_text(json.dumps({"session_id": args.session_id, "read_only": True, "received_cutoff_at": args.cutoff_at, "received_state_db_path": args.state_db_path, "files": [str(candidate)]}))
 print(json.dumps({"session_id": args.session_id}))
-""".lstrip(),
-        encoding="utf-8",
-    )
+""".lstrip().replace("__RECONCILIATION_STATUS__", repr(reconciliation_status))
+    path.write_text(script, encoding="utf-8")
 
 
 def create_accepted_attempt(
@@ -135,6 +135,303 @@ def create_accepted_attempt(
         },
     )
     return state_db, journal, result
+
+
+def test_unverified_state_reconciliation_blocks_remote_write(tmp_path: Path) -> None:
+    module = load_module()
+    session_id = "20260914_115000_a0b1c2d3"
+    state_db = tmp_path / "state.db"
+    journal = tmp_path / "retain-attempts.jsonl"
+    exporter = tmp_path / "unverified_exporter.py"
+    create_state_db(state_db, session_id)
+    write_valid_exporter(exporter, reconciliation_status="not_requested")
+    remote_payloads: list[dict] = []
+
+    result = module.run_export(
+        session_id=session_id,
+        output_root=tmp_path / "runs",
+        journal_path=journal,
+        state_db_path=state_db,
+        export_script=exporter,
+        python_executable=sys.executable,
+        remote_expectation="expected",
+        attempt_id="c1d2e3f4-5678-4abc-8def-0123456789ab",
+        now=datetime(2026, 9, 14, 3, 50, tzinfo=timezone.utc),
+        remote_writer=lambda payload: remote_payloads.append(payload),
+    )
+
+    assert remote_payloads == []
+    assert result["status"] == "blocked_unverified_candidate"
+    events = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert events[-1]["event"] == "remote_write_blocked_unverified_candidate"
+    assert events[-1]["state_reconciliation_status"] == "not_requested"
+
+    scan = module.scan_attempts(
+        journal_path=journal,
+        state_db_path=state_db,
+        now=datetime(2026, 9, 14, 4, 0, tzinfo=timezone.utc),
+        operation_fetcher=lambda _operation_id: (_ for _ in ()).throw(
+            AssertionError("blocked candidate queried remote operation")
+        ),
+        document_fetcher=lambda _document_id: (_ for _ in ()).throw(
+            AssertionError("blocked candidate queried remote document")
+        ),
+    )
+    assert scan["alerts"] == [
+        {
+            "alert_key": (
+                "retain:c1d2e3f4-5678-4abc-8def-0123456789ab:"
+                "candidate_reconciliation_unverified"
+            ),
+            "type": "retain_candidate_reconciliation_unverified",
+            "severity": "high",
+            "attempt_id": "c1d2e3f4-5678-4abc-8def-0123456789ab",
+            "session_id": session_id,
+            "document_id": session_id,
+            "started_at": "2026-09-14T03:50:00+00:00",
+            "state_session_found": True,
+            "state_reconciliation_status": "not_requested",
+            "remote_write_status": "blocked_before_submit",
+            "message": "Retain 候选未完成 StateDB 可见事件对账，已在提交远端前拦截",
+        }
+    ]
+
+
+def test_severely_incomplete_candidate_blocks_remote_write_before_submit(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    session_id = "20260914_120000_a1b2c3d4"
+    attempt_id = "b0f9bf22-9e09-455b-b867-d8cb0fc22775"
+    state_db = tmp_path / "state.db"
+    journal = tmp_path / "retain-attempts.jsonl"
+    exporter = tmp_path / "fake_exporter.py"
+    config = tmp_path / "config.json"
+    create_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, 1, 0, NULL)",
+            [
+                (
+                    message_id,
+                    session_id,
+                    "user" if message_id % 2 else "assistant",
+                    f"message {message_id}",
+                    1000.0 + message_id,
+                )
+                for message_id in range(3, 11)
+            ],
+        )
+    write_valid_exporter(exporter)
+    config.write_text(json.dumps({"bank_id": "Hermes"}), encoding="utf-8")
+    remote_payloads: list[dict] = []
+
+    result = module.run_export(
+        session_id=session_id,
+        output_root=tmp_path / "runs",
+        journal_path=journal,
+        state_db_path=state_db,
+        export_script=exporter,
+        python_executable=sys.executable,
+        remote_expectation="expected",
+        attempt_id=attempt_id,
+        now=datetime(2026, 9, 14, 4, 0, tzinfo=timezone.utc),
+        hindsight_config_path=config,
+        remote_writer=lambda payload: remote_payloads.append(payload),
+    )
+
+    assert remote_payloads == []
+    assert result["status"] == "blocked_incomplete_candidate"
+    events = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert [event["event"] for event in events] == [
+        "started",
+        "export_succeeded",
+        "remote_write_blocked_incomplete_candidate",
+    ]
+    assert events[-1]["state_active_message_count"] == 10
+    assert events[-1]["candidate_message_count"] == 2
+    assert events[-1]["missing_message_count"] == 8
+
+
+def test_single_missing_visible_assistant_blocks_remote_write_before_submit(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    session_id = "20260914_120500_a1b2c3d4"
+    attempt_id = "a6bdd87b-61b0-497b-863b-02942ee78661"
+    state_db = tmp_path / "state.db"
+    journal = tmp_path / "retain-attempts.jsonl"
+    exporter = tmp_path / "fake_exporter.py"
+    config = tmp_path / "config.json"
+    create_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.execute(
+            "INSERT INTO messages VALUES (3, ?, 'assistant', 'second answer', 1003, 1, 0, NULL)",
+            (session_id,),
+        )
+    write_valid_exporter(exporter)
+    config.write_text(json.dumps({"bank_id": "Hermes"}), encoding="utf-8")
+    remote_payloads: list[dict] = []
+
+    def remote_writer(payload: dict) -> dict:
+        remote_payloads.append(payload)
+        return {
+            "success": True,
+            "bank_id": "Hermes",
+            "items_count": 1,
+            "async": True,
+            "operation_id": payload["operation_id"],
+        }
+
+    result = module.run_export(
+        session_id=session_id,
+        output_root=tmp_path / "runs",
+        journal_path=journal,
+        state_db_path=state_db,
+        export_script=exporter,
+        python_executable=sys.executable,
+        remote_expectation="expected",
+        attempt_id=attempt_id,
+        now=datetime(2026, 9, 14, 4, 5, tzinfo=timezone.utc),
+        hindsight_config_path=config,
+        remote_writer=remote_writer,
+    )
+
+    assert remote_payloads == []
+    assert result["status"] == "blocked_visible_event_gap"
+    events = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert events[-1]["event"] == "remote_write_blocked_visible_event_gap"
+    assert events[-1]["missing_user_count"] == 0
+    assert events[-1]["missing_assistant_count"] == 1
+
+    scan = module.scan_attempts(
+        journal_path=journal,
+        state_db_path=state_db,
+        now=datetime(2026, 9, 14, 4, 15, tzinfo=timezone.utc),
+        operation_fetcher=lambda _operation_id: (_ for _ in ()).throw(
+            AssertionError("visible event gap queried remote operation")
+        ),
+        document_fetcher=lambda _document_id: (_ for _ in ()).throw(
+            AssertionError("visible event gap queried remote document")
+        ),
+    )
+    assert scan["alerts"] == [
+        {
+            "alert_key": f"retain:{attempt_id}:candidate_visible_event_gap",
+            "type": "retain_candidate_visible_event_gap",
+            "severity": "high",
+            "attempt_id": attempt_id,
+            "session_id": session_id,
+            "document_id": session_id,
+            "started_at": "2026-09-14T04:05:00+00:00",
+            "state_session_found": True,
+            "required_user_count": 1,
+            "required_assistant_count": 2,
+            "candidate_user_count": 1,
+            "candidate_assistant_count": 1,
+            "missing_user_count": 0,
+            "missing_assistant_count": 1,
+            "remote_write_status": "blocked_before_submit",
+            "message": "Retain 候选少了可见用户或 AI 对话，已在提交远端前拦截",
+        }
+    ]
+
+
+def test_state_snapshot_counts_compacted_visible_assistant(tmp_path: Path) -> None:
+    module = load_module()
+    session_id = "20260914_120700_a1b2c3d4"
+    state_db = tmp_path / "state.db"
+    create_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.execute(
+            "INSERT INTO messages VALUES (3, ?, 'assistant', 'compacted answer', 1003, 0, 1, NULL)",
+            (session_id,),
+        )
+
+    snapshot = module._state_snapshot(
+        state_db,
+        session_id,
+        cutoff_at=datetime(2026, 9, 14, 4, 6, tzinfo=timezone.utc),
+    )
+
+    assert snapshot["active_user_count"] == 1
+    assert snapshot["active_assistant_count"] == 2
+    assert snapshot["active_message_count"] == 3
+
+
+def test_blocked_incomplete_candidate_scans_as_one_explicit_alert(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    session_id = "20260914_121000_b1c2d3e4"
+    attempt_id = "c4c8657f-346d-4b5d-83e0-8467b7da6b58"
+    started_at = datetime(2026, 9, 14, 4, 10, tzinfo=timezone.utc)
+    state_db = tmp_path / "state.db"
+    journal = tmp_path / "retain-attempts.jsonl"
+    exporter = tmp_path / "fake_exporter.py"
+    config = tmp_path / "config.json"
+    create_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, 1, 0, NULL)",
+            [
+                (
+                    message_id,
+                    session_id,
+                    "user" if message_id % 2 else "assistant",
+                    f"message {message_id}",
+                    1000.0 + message_id,
+                )
+                for message_id in range(3, 11)
+            ],
+        )
+    write_valid_exporter(exporter)
+    config.write_text(json.dumps({"bank_id": "Hermes"}), encoding="utf-8")
+    module.run_export(
+        session_id=session_id,
+        output_root=tmp_path / "runs",
+        journal_path=journal,
+        state_db_path=state_db,
+        export_script=exporter,
+        python_executable=sys.executable,
+        remote_expectation="expected",
+        attempt_id=attempt_id,
+        now=started_at,
+        hindsight_config_path=config,
+        remote_writer=lambda _payload: (_ for _ in ()).throw(
+            AssertionError("incomplete candidate reached remote writer")
+        ),
+    )
+
+    result = module.scan_attempts(
+        journal_path=journal,
+        state_db_path=state_db,
+        now=started_at + timedelta(minutes=10),
+        operation_fetcher=lambda _operation_id: (_ for _ in ()).throw(
+            AssertionError("blocked candidate queried remote operation")
+        ),
+        document_fetcher=lambda _document_id: (_ for _ in ()).throw(
+            AssertionError("blocked candidate queried remote document")
+        ),
+    )
+
+    assert result["alerts"] == [
+        {
+            "alert_key": f"retain:{attempt_id}:candidate_severely_incomplete",
+            "type": "retain_candidate_severely_incomplete",
+            "severity": "high",
+            "attempt_id": attempt_id,
+            "session_id": session_id,
+            "document_id": session_id,
+            "started_at": started_at.isoformat(),
+            "state_session_found": True,
+            "state_active_message_count": 10,
+            "candidate_message_count": 2,
+            "missing_message_count": 8,
+            "remote_write_status": "blocked_before_submit",
+            "message": "Retain 候选相对开始时的 StateDB 会话少了一大块有效用户或 AI 消息",
+        }
+    ]
 
 
 def test_torn_journal_tail_preserves_prior_attempts_and_alerts(tmp_path: Path) -> None:
@@ -295,6 +592,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--session-id", required=True)
 parser.add_argument("--skip-hindsight", action="store_true")
 parser.add_argument("--cutoff-at")
+parser.add_argument("--state-db-path")
 parser.add_argument("--output-dir", type=Path, required=True)
 args = parser.parse_args()
 args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -311,7 +609,7 @@ candidate_payload = {
     "turns": turns,
     "document_content": content,
     "document_content_sha256": hashlib.sha256(content.encode()).hexdigest(),
-    "audit": {"candidate_turn_count": 1, "candidate_message_count": 2},
+    "audit": {"candidate_turn_count": 1, "candidate_message_count": 2, "state_reconciliation": {"status": "verified", "source_event_count": 2, "matched_event_count": 2, "added_event_count": 0, "uncovered_event_count": 0}},
 }
 candidate.write_text(json.dumps(candidate_payload), encoding="utf-8")
 manifest = {
@@ -383,7 +681,7 @@ def test_expected_remote_document_missing_after_grace_is_high_alert(tmp_path: Pa
                 "turns": turns,
                 "document_content": candidate_content,
                 "document_content_sha256": candidate_sha,
-                "audit": {"candidate_turn_count": 1, "candidate_message_count": 2},
+                "audit": {"candidate_turn_count": 1, "candidate_message_count": 2, "state_reconciliation": {"status": "verified", "source_event_count": 2, "matched_event_count": 2, "added_event_count": 0, "uncovered_event_count": 0}},
             }
         ),
         encoding="utf-8",
@@ -505,7 +803,7 @@ def test_candidate_with_large_state_db_gap_is_high_alert(tmp_path: Path) -> None
                 "turns": turns,
                 "document_content": candidate_content,
                 "document_content_sha256": candidate_sha,
-                "audit": {"candidate_turn_count": 1, "candidate_message_count": 2},
+                "audit": {"candidate_turn_count": 1, "candidate_message_count": 2, "state_reconciliation": {"status": "verified", "source_event_count": 2, "matched_event_count": 2, "added_event_count": 0, "uncovered_event_count": 0}},
             }
         ),
         encoding="utf-8",
@@ -571,6 +869,322 @@ def test_candidate_with_large_state_db_gap_is_high_alert(tmp_path: Path) -> None
             "state_active_message_count": 10,
             "candidate_message_count": 2,
             "missing_message_count": 8,
+            "message": "Retain 候选相对开始时的 StateDB 会话少了一大块有效用户或 AI 消息",
+        }
+    ]
+
+
+def test_verified_confirmed_only_repair_uses_repair_scope_instead_of_live_session_gap(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    now = datetime(2026, 9, 14, 5, 0, tzinfo=timezone.utc)
+    started_at = now - timedelta(minutes=10)
+    session_id = "20260824_160102_e39c34be"
+    attempt_id = "42d44e79-ecfd-4b36-a553-93df85e532dd"
+    state_db = tmp_path / "state.db"
+    journal = tmp_path / "retain-attempts.jsonl"
+    output_dir = tmp_path / "runs" / session_id / attempt_id
+    output_dir.mkdir(parents=True)
+    create_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, 1, 0, NULL)",
+            [
+                (
+                    message_id,
+                    session_id,
+                    "user" if message_id % 2 else "assistant",
+                    f"message {message_id}",
+                    1000.0 + message_id,
+                )
+                for message_id in range(3, 11)
+            ],
+        )
+    turns = [
+        [
+            {"role": "user", "content": "User: retained request"},
+            {"role": "assistant", "content": "Assistant: retained answer"},
+        ]
+    ]
+    candidate_content = json.dumps(turns, separators=(",", ":"))
+    candidate_sha = hashlib.sha256(candidate_content.encode()).hexdigest()
+    candidate_path = output_dir / f"candidate_document_{session_id}.json"
+    audit = {
+        "candidate_turn_count": 1,
+        "candidate_message_count": 2,
+        "user_count": 1,
+        "assistant_count": 1,
+        "first_role": "user",
+        "repair_scope": {
+            "status": "confirmed_missing_only_verified",
+            "base_remote_sha256": "a" * 64,
+            "old_message_count": 1,
+            "inserted_message_count": 1,
+            "selected_occurrence_ids": ["message_id:1"],
+            "excluded_review_candidate_count": 8,
+            "old_messages_preserved_as_ordered_subsequence": True,
+        },
+    }
+    candidate_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "hindsight-conversation-document-v1",
+                "session_id": session_id,
+                "document_id": session_id,
+                "turns": turns,
+                "document_content": candidate_content,
+                "document_content_sha256": candidate_sha,
+                "audit": audit,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps({"session_id": session_id}), encoding="utf-8")
+    events = [
+        {
+            "schema_version": 1,
+            "attempt_id": attempt_id,
+            "event": "started",
+            "recorded_at": started_at.isoformat(),
+            "session_id": session_id,
+            "document_id": session_id,
+            "remote_expectation": "expected",
+            "output_dir": str(output_dir),
+            "repair_scope": "confirmed_missing_only",
+            "base_remote_sha256": "a" * 64,
+            "state_snapshot": {
+                "session_found": True,
+                "active_user_count": 5,
+                "active_assistant_count": 5,
+                "active_message_count": 10,
+                "max_message_id": 10,
+            },
+        },
+        {
+            "schema_version": 1,
+            "attempt_id": attempt_id,
+            "event": "export_succeeded",
+            "recorded_at": (started_at + timedelta(seconds=1)).isoformat(),
+            "session_id": session_id,
+            "document_id": session_id,
+            "manifest_path": str(manifest_path),
+            "candidate_path": str(candidate_path),
+            "candidate_sha256": candidate_sha,
+            "candidate_turn_count": 1,
+            "candidate_message_count": 2,
+            "audit": audit,
+            "repair_scope": "confirmed_missing_only",
+        },
+        {
+            "schema_version": 1,
+            "attempt_id": attempt_id,
+            "event": "remote_write_started",
+            "recorded_at": (started_at + timedelta(seconds=2)).isoformat(),
+            "session_id": session_id,
+            "document_id": session_id,
+            "operation_id": attempt_id,
+            "bank_id": "Hermes",
+            "update_mode": "replace",
+            "candidate_sha256": candidate_sha,
+        },
+        {
+            "schema_version": 1,
+            "attempt_id": attempt_id,
+            "event": "remote_write_accepted",
+            "recorded_at": (started_at + timedelta(seconds=3)).isoformat(),
+            "session_id": session_id,
+            "document_id": session_id,
+            "operation_id": attempt_id,
+            "bank_id": "Hermes",
+            "candidate_sha256": candidate_sha,
+        },
+    ]
+    journal.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    result = module.scan_attempts(
+        journal_path=journal,
+        state_db_path=state_db,
+        now=now,
+        operation_fetcher=lambda _operation_id: {
+            "status": "found",
+            "operation_id": attempt_id,
+            "operation": {
+                "id": attempt_id,
+                "task_type": "batch_retain",
+                "status": "completed",
+                "document_id": session_id,
+                "items_count": 1,
+                "unit_ids_count": 1,
+                "extraction_errors_count": 0,
+            },
+        },
+        document_fetcher=lambda _document_id: {
+            "status": "found",
+            "document_id": session_id,
+            "document": {"id": session_id, "original_text": candidate_content},
+        },
+    )
+
+    assert result["alerts"] == []
+
+
+def test_exact_remote_copy_enriches_severe_candidate_alert(tmp_path: Path) -> None:
+    module = load_module()
+    now = datetime(2026, 9, 14, 5, 0, tzinfo=timezone.utc)
+    started_at = now - timedelta(minutes=10)
+    session_id = "20260914_125000_c1d2e3f4"
+    attempt_id = "e6d22f41-64e4-4acc-a9a5-672d017945ae"
+    state_db = tmp_path / "state.db"
+    journal = tmp_path / "retain-attempts.jsonl"
+    output_dir = tmp_path / "runs" / session_id / attempt_id
+    output_dir.mkdir(parents=True)
+    create_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, 1, 0, NULL)",
+            [
+                (
+                    message_id,
+                    session_id,
+                    "user" if message_id % 2 else "assistant",
+                    f"message {message_id}",
+                    1000.0 + message_id,
+                )
+                for message_id in range(3, 11)
+            ],
+        )
+    turns = [
+        [
+            {"role": "user", "content": "User: first request"},
+            {"role": "assistant", "content": "Assistant: first answer"},
+        ]
+    ]
+    candidate_content = json.dumps(turns, separators=(",", ":"))
+    candidate_sha = hashlib.sha256(candidate_content.encode()).hexdigest()
+    candidate_path = output_dir / f"candidate_document_{session_id}.json"
+    candidate_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "hindsight-conversation-document-v1",
+                "session_id": session_id,
+                "document_id": session_id,
+                "turns": turns,
+                "document_content": candidate_content,
+                "document_content_sha256": candidate_sha,
+                "audit": {"candidate_turn_count": 1, "candidate_message_count": 2, "state_reconciliation": {"status": "verified", "source_event_count": 2, "matched_event_count": 2, "added_event_count": 0, "uncovered_event_count": 0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps({"session_id": session_id}), encoding="utf-8")
+    journal.write_text(
+        "".join(
+            json.dumps(event) + "\n"
+            for event in [
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt_id,
+                    "event": "started",
+                    "recorded_at": started_at.isoformat(),
+                    "session_id": session_id,
+                    "document_id": session_id,
+                    "remote_expectation": "expected",
+                    "output_dir": str(output_dir),
+                    "state_snapshot": {
+                        "session_found": True,
+                        "active_user_count": 5,
+                        "active_assistant_count": 5,
+                        "active_message_count": 10,
+                        "max_message_id": 10,
+                    },
+                },
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt_id,
+                    "event": "export_succeeded",
+                    "recorded_at": (started_at + timedelta(seconds=5)).isoformat(),
+                    "session_id": session_id,
+                    "document_id": session_id,
+                    "manifest_path": str(manifest_path),
+                    "candidate_path": str(candidate_path),
+                    "candidate_sha256": candidate_sha,
+                    "candidate_turn_count": 1,
+                    "candidate_message_count": 2,
+                },
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt_id,
+                    "event": "remote_write_started",
+                    "recorded_at": (started_at + timedelta(seconds=6)).isoformat(),
+                    "session_id": session_id,
+                    "document_id": session_id,
+                    "operation_id": attempt_id,
+                    "bank_id": "Hermes",
+                    "update_mode": "replace",
+                    "candidate_sha256": candidate_sha,
+                },
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt_id,
+                    "event": "remote_write_accepted",
+                    "recorded_at": (started_at + timedelta(seconds=7)).isoformat(),
+                    "session_id": session_id,
+                    "document_id": session_id,
+                    "operation_id": attempt_id,
+                    "bank_id": "Hermes",
+                    "candidate_sha256": candidate_sha,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = module.scan_attempts(
+        journal_path=journal,
+        state_db_path=state_db,
+        now=now,
+        operation_fetcher=lambda operation_id: {
+            "status": "found",
+            "operation_id": operation_id,
+            "operation": {
+                "id": operation_id,
+                "task_type": "batch_retain",
+                "status": "completed",
+                "document_id": session_id,
+                "items_count": 1,
+                "extraction_errors_count": 0,
+            },
+        },
+        document_fetcher=lambda document_id: {
+            "status": "found",
+            "document_id": document_id,
+            "document": {"id": document_id, "original_text": candidate_content},
+        },
+    )
+
+    assert result["remote_confirmed_count"] == 1
+    assert result["alerts"] == [
+        {
+            "alert_key": f"retain:{attempt_id}:candidate_severely_incomplete",
+            "type": "retain_candidate_severely_incomplete",
+            "severity": "high",
+            "attempt_id": attempt_id,
+            "session_id": session_id,
+            "document_id": session_id,
+            "started_at": started_at.isoformat(),
+            "state_session_found": True,
+            "state_active_message_count": 10,
+            "candidate_message_count": 2,
+            "missing_message_count": 8,
+            "remote_write_status": "completed_exact_candidate",
+            "operation_id": attempt_id,
+            "remote_document_matches_candidate": True,
             "message": "Retain 候选相对开始时的 StateDB 会话少了一大块有效用户或 AI 消息",
         }
     ]
@@ -868,7 +1482,7 @@ def test_success_without_state_db_session_is_unresolved_alert(tmp_path: Path) ->
                 "turns": turns,
                 "document_content": candidate_content,
                 "document_content_sha256": candidate_sha,
-                "audit": {"candidate_turn_count": 1, "candidate_message_count": 2},
+                "audit": {"candidate_turn_count": 1, "candidate_message_count": 2, "state_reconciliation": {"status": "verified", "source_event_count": 2, "matched_event_count": 2, "added_event_count": 0, "uncovered_event_count": 0}},
             }
         ),
         encoding="utf-8",
@@ -969,6 +1583,9 @@ def test_retain_resolves_session_from_profile_state_db_family(tmp_path: Path) ->
         "active_message_count": 2,
         "max_message_id": 2,
     }
+    candidate_path = Path(events[1]["candidate_path"])
+    manifest = json.loads((candidate_path.parent / "manifest.json").read_text())
+    assert manifest["received_state_db_path"] == str(profile_state_db)
 
     result = module.scan_attempts(
         journal_path=journal,
@@ -1084,7 +1701,7 @@ def test_remote_unavailable_is_unresolved_not_missing(tmp_path: Path) -> None:
                 "turns": turns,
                 "document_content": candidate_content,
                 "document_content_sha256": candidate_sha,
-                "audit": {"candidate_turn_count": 1, "candidate_message_count": 2},
+                "audit": {"candidate_turn_count": 1, "candidate_message_count": 2, "state_reconciliation": {"status": "verified", "source_event_count": 2, "matched_event_count": 2, "added_event_count": 0, "uncovered_event_count": 0}},
             }
         ),
         encoding="utf-8",
@@ -1225,6 +1842,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--session-id", required=True)
 parser.add_argument("--skip-hindsight", action="store_true")
 parser.add_argument("--cutoff-at")
+parser.add_argument("--state-db-path")
 parser.add_argument("--output-dir", type=Path, required=True)
 args = parser.parse_args()
 args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1241,7 +1859,7 @@ candidate.write_text(json.dumps({
     "turns": turns,
     "document_content": content,
     "document_content_sha256": hashlib.sha256(content.encode()).hexdigest(),
-    "audit": {"candidate_turn_count": 1, "candidate_message_count": 2},
+    "audit": {"candidate_turn_count": 1, "candidate_message_count": 2, "state_reconciliation": {"status": "verified", "source_event_count": 2, "matched_event_count": 2, "added_event_count": 0, "uncovered_event_count": 0}},
 }), encoding="utf-8")
 manifest = {"session_id": args.session_id, "read_only": True, "files": [str(candidate)]}
 (args.output_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -1472,6 +2090,23 @@ def test_post_export_failure_records_stage_and_process_output(
     assert failure["exporter_stderr"] == ""
 
 
+def test_checker_does_not_misclassify_telegram_read_error_as_subagent_failure() -> None:
+    checker = load_path_module("hindsight_checker_log_classifier_test", CHECKER_PATH)
+    telegram_line = (
+        "2026-09-13 23:30:12,705 WARNING "
+        "hermes_plugins.telegram_platform.adapter: [Telegram] Telegram polling "
+        "reconnect failed: httpx.ReadError:"
+    )
+    model_line = (
+        "2026-09-14 09:59:50,026 WARNING agent.conversation_loop: "
+        "API call failed (attempt 1/4) error_type=ReadError "
+        "thread=bg-review:1 summary=[Errno 32] Broken pipe"
+    )
+
+    assert checker.classify(telegram_line) is None
+    assert checker.classify(model_line) == ("subagent_api_broken_pipe", "medium")
+
+
 def test_existing_checker_collects_retain_attempt_scan_json() -> None:
     checker = load_path_module("hindsight_checker_for_test", CHECKER_PATH)
     alert = {
@@ -1492,6 +2127,20 @@ def test_existing_checker_collects_retain_attempt_scan_json() -> None:
     )
 
     assert audit == {"status": "ok", "attempt_count": 1, "alerts": [alert]}
+
+
+def test_html_monitor_prompt_distinguishes_blocked_and_overwritten_candidates() -> None:
+    scripts_dir = str(Path.home() / ".hermes" / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    monitor = load_path_module("hindsight_html_monitor_prompt_test", HTML_MONITOR_PATH)
+
+    prompt = monitor.build_review_prompt({}, [])
+
+    assert "remote_write_status=blocked_before_submit" in prompt
+    assert "remote_write_status=completed_exact_candidate" in prompt
+    assert "远端文档已经保存了这份严重不完整的候选" in prompt
+    assert "机械差值，不等于已逐条确认的漏记条数" in prompt
 
 
 def test_html_monitor_treats_retain_attempts_as_direct_alerts() -> None:
@@ -1531,13 +2180,14 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--session-id", required=True)
 parser.add_argument("--skip-hindsight", action="store_true")
 parser.add_argument("--cutoff-at")
+parser.add_argument("--state-db-path")
 parser.add_argument("--output-dir", type=Path, required=True)
 args = parser.parse_args()
 args.output_dir.mkdir(parents=True, exist_ok=True)
 turns = [[{"role": "user", "content": "User: first request"}, {"role": "assistant", "content": "Assistant: first answer"}]]
 content = json.dumps(turns, separators=(",", ":"))
 candidate = args.output_dir / f"candidate_document_{args.session_id}.json"
-candidate.write_text(json.dumps({"schema_version": "hindsight-conversation-document-v1", "session_id": args.session_id, "document_id": args.session_id, "turns": turns, "document_content": content, "document_content_sha256": hashlib.sha256(content.encode()).hexdigest(), "audit": {"candidate_turn_count": 1, "candidate_message_count": 2}}))
+candidate.write_text(json.dumps({"schema_version": "hindsight-conversation-document-v1", "session_id": args.session_id, "document_id": args.session_id, "turns": turns, "document_content": content, "document_content_sha256": hashlib.sha256(content.encode()).hexdigest(), "audit": {"candidate_turn_count": 1, "candidate_message_count": 2, "state_reconciliation": {"status": "verified", "source_event_count": 2, "matched_event_count": 2, "added_event_count": 0, "uncovered_event_count": 0}}}))
 (args.output_dir / "manifest.json").write_text(json.dumps({"session_id": args.session_id, "read_only": True, "received_cutoff_at": args.cutoff_at, "files": [str(candidate)]}))
 print(json.dumps({"session_id": args.session_id}))
 """.lstrip(),
@@ -1585,6 +2235,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--session-id", required=True)
 parser.add_argument("--skip-hindsight", action="store_true")
 parser.add_argument("--cutoff-at")
+parser.add_argument("--state-db-path")
 parser.add_argument("--output-dir", type=Path, required=True)
 args = parser.parse_args()
 args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1592,7 +2243,7 @@ turns = [[{"role": "user", "content": "User: first request"}, {"role": "assistan
 content = json.dumps(turns, separators=(",", ":"))
 digest = hashlib.sha256(content.encode()).hexdigest()
 candidate = args.output_dir / f"candidate_document_{args.session_id}.json"
-candidate.write_text(json.dumps({"schema_version": "hindsight-conversation-document-v1", "session_id": args.session_id, "document_id": args.session_id, "turns": turns, "document_content": content, "document_content_sha256": digest, "audit": {"candidate_turn_count": 1, "candidate_message_count": 2}}))
+candidate.write_text(json.dumps({"schema_version": "hindsight-conversation-document-v1", "session_id": args.session_id, "document_id": args.session_id, "turns": turns, "document_content": content, "document_content_sha256": digest, "audit": {"candidate_turn_count": 1, "candidate_message_count": 2, "state_reconciliation": {"status": "verified", "source_event_count": 2, "matched_event_count": 2, "added_event_count": 0, "uncovered_event_count": 0}}}))
 (args.output_dir / "manifest.json").write_text(json.dumps({"session_id": args.session_id, "read_only": True, "received_cutoff_at": args.cutoff_at, "files": [str(candidate)]}))
 print(json.dumps({"session_id": args.session_id}))
 """.lstrip(),
@@ -1932,13 +2583,14 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--session-id", required=True)
 parser.add_argument("--skip-hindsight", action="store_true")
 parser.add_argument("--cutoff-at")
+parser.add_argument("--state-db-path")
 parser.add_argument("--output-dir", type=Path, required=True)
 args = parser.parse_args()
 args.output_dir.mkdir(parents=True, exist_ok=True)
 turns = [[{"role": "user", "content": "User: first request"}, {"role": "assistant", "content": "Assistant: first answer"}]]
 content = json.dumps(turns, separators=(",", ":"))
 candidate = args.output_dir / f"candidate_document_{args.session_id}.json"
-candidate.write_text(json.dumps({"schema_version": "hindsight-conversation-document-v1", "session_id": args.session_id, "document_id": args.session_id, "turns": turns, "document_content": content, "document_content_sha256": hashlib.sha256(content.encode()).hexdigest(), "audit": {"candidate_turn_count": 1, "candidate_message_count": 2}}))
+candidate.write_text(json.dumps({"schema_version": "hindsight-conversation-document-v1", "session_id": args.session_id, "document_id": args.session_id, "turns": turns, "document_content": content, "document_content_sha256": hashlib.sha256(content.encode()).hexdigest(), "audit": {"candidate_turn_count": 1, "candidate_message_count": 2, "state_reconciliation": {"status": "verified", "source_event_count": 2, "matched_event_count": 2, "added_event_count": 0, "uncovered_event_count": 0}}}))
 (args.output_dir / "manifest.json").write_text(json.dumps({"session_id": args.session_id, "read_only": True, "received_cutoff_at": args.cutoff_at, "files": [str(candidate)]}))
 print(json.dumps({"session_id": args.session_id}))
 """.lstrip(),
@@ -1976,6 +2628,29 @@ def test_document_audit_excludes_attempt_managed_documents() -> None:
     checker.remote_document_items = lambda: [{"id": document_id}]
     checker.document_time = lambda item: now
     checker.audit_scopes = lambda: []
+    setattr(
+        checker,
+        "audit_attempt_managed_document",
+        lambda _document_id: {
+            "document_id": document_id,
+            "saved_at": now.isoformat(),
+            "profile_name": "default",
+            "submission_binding_status": "attempt_exact",
+            "submission_id": "attempt-1",
+            "linked_sessions": [document_id],
+            "source_entries": [],
+            "local_retain_entries": [],
+            "document_entries": [],
+            "source_rows_after_document_window": 0,
+            "source_provenance": {"mode": "langfuse_root"},
+            "stage": {
+                "source_matches_local_retain": True,
+                "local_retain_matches_document": True,
+                "failure_stage": None,
+            },
+            "candidates": [],
+        },
+    )
     checker.audit_one_document = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("attempt-managed document must not enter legacy ledger audit")
     )
@@ -1983,6 +2658,7 @@ def test_document_audit_excludes_attempt_managed_documents() -> None:
     result = checker.audit_recent_manual_retain_documents(now)
 
     assert result["attempt_managed_remote_document_count"] == 1
+    assert result["attempt_audited_document_count"] == 1
     assert result["eligible_document_count"] == 0
     assert result["unmapped_remote_document_count"] == 0
     assert result["candidate_document_count"] == 0
@@ -2795,6 +3471,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--session-id", required=True)
 parser.add_argument("--skip-hindsight", action="store_true")
 parser.add_argument("--cutoff-at")
+parser.add_argument("--state-db-path")
 parser.add_argument("--output-dir", type=Path, required=True)
 args = parser.parse_args()
 args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -2802,7 +3479,7 @@ turns = [[{"role": "user", "content": "User: persist this"}, {"role": "assistant
 content = json.dumps(turns, separators=(",", ":"))
 digest = hashlib.sha256(content.encode()).hexdigest()
 candidate = args.output_dir / f"candidate_document_{args.session_id}.json"
-candidate.write_text(json.dumps({"schema_version": "hindsight-conversation-document-v1", "session_id": args.session_id, "document_id": args.session_id, "turns": turns, "document_content": content, "document_content_sha256": digest, "audit": {"candidate_turn_count": 1, "candidate_message_count": 2}}))
+candidate.write_text(json.dumps({"schema_version": "hindsight-conversation-document-v1", "session_id": args.session_id, "document_id": args.session_id, "turns": turns, "document_content": content, "document_content_sha256": digest, "audit": {"candidate_turn_count": 1, "candidate_message_count": 2, "state_reconciliation": {"status": "verified", "source_event_count": 2, "matched_event_count": 2, "added_event_count": 0, "uncovered_event_count": 0}}}))
 (args.output_dir / "manifest.json").write_text(json.dumps({"session_id": args.session_id, "read_only": True, "received_cutoff_at": args.cutoff_at, "files": [str(candidate)]}))
 print(json.dumps({"session_id": args.session_id}))
 """.lstrip(),
