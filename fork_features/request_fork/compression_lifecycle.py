@@ -47,6 +47,7 @@ class CompressionLifecycle:
         self.finished = False
         self.outcome: Optional[str] = None
         self.reason = ""
+        self.persistent_context_source = ""
 
     def rematerialize_after_adoption(self, messages: list) -> None:
         """Replace a stale prepared request with the host-owned adopted-parent rebuild."""
@@ -108,6 +109,7 @@ class CompressionLifecycle:
 
     def prepare_persistent_context(self) -> Optional[dict[str, Any]]:
         """Collect one bounded hidden context row before entering the commit fence."""
+        self.persistent_context_source = ""
         try:
             from hermes_cli.lifecycle import has_hook, invoke_hook
 
@@ -120,6 +122,7 @@ class CompressionLifecycle:
                 in_place=self.in_place,
                 api_mode=str(getattr(self.agent, "api_mode", "") or ""),
                 trigger_source=self.trigger_source,
+                max_context_chars=_MAX_PERSISTENT_COMPRESSION_CONTEXT_CHARS,
             )
         except Exception:
             logger.warning("on_compression_prepare_commit hook failed", exc_info=True)
@@ -157,6 +160,7 @@ class CompressionLifecycle:
             }
             if prepared is None:
                 prepared = candidate
+                self.persistent_context_source = source
             else:
                 logger.warning(
                     "Ignoring additional persistent compression context from source=%s; only one row is supported",
@@ -183,6 +187,9 @@ class CompressionLifecycle:
                 outcome=outcome,
                 reason=reason,
                 trigger_source=self.trigger_source,
+                persistent_context_source=(
+                    self.persistent_context_source if outcome == "committed" else ""
+                ),
             )
             return True
         except Exception:

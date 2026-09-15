@@ -2690,6 +2690,29 @@ What changed:
   and wraps at most one returned context row, then the existing in-place or
   rotation transaction persists it atomically with the compressed transcript.
   The next successful compression replaces the old row instead of stacking it.
+- The prepare hook receives the host's `max_context_chars`; finish reports
+  `persistent_context_source` only for the accepted row after a committed
+  transaction (including the deferred outer-commit decision). Preparing a row,
+  committing a summary, or accepting another source is not a delivery receipt.
+- The continuity plugin leaves under-limit recovery unchanged. On overflow it
+  omits only `user_messages[].interpretation` from a private automatic-injection
+  projection, retaining all user text, other recovery fields, and the complete
+  canonical state/manual tool output. It counts accompanying notices/receipts.
+  If that projection still exceeds the limit, inject a small task directory with
+  per-section Token estimates (user words and AI interpretations are separate),
+  not an empty recovery or an implicitly complete task summary. Estimates reuse
+  Hermes' local preflight estimator and are explicitly not provider usage.
+  `long_task_state(section='index')` returns the same directory; listed sections
+  support zero-based character pagination of serialized JSON via `offset`/`limit`,
+  defaulting to 6000 characters with an explicit next offset and revision. Invalid
+  partial-read arguments never silently return full state. Existing unqualified
+  full reads and named-delta writes remain compatible; the directory instructs
+  the model to select only needed parts rather than read everything back.
+  Host-rejected delivery remains eligible for one-time request retry,
+  acknowledged only by the matching successful API request; a later accepted
+  compression clears older pending deliveries without clearing newer ones.
+  The plugin's `tests/test_delivery_bounds.py` and `tests/test_index_fallback.py`
+  cover these host/plugin contracts.
 - The central real-user predicate and both user-message merge paths recognize the
   stable runtime-context envelope, so the synthetic row is not treated as user
   evidence or merged into genuine user text. Gateway voice and media current-turn
@@ -2700,6 +2723,17 @@ What changed:
   for retryable transport failures, creates a fresh independently owned client
   for every attempt, and uses the host backoff policy. Checkpoint JSON correction
   attempts remain separate from transport retries.
+- Each checkpoint correction reuses the exact initial instructions, delta template,
+  and frozen accepted-state baseline, followed by only the latest failed output
+  and errors. Correction replaces the entire failed delta, including its valid
+  unsaved changes; it is not a patch applied onto failed drafts. Parent input,
+  tool schemas, cache identity, retry limits, and CAS conflict handling stay intact.
+- Automatic checkpoint instructions and the manual state-tool description both
+  require evidence-based updates to affected older facts when progress changes,
+  preserving unresolved acceptance and valid constraints. This is model guidance,
+  not a keyword-based contradiction validator or a new update schedule; empty
+  lists alone do not imply missing tasks. Plugin `tests/test_retry_context.py`
+  covers prompt delivery and the real Fork transport boundary with offline replies.
 - Every successful Request Fork call emits one fail-open WARNING usage line keyed by
   `request_id`, with total prompt tokens, uncached input, cache read/write tokens,
   and cache-hit percentage. This keeps checkpoint cache behavior locally auditable
