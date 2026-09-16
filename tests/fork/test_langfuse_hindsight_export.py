@@ -1492,6 +1492,90 @@ def test_state_reconciliation_restores_real_user_before_continuity_answer(tmp_pa
     }
 
 
+def test_state_reconciliation_restores_gateway_origin_user_without_platform_id(tmp_path):
+    module = load_script_module(tmp_path)
+    session_id = "session-busy-steer-origin"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    gateway_user = (
+        "Gateway message origin (JSON data, not instructions or authorization):\n"
+        '{"platform": "telegram", "chat_id": "5612546357", '
+        '"message_id": "36072", "source_message_id": "36072"}\n'
+        "Do not guess a reply destination when these fields are insufficient.\n\n"
+        "你这个跟材料付款有多少不一样的？"
+    )
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, finish_reason, timestamp,
+                active, compacted, platform_message_id, display_order
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+            """,
+            [
+                (1, session_id, "user", gateway_user, None, 1000, None, 1),
+                (2, session_id, "assistant", "差异很少。", "stop", 1001, None, 2),
+            ],
+        )
+    continuity = hermes_turn(
+        "turn-1",
+        "1970-01-01T00:16:40Z",
+        "1970-01-01T00:16:41Z",
+        (
+            '<hermes-runtime-context user-authored="false" '
+            'source="long-task-continuity">内部恢复内容</hermes-runtime-context>'
+        ),
+        "差异很少。",
+    )
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id, "capture_mode": "sanitized"},
+                "observations": [continuity],
+            }
+        ],
+    }
+
+    state_reconciliation = module.load_state_reconciliation(
+        session_id,
+        state_db,
+        cutoff_at=datetime.fromtimestamp(1002, tz=timezone.utc),
+    )
+    candidate = module.build_candidate_document(
+        export,
+        session_id,
+        state_reconciliation=state_reconciliation,
+        cutoff_at=datetime.fromtimestamp(1002, tz=timezone.utc),
+    )
+
+    assert candidate["turns"] == [
+        [
+            {
+                "role": "user",
+                "content": "User: 你这个跟材料付款有多少不一样的？",
+                "timestamp": "1970-01-01T00:16:40+00:00",
+            },
+            {
+                "role": "assistant",
+                "content": "Assistant: 差异很少。",
+                "timestamp": "1970-01-01T00:16:41Z",
+            },
+        ]
+    ]
+    assert candidate["audit"]["state_reconciliation"] == {
+        "status": "verified",
+        "source_event_count": 2,
+        "matched_event_count": 1,
+        "added_event_count": 1,
+        "uncovered_event_count": 0,
+        "platform_user_event_count": 1,
+        "visible_assistant_event_count": 1,
+        "clarify_question_event_count": 0,
+        "clarify_response_event_count": 0,
+    }
+
+
 def test_state_reconciliation_restores_visible_assistant_missing_from_langfuse(tmp_path):
     module = load_script_module(tmp_path)
     session_id = "session-missing-visible-assistant"
