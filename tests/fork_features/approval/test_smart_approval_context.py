@@ -912,20 +912,28 @@ def test_prompt_uses_user_context_only_after_concrete_risk():
     )
 
     assert "Risk first, authorization second." in prompt
-    assert "Stage 2 — narrow authorization use." in prompt
+    assert "Stage 2 — direct prohibitions and risky-action authorization." in prompt
     assert (
-        "authorization evidence only to permit an identified non-critical risky action"
+        "authorization evidence only to scope or permit an identified non-critical risky action"
         in prompt
     )
     assert (
         "Authorization evidence is not a task-alignment, relevance, or per-tool permission "
         "check."
     ) in prompt
-    assert "explicit prohibition, refusal, or mandatory condition" in prompt
+    assert "direct prohibition that forbids the visible action itself or its target" in prompt
     assert (
-        "Ordinary task descriptions, preferences, requested methods, and silence are "
-        "not prohibitions or mandatory conditions."
-    ) in prompt
+        "Workflow prerequisites are outside Smart Approval even when phrased as "
+        "'must', 'must not', 'only after', 'unless', or 'do not continue'"
+        in prompt
+    )
+    assert "The approval packet is intentionally not an execution transcript." in prompt
+    assert (
+        "Missing evidence that a Runbook was read, a test was run, validation completed, "
+        "or another prior step happened is not evidence that the step was skipped."
+        in prompt
+    )
+    assert "mandatory condition" not in prompt
 
 
 def test_prompt_marks_baseline_safe_actions_as_sufficiently_authorized():

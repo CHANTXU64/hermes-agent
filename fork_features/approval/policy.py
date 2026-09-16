@@ -232,13 +232,15 @@ class ApprovalPolicy:
         if self.retry_key is None:
             if self.prefers_chinese:
                 message = (
-                    f"智能审批已拒绝这项操作。原因：{description}。当前没有可验证的用户回合，"
+                    f"智能审批已拒绝这项操作。原因：{description}。"
+                    "当前执行环境没有可用的一次性人工审批通道，"
                     "因此不能提供重复后转人工的路径。不要重试、改写、拆分或换用其他路径。"
                 )
             else:
                 message = (
-                    f"Smart approval denied this operation: {description}. No verified "
-                    "user turn is available, so repeat-to-human escalation is disabled. "
+                    f"Smart approval denied this operation: {description}. This execution "
+                    "context has no one-shot human approval route, so repeat-to-human "
+                    "escalation is unavailable. "
                     "Do not retry, rewrite, split, or use another route."
                 )
             return {

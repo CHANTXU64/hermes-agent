@@ -156,6 +156,30 @@ def test_concrete_policy_returns_existing_structured_review_contract() -> None:
     )
 
 
+def test_policy_without_retry_identity_reports_unavailable_human_route() -> None:
+    policy = ApprovalPolicy(
+        approval_context={"latest_user_message": "运行定时任务", "clarifications": []},
+        interface_language="zh",
+        operator_policy="",
+        strip_shell_comments=lambda command: command,
+        call_llm=lambda **_kwargs: None,
+        redact_action=lambda action: action,
+        retry_key=None,
+        lock=threading.RLock(),
+        max_retry_entries=16,
+    )
+
+    result = policy.first_denial(
+        "python safe.py",
+        "错误拒绝原因",
+        source_kind="shell",
+    )
+
+    assert result["retry_escalation_available"] is False
+    assert "当前执行环境没有可用的一次性人工审批通道" in result["message"]
+    assert "没有可验证的用户回合" not in result["message"]
+
+
 def test_high_churn_hosts_consume_only_public_policy_facade() -> None:
     repo = _repo()
     approval_source = (repo / "tools/approval.py").read_text(encoding="utf-8")

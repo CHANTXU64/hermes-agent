@@ -286,6 +286,10 @@ def test_safe_assessment_does_not_require_task_authorization(tmp_path):
                 })),
             )
             assert result.decision == "approve", (decision, authorization, result)
+            assert result.risk_level == "low"
+            assert result.authorization == "sufficient"
+            assert result.risk_evidence == ""
+            assert result.prohibition == ""
 
 
 def test_risky_actions_and_explicit_prohibitions_keep_their_gate(tmp_path):

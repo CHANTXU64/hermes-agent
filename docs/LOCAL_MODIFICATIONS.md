@@ -2392,10 +2392,18 @@ What changed:
   fallback. A Chinese interface therefore remains Chinese even when the latest
   user message is English or language-neutral. Structured decision/risk/
   authorization values remain stable machine enums.
-- The reviewer returns `decision`, `risk_level`, `authorization`, and a short
-  semantic `reason`. Critical risk is denied; an approval whose risk and
-  authorization fields conflict is downgraded to escalation; high-risk exact
-  authorization remains eligible for one-operation approval.
+- The reviewer treats the approval packet as risk evidence rather than an
+  execution transcript. Missing proof of prior Runbook reading, testing,
+  validation, or other workflow steps is not evidence that those steps were
+  skipped. Workflow prerequisites remain main-agent obligations even when
+  phrased as `must`, `must not`, `only after`, or `do not continue`; they do not
+  become approval prohibitions.
+- The reviewer returns `decision`, `risk_level`, `risk_evidence`, `prohibition`,
+  `authorization`, and a short semantic `reason`. User context may scope or
+  authorize an identified risky side effect, or enforce a direct prohibition
+  against the visible action or target. Critical risk is denied; an approval
+  whose risk and authorization fields conflict is downgraded to escalation;
+  high-risk exact authorization remains eligible for one-operation approval.
 - Existing integrations that compare the historical one-word smart decision
   remain compatible. Smart approvals still do not create a permanent broad
   allowlist entry.
@@ -2444,6 +2452,9 @@ What changed:
   `escalate`, and selected approval transports retain their prior denial and
   timeout behavior. Both a real session identifier and a real turn identifier
   are required, and the state is deliberately in-memory only.
+- When the current execution context has no one-shot human route, the fixed
+  denial text reports that unavailable route directly; it no longer claims that
+  no verified user turn exists.
 - Gateway restart/stop remains a deterministic hard block in the running
   Gateway. Repeating it does not create an approval card and does not execute
   the lifecycle action. Computer Use, Cron, cross-tool intent tracking, and
@@ -2545,6 +2556,20 @@ Verification:
   configuration change, Gateway restart, commit, or push was performed. The
   running Gateway must be restarted separately before these source changes can
   affect live approval requests.
+- 2026-09-16 workflow-prerequisite correction: the two new focused regressions
+  first failed against the old reviewer contract and fixed denial text, then
+  passed after the minimal correction. Eight sequential review-only calls used
+  the explicit official Codex endpoint with `openai-codex / gpt-5.6-luna` and
+  executed none of the reviewed commands. The original 3,900-character Cron
+  context and resolver command returned `low / sufficient / approve` three
+  times with empty `risk_evidence` and `prohibition`; paired cases preserved a
+  negated Runbook prerequisite, a direct action prohibition, unapproved versus
+  Clarify-authorized valuable deletion, and normal official-API authentication.
+  Focused reviewer/Policy/script-evidence/Terminal/`execute_code`/Cron coverage
+  completed with `290 passed`; Ruff, `py_compile`, and `git diff --check`
+  passed. No configuration, context extraction, operator policy, script-evidence
+  scope, Cron/KG logic, Computer Use behavior, Gateway restart, commit, or push
+  was included.
 
 Feature docs: `docs/chantxu64/current-turn-smart-approval/README.md`
 

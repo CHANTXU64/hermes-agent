@@ -4,14 +4,15 @@
 
 This fork keeps Smart Approval narrow and auditable while avoiding false manual approvals and denial-bypass retry loops.
 
-It combines six related guarantees:
+It combines seven related guarantees:
 
 1. authorization evidence comes only from the latest real user turn and subsequent completed Clarify exchanges;
-2. directly launched custom scripts and explicitly named local Python files provide best-effort source evidence without external dependency inspection; Git-tracked entries are identified without sending their source, while oversized untracked entries provide a bounded prefix;
-3. standard package-managed development tools are not misclassified as unreadable custom scripts;
-4. user-visible approval explanations follow Hermes' configured interface language;
-5. a first Smart Review denial exposes one legitimate text-similar retry route; an existing legal bypass or a later `approve` remains effective, while a second `deny` can fall back to one-shot human approval;
-6. a denial or timeout on that repeat one-shot card is final for the same or similar Terminal/`execute_code` action in that user turn, without changing ordinary approval behavior.
+2. the reviewer first identifies concrete operational risk, then uses user context only to scope or authorize that risk or to enforce a direct prohibition against the visible action or target;
+3. directly launched custom scripts and explicitly named local Python files provide best-effort source evidence without external dependency inspection; Git-tracked entries are identified without sending their source, while oversized untracked entries provide a bounded prefix;
+4. standard package-managed development tools are not misclassified as unreadable custom scripts;
+5. user-visible approval explanations follow Hermes' configured interface language;
+6. a first Smart Review denial exposes one legitimate text-similar retry route; an existing legal bypass or a later `approve` remains effective, while a second `deny` can fall back to one-shot human approval;
+7. a denial or timeout on that repeat one-shot card is final for the same or similar Terminal/`execute_code` action in that user turn, without changing ordinary approval behavior.
 
 It also validates the Tirith command-line protocol before trusting a same-named executable found on `PATH`.
 
@@ -28,6 +29,12 @@ Smart Approval receives only:
 The context normalizer excludes compaction summaries, ToDo snapshots, background and recovery notifications, Skill bodies, model-switch notices, reply/thread metadata, Cron delivery guidance, and pre-run/context-job output.
 
 This prevents runtime scaffolding from becoming authorization evidence and prevents concurrent tool calls from borrowing another request's context.
+
+The approval packet is intentionally not an execution transcript. It does not include prior `read_file` results, test output, validation output, or the full tool history. Missing proof that a Runbook was read, a test ran, or another prior step completed is not evidence that the step was skipped.
+
+The reviewer must not use user context to enforce task alignment, tool choice, step ordering, required reading, tests, validation, output format, or quality gates. Those remain obligations for the main agent. They do not become approval prohibitions when phrased as `must`, `must not`, `only after`, `unless`, or `do not continue`.
+
+A direct prohibition forbids the visible action itself or its target, for example `do not run this script`. A condition that scopes an identified risky side effect, such as `ask me before deleting this directory` or `send this credential only to this domain`, constrains authorization for that risk. Ordinary workflow prerequisites do neither.
 
 ## Development tools versus custom scripts
 
@@ -181,6 +188,7 @@ This feature does not:
 - trust scripts based on filenames containing `test`;
 - make destructive custom scripts safe merely because they are part of a test workflow;
 - add per-command or per-case keyword exceptions;
+- receive or evaluate the complete execution history, or act as a Runbook/procedure-compliance auditor;
 - change the configured approval model, endpoint, fallback chain, or operator policy;
 - add cross-tool semantic same-result detection or change Computer Use approval behavior;
 - persist denial/retry state across processes or Gateway restart;
@@ -208,9 +216,8 @@ If upstream implements a broader recursive analyzer or uses wider conversation h
 Run at minimum:
 
 ```bash
-python -m pytest -q -o 'addopts=' \
+scripts/run_tests.sh \
   tests/fork_features/approval \
-  tests/fork_features/approval/test_smart_approval_context.py \
   tests/tools/test_smart_approval_policy.py \
   tests/tools/test_smart_approval_injection.py \
   tests/tools/test_denial_retry_escalation.py \
@@ -223,14 +230,14 @@ python -m pytest -q -o 'addopts=' \
   tests/tools/test_request_tool_approval.py \
   tests/hermes_cli/test_gateway_restart_loop.py
 
-python -m pytest -q -o 'addopts=' \
+scripts/run_tests.sh \
   tests/tools/test_terminal_tool.py \
   tests/tools/test_code_execution.py \
   tests/tools/test_code_execution_modes.py \
   tests/tools/test_tirith_security.py \
   tests/agent/test_i18n.py
 
-python -m pytest -q -o 'addopts=' \
+scripts/run_tests.sh \
   tests/agent/test_context_compressor_zero_user_provenance.py \
   tests/agent/test_compression_concurrent_fork.py \
   tests/agent/test_context_compressor.py
@@ -300,6 +307,15 @@ git diff --check
 - conversation-compression and real-user provenance coverage: `197 passed`;
 - the reviewer, script-evidence, and retry-policy source files were byte-identical to baseline `63f75f3b6d8c7d54d411e88990b400743d474fc5`; six fixed context samples matched the baseline builder exactly;
 - Ruff, `py_compile`, and `git diff --check` passed. No paid model replay, configuration change, Gateway restart, commit, or push was performed.
+
+2026-09-16 workflow-prerequisite boundary correction:
+
+- two focused regressions first failed against the old reviewer contract and fixed denial wording, then passed after the correction;
+- eight sequential review-only calls used the explicit official Codex endpoint with `openai-codex / gpt-5.6-luna`; none of the reviewed commands was executed;
+- the original 3,900-character Cron approval context and resolver command returned `low / sufficient / approve` three times, with empty `risk_evidence` and `prohibition` in both raw six-field JSON and enforced results;
+- a negated Runbook prerequisite remained approved, a direct `do not run this script` prohibition denied, valuable deletion escalated without authorization and approved only with exact matching Clarify authorization, and normal authentication to the provider's official API remained approved;
+- focused reviewer, Policy, script-evidence, Terminal, `execute_code`, and Cron regression completed with `290 passed`; Ruff, `py_compile`, and `git diff --check` passed;
+- no configuration, context extraction, operator policy, script-evidence scope, Cron/KG logic, Computer Use behavior, or running Gateway state changed. No commit or push was performed.
 
 ## Runtime activation
 
