@@ -337,6 +337,134 @@ def test_single_missing_visible_assistant_blocks_remote_write_before_submit(
     ]
 
 
+def test_scan_ignores_visible_event_gap_caused_only_by_compression_user(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    now = datetime(2026, 9, 16, 13, 10, tzinfo=timezone.utc)
+    started_at = now - timedelta(minutes=5)
+    session_id = "20260916_143630_1a99ccd3"
+    attempt_id = "d82c8f23-4b91-461b-b8e6-e3f9f390cc1b"
+    state_db = tmp_path / "state.db"
+    journal = tmp_path / "retain-attempts.jsonl"
+    output_dir = tmp_path / "runs" / session_id / attempt_id
+    output_dir.mkdir(parents=True)
+    create_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.execute(
+            "INSERT INTO messages VALUES (?, ?, 'user', ?, 1003, 1, 0, NULL)",
+            (
+                3,
+                session_id,
+                "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted",
+            ),
+        )
+    turns = [
+        [
+            {"role": "user", "content": "User: first request"},
+            {"role": "assistant", "content": "Assistant: first answer"},
+        ]
+    ]
+    candidate_content = json.dumps(turns, separators=(",", ":"))
+    candidate_sha = hashlib.sha256(candidate_content.encode()).hexdigest()
+    candidate_path = output_dir / f"candidate_document_{session_id}.json"
+    candidate_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "hindsight-conversation-document-v1",
+                "session_id": session_id,
+                "document_id": session_id,
+                "turns": turns,
+                "document_content": candidate_content,
+                "document_content_sha256": candidate_sha,
+                "audit": {
+                    "candidate_turn_count": 1,
+                    "candidate_message_count": 2,
+                    "state_reconciliation": {
+                        "status": "verified",
+                        "source_event_count": 2,
+                        "matched_event_count": 2,
+                        "added_event_count": 0,
+                        "uncovered_event_count": 0,
+                        "clarify_question_event_count": 0,
+                        "clarify_response_event_count": 0,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps({"session_id": session_id}), encoding="utf-8")
+    cutoff = "2026-09-16T12:45:57.628766+00:00"
+    journal.write_text(
+        "".join(
+            json.dumps(event) + "\n"
+            for event in [
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt_id,
+                    "event": "started",
+                    "recorded_at": started_at.isoformat(),
+                    "session_id": session_id,
+                    "document_id": session_id,
+                    "cutoff_at": cutoff,
+                    "remote_expectation": "expected",
+                    "state_snapshot": {
+                        "session_found": True,
+                        "active_user_count": 2,
+                        "active_assistant_count": 1,
+                        "active_message_count": 3,
+                        "max_message_id": 3,
+                    },
+                },
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt_id,
+                    "event": "export_succeeded",
+                    "recorded_at": (started_at + timedelta(seconds=1)).isoformat(),
+                    "session_id": session_id,
+                    "document_id": session_id,
+                    "manifest_path": str(manifest_path),
+                    "candidate_path": str(candidate_path),
+                    "candidate_sha256": candidate_sha,
+                    "candidate_turn_count": 1,
+                    "candidate_message_count": 2,
+                },
+                {
+                    "schema_version": 1,
+                    "attempt_id": attempt_id,
+                    "event": "remote_write_blocked_visible_event_gap",
+                    "recorded_at": (started_at + timedelta(seconds=1)).isoformat(),
+                    "session_id": session_id,
+                    "document_id": session_id,
+                    "required_user_count": 2,
+                    "required_assistant_count": 1,
+                    "candidate_user_count": 1,
+                    "candidate_assistant_count": 1,
+                    "missing_user_count": 1,
+                    "missing_assistant_count": 0,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = module.scan_attempts(
+        journal_path=journal,
+        state_db_path=state_db,
+        now=now,
+        operation_fetcher=lambda _operation_id: (_ for _ in ()).throw(
+            AssertionError("compression-only gap queried remote operation")
+        ),
+        document_fetcher=lambda _document_id: (_ for _ in ()).throw(
+            AssertionError("compression-only gap queried remote document")
+        ),
+    )
+
+    assert result["alerts"] == []
+
+
 def test_state_snapshot_counts_compacted_visible_assistant(tmp_path: Path) -> None:
     module = load_module()
     session_id = "20260914_120700_a1b2c3d4"
@@ -1031,6 +1159,63 @@ def test_verified_confirmed_only_repair_uses_repair_scope_instead_of_live_sessio
     )
 
     assert result["alerts"] == []
+
+
+def test_success_candidate_material_accepts_repair_manifest_document_id(
+    tmp_path: Path,
+) -> None:
+    module = load_module()
+    session_id = "20260810_101115_f263e7a2"
+    turns = [
+        [
+            {"role": "user", "content": "User: retained request"},
+            {"role": "assistant", "content": "Assistant: retained answer"},
+        ]
+    ]
+    candidate_content = json.dumps(turns, separators=(",", ":"))
+    candidate_sha = hashlib.sha256(candidate_content.encode()).hexdigest()
+    candidate_path = tmp_path / f"candidate_document_{session_id}.json"
+    candidate_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "hermes-hindsight-confirmed-repair-v1",
+                "session_id": session_id,
+                "document_id": session_id,
+                "turns": turns,
+                "document_content": candidate_content,
+                "document_content_sha256": candidate_sha,
+                "audit": {
+                    "candidate_turn_count": 1,
+                    "candidate_message_count": 2,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"document_id": session_id, "status": "ready"}),
+        encoding="utf-8",
+    )
+    succeeded = {
+        "manifest_path": str(manifest_path),
+        "candidate_path": str(candidate_path),
+        "candidate_sha256": candidate_sha,
+        "candidate_turn_count": 1,
+        "candidate_message_count": 2,
+    }
+
+    material = module._success_candidate_material(succeeded, session_id)
+
+    assert material is not None
+    assert material["sha256"] == candidate_sha
+    assert material["message_count"] == 2
+
+    manifest_path.write_text(
+        json.dumps({"document_id": "20260810_101115_other"}),
+        encoding="utf-8",
+    )
+    assert module._success_candidate_material(succeeded, session_id) is None
 
 
 def test_exact_remote_copy_enriches_severe_candidate_alert(tmp_path: Path) -> None:
@@ -2105,6 +2290,157 @@ def test_checker_does_not_misclassify_telegram_read_error_as_subagent_failure() 
 
     assert checker.classify(telegram_line) is None
     assert checker.classify(model_line) == ("subagent_api_broken_pipe", "medium")
+
+
+def test_checker_langfuse_source_reads_nested_hermes_turns(tmp_path: Path) -> None:
+    checker = load_path_module(
+        "hindsight_checker_langfuse_nested_turns_test", CHECKER_PATH
+    )
+    export_path = tmp_path / "langfuse_export_nested.json"
+    export_path.write_text(
+        json.dumps(
+            {
+                "session_id": "20260916_073119_deb8ced8",
+                "traces": [
+                    {
+                        "id": "outer-trace",
+                        "sessionId": "20260916_073119_deb8ced8",
+                        "name": "Hermes turn",
+                        "timestamp": "2026-09-16T06:00:00.000Z",
+                        "input": {"role": "user", "content": "first question"},
+                        "output": {"role": "assistant", "content": "first answer"},
+                        "observations": [
+                            {
+                                "id": "obs-0",
+                                "name": "Hermes turn",
+                                "type": "CHAIN",
+                                "startTime": "2026-09-16T06:00:00.000Z",
+                                "input": {"role": "user", "content": "first question"},
+                                "output": {"content": "first answer"},
+                            },
+                            {
+                                "id": "obs-1",
+                                "name": "Hermes turn",
+                                "type": "CHAIN",
+                                "startTime": "2026-09-16T06:01:00.000Z",
+                                "input": {"role": "user", "content": "second question"},
+                                "output": {"content": "second answer"},
+                            },
+                            {
+                                "id": "obs-framework",
+                                "name": "Hermes turn",
+                                "type": "CHAIN",
+                                "startTime": "2026-09-16T06:02:00.000Z",
+                                "input": {
+                                    "role": "user",
+                                    "content": (
+                                        '<hermes-runtime-context user-authored="false" '
+                                        'source="long-task-continuity">ignored</hermes-runtime-context>'
+                                    ),
+                                },
+                                "output": {"content": "framework reply"},
+                            },
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = checker.langfuse_root_source_entries(
+        export_path, "20260916_073119_deb8ced8"
+    )
+    texts = [(entry.role, entry.content) for entry in entries]
+
+    assert ("user", "first question") in texts
+    assert ("assistant", "first answer") in texts
+    assert ("user", "second question") in texts
+    assert ("assistant", "second answer") in texts
+    assert ("assistant", "framework reply") in texts
+    assert not any(entry.role == "user" and "hermes-runtime-context" in entry.content for entry in entries)
+    assert sum(1 for role, content in texts if content == "first question") == 1
+
+
+def test_checker_langfuse_source_falls_back_to_root_without_observations(
+    tmp_path: Path,
+) -> None:
+    checker = load_path_module(
+        "hindsight_checker_langfuse_root_fallback_test", CHECKER_PATH
+    )
+    export_path = tmp_path / "langfuse_export_root.json"
+    export_path.write_text(
+        json.dumps(
+            {
+                "session_id": "20260916_073119_deb8ced8",
+                "traces": [
+                    {
+                        "id": "root-only",
+                        "sessionId": "20260916_073119_deb8ced8",
+                        "name": "Hermes turn",
+                        "timestamp": "2026-09-16T06:00:00.000Z",
+                        "input": {"role": "user", "content": "only root question"},
+                        "output": {"role": "assistant", "content": "only root answer"},
+                        "observations": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = checker.langfuse_root_source_entries(
+        export_path, "20260916_073119_deb8ced8"
+    )
+    texts = [(entry.role, entry.content) for entry in entries]
+    assert texts == [("user", "only root question"), ("assistant", "only root answer")]
+
+
+def test_checker_source_order_follows_message_id_not_later_timestamp() -> None:
+    checker = load_path_module(
+        "hindsight_checker_source_order_test", CHECKER_PATH
+    )
+    user = checker.Entry(
+        role="user",
+        content="看下临时目录",
+        canonical="看下临时目录",
+        source="state_db",
+        occurrence_id="state:s:10",
+        message_id=10,
+        timestamp=100.0,
+        display_order=10,
+        active=1,
+        compacted=0,
+    )
+    assistant = checker.Entry(
+        role="assistant",
+        content="结论",
+        canonical="结论",
+        source="state_db",
+        occurrence_id="state:s:11",
+        message_id=11,
+        timestamp=300.0,
+        display_order=11,
+        active=1,
+        compacted=0,
+    )
+    later_user = checker.Entry(
+        role="user",
+        content="怎么移植漏这么多还过了测试啊",
+        canonical="怎么移植漏这么多还过了测试啊",
+        source="state_db",
+        occurrence_id="state:s:12",
+        message_id=12,
+        timestamp=200.0,
+        display_order=12,
+        active=1,
+        compacted=0,
+    )
+
+    ordered = checker._merge_independent_source_entries(
+        [], [later_user, assistant, user]
+    )
+    assert [entry.message_id for entry in ordered] == [10, 11, 12]
 
 
 def test_existing_checker_collects_retain_attempt_scan_json() -> None:

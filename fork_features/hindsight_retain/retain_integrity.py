@@ -1211,7 +1211,12 @@ def _success_candidate_material(
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-        if not isinstance(manifest, dict) or manifest.get("session_id") != session_id:
+        manifest_session = (
+            (manifest.get("session_id") or manifest.get("document_id"))
+            if isinstance(manifest, dict)
+            else None
+        )
+        if manifest_session != session_id:
             return None
         expected_turn_count = _strict_nonnegative_int(
             succeeded.get("candidate_turn_count"), "success receipt turn count"
@@ -1695,6 +1700,46 @@ def scan_attempts(
             None,
         )
         if visible_event_gap_block is not None:
+            live_gap = None
+            cutoff_value = started.get("cutoff_at")
+            if cutoff_value is None and scheduled is not None:
+                cutoff_value = scheduled.get("cutoff_at")
+            try:
+                gap_cutoff = _parse_time(cutoff_value)
+            except (TypeError, ValueError):
+                gap_cutoff = None
+            if (
+                candidate_material is not None
+                and gap_cutoff is not None
+                and state_session_found
+            ):
+                live_snapshot = _state_snapshot(
+                    Path(state_db_path),
+                    session_id,
+                    cutoff_at=gap_cutoff,
+                )
+                if live_snapshot.get("session_found"):
+                    live_gap = _candidate_visible_event_gap(
+                        live_snapshot,
+                        candidate_material["counts"],
+                        candidate_material.get("audit") or {},
+                    )
+                    if live_gap is None:
+                        continue
+            gap = live_gap or {
+                "required_user_count": int(
+                    visible_event_gap_block.get("required_user_count") or 0
+                ),
+                "required_assistant_count": int(
+                    visible_event_gap_block.get("required_assistant_count") or 0
+                ),
+                "missing_user_count": int(
+                    visible_event_gap_block.get("missing_user_count") or 0
+                ),
+                "missing_assistant_count": int(
+                    visible_event_gap_block.get("missing_assistant_count") or 0
+                ),
+            }
             alerts.append(
                 {
                     "alert_key": f"retain:{attempt_id}:candidate_visible_event_gap",
@@ -1705,24 +1750,16 @@ def scan_attempts(
                     "document_id": document_id,
                     "started_at": started_at.isoformat(),
                     "state_session_found": state_session_found,
-                    "required_user_count": int(
-                        visible_event_gap_block.get("required_user_count") or 0
-                    ),
-                    "required_assistant_count": int(
-                        visible_event_gap_block.get("required_assistant_count") or 0
-                    ),
+                    "required_user_count": gap["required_user_count"],
+                    "required_assistant_count": gap["required_assistant_count"],
                     "candidate_user_count": int(
                         visible_event_gap_block.get("candidate_user_count") or 0
                     ),
                     "candidate_assistant_count": int(
                         visible_event_gap_block.get("candidate_assistant_count") or 0
                     ),
-                    "missing_user_count": int(
-                        visible_event_gap_block.get("missing_user_count") or 0
-                    ),
-                    "missing_assistant_count": int(
-                        visible_event_gap_block.get("missing_assistant_count") or 0
-                    ),
+                    "missing_user_count": gap["missing_user_count"],
+                    "missing_assistant_count": gap["missing_assistant_count"],
                     "remote_write_status": "blocked_before_submit",
                     "message": "Retain 候选少了可见用户或 AI 对话，已在提交远端前拦截",
                 }
