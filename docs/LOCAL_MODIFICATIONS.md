@@ -1080,6 +1080,11 @@ Primary files:
 - `tests/hermes_state/test_hermes_state.py`
 - `fork_features/request_context.py` (Fork placement and sidecar policy)
 - `fork_features/prompt_cache_routing.py` (Fork scope/header policy)
+- `agent/prompt_builder.py` — `STEER_CHANNEL_NOTE` must describe the Fork's in-tool-result steer
+  delivery (`_append_steer_marker_to_tool_result`), NOT upstream's standalone `steer_user_row`.
+  Upstream rewrote this note in the 2026-09-20 sync and git auto-merged it with no conflict, briefing
+  the model for a mechanism this Fork does not use (#40240 regression). Re-check it every sync;
+  pinned by `tests/agent/test_steer.py::TestSteerMarkerContract`.
 - `agent/turn_context.py` (`build_turn_context` collection and
   `build_api_messages` request-copy application seam)
 - `agent/conversation_loop.py` (active-redirect request marker, turn-state

@@ -598,34 +598,6 @@ class TestPrefetch:
         p.queue_prefetch("test")
         p._client.arecall.assert_not_called()
 
-class TestPrefetchServerRetainVisibility:
-    """PR #62871 review follow-up: draining the local writer queue is not a
-    read-after-write signal for async retains. With ``retain_async=True`` the
-    server accepts the write and returns an ``operation_id`` that stays
-    ``pending`` until the write is durable/recall-visible. The background
-    prefetch must gate on server-side operation completion, not just the local
-    queue, before recalling.
-    """
-
-    def _client_with_ops(self, statuses):
-        """Mock client whose aretain_batch returns an async operation_id and
-        whose operations.get_operation_status yields *statuses* in order
-        (last value repeats)."""
-        client = _make_mock_client()
-        client.aretain_batch = AsyncMock(
-            return_value=SimpleNamespace(operation_id="op-1", operation_ids=None)
-        )
-        seq = list(statuses)
-
-        async def _status(**kwargs):
-            value = seq.pop(0) if len(seq) > 1 else seq[0]
-            return SimpleNamespace(status=value)
-
-        client.operations = MagicMock()
-        client.operations.get_operation_status = AsyncMock(side_effect=_status)
-        return client
-
-class TestRecallStatus:
     def test_queue_prefetch_does_not_recall_long_raw_query(self, provider_with_config):
         p = provider_with_config(recall_max_input_chars=10)
 

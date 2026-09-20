@@ -79,7 +79,7 @@ def compress_now(
     discarded; otherwise the caller must call ``finalize_context_engine_compression_notification(agent,
     committed=True)`` once its own history transaction commits (``committed=False`` on failure).
     ``request_fork`` (Fork) forwards an out-of-turn frozen provider request to ``_compress_context``;
-    None keeps the upstream behavior exactly.
+    None omits the kwarg entirely, so duck-typed agents without it keep working.
     ``system_message=None`` makes ``_compress_context`` rebuild the prompt; passing the cached prompt
     duplicated the identity block (#15281). ``skip_without_window`` (gateway) answers ``nothing_to_do``
     when the local compressor sees no summarizable middle; the in-process surfaces leave it off because
@@ -109,7 +109,8 @@ def compress_now(
     try:
         compressed, _ = agent._compress_context(
             head, system_message, approx_tokens=before_tokens, focus_topic=request.focus_topic, force=True,
-            defer_context_engine_notification=True, request_fork=request_fork,
+            defer_context_engine_notification=True,
+            **({"request_fork": request_fork} if request_fork is not None else {}),
             **({"task_id": task_id} if task_id != "default" else {}))
     except Exception:
         finalize_context_engine_compression_notification(agent, committed=False)

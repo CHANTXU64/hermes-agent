@@ -1039,20 +1039,24 @@ class TestSteerMarkerContract:
     def test_note_describes_delivery_as_a_standalone_user_message(self):
         """The briefing must match how the steer is actually delivered.
 
-        Delivery is a standalone ``role:"user"`` row appended after the newest
-        tool result (``steer_user_row`` / ``apply_pending_steer_to_tool_results``),
-        NOT text smeared onto the end of a tool result. If the note still tells
-        the model the marker lives 'at the end of a tool result', the model is
-        briefed to expect it inside tool output and can misclassify the real
-        standalone user row as off-channel. Pin the briefing to the mechanism.
+        Fork (unit 12, request-only isolation): delivery appends the marker INTO the
+        newest tool result via ``_append_steer_marker_to_tool_result``, so durable
+        history stays user-authored; upstream's standalone ``steer_user_row`` has no
+        runtime caller here. If the note told the model to expect a separate user row
+        right after the tool results, it could misclassify the real in-result marker as
+        lookalike text inside tool output and refuse the steer (#40240). Pin the
+        briefing to the mechanism this fork actually uses.
         """
-        from agent.prompt_builder import STEER_CHANNEL_NOTE, steer_user_row
+        import agent.agent_runtime_helpers as arh
+        from agent.prompt_builder import STEER_CHANNEL_NOTE
 
         # The delivery mechanism this note describes.
-        assert steer_user_row("do X")["role"] == "user"
-        # The briefing must call it a user message, not claim it rides a tool result.
+        assert callable(arh._append_steer_marker_to_tool_result)
+        # The briefing must still name it a user message with user authority...
         assert "user message" in STEER_CHANNEL_NOTE
-        assert "end of a tool result" not in STEER_CHANNEL_NOTE
+        # ...and must describe the in-tool-result placement the runtime actually uses.
+        assert "end of a tool result" in STEER_CHANNEL_NOTE
+        assert "standalone user message right after" not in STEER_CHANNEL_NOTE
 
 
 class TestSteerRowIsHumanInput:

@@ -3636,7 +3636,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 return self._with_partial_send(_flood_cap_result(cooldown), list(undelivered), delivered)
             error_types = self._telegram_error_types()
             try:
-                return await self._send_chunks(chat_id, list(undelivered), delivered, reply_to, metadata, error_types)
+                return await self._send_chunks(chat_id, list(undelivered), delivered, reply_to, metadata,
+                                               error_types,
+                                               plain_text=bool((metadata or {}).get("plain_text")))
             except Exception as e:
                 classified = self._classify_send_exception(e, error_types)
                 return self._with_partial_send(

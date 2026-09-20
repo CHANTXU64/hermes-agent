@@ -1095,7 +1095,6 @@ def run_codex_stream(
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
-        from agent.sdk_transform_bypass import bypass_sdk_request_transform
         stream_kwargs = bypass_sdk_request_transform(stream_kwargs)
         if callable(on_physical_request):
             try:

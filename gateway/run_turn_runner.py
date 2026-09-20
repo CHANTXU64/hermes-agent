@@ -1350,7 +1350,8 @@ class TurnRunner:
         """
         if questions:
             return self._clarify_batch_sync(questions)
-        response, _answered = self._ask_clarify_question(question, choices, multi_select)
+        response, _answered = self._ask_clarify_question(
+            question, choices, multi_select, recommended_index=recommended_index)
         return response
 
     def _clarify_batch_sync(self, questions) -> str:
@@ -1363,7 +1364,7 @@ class TurnRunner:
         for index, entry in enumerate(questions):
             raw, answered = self._ask_clarify_question(
                 entry.get("question", ""), entry.get("choices"), bool(entry.get("multi_select")),
-                rearm=index == last)
+                rearm=index == last, recommended_index=entry.get("recommended_index"))
             if not answered:
                 # The surface's own no-answer text ("could not be delivered", "did not respond
                 # within Nm") rides along as ``notice``: blank answers alone read as user
@@ -1373,7 +1374,9 @@ class TurnRunner:
             answers[entry.get("qid") or f"q{index}"] = raw
         return json.dumps(payload, ensure_ascii=False)
 
-    def _ask_clarify_question(self, question, choices, multi_select, rearm: bool = True) -> tuple[str, bool]:
+    def _ask_clarify_question(
+        self, question, choices, multi_select, rearm: bool = True, recommended_index=None,
+    ) -> tuple[str, bool]:
         """One card: register, send, wait, then retire it (no answer) or re-arm (answer).
         Returns ``(response, answered)``; the caller decides what "no answer" means — a sentinel
         for a single question, the batch's ``timed_out`` flag."""
