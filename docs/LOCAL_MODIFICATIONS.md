@@ -198,6 +198,8 @@ Date: 2026-05-09; boundary refactored 2026-08-30
 
 Files:
 
+- `hermes_cli/update_cmd_maint.py` — `hermes update` reports the `auto_disabled` set (count line
+  plus the named list) so a silently disabled new skill stays visible.
 - `fork_features/bundled_skills_policy.py` — fork-owned policy
 - `tools/skills_sync.py` — one post-copy call and result handoff
 - `hermes_cli/update_cmd.py` — reports the generic `auto_disabled` result
@@ -755,6 +757,7 @@ Upstream status: fork-only feature retired; official Hindsight tools and automat
 
 Files / touchpoints:
 
+- `fork_features/hindsight_retain/__init__.py` — package marker for the delayed-Retain feature.
 - `gateway/run.py` — upstream Gateway Quick Command exec seam
 - `tests/fork/test_gateway_quick_command_session_env.py` — Fork-owned behavior and cross-route concurrency coverage
 - `fork_features/hindsight_retain/retain_integrity.py` — Fork-owned delayed Retain scheduler, writer, receipt scanner, and remote verifier
@@ -1274,6 +1277,10 @@ True upstream host seams:
 
 Primary files:
 
+- `gateway/session_recovery.py` — recovery compares routing identity via
+  `split_account_session_key`, so a row for another account_id is never adopted.
+- `gateway/run_adapters.py` — `_queue_retryable_fatal_adapter` re-queues a retryable fatal adapter
+  instead of dropping that account's slot. Pinned by `tests/fork/test_multi_telegram_accounts.py`.
 - `gateway/config_env.py`
 - `gateway/run_startup.py`
 - `gateway/run_notifications.py`
@@ -1457,6 +1464,9 @@ Date: 2026-07-16; boundary refactored 2026-08-30
 
 Files:
 
+- `apps/desktop/src/store/clarify.ts` — choice validation (non-empty, <=200 chars after the
+  recommended-marker strip, no newlines) for the decision card.
+- `apps/desktop/src/components/assistant-ui/clarify-tool.tsx` — desktop rendering of the card.
 - `fork_features/clarify_decision_card.py`
 - `tools/clarify_tool.py`
 - `gateway/run_turn_runner.py`
@@ -1713,6 +1723,35 @@ Upstream status: upstream-equivalent accepted at upstream `main`
 `26350357d76e4508c8df9304a3374bdc5a6f6220`.
 
 
+### 30. Plugin-state compare-and-set
+
+Status: active
+
+Date introduced: recorded 2026-09-20 during the upstream-sync audit; the code predates this entry.
+
+- ID: `fork-plugin-state-cas`
+- Depends on: none
+- Source boundary: logical-only — one method on the existing upstream runtime store
+
+Files:
+
+- `hermes_cli/plugins_state.py` — `compare_and_set(key, *, expected, value)` writes only when the
+  on-disk value still equals `expected`, via `utils.atomic_json_write`. A stale expected value is
+  rejected instead of clobbering a concurrent writer's state.
+- `tests/fork_features/test_plugin_state_cas.py` — pins the stale-expected rejection.
+
+Behavior contract:
+
+- Returns True on a committed write, False when the stored value moved. Callers must treat False as
+  "retry or abandon", never as success.
+
+Upstream status: no equivalent at fixed review point `upstream/main@9573f44c`; upstream's store has
+only unconditional writes.
+
+Note: this entry was created because the 2026-09-20 sync found the file carrying Fork delta with no
+index coverage. The behavior above is read from the code and its test; the original intent was not
+recorded at the time and is worth confirming with the author.
+
 ### 21. Delivery-ledger session-reset boundary
 
 Status: active fork maintenance
@@ -1722,6 +1761,12 @@ Refactored: 2026-08-31
 
 Files:
 
+- `ui-tui/src/app/slash/commands/core.ts` — `/reset` is an alias of `/new` on the TUI surface and
+  takes the same fresh-session path (`startFreshSession`), so the boundary fires identically.
+- `ui-tui/src/app/submissionCore.ts` — `enqueue(text, display?)` carries a display override so a
+  queued submission renders the user's text, not the rewritten command.
+- `ui-tui/src/__tests__/createSlashHandler.test.ts`
+- `ui-tui/src/__tests__/submissionCore.test.ts`
 - `fork_features/delivery_session_boundary.py`
 - `gateway/delivery_ledger.py`
 - `gateway/slash_commands_session.py` (stable host seam only)
@@ -1885,6 +1930,13 @@ Date: 2026-08-08; responsibility boundary refactored 2026-08-31
 
 Files:
 
+- `tools/memory_tool_store.py` — Fork-owned Store surface the governance context reads through:
+  `read_entries_checked`, `read_target_entries_checked`, `sanitize_entries_for_snapshot` (threat
+  scan), `preview_entries`, `path_for_target`, and the `transaction` / `_mutate` coordinator that
+  makes an audited change atomic. Consumed by `background_review.build_memory_governance_context`.
+- `agent/inline_tool_executors.py` — inline memory calls go through
+  `fork_features.memory_governance.forwarded_memory_kwargs(args)`, so an inline invocation carries
+  the same governance kwargs as the tool path.
 - `tools/memory_tool.py`
 - `fork_features/memory_governance.py`
 - `fork_features/memory_audit.py`
@@ -2591,6 +2643,8 @@ Date: 2026-08-28; persistent delivery redesign 2026-08-30
 
 Files:
 
+- `agent/compression_facade.py` — `_compress_context` forwarder; carries `request_fork` and
+  `request_fork_rematerializer` through to `compress_context`.
 - `gateway/run_voice.py`
 - `tests/fork_features/test_runtime_context_boundaries.py`
 - `tests/fork_features/test_pre_llm_context_contract.py`
