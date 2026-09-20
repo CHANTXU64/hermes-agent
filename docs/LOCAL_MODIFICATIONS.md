@@ -2594,6 +2594,9 @@ Files:
 - `fork_features/request_fork/prepared_request.py`
 - `agent/conversation_loop.py`
 - `agent/conversation_compression.py`
+- `agent/conversation_compression_manual.py` — upstream manual-compression entry; Fork adds an
+  optional `request_fork` passthrough to `_compress_context` so the gateway `/compress` path keeps its
+  out-of-turn frozen request. `None` preserves upstream behavior exactly (added 2026-09-20 sync).
 - `agent/turn_api_call.py`
 - `agent/turn_api_error.py`
 - `agent/turn_context_compaction.py`
