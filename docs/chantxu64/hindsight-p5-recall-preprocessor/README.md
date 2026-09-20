@@ -217,7 +217,7 @@ The preprocessor is skipped when Hindsight is in tools-only mode, `auto_recall` 
 - `tests/fork/test_hindsight_provider_regressions.py` — synchronous carryover,
   no-op post-turn hook, and provider regressions.
 - `tests/agent/test_turn_context.py` — duck-typed manager compatibility and request-context invariants.
-- `tests/run_agent/test_run_agent_codex_responses.py` and `tests/agent/test_auxiliary_client.py` — terminal model provenance.
+- `tests/agent/test_run_agent_codex_responses.py` and `tests/agent/test_auxiliary_client.py` — terminal model provenance.
 
 ## Merge Guidance
 

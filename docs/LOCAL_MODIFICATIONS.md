@@ -269,7 +269,7 @@ Files:
 - `tests/fork/test_hindsight_manual_retain_removed.py`
 - `tests/plugins/memory/test_hindsight_provider.py`
 - `tests/agent/test_memory_session_switch.py`
-- `tests/run_agent/test_memory_sync_interrupted.py`
+- `tests/agent/test_memory_sync_interrupted.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
 What changed:
@@ -376,7 +376,7 @@ Files:
 - `tests/agent/test_memory_provider.py`
 - `tests/fork/test_hindsight_provider_regressions.py`
 - `tests/hermes_cli/test_plugin_auxiliary_tasks.py`
-- `tests/run_agent/test_run_agent_codex_responses.py`
+- `tests/agent/test_run_agent_codex_responses.py`
 - `tests/agent/test_auxiliary_client.py`
 - `docs/chantxu64/hindsight-p5-recall-preprocessor/README.md`
 - `docs/LOCAL_MODIFICATIONS.md`
@@ -636,7 +636,7 @@ Files:
 
 - `run_agent.py`
 - `tools/skill_manager_tool.py`
-- `tests/run_agent/test_background_review.py`
+- `tests/agent/test_background_review.py`
 - `docs/LOCAL_MODIFICATIONS.md`
 
 What changed historically:
@@ -1077,7 +1077,7 @@ Primary files:
 - `agent/agent_init.py`
 - `hermes_state_messages.py`
 - `tests/agent/test_turn_finalizer_cleanup_guard.py`
-- `tests/test_hermes_state.py`
+- `tests/hermes_state/test_hermes_state.py`
 - `fork_features/request_context.py` (Fork placement and sidecar policy)
 - `fork_features/prompt_cache_routing.py` (Fork scope/header policy)
 - `agent/turn_context.py` (`build_turn_context` collection and
@@ -1104,10 +1104,10 @@ Primary files:
 - `tests/agent/test_gateway_turn_sidecar.py`
 - `tests/agent/transports/test_codex_transport.py`
 - `tests/gateway/test_replay_entry_fields.py`
-- `tests/run_agent/test_steer.py`
+- `tests/agent/test_steer.py`
 - `tests/agent/test_turn_finalizer_iteration_limit_exit.py`
-- `tests/run_agent/test_run_agent_codex_responses.py`
-- `tests/run_agent/test_codex_app_server_integration.py`
+- `tests/agent/test_run_agent_codex_responses.py`
+- `tests/agent/test_codex_app_server_integration.py`
 - `tests/agent/test_codex_request_only_memory_context.py`
 - `tests/fork_features/test_request_context_policy.py`
 - `tests/fork_features/test_long_task_continuity_recovery.py`
@@ -1894,7 +1894,7 @@ Files:
 - `tests/tools/test_memory_tool.py`
 - `tests/tools/test_memory_tool_schema.py`
 - `tests/tools/test_write_approval.py`
-- `tests/run_agent/test_run_agent.py`
+- `tests/agent/test_run_agent.py`
 - `docs/chantxu64/memory-change-governance/README.md`
 - `docs/LOCAL_MODIFICATIONS.md`
 
@@ -2324,7 +2324,7 @@ Files:
 - `tests/fork_features/approval/test_smart_review.py`
 - `tests/fork_features/approval/test_retry_policy.py`
 - `tests/hermes_cli/test_gateway_restart_loop.py`
-- `tests/run_agent/test_run_agent.py`
+- `tests/agent/test_run_agent.py`
 - `docs/chantxu64/current-turn-smart-approval/README.md`
 - `docs/LOCAL_MODIFICATIONS.md`
 
@@ -2622,12 +2622,12 @@ Files:
 - `tests/agent/test_reference_handoff_active_turn.py`
 - `tests/agent/test_turn_context.py`
 - `tests/agent/test_turn_retry_state.py`
-- `tests/run_agent/test_message_sequence_repair.py`
-- `tests/run_agent/test_thinking_only_sanitizer.py`
-- `tests/run_agent/test_413_compression.py`
-- `tests/run_agent/test_compression_budget_rearm.py`
-- `tests/run_agent/test_compression_boundary_hook.py`
-- `tests/run_agent/test_run_agent_codex_responses.py`
+- `tests/agent/test_message_sequence_repair.py`
+- `tests/agent/test_thinking_only_sanitizer.py`
+- `tests/agent/test_413_compression.py`
+- `tests/agent/test_compression_budget_rearm.py`
+- `tests/agent/test_compression_boundary_hook.py`
+- `tests/agent/test_run_agent_codex_responses.py`
 - `tests/agent/test_api_content_sidecar.py`
 - `tests/agent/test_turn_finalizer_iteration_limit_exit.py`
 - `tests/gateway/test_compress_command.py`
@@ -2852,7 +2852,7 @@ deltas are expected in these areas:
   - `tests/fork_features/test_hindsight_p5_policy.py`
   - `tests/plugins/memory/test_hindsight_provider.py`
   - `tests/fork/test_hindsight_unicode_contract.py`
-  - `tests/test_hermes_state.py`
+  - `tests/hermes_state/test_hermes_state.py`
   - `tests/agent/test_memory_session_switch.py`
   - `tests/fork/test_hindsight_provider_regressions.py`
   - `tests/fork/test_hindsight_recall_preprocessor.py`
@@ -2927,7 +2927,7 @@ deltas are expected in these areas:
   - `tests/fork_features/approval/test_smart_review.py`
   - `tests/fork_features/approval/test_retry_policy.py`
   - `tests/hermes_cli/test_gateway_restart_loop.py`
-  - `tests/run_agent/test_run_agent.py`
+  - `tests/agent/test_run_agent.py`
   - `docs/chantxu64/current-turn-smart-approval/README.md`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Safe command rewrite:
@@ -2969,9 +2969,9 @@ deltas are expected in these areas:
   - `tests/agent/test_turn_finalizer_iteration_limit_exit.py`
   - `tests/agent/transports/test_codex_transport.py`
   - `tests/gateway/test_replay_entry_fields.py`
-  - `tests/run_agent/test_steer.py`
-  - `tests/run_agent/test_run_agent_codex_responses.py`
-  - `tests/run_agent/test_codex_app_server_integration.py`
+  - `tests/agent/test_steer.py`
+  - `tests/agent/test_run_agent_codex_responses.py`
+  - `tests/agent/test_codex_app_server_integration.py`
   - `tests/agent/test_codex_request_only_memory_context.py`
 - Delivery-ledger session-reset boundary:
   - `fork_features/delivery_session_boundary.py`
@@ -3012,7 +3012,7 @@ deltas are expected in these areas:
   - `tests/tools/test_memory_tool.py`
   - `tests/tools/test_memory_tool_schema.py`
   - `tests/tools/test_write_approval.py`
-  - `tests/run_agent/test_run_agent.py`
+  - `tests/agent/test_run_agent.py`
   - `docs/chantxu64/memory-change-governance/README.md`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Provider-native long-task continuity Request Fork:
@@ -3044,9 +3044,9 @@ deltas are expected in these areas:
   - `tests/fork_features/test_plugin_state_cas.py`
   - `tests/agent/test_compression_adoption_preserves_live_tail.py`
   - `tests/agent/test_turn_retry_state.py`
-  - `tests/run_agent/test_413_compression.py`
-  - `tests/run_agent/test_compression_boundary_hook.py`
-  - `tests/run_agent/test_run_agent_codex_responses.py`
+  - `tests/agent/test_413_compression.py`
+  - `tests/agent/test_compression_boundary_hook.py`
+  - `tests/agent/test_run_agent_codex_responses.py`
   - `tests/gateway/test_compress_command.py`
   - `tests/fork/test_langfuse_hindsight_export.py`
   - `docs/LOCAL_MODIFICATIONS.md`

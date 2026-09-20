@@ -110,7 +110,7 @@ def _fake_scope(agent, frozen):
 
 
 def test_freeze_accepts_sdk_transform_bypassed_physical_request(monkeypatch):
-    from agent.codex_runtime import _bypass_sdk_request_transform
+    from agent.sdk_transform_bypass import bypass_sdk_request_transform as _bypass_sdk_request_transform
 
     monkeypatch.setattr(
         "fork_features.request_fork.compression_request_fork_enabled",
