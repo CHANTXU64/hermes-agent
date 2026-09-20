@@ -935,29 +935,6 @@ class AIAgent(
         if not (user_text and response_text):
             return
         memory_messages = messages
-        oob_events = list(getattr(self, "_memory_oob_user_events", None) or [])
-        if messages is not None and oob_events:
-            memory_messages = [
-                dict(message) if isinstance(message, dict) else message
-                for message in messages
-            ]
-            by_object_id = {
-                id(message): index
-                for index, message in enumerate(messages)
-                if isinstance(message, dict)
-            }
-            for event in oob_events:
-                index = by_object_id.get(event.get("message_object_id"))
-                if index is None:
-                    continue
-                copied = memory_messages[index]
-                if not isinstance(copied, dict):
-                    continue
-                if copied.get("tool_call_id") != event.get("tool_call_id"):
-                    continue
-                copied.setdefault("_hermes_oob_user_messages", []).append(
-                    event["user_text"]
-                )
         try:
             sync_kwargs = {
                 "session_id": self.session_id or "",
@@ -985,9 +962,6 @@ class AIAgent(
                 queue_prefetch(user_text, **queue_kwargs)
         except Exception:
             pass
-        finally:
-            if oob_events:
-                self._memory_oob_user_events = []
 
     def release_clients(self) -> None:
         """Release LLM clients and child agents WITHOUT tearing down session tool state (gateway cache

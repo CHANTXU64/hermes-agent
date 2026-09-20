@@ -19,7 +19,7 @@ from hermes_cli.timeouts import get_provider_request_timeout
 from agent.message_sanitization import (
     _FULL_ARGS_LOG_BOUND, coalesce_tool_call_id, coerce_tool_name, tool_call_id_variants, tool_result_id_variants
 )
-from agent.prompt_builder import STEER_DISPLAY_KIND, format_steer_marker
+from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.think_scrubber import THINK_TAG_NAMES
 from agent.trajectory import convert_scratchpad_to_think
@@ -3404,37 +3404,25 @@ def _requeue_pending_steer(agent, steer_text: str) -> None:
         agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
 
 
-def _append_steer_marker_to_tool_result(agent, target: dict, steer_text: str) -> None:
-    """Attach /steer to a tool result and record trusted memory provenance.
-
-    Fork request-only isolation keeps durable history as clean user-authored
-    content. Steer is visible to the model on the tool row and copied into
-    external memory via ``_memory_oob_user_events``, not as a new user turn.
-    """
-    marker = format_steer_marker(steer_text)
-    existing_content = target.get("content", "")
-    if isinstance(existing_content, str):
-        target["content"] = existing_content + marker
-    else:
-        try:
-            target["content"] = [*(existing_content or []), {"type": "text", "text": marker.lstrip()}]
-        except Exception:
-            target["content"] = f"{existing_content}{marker}"
-    events = getattr(agent, "_memory_oob_user_events", None)
-    if events is None:
-        events = []
-        agent._memory_oob_user_events = events
-    events.append({
-        "message_object_id": id(target),
-        "tool_call_id": target.get("tool_call_id"),
-        "user_text": steer_text,
-    })
-
-
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
-    """Deliver any pending /steer text on the newest tool result in this batch.
+    """Persist any pending /steer text as a standalone user message.
 
     Called at the end of a tool-call batch, before the next API call.
+
+    The steer is emitted as a NEW ``role:"user"`` message appended after the
+    last tool result (marker text included), so:
+
+    - the model still sees the self-describing out-of-band marker (same text,
+      same provenance semantics);
+    - message-role alternation stays legal — ``assistant(tool_calls) → tool →
+      user`` is the documented "user jumped in mid-run" pattern that
+      ``repair_message_sequence`` deliberately keeps;
+    - the appended dict carries no ``_DB_PERSISTED_MARKER`` yet, so the next
+      ``_flush_messages_to_session_db`` writes it to the session store — the
+      steer text finally becomes part of the durable transcript instead of
+      being smeared onto an already-persisted tool row that append-only
+      persistence never rewrites (replayed histories then diverge from the
+      live request bytes and break the provider prompt cache).
     """
     if num_tool_msgs <= 0 or not messages:
         return
@@ -3450,9 +3438,9 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # user message (which persists like any other user turn).
         _requeue_pending_steer(agent, steer_text)
         return
-    _append_steer_marker_to_tool_result(agent, target, steer_text)
+    messages.append(steer_user_row(steer_text))
     _ra().logger.info(
-        "Delivered /steer to agent after tool batch (%d chars) on tool result: %s", len(steer_text),
+        "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
     )
 

@@ -530,7 +530,6 @@ _CONTROL_STATE: Dict[str, Any] = {
     "_pending_steer": None,
     "_pending_steer_lock": threading.Lock,
     # Trusted user-origin notes are projected into a memory-only copy at turn end.
-    "_memory_oob_user_events": list,
     # Active-turn redirect: keep the valid turn prefix, cancel only the in-flight request,
     # rebuild the tail with the correction. Drained at a role-safe boundary.
     "_pending_redirect": None,

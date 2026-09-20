@@ -1561,7 +1561,6 @@ def _run_conversation_turn(
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
-    agent._memory_oob_user_events = []
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,
