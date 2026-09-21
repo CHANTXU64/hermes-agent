@@ -5,15 +5,17 @@ const mocks = await vi.hoisted(async () => {
   const { atom } = await import('nanostores')
   const messages = atom<unknown[]>([])
 
-  const useVoiceConversation = vi.fn(() => ({
-    end: vi.fn(async () => undefined),
-    level: 0,
-    muted: false,
-    start: vi.fn(async () => undefined),
-    status: 'idle' as const,
-    stopTurn: vi.fn(),
-    toggleMute: vi.fn()
-  }))
+  const useVoiceConversation = vi.fn(
+    (_options: { onSubmit: (text: string) => Promise<void> | void }) => ({
+      end: vi.fn(async () => undefined),
+      level: 0,
+      muted: false,
+      start: vi.fn(async () => undefined),
+      status: 'idle' as const,
+      stopTurn: vi.fn(),
+      toggleMute: vi.fn()
+    })
+  )
 
   return { messages, useVoiceConversation }
 })
@@ -81,6 +83,9 @@ test('a local-STT turn submits the voice-origin marker, not the bare transcript'
   const submitVoiceTurn = mocks.useVoiceConversation.mock.calls.at(-1)?.[0]?.onSubmit
 
   expect(typeof submitVoiceTurn).toBe('function')
+  if (typeof submitVoiceTurn !== 'function') {
+    throw new Error('useVoiceConversation was not given onSubmit')
+  }
 
   await act(async () => {
     await submitVoiceTurn('check the auth log')
