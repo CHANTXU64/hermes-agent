@@ -2190,6 +2190,14 @@ Date: 2026-08-15
 Files:
 
 - `gateway/run_inbound.py`
+- `apps/desktop/src/app/chat/composer/hooks/use-composer-voice.ts` — `submitVoiceTurn` wraps a
+  local-STT transcript in the same marker before submit, so the desktop's own STT button reaches
+  the model with voice provenance (added 2026-09-21). GPT-Live does NOT go through here: it passes
+  the marker out-of-band via `voiceContext`, keeping bubble and history clean.
+  Accepted costs on this surface, for parity with the gateway path: the marker IS the submitted
+  text, so the chat bubble renders it and the persisted row stores the wrapper rather than the bare
+  transcript. The gateway hides it behind a voice-message bubble; this surface has none.
+- `apps/desktop/src/app/chat/composer/hooks/use-composer-voice-stt-marker.test.tsx` — pins the wrap.
 - `tests/gateway/test_stt_config.py`
 - `tests/gateway/test_telegram_audio_vs_voice.py`
 - `tests/gateway/test_telegram_voice_v0_regressions.py`

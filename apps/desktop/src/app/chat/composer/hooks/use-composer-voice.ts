@@ -160,6 +160,20 @@ export function useComposerVoice({
     }
   }
 
+  /** Fork: a local-STT turn carries the same voice-origin marker the platform
+   *  gateway prepends (gateway/run_inbound.py `_transcribe_one_clip`), so the
+   *  model can account for speech-recognition errors instead of reading the
+   *  transcript as deliberately authored text.
+   *
+   *  Two known costs, accepted for parity with the Telegram path:
+   *  - the marker is the submitted `text`, so the chat bubble shows it (the
+   *    gateway hides it behind a voice-message bubble; this surface has none);
+   *  - the persisted row stores the wrapper rather than the bare transcript
+   *    (already true on the gateway path).
+   *  Upstream removed this wrapper because it could be read as a
+   *  meta-instruction and make the model comment on voice mode; the Fork keeps
+   *  it deliberately. GPT-Live does NOT go through here — it passes the marker
+   *  out-of-band via `voiceContext`, which keeps bubble and history clean. */
   const submitVoiceTurn = async (text: string) => {
     if (busy) {
       return
@@ -168,7 +182,7 @@ export function useComposerVoice({
     triggerHaptic('submit')
     resetBrowseState(sessionId)
     clearDraft()
-    await onSubmit(text)
+    await onSubmit(`[The user sent a voice message~ Here's what they said: "${text}"]`)
   }
 
   /** A GPT-Live delegation → Hermes turn. The bubble and the persisted row are
