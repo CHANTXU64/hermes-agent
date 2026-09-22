@@ -149,6 +149,118 @@ def hermes_turn(
     }
 
 
+def test_failed_turn_retried_successfully_is_not_duplicated(tmp_path):
+    """A 403 turn and its retry share one user message; only the retry survives.
+
+    Regression for the session where an upstream auth failure was traced as its
+    own turn, making the user's message appear twice in the candidate.
+    """
+    module = load_script_module(tmp_path)
+    session_id = "session-failed-retry"
+    failed_turn = {
+        "id": "turn-failed",
+        "type": "CHAIN",
+        "name": "Hermes turn",
+        "startTime": "2026-09-21T00:19:29Z",
+        "endTime": "2026-09-21T00:19:35Z",
+        "input": {"role": "user", "content": "你拉下最新的代码"},
+        "output": {
+            "error": {
+                "error": True,
+                "error_type": "PermissionDeniedError",
+                "status_code": 403,
+                "retryable": False,
+            }
+        },
+    }
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id},
+                "observations": [
+                    failed_turn,
+                    hermes_turn(
+                        "turn-retry",
+                        "2026-09-21T00:19:36Z",
+                        "2026-09-21T00:19:50Z",
+                        "你拉下最新的代码",
+                        "已拉到最新。",
+                    ),
+                ],
+            }
+        ],
+    }
+
+    candidate = module.build_candidate_document(export, session_id)
+    messages = [message for turn in candidate["turns"] for message in turn]
+
+    assert messages == [
+        {
+            "role": "user",
+            "content": "User: 你拉下最新的代码",
+            "timestamp": "2026-09-21T00:19:36Z",
+        },
+        {
+            "role": "assistant",
+            "content": "Assistant: 已拉到最新。",
+            "timestamp": "2026-09-21T00:19:50Z",
+        },
+    ]
+
+
+def test_failed_turn_without_retry_keeps_the_user_message(tmp_path):
+    """An unanswered failure is the only record of that message — keep it.
+
+    Dropping every failed turn would silently lose the user's words whenever a
+    request failed and was never re-sent.
+    """
+    module = load_script_module(tmp_path)
+    session_id = "session-failed-final"
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id},
+                "observations": [
+                    hermes_turn(
+                        "turn-ok",
+                        "2026-09-21T00:10:00Z",
+                        "2026-09-21T00:10:05Z",
+                        "第一个问题",
+                        "第一个回答",
+                    ),
+                    {
+                        "id": "turn-failed-final",
+                        "type": "CHAIN",
+                        "name": "Hermes turn",
+                        "startTime": "2026-09-21T00:11:00Z",
+                        "endTime": "2026-09-21T00:11:06Z",
+                        "input": {"role": "user", "content": "这条永远没被回答"},
+                        "output": {
+                            "error": {
+                                "error": True,
+                                "error_type": "APIConnectionError",
+                                "retryable": True,
+                            }
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+
+    candidate = module.build_candidate_document(export, session_id)
+    user_messages = [
+        message["content"]
+        for turn in candidate["turns"]
+        for message in turn
+        if message["role"] == "user"
+    ]
+
+    assert "User: 这条永远没被回答" in user_messages
+
+
 def test_build_candidate_document_orders_real_turns_and_strips_model_note(tmp_path):
     module = load_script_module(tmp_path)
     session_id = "session-main"
@@ -1490,6 +1602,101 @@ def test_state_reconciliation_restores_real_user_before_continuity_answer(tmp_pa
         "clarify_question_event_count": 0,
         "clarify_response_event_count": 0,
     }
+
+
+def test_state_reconciliation_drops_compaction_replayed_assistant_copies(tmp_path):
+    """A compaction block replays earlier assistant text with fresh timestamps.
+
+    The (body, timestamp) dedupe key cannot see those copies, so each compaction
+    used to add another copy of the same reply to the candidate. Regression for the
+    FIP session that exported one reply 5 times and another 8 times.
+    """
+    module = load_script_module(tmp_path)
+    session_id = "session-compaction-replay"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+
+    marker = (
+        "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
+        "into the summary below."
+    )
+    rows = [
+        # Real conversation.
+        (1, "user", "第一个问题", 1000, 1),
+        (2, "assistant", "第一个回答", 1001, 2),
+        (3, "user", "第二个问题", 1002, 3),
+        (4, "assistant", "第二个回答", 1003, 4),
+        # First compaction: marker, then the replayed prefix at fresh timestamps.
+        (5, "assistant", marker, 1004, 5),
+        (6, "user", "第一个问题", 1004.1, 6),
+        (7, "assistant", "第一个回答", 1004.2, 7),
+        (8, "user", "第二个问题", 1004.3, 8),
+        (9, "assistant", "第二个回答", 1004.4, 9),
+        # Second compaction replays the same prefix again.
+        (10, "assistant", marker, 1005, 10),
+        (11, "user", "第一个问题", 1005.1, 11),
+        (12, "assistant", "第一个回答", 1005.2, 12),
+        (13, "user", "第二个问题", 1005.3, 13),
+        (14, "assistant", "第二个回答", 1005.4, 14),
+    ]
+    with sqlite3.connect(state_db) as conn:
+        for row_id, role, content, ts, order in rows:
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    id, session_id, role, content, timestamp, display_order
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (row_id, session_id, role, content, ts, order),
+            )
+
+    reconciliation = module.load_state_reconciliation(session_id, state_db)
+    assistant_bodies = [
+        event["content"]
+        for event in reconciliation["events"]
+        if event["source_kind"] == "visible_assistant"
+    ]
+
+    # Each distinct reply survives exactly once, despite two replays apiece.
+    assert assistant_bodies == ["第一个回答", "第二个回答"]
+
+
+def test_state_reconciliation_keeps_genuine_repeat_outside_compaction(tmp_path):
+    """Deduping must stay scoped to replay blocks, never global text matching.
+
+    A user can legitimately get the same short answer twice in one session; only
+    copies inside a compaction replay block are duplicates.
+    """
+    module = load_script_module(tmp_path)
+    session_id = "session-genuine-repeat"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+
+    rows = [
+        (1, "user", "第一次问", 1000, 1),
+        (2, "assistant", "好的", 1001, 2),
+        (3, "user", "第二次问", 1002, 3),
+        (4, "assistant", "好的", 1003, 4),
+    ]
+    with sqlite3.connect(state_db) as conn:
+        for row_id, role, content, ts, order in rows:
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    id, session_id, role, content, timestamp, display_order
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (row_id, session_id, role, content, ts, order),
+            )
+
+    reconciliation = module.load_state_reconciliation(session_id, state_db)
+    assistant_bodies = [
+        event["content"]
+        for event in reconciliation["events"]
+        if event["source_kind"] == "visible_assistant"
+    ]
+
+    assert assistant_bodies == ["好的", "好的"]
 
 
 def test_state_reconciliation_restores_gateway_origin_user_without_platform_id(tmp_path):

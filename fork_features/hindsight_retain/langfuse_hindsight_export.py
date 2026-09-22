@@ -34,12 +34,13 @@ DEFAULT_SQLITE_PATH = (
     Path.home() / ".hermes" / "hindsight" / "retain_turns.sqlite3"
 )
 DEFAULT_STATE_DB_PATH = Path.home() / ".hermes" / "state.db"
+_COMPACTION_MARKER_PREFIX = "[CONTEXT COMPACTION —"
 _STATE_FRAMEWORK_PREFIXES = (
     "[Session Arc Summary ",
     "[Your active task list was preserved across context compression]",
     "[Current user objective preserved from compacted history]",
     "[Recent Summary (",
-    "[CONTEXT COMPACTION —",
+    _COMPACTION_MARKER_PREFIX,
     "[Durable Summary (",
     "[ASYNC DELEGATION COMPLETE —",
     "[ASYNC DELEGATION BATCH COMPLETE —",
@@ -1048,7 +1049,10 @@ def load_state_reconciliation(
             }
         )
 
+    compaction_replay_ids = _compaction_replay_row_ids(rows)
     seen_visible_assistants: set[tuple[str, str]] = set()
+    seen_replay_bodies: set[str] = set()
+    deferred_replay_rows: list[tuple[dict, str, str, str]] = []
     for row in rows:
         if row["role"] != "assistant":
             continue
@@ -1063,13 +1067,35 @@ def load_state_reconciliation(
         if not content or _is_state_framework_content(content):
             continue
         timestamp = _utc_timestamp(row["timestamp"])
-        logical_key = (
-            " ".join(unicodedata.normalize("NFKC", content).split()),
-            timestamp,
-        )
+        body = " ".join(unicodedata.normalize("NFKC", content).split())
+        logical_key = (body, timestamp)
         if logical_key in seen_visible_assistants:
             continue
         seen_visible_assistants.add(logical_key)
+        if row["id"] in compaction_replay_ids:
+            # A compaction block replays earlier context with fresh timestamps, so the
+            # (body, timestamp) key cannot recognise it. Hold these rows back and keep
+            # one only when no real occurrence of the same body survives elsewhere.
+            deferred_replay_rows.append(
+                (row, content, timestamp, body)
+            )
+            continue
+        seen_replay_bodies.add(body)
+        events.append(
+            {
+                "source_kind": "visible_assistant",
+                "source_key": f"visible_assistant:{row['id']}",
+                "role": "assistant",
+                "content": _external_safe_text(content),
+                "timestamp": timestamp,
+                "display_order": int(row["display_order"] or row["id"]),
+            }
+        )
+
+    for row, content, timestamp, body in deferred_replay_rows:
+        if body in seen_replay_bodies:
+            continue
+        seen_replay_bodies.add(body)
         events.append(
             {
                 "source_kind": "visible_assistant",
@@ -1157,6 +1183,78 @@ def load_state_reconciliation(
                     )
     result.update({"status": "ready", "reason": "state_visible_events_loaded", "events": events})
     return result
+
+
+def _chain_error_payload(chain: dict) -> dict | None:
+    """Return the error payload when a turn ended in a failed model call."""
+    output = chain.get("output")
+    if not isinstance(output, dict):
+        return None
+    error = output.get("error")
+    if isinstance(error, dict) and error.get("error") is True:
+        return error
+    return None
+
+
+def _superseded_failed_retry_chain_ids(chains: list[dict]) -> set[str]:
+    """Find failed turns whose user input was re-sent and answered successfully.
+
+    A failed model call (auth error, upstream 5xx) is traced as its own turn
+    carrying the same user input as the retry that follows it. Keeping both makes
+    the user's message appear twice in the candidate. Only drop a failed turn when
+    a later turn with identical input did produce an answer — an unanswered failure
+    is the sole record of that message and must survive.
+    """
+    superseded: set[str] = set()
+    for index, chain in enumerate(chains):
+        if _chain_error_payload(chain) is None:
+            continue
+        chain_input = chain.get("input")
+        if not isinstance(chain_input, dict) or chain_input.get("role") != "user":
+            continue
+        failed_content = _clean_user_content(chain_input.get("content"))
+        if not failed_content:
+            continue
+        for later in chains[index + 1 :]:
+            later_input = later.get("input")
+            if not isinstance(later_input, dict):
+                continue
+            if _clean_user_content(later_input.get("content")) != failed_content:
+                continue
+            later_output = later.get("output")
+            if not isinstance(later_output, dict):
+                continue
+            if isinstance(later_output.get("content"), str) and later_output[
+                "content"
+            ].strip():
+                superseded.add(str(chain.get("id") or ""))
+                break
+    superseded.discard("")
+    return superseded
+
+
+def _compaction_replay_row_ids(rows) -> set[int]:
+    """Identify StateDB rows that a compaction block replayed from earlier context.
+
+    Context compression writes the retained prefix back as fresh rows carrying new
+    timestamps, so identical assistant text reappears once per compaction. Such a
+    block starts at a ``[CONTEXT COMPACTION`` marker and runs until ``display_order``
+    jumps back below the marker's, which is where the replayed history resumes.
+    """
+    ordered = list(rows)
+    replay_ids: set[int] = set()
+    for index, row in enumerate(ordered):
+        content = _decode_state_content(row["content"])
+        if not isinstance(content, str):
+            continue
+        if not content.lstrip().startswith(_COMPACTION_MARKER_PREFIX):
+            continue
+        marker_order = int(row["display_order"] or row["id"])
+        for candidate in ordered[index + 1 :]:
+            if int(candidate["display_order"] or candidate["id"]) < marker_order:
+                break
+            replay_ids.add(int(candidate["id"]))
+    return replay_ids
 
 
 def _state_event_key(role, content: str) -> tuple[str, str]:
@@ -1382,8 +1480,11 @@ def build_candidate_document(
                 (timestamp, _document_message("user", content, timestamp))
             )
 
+    superseded_chain_ids = _superseded_failed_retry_chain_ids(chains)
     turn_entries: list[tuple[str, int, str, list[dict]]] = []
     for chain in chains:
+        if str(chain.get("id") or "") in superseded_chain_ids:
+            continue
         messages: list[dict] = []
         intermediate_events: list[tuple[str, int, dict]] = []
         chain_input = chain.get("input") or {}

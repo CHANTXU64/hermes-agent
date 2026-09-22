@@ -778,6 +778,8 @@ Intent / invariants:
 - The daily Hindsight attempt monitor takes a shared journal lock, preserves earlier valid attempts after a torn final JSONL line while emitting a dedicated high alert, and distinguishes lost scheduled workers, local interruption, unverified-reconciliation blocks, single-role visible-event gaps, severe total gaps, invalid confirmed-only repair scopes, write-not-started/rejected/uncertain, operation missing/pending/stalled/failed/unavailable/identity or metadata mismatch, extraction errors, Document identity/missing/unavailable, severe content loss, and exact-hash mismatch. Either blocked-candidate receipt produces one explicit alert without a second false “write not started” alert. A historical confirmed-only repair may bypass the live full-session size comparison only when its candidate audit proves one unchanged base hash, unique selected occurrence IDs, `old+inserted=candidate` message counts, and preservation of all old messages as an ordered subsequence; malformed or partial repair receipts fail closed. When an older unguarded attempt completed and the remote Document exactly matches its severe incomplete candidate, that same candidate alert carries the completed remote status so reports state that the remote Document was overwritten rather than calling the remote impact unknown. Remote success requires a completed `retain`/`batch_retain` operation with an explicit integer `extraction_errors_count=0`, matching operation and Document identities, and exact `Document.original_text` hash. A later `remote_write_started` generation supersedes older current-Document comparisons without claiming that the newer operation succeeded.
 - New writer Documents are owned by this attempt/operation/hash audit and are excluded from the retired provider-ledger/unmapped Document audit. Legacy StateDB and SQLite ledgers are opened with URI `mode=ro` plus `PRAGMA query_only=ON`; writer, remote Document audit, and legacy shared-bank audit all use the Bank loaded from the default profile's Hindsight config. StateDB is cross-evidence only and cannot substitute for the fsynced attempt intent.
 - Retain StateDB cross-evidence treats the configured `--state-db` as the entry point to one Hermes home: it matches the exact session ID against the default StateDB and every `profiles/*/state.db`, then passes that exact resolved database to both the request-cutoff snapshot and candidate exporter. A previously recorded `session_found=false` snapshot is rebuilt at its original cutoff when the exact session is now found, so fixing profile discovery restores the content check instead of merely suppressing the missing-session alert. It never chooses a recent session, combines profiles, changes the remote write target, or suppresses a session that is absent from every StateDB.
+- Candidate construction drops two classes of duplicate that neither Langfuse nor the remote side creates. (a) A model call that failed upstream (`output.error.error is true`, carrying `error_type`/`status_code`) and was followed by a successful retry carrying the same user text is skipped, so one real user event does not enter the candidate twice; a failed turn with NO successful retry keeps its user message, because that input is otherwise lost. (b) StateDB rows replayed immediately after a context-compression marker are collapsed to the earliest available copy of each assistant body. Deduplication is scoped to the replay block only — a global text-level dedup is forbidden, since it would delete genuinely repeated messages (the user saying `继续` twice, 14 hours apart, is two real events). Bodies that exist only inside a replay block are preserved rather than dropped.
+- `/Users/robot/.hermes/scripts/check-hermes-hindsight.py` canonicalizes the Gateway routing header off StateDB user rows before comparing them against candidate text. StateDB stores the wrapper; the candidate stores the bare body, so without this the monitor reports phantom "missing user message" alerts. Body text that merely mentions the header without matching the full wrapper must not be truncated.
 - The writer/exporter are managed Fork components. The machine-local daily monitor and deployment configuration remain profile-local; all stay outside the retired Hindsight provider chain, `/new`, generic `/undo`, and CLI/TUI/Desktop lifecycles.
 
 Merge decision:
@@ -3199,11 +3201,80 @@ deltas are expected in these areas:
   - `docs/LOCAL_MODIFICATIONS.md`
 
 
+### 30. disk-cleanup never deletes authored work
+
+ID: `disk-cleanup-authored-work-guard`
+
+Status: active
+
+Date: 2026-09-22
+
+Depends on: none
+
+Source boundary: logical-only
+
+Files:
+
+- `plugins/disk-cleanup/disk_cleanup.py` — adds `"scripts"` to `_NEVER_TRACK_TOP_LEVEL`;
+  adds `_git_repo_root()` (per-directory `lru_cache`) and `_is_git_tracked()`, called as the
+  second guard in `guess_category()` right after `is_safe_path()`.
+- `tests/plugins/test_disk_cleanup_plugin.py` — `test_scripts_test_files_are_never_tracked_or_deleted`
+  plus the `TestGitTrackedFilesAreNeverDisposable` class.
+
+Intent / invariants:
+
+The plugin classifies any file named `test_*` / `tmp_*` under `HERMES_HOME` as category
+`test`, and `test` has a zero retention period — `_on_session_end` deletes it at the end of
+the same turn. `scripts/` was missing from the never-track whitelist, so operational test
+suites under `~/.hermes/scripts/tests/` were destroyed minutes after being written: 26
+`DELETED` records in `~/.hermes/disk-cleanup/cleanup.log` between 2026-07-18 and 2026-09-22,
+each one created and swept inside a single turn.
+
+Two guards, deliberately at different levels:
+
+- `scripts` in the whitelist protects the one directory Hermes cron actually runs scripts from.
+- `_is_git_tracked()` generalizes it: a file committed to a repository is authored work
+  whatever its name, so being tracked disqualifies it from every disposable category. This
+  also covers repos outside `HERMES_HOME`.
+
+Invariants that must survive a merge:
+
+- An uncommitted `test_*` file still classifies normally — being *inside* a repo is not
+  enough, only being *tracked* is. Cleanup must keep working for genuine scratch files.
+- `_is_git_tracked()` runs on the `post_tool_call` hook, i.e. after every tool call. It must
+  never raise (a missing/broken `git` returns False) and must not spawn a process per
+  candidate — hence the directory-level cache. Removing the cache is a performance
+  regression, not a simplification.
+
+Merge decision:
+
+- Preserve when: `guess_category()` still drives auto-deletion, or any category retains a
+  zero-age deletion rule.
+- Drop when: upstream gives `test` a non-zero retention period AND adds its own
+  authored-work guard covering both cases above.
+- Ask when: upstream restructures `_NEVER_TRACK_TOP_LEVEL` or moves category classification
+  out of `guess_category()`.
+
+Verification:
+
+```bash
+scripts/run_tests.sh tests/plugins/test_disk_cleanup_plugin.py
+```
+
+35 tests pass. The 4 new tests were confirmed red against the unpatched plugin.
+
+Upstream status: fork-only.
+
+Last validated: 2026-09-22, against the working tree at the time of this entry.
+
+Feature docs: none — the two guards are self-contained and documented inline.
+
+
 ## Summary statistics
 
-Documented entries: 29 major entries.
+Documented entries: 30 major entries.
 
-Active / current entries: 21.
+Active / current entries: 22.
 
 Historical reverted / abandoned / superseded areas: 8.
 
