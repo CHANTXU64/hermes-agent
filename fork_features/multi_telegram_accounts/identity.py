@@ -51,6 +51,34 @@ def split_account_session_key(session_key: str) -> tuple[str, Optional[str]]:
     return base, account
 
 
+def restore_account_session_source(source: Any, session_key: Any) -> Optional[Any]:
+    """Re-pin runtime-only Telegram account identity from a trusted route key.
+
+    ``SessionSource.account_id`` is intentionally excluded from peer-controlled
+    wire data. Durable Gateway routes already carry the account suffix, so
+    synthetic/restored events recover from that key and fail closed on any
+    conflict instead of silently falling back to the primary Bot.
+    """
+    _base, key_account = split_account_session_key(session_key)
+    platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
+    raw_source_account = getattr(source, "account_id", None)
+    source_account = normalize_account_id(raw_source_account)
+    if raw_source_account not in (None, "") and source_account is None:
+        return None
+    if str(platform or "").lower() != "telegram":
+        return source if key_account is None and source_account is None else None
+    if source_account is not None and source_account != key_account:
+        logger.warning(
+            "Refusing Telegram route with conflicting account identity: source=%s key=%s",
+            source_account,
+            key_account,
+        )
+        return None
+    if source_account is None and key_account is not None:
+        source.account_id = key_account
+    return source
+
+
 def discover_named_telegram_accounts(
     token_env: Mapping[str, Any],
     *,
@@ -126,5 +154,6 @@ __all__ = [
     "append_account_session_key",
     "discover_named_telegram_accounts",
     "normalize_account_id",
+    "restore_account_session_source",
     "split_account_session_key",
 ]

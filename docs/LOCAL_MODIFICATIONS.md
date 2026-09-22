@@ -1223,7 +1223,8 @@ replay; compatible upstream schema and content-addressed key hardening retained.
 
 Status: active; Fork policy isolated (2026-08-31)
 
-Date: 2026-07-13; boundary refactored 2026-08-31
+Date: 2026-07-13; boundary refactored 2026-08-31; restored completion
+routing fixed 2026-09-22
 
 Stable ID: `F-telegram-multi-account`
 
@@ -1262,8 +1263,10 @@ True upstream host seams:
   named-account configs.
 - `gateway/session.py`, `gateway/platforms/base.py`, and
   `plugins/platforms/telegram/adapter.py` preserve account provenance from an
-  inbound Telegram event through session serialization and outbound routing.
+  inbound Telegram event through runtime routing and the durable account-aware
+  session key; the account field itself remains runtime-only.
 - `gateway/authz_mixin.py` asks the Fork runtime for the exact named adapter and
+  restores post-restart account provenance from the trusted durable key; it
   fails closed while that configured bot is disconnected.
 - `gateway/slash_commands.py` delegates cross-bot resume policy and keeps account
   provenance in restart metadata.
@@ -1313,6 +1316,9 @@ Behavior contract:
 - The primary token keeps the legacy session key and default adapter slot.
 - Named bots use `SessionSource.account_id` plus `:account:<id>` session-key
   suffixes while real Telegram user/chat IDs remain available for ownership.
+- Async completion reconstructs a missing runtime account from the trusted
+  session-key suffix after persisted-source reload, rejects conflicting account
+  data, and never borrows the primary Bot when the named adapter is offline.
 - Streaming, typing, media, busy replies, background completion, restart notices,
   authorization, and normal replies return through the originating bot.
 - Cross-bot `/resume` transfers only an idle transcript to the current bot route;
@@ -1336,6 +1342,10 @@ Effective exposure and lifecycle evidence:
 - Pre-refactor focused baseline: `125 passed`.
 - Disposable sample focused suite: `148 passed`.
 - Final host-integrated canonical suite, including shutdown: `151 passed`.
+- 2026-09-22 named-account completion regression: the combined canonical
+  delegation and multi-account suite reported `427 passed`; it covers direct
+  reconstruction, post-restart origin reconstruction, actual named-Bot
+  injection, conflicting identity, and offline fail-closed behavior.
 - Input-transformation counterexamples cover blank/case/invalid account IDs,
   duplicate primary and named tokens, and valid/invalid existing key suffixes.
 - Broad `ty` comparison changed `399` baseline diagnostics to `398` candidate
@@ -1350,8 +1360,8 @@ scripts/run_tests.sh tests/fork_features/test_multi_telegram_accounts_boundary.p
 
 Merge-time semantic review:
 
-- Recheck the primary legacy key, account suffix, account provenance
-  serialization, exact named-adapter lookup, all return-path metadata,
+- Recheck the primary legacy key, account suffix, trusted-key restoration of
+  runtime account provenance, exact named-adapter lookup, all return-path metadata,
   cross-bot resume ownership, independent named reconnect, and Gateway survival
   when the primary bot is down but a named bot remains live or queued.
 
@@ -2253,17 +2263,20 @@ Upstream status: fork-only.
 Status: active
 
 Date: 2026-08-15; native Anthropic reasoning probe fixed 2026-08-28;
-route-policy boundary refactored 2026-08-31
+route-policy boundary refactored 2026-08-31; control/completion observability
+fixed 2026-09-22
 
 Files:
 
 - `fork_features/delegation_routing.py`
 - `tools/delegate_tool.py`
+- `tools/delegate_tool_registry.py`
 - `tools/delegate_tool_config.py`
 - `tools/delegate_tool_dispatch.py`
 - `tools/delegate_tool_child_run.py`
 - `tools/async_delegation.py`
 - `run_agent.py`
+- `gateway/run_notifications.py`
 - `tests/fork_features/test_delegation_routing.py`
 - `tests/tools/test_delegate.py`
 - `tests/tools/test_delegate_control_actions.py`
@@ -2293,6 +2306,11 @@ What changed:
 - Routed children resolve reasoning configuration against the target model. An explicit effort is used only when the production request builder preserves it exactly; otherwise Hermes keeps the selected provider/model and applies that target model's normal override/global/provider reasoning configuration without claiming that the requested value took effect.
 - Exact reasoning probes cover Chat Completions, Responses, and native Anthropic Messages routes. Anthropic Messages reuses the production request builder: `low`, `medium`, `high`, `xhigh`, and `max` are exact; `minimal -> low`, `ultra -> max`, and omission for `none` are not reported as exact and therefore keep the same-model automatic/default fallback contract.
 - Every batch task is route-validated before any child starts. Safe effective route metadata is present in child results, async status, SQLite task payloads, restart recovery, and completion events; secrets and raw request overrides are excluded.
+- Model-facing `list`, `steer`, and `stop` remain synchronous in both the normal
+  `AIAgent` dispatcher and registry fallback; automatic background mode applies
+  only to spawn calls. `list` reports retained async units separately from live
+  child objects and exposes durable delivery state, so `completed` cannot be
+  mistaken for either `not finished` or `delivered`.
 - Model-route errors keep structured error codes and render bounded Markdown suggestions in the error text. They combine up to 10 recent frequently used routes with up to 10 name-similar routes, deduplicate by `(provider, model)`, and stay within 1,800 characters. Recent usage is read from the active profile's local `state.db` and intersected with the current authenticated curated inventory, so stale historical routes are excluded. No LLM, child launch, forced catalog refresh, reasoning-model scan, or automatic model substitution is involved; the full catalog is never inserted into the persistent tool schema.
 
 Why it matters:
@@ -2304,6 +2322,9 @@ Merge protection:
 
 - Preserve when upstream does not provide the combined contract of per-invocation/per-task cross-provider routing, target-model reasoning resolution, truthful same-model automatic/default fallback for unsupported explicit effort, all-task prevalidation, durable safe route metadata, and bounded current-availability Markdown suggestions.
 - Preserve the narrow host/Fork boundary: the Fork module owns route policy, while the host owns credential/runtime resolution and child lifecycle and the async module owns durable task storage/recovery. Do not move provider credentials, child execution, or async Ledger state into `fork_features` merely to reduce host line count.
+- Preserve tests at the model-facing dispatcher and registry fallback, not only
+  direct `delegate_task()` calls. Keep the completed-vs-delivered list regression
+  so a control-call failure cannot silently become a status guess.
 - Drop when upstream provides an equivalent public schema, routing precedence, validation behavior, persistence/recovery metadata, and error-result budget with matching regressions.
 - Ask user when upstream offers a similar interface but silently chooses ambiguous providers, claims a clamped/mapped reasoning value was honored, switches models for reasoning, omits durable per-task routes, injects a full catalog into the schema, or uses materially different precedence/fallback semantics.
 
@@ -2312,6 +2333,11 @@ Verification:
 - 2026-08-16 revised-contract validation: core delegate/control/async tests reported `125 passed in 16.72s`; adjacent DeepSeek/OpenCode Go/Codex request-builder tests reported `158 passed in 1.82s`; restoration, API Server, Gateway binding, CLI delivery, TUI lifecycle, batch/output-schema, and FD-leak tests reported `65 passed in 7.77s` with seven pre-existing third-party deprecation warnings. Ruff, `py_compile`, and `git diff --check` passed. A read-only live-profile candidate render excluded stale historical `openai-codex` routes and returned only current authenticated picker-inventory routes.
 - 2026-08-28 native Anthropic regression validation: delegate/control/async tests reported `127 passed`; Anthropic adapter/sanitization tests reported `98 passed`; Ruff, `py_compile`, and `git diff --check` passed. After Gateway restart, a live `custom:cloudflare-claude` / `claude-fable-5` child completed one API call with the requested effective `low` effort instead of falling back to the model's `high` default.
 - 2026-08-31 route-policy boundary validation: Fork boundary plus delegate/control/async tests reported `129 passed`; adjacent DeepSeek/OpenCode Go/Codex/Anthropic request-builder tests reported `302 passed`; Ruff, `py_compile`, the structural ownership check, and `git diff --check` passed. Functional validation did not launch a live child or call a target route; one model subagent performed a separate read-only code review. No Gateway restart, commit, or Push was performed.
+- 2026-09-22 control/completion reliability validation: the combined canonical
+  delegation and multi-account suite reported `427 passed` in per-file isolated
+  subprocesses. The new regressions first failed on all observed defects, then
+  passed after the fix; Ruff, Python compilation, and `git diff --check` passed.
+  No Gateway restart, commit, or Push was performed.
 
 ```bash
 scripts/run_tests.sh \

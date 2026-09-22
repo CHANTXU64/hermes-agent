@@ -17,6 +17,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner, _parse_session_key
+from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +643,164 @@ def test_build_process_event_source_named_profile_key(monkeypatch, tmp_path):
     assert source.chat_id == "123"
     assert source.chat_type == "dm"
     assert source.profile == "work"
+
+
+def test_build_process_event_source_restores_named_telegram_account_from_key(
+    monkeypatch, tmp_path,
+):
+    """A completion event's trusted route key restores its named Bot."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+
+    source = runner._build_process_event_source(
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_named",
+            "session_key": "agent:main:telegram:dm:123:account:monika",
+        }
+    )
+
+    assert source is not None
+    assert source.account_id == "monika"
+
+
+def test_build_process_event_source_rehydrates_persisted_origin_account(
+    monkeypatch, tmp_path,
+):
+    """Post-restart origins lose the runtime-only account field on serialization."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    session_key = "agent:main:telegram:dm:123:account:monika"
+    origin = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+    setattr(runner, "session_store", SimpleNamespace(
+        _ensure_loaded=lambda: None,
+        _entries={
+            session_key: SimpleNamespace(
+                origin=origin,
+                session_key=session_key,
+                transport_profile=None,
+            )
+        },
+    ))
+
+    source = runner._build_process_event_source(
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_restored",
+            "session_key": session_key,
+        }
+    )
+
+    assert source is not None
+    assert source.account_id == "monika"
+
+
+def test_build_process_event_source_rejects_conflicting_persisted_account(
+    monkeypatch, tmp_path,
+):
+    """A stale or forged origin may not cross from one named Bot to another."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    session_key = "agent:main:telegram:dm:123:account:monika"
+    origin = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="dm",
+        account_id="work",
+    )
+    setattr(runner, "session_store", SimpleNamespace(
+        _ensure_loaded=lambda: None,
+        _entries={
+            session_key: SimpleNamespace(
+                origin=origin,
+                session_key=session_key,
+                transport_profile=None,
+            )
+        },
+    ))
+
+    assert (
+        runner._build_process_event_source(
+            {
+                "type": "async_delegation",
+                "delegation_id": "deleg_conflict",
+                "session_key": session_key,
+            }
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_delegation_completion_returns_through_named_telegram_bot(
+    monkeypatch, tmp_path,
+):
+    """The production symptom: completion wakes the originating named Bot."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    primary = runner.adapters[Platform.TELEGRAM]
+    named = SimpleNamespace(handle_message=AdmittingHandler())
+    runner._telegram_account_adapters["monika"] = named
+    session_key = "agent:main:telegram:dm:123:account:monika"
+    # Model the restart path: account_id was intentionally not serialized in
+    # origin_json, while the trusted session key retained the account suffix.
+    setattr(runner, "session_store", SimpleNamespace(
+        _ensure_loaded=lambda: None,
+        _entries={
+            session_key: SimpleNamespace(
+                origin=SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id="123",
+                    chat_type="dm",
+                ),
+                session_key=session_key,
+                transport_profile=None,
+            )
+        },
+    ))
+
+    accepted = await runner._inject_watch_notification(
+        "[ASYNC DELEGATION COMPLETE]",
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_named_delivery",
+            "session_key": session_key,
+        },
+    )
+
+    assert accepted is True
+    getattr(primary, "handle_message").assert_not_awaited()
+    named.handle_message.assert_awaited_once()
+    event = named.handle_message.await_args.args[0]
+    assert event.source.account_id == "monika"
+
+
+@pytest.mark.asyncio
+async def test_async_delegation_named_account_offline_fails_closed(
+    monkeypatch, tmp_path,
+):
+    """Never leak a named-Bot completion through the primary Bot."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    primary = runner.adapters[Platform.TELEGRAM]
+
+    source = runner._build_process_event_source(
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_named_offline",
+            "session_key": "agent:main:telegram:dm:123:account:offline",
+        }
+    )
+    assert source is not None
+    assert source.account_id == "offline"
+    assert runner._delivery_adapter_for(source) is None
+
+    accepted = await runner._inject_watch_notification(
+        "[ASYNC DELEGATION COMPLETE]",
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_named_offline",
+            "session_key": "agent:main:telegram:dm:123:account:offline",
+        },
+    )
+
+    assert accepted is False
+    getattr(primary, "handle_message").assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

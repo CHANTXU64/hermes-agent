@@ -44,16 +44,19 @@ Upstream-owned host files keep only the seams the feature genuinely needs:
 
 - `gateway/config.py` supplies the active secret scope and stores discovered
   named-account configs.
-- `gateway/session.py` serializes account provenance and re-exports the stable
-  session-key helpers.
+- `gateway/session.py` keeps account provenance runtime-only and re-exports the
+  stable session-key helpers.
 - `gateway/platforms/base.py` carries account provenance through source creation.
 - `plugins/platforms/telegram/adapter.py` stamps account provenance before auth,
   batching, observation persistence, and session-key computation.
-- `gateway/authz_mixin.py` asks the Fork runtime for the exact named adapter.
+- `gateway/authz_mixin.py` asks the Fork runtime for the exact named adapter and
+  restores post-restart account provenance from the trusted durable session key.
 - `gateway/slash_commands.py` delegates cross-bot resume policy and preserves the
   account route for restart notices.
 - `gateway/run.py` creates the runtime and keeps thin startup, fatal, reconnect,
   shutdown, and status handoffs.
+- `gateway/run_notifications.py` reconstructs async-completion sources with the
+  account suffix and resolves the exact named adapter rather than the primary.
 
 ## Configuration / Usage
 
@@ -153,6 +156,9 @@ Refactor evidence before applying to the primary working tree:
   zero new unique diagnostics
 - same fixed upstream SHA: zero added conflict paths, conflict hunks, or
   Telegram-policy conflict hunks
+- 2026-09-22 named-account completion regression: the combined canonical
+  delegation and multi-account suite reported `427 passed`; Ruff, Python
+  compilation, and `git diff --check` also passed
 
 The existing whole-file conflicts in `gateway/run.py` and
 `gateway/slash_commands.py` are unrelated Fork overlap and remain visible; this
@@ -163,10 +169,12 @@ maintenance unit does not claim to remove them.
 Preserve these semantic contracts during every upstream sync:
 
 1. primary legacy session key and default adapter slot
-2. `SessionSource.account_id` serialization and `:account:<id>` suffix
+2. runtime-only `SessionSource.account_id`, with post-restart restoration from
+   the trusted `:account:<id>` session-key suffix
 3. account provenance before auth, batching, observation, and session selection
 4. exact named-adapter lookup with disconnected-account fail-closed behavior
-5. original-Bot routing for every reply and notification path
+5. original-Bot routing for every reply and notification path, including async
+   delegation completion after persisted-source reconstruction
 6. cross-bot `/resume` ownership and running-target rejection
 7. per-named-Bot fatal/reconnect ownership and Gateway survival rules
 

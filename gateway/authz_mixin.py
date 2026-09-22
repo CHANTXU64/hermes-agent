@@ -277,9 +277,10 @@ class GatewayAuthorizationMixin:
 
                 runtime = TelegramAccountRuntime(self)
                 self._telegram_accounts = runtime
-            recognized, adapter = runtime.resolve_stamped_adapter(acc)
-            if recognized:
-                return adapter
+            _recognized, adapter = runtime.resolve_stamped_adapter(acc)
+            # An account stamp is an explicit transport boundary. Unknown or
+            # offline named accounts fail closed instead of borrowing primary.
+            return adapter
         owner = self._transport_owner(source)
         if owner is not None:
             return owner[0]
@@ -313,6 +314,10 @@ class GatewayAuthorizationMixin:
         adapter = self._intake_adapter_for(source)
         if adapter is not None:
             return adapter
+        if getattr(source, "account_id", None):
+            # A named account was explicit but has no live adapter.  Do not let
+            # the generic profile fallback borrow the primary Telegram Bot.
+            return None
         # A pinned identity NAMES the receiving bot (live or restored from ``transport_profile``).
         # If that bot has no adapter right now it is offline: fail closed rather than fall through to
         # the runtime profile's bot — that fallthrough is the "restored lane answers from the wrong
@@ -403,7 +408,8 @@ class GatewayAuthorizationMixin:
             return None
         from gateway.session_identity import restore_identity
         restore_identity(source, runner=self, transport_profile=getattr(entry, "transport_profile", None))
-        return source
+        from fork_features.multi_telegram_accounts import restore_account_session_source
+        return restore_account_session_source(source, getattr(entry, "session_key", ""))
 
     def _adapter_flag(self, platform, name: str, profile) -> bool:
         """Adapter-declared boolean, False when unknown. ``authorization_is_upstream`` (relay: a trusted

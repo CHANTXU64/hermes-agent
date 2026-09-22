@@ -351,27 +351,26 @@ def test_append_replaces_existing_account_suffix():
     )
 
 
-def test_adapter_for_source_routes_named_account_and_fails_closed():
+def test_delivery_adapter_for_source_routes_named_account_and_fails_closed():
     runner = _make_runtime_runner()
     primary = object()
     work = object()
     runner.adapters = {Platform.TELEGRAM: primary}
     runner._telegram_account_adapters = {"work": work}
 
-    base = dict(
-        platform=Platform.TELEGRAM,
-        chat_id="5612546357",
-        chat_type="dm",
-        user_id="5612546357",
-    )
-    assert runner._adapter_for_source(SessionSource(**base)) is primary
-    assert runner._adapter_for_source(
-        SessionSource(**base, account_id="work")
-    ) is work
+    def source(account_id=None):
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="5612546357",
+            chat_type="dm",
+            user_id="5612546357",
+            account_id=account_id,
+        )
+
+    assert runner._delivery_adapter_for(source()) is primary
+    assert runner._delivery_adapter_for(source("work")) is work
     # Never leak a named-account turn to the primary bot when it is offline.
-    assert runner._adapter_for_source(
-        SessionSource(**base, account_id="missing")
-    ) is None
+    assert runner._delivery_adapter_for(source("missing")) is None
 
 
 def test_telegram_predispatch_event_and_auth_carry_account_id():

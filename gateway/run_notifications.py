@@ -1032,6 +1032,7 @@ class GatewayNotificationsMixin:
         return SessionSource(
             platform=platform, chat_id=chat_id, chat_type=chat_type, thread_id=_opt("thread_id"),
             user_id=_opt("user_id"), user_name=_opt("user_name"), scope_id=scope_id, profile=profile,
+            account_id=derived.get("account_id"),
         )
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
@@ -1135,6 +1136,12 @@ class GatewayNotificationsMixin:
         Platform.RELAY adapter fronts N logical platforms; native wins), literal ``p.value`` scan as
         fallback for minimal runner stubs / exotic platform strings when the resolver can't run."""
         from gateway.delivery import resolve_delivery_transport
+        if source is not None and getattr(source, "account_id", None):
+            delivery_adapter_for = getattr(self, "_delivery_adapter_for", None)
+            adapter: Any = cast(Any, delivery_adapter_for(source) if callable(delivery_adapter_for) else None)
+            # A named Telegram account is an explicit transport boundary.  If
+            # that adapter is offline, fail closed instead of borrowing primary.
+            return adapter
         if source is not None:
             owner = self._transport_owner(source)
             if owner is not None:

@@ -9,6 +9,7 @@ from .identity import (
     append_account_session_key,
     discover_named_telegram_accounts,
     normalize_account_id,
+    restore_account_session_source,
     split_account_session_key,
 )
 
@@ -16,5 +17,6 @@ __all__ = [
     "append_account_session_key",
     "discover_named_telegram_accounts",
     "normalize_account_id",
+    "restore_account_session_source",
     "split_account_session_key",
 ]

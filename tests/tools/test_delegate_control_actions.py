@@ -136,6 +136,68 @@ def test_list_empty_registry_has_note():
     assert "note" in out
 
 
+def test_list_reports_recent_completed_unit_and_delivery_state(monkeypatch):
+    """A finished child that left the live registry must remain observable.
+
+    Regression: completion delivery could fail while action='list' reported no
+    live child, and the caller then guessed that the child had not finished.
+    """
+    import tools.async_delegation as ad
+
+    parent = _StubParentWithSession("sess-recent")
+    monkeypatch.setattr(
+        ad,
+        "list_async_delegations",
+        lambda: [
+            {
+                "delegation_id": "deleg-recent",
+                "parent_session_id": "sess-recent",
+                "goal": "independent check",
+                "model": "test-model",
+                "status": "completed",
+                "dispatched_at": 10.0,
+                "completed_at": 20.0,
+            },
+            {
+                "delegation_id": "deleg-foreign",
+                "parent_session_id": "other-session",
+                "goal": "foreign",
+                "status": "running",
+                "dispatched_at": 30.0,
+                "completed_at": None,
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        ad,
+        "get_durable_delegation",
+        lambda delegation_id: {
+            "delivery_state": "pending",
+            "delivery_attempts": 0,
+        }
+        if delegation_id == "deleg-recent"
+        else None,
+    )
+
+    out = json.loads(_handle_control_action("list", None, None, parent))
+
+    assert out["count"] == 0
+    assert out["delegation_count"] == 1
+    assert out["delegations"] == [
+        {
+            "delegation_id": "deleg-recent",
+            "goal": "independent check",
+            "model": "test-model",
+            "status": "completed",
+            "dispatched_at": 10.0,
+            "completed_at": 20.0,
+            "delivery_state": "pending",
+            "delivery_attempts": 0,
+        }
+    ]
+    assert "completed does not mean delivered" in out["note"]
+
+
 # ---------------------------------------------------------------------------
 # action='steer'
 # ---------------------------------------------------------------------------
@@ -255,6 +317,56 @@ def test_delegate_task_routes_control_action_before_spawn_machinery():
     parent = _StubParent()
     out = json.loads(delegate_task(action="list", parent_agent=parent))
     assert out["action"] == "list"
+
+
+def test_model_dispatch_does_not_force_background_onto_control_action():
+    """The normal AIAgent dispatch path must keep list/steer/stop synchronous."""
+    from run_agent import AIAgent
+
+    parent = object.__new__(AIAgent)
+    setattr(parent, "_delegate_depth", 0)
+
+    out = json.loads(parent._dispatch_delegate_task({"action": "list"}))
+
+    assert out["action"] == "list"
+
+
+@pytest.mark.parametrize("action", ["steer", "stop"])
+def test_model_dispatch_keeps_targeted_control_actions_synchronous(action):
+    from run_agent import AIAgent
+
+    parent = object.__new__(AIAgent)
+    setattr(parent, "_delegate_depth", 0)
+
+    out = json.loads(parent._dispatch_delegate_task({"action": action}))
+
+    assert "spawn route fields" not in out.get("error", "")
+    assert "requires subagent_id" in out["error"]
+
+
+def test_registry_fallback_does_not_force_background_onto_control_action():
+    """The registry fallback must match the normal model dispatch path."""
+    from tools.registry import registry
+
+    entry = registry.get_entry("delegate_task")
+    assert entry is not None
+
+    out = json.loads(entry.handler({"action": "list"}, parent_agent=_StubParent()))
+
+    assert out["action"] == "list"
+
+
+@pytest.mark.parametrize("action", ["steer", "stop"])
+def test_registry_fallback_keeps_targeted_control_actions_synchronous(action):
+    from tools.registry import registry
+
+    entry = registry.get_entry("delegate_task")
+    assert entry is not None
+
+    out = json.loads(entry.handler({"action": action}, parent_agent=_StubParent()))
+
+    assert "spawn route fields" not in out.get("error", "")
+    assert "requires subagent_id" in out["error"]
 
 
 def test_delegate_task_control_action_rejects_spawn_route_fields():

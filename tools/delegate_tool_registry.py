@@ -234,6 +234,55 @@ def _owns_subagent_record(record: Dict[str, Any], parent_agent: Any) -> bool:
     # Compression rotation on either side: compare lineage tips.
     return _resolve_session_lineage(owner_sid, parent_agent) in {parent_sid, _resolve_session_lineage(parent_sid, parent_agent)}
 
+
+def _delegation_units_for_parent(parent_agent: Any) -> list[Dict[str, Any]]:
+    """Recent async units owned by this durable conversation.
+
+    Live child objects disappear as soon as their worker exits, while the async
+    unit and its delivery ledger remain long enough to answer the materially
+    different questions "did it finish?" and "was it delivered?".
+    """
+    parent_sid = str(getattr(parent_agent, "session_id", "") or "")
+    if not parent_sid:
+        return []
+    try:
+        from tools import async_delegation
+
+        records = async_delegation.list_async_delegations()
+    except Exception:
+        logger.debug("Could not inspect async delegation units", exc_info=True)
+        return []
+
+    parent_tip = _resolve_session_lineage(parent_sid, parent_agent)
+    owned = []
+    for record in records:
+        owner_sid = str(record.get("parent_session_id") or "")
+        if not owner_sid:
+            continue
+        if owner_sid != parent_sid and _resolve_session_lineage(owner_sid, parent_agent) != parent_tip:
+            continue
+        entry = {
+            key: record.get(key)
+            for key in (
+                "delegation_id", "goal", "model", "status",
+                "dispatched_at", "completed_at",
+            )
+        }
+        delegation_id = str(record.get("delegation_id") or "")
+        if delegation_id:
+            try:
+                durable = async_delegation.get_durable_delegation(delegation_id)
+            except Exception:
+                logger.debug("Could not inspect delegation delivery state", exc_info=True)
+                durable = None
+            if durable:
+                entry["delivery_state"] = durable.get("delivery_state")
+                entry["delivery_attempts"] = durable.get("delivery_attempts")
+        owned.append(entry)
+    owned.sort(key=lambda item: float(item.get("dispatched_at") or 0), reverse=True)
+    return owned[:10]
+
+
 def _list_payload(parent_agent: Any) -> Dict[str, Any]:
     with _active_subagents_lock:
         records = list(_active_subagents.values())
@@ -252,12 +301,20 @@ def _list_payload(parent_agent: Any) -> Dict[str, Any]:
             "accepting_steer": bool(r.get("accepting_steer", False)),
             "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
         })
-    payload: Dict[str, Any] = {"action": "list", "count": len(entries), "subagents": entries}
+    delegations = _delegation_units_for_parent(parent_agent)
+    payload: Dict[str, Any] = {
+        "action": "list",
+        "count": len(entries),
+        "subagents": entries,
+        "delegation_count": len(delegations),
+        "delegations": delegations,
+    }
     if not entries:
         payload["note"] = (
-            "No live subagents right now. Children that already finished "
-            "have delivered (or will deliver) their results as normal "
-            "completion messages — there is nothing to steer or stop."
+            "No live subagents right now. Recent delegation units are listed separately: "
+            "completed does not mean delivered, so use delivery_state instead of guessing."
+            if delegations else
+            "No live subagents or retained delegation units for this conversation."
         )
     return payload
 
