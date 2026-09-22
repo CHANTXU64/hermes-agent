@@ -14,6 +14,8 @@ Covers the bundled plugin at ``plugins/disk-cleanup/``:
 
 import importlib
 import json
+import os
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -237,6 +239,87 @@ class TestProtectedDirsNeverRmtreed:
         assert att.exists(), "kanban attachments are task-managed, never auto-deleted"
         assert not scratch.exists(), "root-level scratch files are still cleaned up (control)"
         assert dg.load_tracked() == []
+
+    def test_scripts_test_files_are_never_tracked_or_deleted(self, _isolate_env):
+        """``scripts/`` holds operational scripts and their suites, not disposable artifacts.
+
+        Deleting by name alone destroyed 26 test files under ``scripts/tests/`` between
+        2026-07 and 2026-09, each one created and swept within the same turn.
+        """
+        pi = _load_plugin_init()
+        dg = _load_lib()
+        suite = _isolate_env / "scripts" / "tests" / "test_monitor_canonical.py"
+        suite.parent.mkdir(parents=True)
+        suite.write_text("x")
+        assert dg.guess_category(suite) is None
+
+        # A stale pre-fix entry must be dropped by re-validation instead of deleted.
+        dg.save_tracked([{"path": str(suite), "category": "test",
+                          "timestamp": datetime.now(timezone.utc).isoformat(), "size": 1}])
+        pi._on_post_tool_call(tool_name="write_file", args={"path": str(suite), "content": "x"},
+                              result="OK", task_id="t1", session_id="s_sc")
+        scratch = _isolate_env / "test_scratch.py"
+        scratch.write_text("x")
+        pi._on_post_tool_call(tool_name="write_file", args={"path": str(scratch), "content": "x"},
+                              result="OK", task_id="t1", session_id="s_sc")
+
+        pi._on_session_end(session_id="s_sc", completed=True, interrupted=False)
+
+        assert suite.exists(), "scripts/ test suites are authored work, never auto-deleted"
+        assert not scratch.exists(), "root-level scratch files are still cleaned up (control)"
+
+
+class TestGitTrackedFilesAreNeverDisposable:
+    """A file committed to git is authored work, whatever it is named."""
+
+    @staticmethod
+    def _init_repo(directory):
+        directory.mkdir(parents=True, exist_ok=True)
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+               "PATH": os.environ.get("PATH", "")}
+        subprocess.run(["git", "init", "-q"], cwd=directory, check=True, env=env)
+        return env
+
+    def test_tracked_test_file_outside_hermes_home_is_not_tracked(self, _isolate_env, tmp_path):
+        dg = _load_lib()
+        dg._git_repo_root.cache_clear()
+        repo = tmp_path / "repo"
+        env = self._init_repo(repo)
+        committed = repo / "test_suite.py"
+        committed.write_text("x")
+        subprocess.run(["git", "add", "test_suite.py"], cwd=repo, check=True, env=env)
+        subprocess.run(["git", "commit", "-qm", "add"], cwd=repo, check=True, env=env)
+
+        assert dg.guess_category(committed) is None
+
+    def test_untracked_sibling_in_same_repo_still_classifies(self, _isolate_env, tmp_path):
+        """Being inside a repo is not enough — only committed files are protected."""
+        dg = _load_lib()
+        dg._git_repo_root.cache_clear()
+        repo = _isolate_env / "cache" / "repo"
+        env = self._init_repo(repo)
+        tracked = repo / "test_kept.py"
+        tracked.write_text("x")
+        subprocess.run(["git", "add", "test_kept.py"], cwd=repo, check=True, env=env)
+        subprocess.run(["git", "commit", "-qm", "add"], cwd=repo, check=True, env=env)
+        untracked = repo / "test_throwaway.py"
+        untracked.write_text("x")
+
+        assert dg.guess_category(tracked) is None
+        assert dg.guess_category(untracked) == "temp", "uncommitted scratch still ages out"
+
+    def test_missing_git_binary_does_not_crash_classification(self, _isolate_env, monkeypatch):
+        """The hook runs after every tool call; a git failure must never raise."""
+        dg = _load_lib()
+        dg._git_repo_root.cache_clear()
+        monkeypatch.setattr(dg.subprocess, "run",
+                            lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("git")))
+        scratch = _isolate_env / "cache" / "scratch" / "test_x.py"
+        scratch.parent.mkdir(parents=True, exist_ok=True)
+        scratch.write_text("x")
+
+        assert dg.guess_category(scratch) == "temp"
 
 
 class TestStaleCronEntryMigration:

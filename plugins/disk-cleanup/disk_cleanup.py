@@ -13,6 +13,7 @@ import functools
 import json
 import logging
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -108,7 +109,10 @@ _NEVER_TRACK_TOP_LEVEL = frozenset({
     "profiles", "backups", "optional-skills", "workspace", "plans", "home",
     # Kanban task attachments/workspaces have their own lifecycle; test_* staging files there are
     # not disposable (#114552).
-    "kanban"})
+    "kanban",
+    # ``scripts/`` holds long-lived operational scripts and their test suites. Deleting a file
+    # there because it is named test_* destroyed 26 test files between 2026-07 and 2026-09.
+    "scripts"})
 
 
 def _is_protected_dir(p: Path) -> bool:
@@ -336,9 +340,47 @@ _TEST_PATTERNS = ("test_", "tmp_")
 _TEST_SUFFIXES = (".test.py", ".test.js", ".test.ts", ".test.md")
 
 
+@functools.lru_cache(maxsize=256)
+def _git_repo_root(directory: str) -> Optional[str]:
+    """Repository root for *directory*, or None when it is not inside a work tree.
+
+    Cached per directory: ``guess_category`` runs after every tool call, so this must
+    not spawn a git process per candidate path.
+    """
+    with contextlib.suppress(Exception):
+        proc = subprocess.run(
+            ["git", "-C", directory, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if proc.returncode == 0 and (root := proc.stdout.strip()):
+            return root
+    return None
+
+
+def _is_git_tracked(path: Path) -> bool:
+    """True when *path* is committed to a git repository.
+
+    A file under version control is authored work, never a disposable artifact — whatever
+    its name. Without this, ``scripts/tests/test_*.py`` style suites are deleted by name
+    alone; being tracked is the strongest available signal that a human meant to keep it.
+    """
+    with contextlib.suppress(Exception):
+        directory = str(path.parent)
+        if _git_repo_root(directory) is None:
+            return False
+        proc = subprocess.run(
+            ["git", "-C", directory, "ls-files", "--error-unmatch", "--", path.name],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        return proc.returncode == 0
+    return False
+
+
 def guess_category(path: Path) -> Optional[str]:
     """Category label for *path*, or None if we shouldn't track it (``post_tool_call`` hook)."""
     if not is_safe_path(path):
+        return None
+    if _is_git_tracked(path):
         return None
     with contextlib.suppress(ValueError):  # not under HERMES_HOME (/tmp/hermes-*) — name rules only
         rel = path.resolve().relative_to(get_hermes_home())
