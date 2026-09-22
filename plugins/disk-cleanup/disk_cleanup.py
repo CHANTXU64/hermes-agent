@@ -340,19 +340,29 @@ _TEST_PATTERNS = ("test_", "tmp_")
 _TEST_SUFFIXES = (".test.py", ".test.js", ".test.ts", ".test.md")
 
 
-@functools.lru_cache(maxsize=256)
+_GIT_REPO_ROOT_CACHE: dict[str, str] = {}
+_GIT_REPO_ROOT_CACHE_SIZE = 256
+
+
 def _git_repo_root(directory: str) -> Optional[str]:
     """Repository root for *directory*, or None when it is not inside a work tree.
 
-    Cached per directory: ``guess_category`` runs after every tool call, so this must
-    not spawn a git process per candidate path.
+    Successful lookups are cached because ``guess_category`` runs after every tool
+    call. Misses are deliberately not cached: a directory can become a repository
+    later in the same session, before cleanup revalidates the file.
     """
+    cached = _GIT_REPO_ROOT_CACHE.get(directory)
+    if cached is not None:
+        return cached
     with contextlib.suppress(Exception):
         proc = subprocess.run(
             ["git", "-C", directory, "rev-parse", "--show-toplevel"],
             capture_output=True, text=True, timeout=5, check=False,
         )
         if proc.returncode == 0 and (root := proc.stdout.strip()):
+            if len(_GIT_REPO_ROOT_CACHE) >= _GIT_REPO_ROOT_CACHE_SIZE:
+                _GIT_REPO_ROOT_CACHE.pop(next(iter(_GIT_REPO_ROOT_CACHE)))
+            _GIT_REPO_ROOT_CACHE[directory] = root
             return root
     return None
 

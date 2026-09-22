@@ -778,7 +778,7 @@ Intent / invariants:
 - The daily Hindsight attempt monitor takes a shared journal lock, preserves earlier valid attempts after a torn final JSONL line while emitting a dedicated high alert, and distinguishes lost scheduled workers, local interruption, unverified-reconciliation blocks, single-role visible-event gaps, severe total gaps, invalid confirmed-only repair scopes, write-not-started/rejected/uncertain, operation missing/pending/stalled/failed/unavailable/identity or metadata mismatch, extraction errors, Document identity/missing/unavailable, severe content loss, and exact-hash mismatch. Either blocked-candidate receipt produces one explicit alert without a second false “write not started” alert. A historical confirmed-only repair may bypass the live full-session size comparison only when its candidate audit proves one unchanged base hash, unique selected occurrence IDs, `old+inserted=candidate` message counts, and preservation of all old messages as an ordered subsequence; malformed or partial repair receipts fail closed. When an older unguarded attempt completed and the remote Document exactly matches its severe incomplete candidate, that same candidate alert carries the completed remote status so reports state that the remote Document was overwritten rather than calling the remote impact unknown. Remote success requires a completed `retain`/`batch_retain` operation with an explicit integer `extraction_errors_count=0`, matching operation and Document identities, and exact `Document.original_text` hash. A later `remote_write_started` generation supersedes older current-Document comparisons without claiming that the newer operation succeeded.
 - New writer Documents are owned by this attempt/operation/hash audit and are excluded from the retired provider-ledger/unmapped Document audit. Legacy StateDB and SQLite ledgers are opened with URI `mode=ro` plus `PRAGMA query_only=ON`; writer, remote Document audit, and legacy shared-bank audit all use the Bank loaded from the default profile's Hindsight config. StateDB is cross-evidence only and cannot substitute for the fsynced attempt intent.
 - Retain StateDB cross-evidence treats the configured `--state-db` as the entry point to one Hermes home: it matches the exact session ID against the default StateDB and every `profiles/*/state.db`, then passes that exact resolved database to both the request-cutoff snapshot and candidate exporter. A previously recorded `session_found=false` snapshot is rebuilt at its original cutoff when the exact session is now found, so fixing profile discovery restores the content check instead of merely suppressing the missing-session alert. It never chooses a recent session, combines profiles, changes the remote write target, or suppresses a session that is absent from every StateDB.
-- Candidate construction drops two classes of duplicate that neither Langfuse nor the remote side creates. (a) A model call that failed upstream (`output.error.error is true`, carrying `error_type`/`status_code`) and was followed by a successful retry carrying the same user text is skipped, so one real user event does not enter the candidate twice; a failed turn with NO successful retry keeps its user message, because that input is otherwise lost. (b) StateDB rows replayed immediately after a context-compression marker are collapsed to the earliest available copy of each assistant body. Deduplication is scoped to the replay block only — a global text-level dedup is forbidden, since it would delete genuinely repeated messages (the user saying `继续` twice, 14 hours apart, is two real events). Bodies that exist only inside a replay block are preserved rather than dropped.
+- Candidate construction drops two classes of duplicate only when the local evidence proves they are physical/retry copies. (a) A failed upstream model-call chain is collapsed only when the immediately following turn(s) carry the same cleaned user input, each begins within five minutes of the previous failure ending, and the contiguous chain ends in a successful answer. A distant or intervened same-text message is a new real event and is preserved; a failed turn with no proven retry also keeps its user message. (b) StateDB assistant rows are collapsed by the native durable `display_identity`, which is shared by active/compacted physical clones but differs for a later real message even when its visible text is identical. Legacy databases without that identity fail open: only exact `(body, timestamp)` physical copies collapse; marker position or body equality alone never deletes a row. This intentionally prefers a possible legacy duplicate over losing a real repeated message.
 - `/Users/robot/.hermes/scripts/check-hermes-hindsight.py` canonicalizes the Gateway routing header off StateDB user rows before comparing them against candidate text. StateDB stores the wrapper; the candidate stores the bare body, so without this the monitor reports phantom "missing user message" alerts. Body text that merely mentions the header without matching the full wrapper must not be truncated.
 - The writer/exporter are managed Fork components. The machine-local daily monitor and deployment configuration remain profile-local; all stay outside the retired Hindsight provider chain, `/new`, generic `/undo`, and CLI/TUI/Desktop lifecycles.
 
@@ -791,10 +791,16 @@ Merge decision:
 Verification:
 
 ```bash
-.venv/bin/python -m pytest -q -o 'addopts=' tests/fork/test_gateway_quick_command_session_env.py tests/fork/test_hindsight_retain_integrity.py tests/fork/test_langfuse_hindsight_export.py tests/cli/test_quick_commands.py
+.venv/bin/python -m pytest -q -o 'addopts=' tests/fork/test_gateway_quick_command_session_env.py tests/fork/test_hindsight_retain_integrity.py tests/fork/test_langfuse_hindsight_export.py tests/hermes_cli/test_quick_commands.py
 python3 -m py_compile gateway/run.py fork_features/hindsight_retain/retain_integrity.py fork_features/hindsight_retain/langfuse_hindsight_export.py tests/fork/test_gateway_quick_command_session_env.py tests/fork/test_hindsight_retain_integrity.py tests/fork/test_langfuse_hindsight_export.py /Users/robot/.hermes/scripts/check-hermes-hindsight.py /Users/robot/.hermes/scripts/hindsight_monitor_html.py
 git diff --check
 ```
+
+- 2026-09-22 data-integrity follow-up: the three Retain/Gateway files reported
+  `131 passed`, the canonical Quick Command file reported `8 passed`, and the disk-cleanup
+  file reported `36 passed`. The three new behavior regressions each failed against the
+  corresponding unsafe behavior before turning green. Ruff, Python compilation, and
+  `git diff --check` passed. No Gateway restart, commit, Push, or remote write was performed.
 
 - Upstream status: fork-only
 - Last validated: upstream `64a6f42cb38def7ad6524bdfe640a16997c88760`; Fork working tree based on `4e00fb68f5fe583cb7c44a124fa59c91bf40aa0f` (uncommitted)
@@ -3216,8 +3222,8 @@ Source boundary: logical-only
 Files:
 
 - `plugins/disk-cleanup/disk_cleanup.py` — adds `"scripts"` to `_NEVER_TRACK_TOP_LEVEL`;
-  adds `_git_repo_root()` (per-directory `lru_cache`) and `_is_git_tracked()`, called as the
-  second guard in `guess_category()` right after `is_safe_path()`.
+  adds `_git_repo_root()` (bounded positive-only per-directory cache) and `_is_git_tracked()`,
+  called as the second guard in `guess_category()` right after `is_safe_path()`.
 - `tests/plugins/test_disk_cleanup_plugin.py` — `test_scripts_test_files_are_never_tracked_or_deleted`
   plus the `TestGitTrackedFilesAreNeverDisposable` class.
 
@@ -3242,9 +3248,10 @@ Invariants that must survive a merge:
 - An uncommitted `test_*` file still classifies normally — being *inside* a repo is not
   enough, only being *tracked* is. Cleanup must keep working for genuine scratch files.
 - `_is_git_tracked()` runs on the `post_tool_call` hook, i.e. after every tool call. It must
-  never raise (a missing/broken `git` returns False) and must not spawn a process per
-  candidate — hence the directory-level cache. Removing the cache is a performance
-  regression, not a simplification.
+  never raise (a missing/broken `git` returns False). Successful repository-root lookups are
+  cached so multiple candidates in one worktree do not each run `git rev-parse`; misses are
+  deliberately not cached, because the same directory may become a repository before cleanup
+  revalidates it. A file committed after its first classification must survive `quick()`.
 
 Merge decision:
 
@@ -3261,7 +3268,8 @@ Verification:
 scripts/run_tests.sh tests/plugins/test_disk_cleanup_plugin.py
 ```
 
-35 tests pass. The 4 new tests were confirmed red against the unpatched plugin.
+36 tests pass. The authored-work regressions were confirmed red against the respective
+unpatched behavior before turning green.
 
 Upstream status: fork-only.
 

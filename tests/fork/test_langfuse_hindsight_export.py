@@ -209,6 +209,55 @@ def test_failed_turn_retried_successfully_is_not_duplicated(tmp_path):
     ]
 
 
+def test_distant_same_text_success_does_not_erase_earlier_failed_event(tmp_path):
+    """Equal text weeks later is a new user event, not proof of a retry."""
+    module = load_script_module(tmp_path)
+    session_id = "session-distant-repeat"
+    failed_turn = {
+        "id": "turn-failed-old",
+        "type": "CHAIN",
+        "name": "Hermes turn",
+        "startTime": "2026-09-01T00:00:00Z",
+        "endTime": "2026-09-01T00:00:05Z",
+        "input": {"role": "user", "content": "继续"},
+        "output": {
+            "error": {
+                "error": True,
+                "error_type": "APIConnectionError",
+                "retryable": True,
+            }
+        },
+    }
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id},
+                "observations": [
+                    failed_turn,
+                    hermes_turn(
+                        "turn-success-later",
+                        "2026-09-21T00:00:00Z",
+                        "2026-09-21T00:00:05Z",
+                        "继续",
+                        "已继续。",
+                    ),
+                ],
+            }
+        ],
+    }
+
+    candidate = module.build_candidate_document(export, session_id)
+    user_messages = [
+        message["content"]
+        for turn in candidate["turns"]
+        for message in turn
+        if message["role"] == "user"
+    ]
+
+    assert user_messages == ["User: 继续", "User: 继续"]
+
+
 def test_failed_turn_without_retry_keeps_the_user_message(tmp_path):
     """An unanswered failure is the only record of that message — keep it.
 
@@ -1523,7 +1572,8 @@ def _create_reconciliation_state_db(path: Path, session_id: str) -> None:
                 compacted INTEGER NOT NULL DEFAULT 0,
                 display_kind TEXT,
                 platform_message_id TEXT,
-                display_order INTEGER
+                display_order INTEGER,
+                display_identity BLOB
             );
             """
         )
@@ -1605,9 +1655,9 @@ def test_state_reconciliation_restores_real_user_before_continuity_answer(tmp_pa
 
 
 def test_state_reconciliation_drops_compaction_replayed_assistant_copies(tmp_path):
-    """A compaction block replays earlier assistant text with fresh timestamps.
+    """Durable identities collapse compaction copies despite fresh timestamps.
 
-    The (body, timestamp) dedupe key cannot see those copies, so each compaction
+    The fallback (body, timestamp) key cannot see those copies, so each compaction
     used to add another copy of the same reply to the candidate. Regression for the
     FIP session that exported one reply 5 times and another 8 times.
     """
@@ -1622,32 +1672,33 @@ def test_state_reconciliation_drops_compaction_replayed_assistant_copies(tmp_pat
     )
     rows = [
         # Real conversation.
-        (1, "user", "第一个问题", 1000, 1),
-        (2, "assistant", "第一个回答", 1001, 2),
-        (3, "user", "第二个问题", 1002, 3),
-        (4, "assistant", "第二个回答", 1003, 4),
-        # First compaction: marker, then the replayed prefix at fresh timestamps.
-        (5, "assistant", marker, 1004, 5),
-        (6, "user", "第一个问题", 1004.1, 6),
-        (7, "assistant", "第一个回答", 1004.2, 7),
-        (8, "user", "第二个问题", 1004.3, 8),
-        (9, "assistant", "第二个回答", 1004.4, 9),
-        # Second compaction replays the same prefix again.
-        (10, "assistant", marker, 1005, 10),
-        (11, "user", "第一个问题", 1005.1, 11),
-        (12, "assistant", "第一个回答", 1005.2, 12),
-        (13, "user", "第二个问题", 1005.3, 13),
-        (14, "assistant", "第二个回答", 1005.4, 14),
+        (1, "user", "第一个问题", 1000, 1, b"user-1"),
+        (2, "assistant", "第一个回答", 1001, 2, b"assistant-1"),
+        (3, "user", "第二个问题", 1002, 3, b"user-2"),
+        (4, "assistant", "第二个回答", 1003, 4, b"assistant-2"),
+        # First compaction: physical copies retain their durable identities.
+        (5, "assistant", marker, 1004, 5, b"marker-1"),
+        (6, "user", "第一个问题", 1004.1, 6, b"user-1"),
+        (7, "assistant", "第一个回答", 1004.2, 7, b"assistant-1"),
+        (8, "user", "第二个问题", 1004.3, 8, b"user-2"),
+        (9, "assistant", "第二个回答", 1004.4, 9, b"assistant-2"),
+        # Second compaction replays the same logical messages again.
+        (10, "assistant", marker, 1005, 10, b"marker-2"),
+        (11, "user", "第一个问题", 1005.1, 11, b"user-1"),
+        (12, "assistant", "第一个回答", 1005.2, 12, b"assistant-1"),
+        (13, "user", "第二个问题", 1005.3, 13, b"user-2"),
+        (14, "assistant", "第二个回答", 1005.4, 14, b"assistant-2"),
     ]
     with sqlite3.connect(state_db) as conn:
-        for row_id, role, content, ts, order in rows:
+        for row_id, role, content, ts, order, identity in rows:
             conn.execute(
                 """
                 INSERT INTO messages (
-                    id, session_id, role, content, timestamp, display_order
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    id, session_id, role, content, timestamp, display_order,
+                    display_identity
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (row_id, session_id, role, content, ts, order),
+                (row_id, session_id, role, content, ts, order, identity),
             )
 
     reconciliation = module.load_state_reconciliation(session_id, state_db)
@@ -1661,11 +1712,54 @@ def test_state_reconciliation_drops_compaction_replayed_assistant_copies(tmp_pat
     assert assistant_bodies == ["第一个回答", "第二个回答"]
 
 
+def test_state_reconciliation_keeps_real_repeat_after_compaction_replay(tmp_path):
+    """A new reply after replay survives even when its text matches older replies."""
+    module = load_script_module(tmp_path)
+    session_id = "session-repeat-after-compaction"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    marker = (
+        "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
+        "into the summary below."
+    )
+    rows = [
+        (1, "user", "第一次问", 1000, 1, b"user-1"),
+        (2, "assistant", "好的", 1001, 2, b"assistant-1"),
+        (3, "assistant", marker, 1002, 3, b"marker-1"),
+        (4, "user", "第一次问", 1002.1, 4, b"user-1"),
+        (5, "assistant", "好的", 1002.2, 5, b"assistant-1"),
+        (6, "user", "第二次问", 1003, 6, b"user-2"),
+        (7, "assistant", "好的", 1004, 7, b"assistant-2"),
+    ]
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, timestamp, display_order,
+                display_identity
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (row_id, session_id, role, content, ts, order, identity)
+                for row_id, role, content, ts, order, identity in rows
+            ],
+        )
+
+    reconciliation = module.load_state_reconciliation(session_id, state_db)
+    assistant_bodies = [
+        event["content"]
+        for event in reconciliation["events"]
+        if event["source_kind"] == "visible_assistant"
+    ]
+
+    assert assistant_bodies == ["好的", "好的"]
+
+
 def test_state_reconciliation_keeps_genuine_repeat_outside_compaction(tmp_path):
-    """Deduping must stay scoped to replay blocks, never global text matching.
+    """Deduping must use physical identity, never global text matching.
 
     A user can legitimately get the same short answer twice in one session; only
-    copies inside a compaction replay block are duplicates.
+    rows proven to be physical copies may collapse.
     """
     module = load_script_module(tmp_path)
     session_id = "session-genuine-repeat"

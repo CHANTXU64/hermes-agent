@@ -283,7 +283,7 @@ class TestGitTrackedFilesAreNeverDisposable:
 
     def test_tracked_test_file_outside_hermes_home_is_not_tracked(self, _isolate_env, tmp_path):
         dg = _load_lib()
-        dg._git_repo_root.cache_clear()
+        dg._GIT_REPO_ROOT_CACHE.clear()
         repo = tmp_path / "repo"
         env = self._init_repo(repo)
         committed = repo / "test_suite.py"
@@ -293,10 +293,31 @@ class TestGitTrackedFilesAreNeverDisposable:
 
         assert dg.guess_category(committed) is None
 
+    def test_file_committed_after_initial_classification_survives_quick(self, _isolate_env):
+        """A negative repo lookup must not outlive a later ``git init`` + commit."""
+        dg = _load_lib()
+        dg._GIT_REPO_ROOT_CACHE.clear()
+        repo = _isolate_env / "late-repo"
+        repo.mkdir()
+        committed = repo / "test_authored.py"
+        committed.write_text("x")
+
+        assert dg.guess_category(committed) == "test"
+        assert dg.track(str(committed), "test", silent=True) is True
+
+        env = self._init_repo(repo)
+        subprocess.run(["git", "add", "test_authored.py"], cwd=repo, check=True, env=env)
+        subprocess.run(["git", "commit", "-qm", "add"], cwd=repo, check=True, env=env)
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert committed.exists(), "a file committed after classification is authored work"
+
     def test_untracked_sibling_in_same_repo_still_classifies(self, _isolate_env, tmp_path):
         """Being inside a repo is not enough — only committed files are protected."""
         dg = _load_lib()
-        dg._git_repo_root.cache_clear()
+        dg._GIT_REPO_ROOT_CACHE.clear()
         repo = _isolate_env / "cache" / "repo"
         env = self._init_repo(repo)
         tracked = repo / "test_kept.py"
@@ -312,7 +333,7 @@ class TestGitTrackedFilesAreNeverDisposable:
     def test_missing_git_binary_does_not_crash_classification(self, _isolate_env, monkeypatch):
         """The hook runs after every tool call; a git failure must never raise."""
         dg = _load_lib()
-        dg._git_repo_root.cache_clear()
+        dg._GIT_REPO_ROOT_CACHE.clear()
         monkeypatch.setattr(dg.subprocess, "run",
                             lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("git")))
         scratch = _isolate_env / "cache" / "scratch" / "test_x.py"
