@@ -1766,6 +1766,15 @@ class GatewayTurnMixin:
             # Conversation boundary: the funnel clears every conversation-scoped per-session dict.
             self._clear_conversation_scope(session_key, reason="compression_exhausted_reset")
             if new_entry is not None:
+                from fork_features.request_fork.session_recovery import restore_reset_context
+
+                restored = await restore_reset_context(
+                    self.async_session_store, old_session_id=session_entry.session_id,
+                    new_session_id=new_entry.session_id,
+                    platform=source.platform.value if source.platform else "",
+                )
+                if restored is False:
+                    response = (response or "") + "\n\n⚠️ Session recovery context could not be saved."
                 # Re-point the Telegram topic binding at the fresh session, or the binding-heal walk
                 # switches the next message back onto the bloated child and re-triggers exhaustion
                 # forever. No-op on non-topic lanes.

@@ -128,44 +128,11 @@ class CompressionLifecycle:
             logger.warning("on_compression_prepare_commit hook failed", exc_info=True)
             return None
 
-        prepared: Optional[dict[str, Any]] = None
-        for result in results or []:
-            if not isinstance(result, dict):
-                continue
-            source = str(result.get("source") or "").strip()
-            context = result.get("context")
-            if (
-                not source
-                or len(source) > 64
-                or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for char in source)
-                or not isinstance(context, str)
-                or not context.strip()
-            ):
-                logger.warning("Ignoring invalid persistent compression context result")
-                continue
-            context = context.strip()
-            if len(context) > _MAX_PERSISTENT_COMPRESSION_CONTEXT_CHARS:
-                logger.warning(
-                    "Ignoring oversized persistent compression context from source=%s chars=%d limit=%d",
-                    source, len(context), _MAX_PERSISTENT_COMPRESSION_CONTEXT_CHARS,
-                )
-                continue
-            candidate = {
-                "role": "user",
-                "content": (
-                    '<hermes-runtime-context user-authored="false" '
-                    f'source="{source}">\n{context}\n</hermes-runtime-context>'
-                ),
-                "display_kind": "hidden",
-            }
-            if prepared is None:
-                prepared = candidate
-                self.persistent_context_source = source
-            else:
-                logger.warning(
-                    "Ignoring additional persistent compression context from source=%s; only one row is supported",
-                    source,
-                )
+        from .session_recovery import recovery_context_message
+
+        prepared, self.persistent_context_source = recovery_context_message(
+            results, max_context_chars=_MAX_PERSISTENT_COMPRESSION_CONTEXT_CHARS,
+        )
         return prepared
 
     def set_outcome(self, outcome: str, reason: str = "") -> None:

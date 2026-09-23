@@ -2670,6 +2670,9 @@ Upstream status: fork-only.
 
 ### 29. Provider-native long-task continuity Request Fork
 
+- ID: `provider-native-long-task-continuity-request-fork`
+- Source boundary: logical-only
+
 Status: active fork maintenance; current persistent compression-boundary delivery
 is locally verified but not yet loaded or live-verified in the default Gateway.
 The earlier request-local delivery was previously live-verified and is now
@@ -2687,6 +2690,9 @@ Files:
 - `fork_features/request_fork/__init__.py`
 - `fork_features/request_fork/compression_lifecycle.py`
 - `fork_features/request_fork/prepared_request.py`
+- `fork_features/request_fork/session_recovery.py` — shared bounded recovery-envelope selection and verified reset-context persistence.
+- `gateway/run_turn.py` — thin exhaustion-reset call with exact old/new session IDs.
+- `tests/fork_features/test_session_recovery.py` — recovery acceptance, readback and disabled-plugin contracts.
 - `agent/conversation_loop.py`
 - `agent/conversation_compression.py`
 - `agent/conversation_compression_manual.py` — upstream manual-compression entry; Fork adds an
@@ -2736,6 +2742,23 @@ Files:
 - `docs/LOCAL_MODIFICATIONS.md`
 
 What changed:
+
+- Same-task exhaustion recovery reuses `on_session_reset` with the explicit
+  `compression_exhausted` reason and exact old/new IDs. It does not copy the
+  oversized history and does not weaken manual-new/subagent isolation. The
+  standalone plugin owns durable task identity and retry state; the host owns
+  session reset, bounded hidden-row persistence and readback.
+- `on_session_reset_complete` acknowledges only a recovery row found in the
+  durable transcript. A queued/failed write is not delivery. The plugin retains
+  retry state on rejection/failure and recognizes an already-persisted complete
+  recovery envelope after a lost notification rather than adding a duplicate.
+- Checkpoint generation and task recovery are separate: an unavailable current
+  model/request snapshot must not suppress restoration of an accepted task at a
+  successful compression boundary. A valid task update survives a later abort;
+  the next checkpoint receives that saved revision.
+- Recovery contracts are exercised both by `tests/fork_features/test_session_recovery.py`
+  and the standalone plugin's real temporary Gateway/PluginManager/SQLite probe;
+  existing compression/overflow/CLI tests remain part of the maintenance gate.
 
 - `fork_features/request_fork/compression_lifecycle.py` owns the request snapshot,
   hook payload validation and pending outer-commit notification as one lifecycle.
