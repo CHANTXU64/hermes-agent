@@ -74,6 +74,82 @@ class TestHandleResumeCommand:
     """Tests for GatewayRunner._handle_resume_command."""
 
     @pytest.mark.asyncio
+    async def test_numeric_resume_with_real_telegram_session_store(self, tmp_path, monkeypatch):
+        """The production store/facade must support the Telegram resume route check."""
+        from gateway.config import GatewayConfig
+        from gateway.session import AsyncSessionStore, SessionStore
+        from hermes_state import AsyncSessionDB, SessionDB
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        event = _make_event(text="/resume 1")
+        store = SessionStore(tmp_path / "sessions", GatewayConfig())
+        db = cast(SessionDB, store._db)
+        assert db is not None
+        try:
+            previous = store.get_or_create_session(event.source)
+            db.set_session_title(previous.session_id, "Previous work")
+            current = store.reset_session(previous.session_key)
+            assert current is not None
+
+            runner = _make_runner(session_db=None, event=event)
+            runner.session_store = store
+            runner._async_session_store = AsyncSessionStore(store)
+            runner._session_db = AsyncSessionDB(db)
+
+            result = await runner._handle_resume_command(event)
+
+            assert "Resumed" in result
+            assert "Previous work" in result
+            assert store.peek_session_id(current.session_key) == previous.session_id
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target_running", [False, True])
+    async def test_cross_bot_resume_with_real_store(self, tmp_path, monkeypatch, target_running):
+        """Only idle targets move to the receiving bot, without losing their transcript."""
+        from gateway.config import GatewayConfig
+        from gateway.session import AsyncSessionStore, SessionStore
+        from hermes_state import AsyncSessionDB, SessionDB
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = SessionStore(tmp_path / "sessions", GatewayConfig())
+        db = cast(SessionDB, store._db)
+        assert db is not None
+        try:
+            primary_event = _make_event(text="/resume Cross bot work")
+            previous = store.get_or_create_session(primary_event.source)
+            db.set_session_title(previous.session_id, "Cross bot work")
+            db.append_message(previous.session_id, "user", "Important context")
+
+            named_event = _make_event(text="/resume Cross bot work")
+            named_event.source.account_id = "monika"
+            current = store.get_or_create_session(named_event.source)
+            runner = _make_runner(session_db=None, event=named_event)
+            runner.session_store = store
+            runner._async_session_store = AsyncSessionStore(store)
+            runner._session_db = AsyncSessionDB(db)
+            if target_running:
+                runner._running_agents[previous.session_key] = object()
+
+            result = await runner._handle_resume_command(named_event)
+
+            if target_running:
+                assert "still running" in result.lower()
+                assert store.peek_session_id(previous.session_key) == previous.session_id
+                assert store.peek_session_id(current.session_key) == current.session_id
+            else:
+                assert "Resumed" in result
+                assert store.peek_session_id(current.session_key) == previous.session_id
+                assert store.peek_session_id(previous.session_key) is None
+                assert any(
+                    msg.get("content") == "Important context"
+                    for msg in store.load_transcript(previous.session_id)
+                )
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
     async def test_no_session_db(self):
         """Returns error when session database is unavailable."""
         runner = _make_runner(session_db=None)

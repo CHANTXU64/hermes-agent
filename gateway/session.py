@@ -1302,6 +1302,17 @@ class SessionStore(
             self._ensure_loaded_locked()
             return next((e for e in self._entries.values() if e.session_id == session_id), None)
 
+    def routing_keys_for_session_id(self, session_id: str) -> List[str]:
+        """Return every live route pointing at a session (used by Telegram /resume)."""
+        if not session_id:
+            return []
+        with self._lock:
+            self._ensure_loaded_locked()
+            return sorted(
+                key for key, entry in self._entries.items()
+                if entry.session_id == session_id
+            )
+
     def lookup_by_session_key(self, session_key: str) -> Optional[SessionEntry]:
         """Return the persisted routing entry for an exact session key."""
         if not session_key:

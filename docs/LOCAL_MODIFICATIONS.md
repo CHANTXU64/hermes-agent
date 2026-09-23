@@ -1272,7 +1272,9 @@ True upstream host seams:
 - `gateway/session.py`, `gateway/platforms/base.py`, and
   `plugins/platforms/telegram/adapter.py` preserve account provenance from an
   inbound Telegram event through runtime routing and the durable account-aware
-  session key; the account field itself remains runtime-only.
+  session key; the account field itself remains runtime-only. `SessionStore`
+  exposes the live routing keys for a session ID so `/resume` can check other
+  bots before switching or transferring a session.
 - `gateway/authz_mixin.py` asks the Fork runtime for the exact named adapter and
   restores post-restart account provenance from the trusted durable key; it
   fails closed while that configured bot is disconnected.
@@ -1331,6 +1333,9 @@ Behavior contract:
   authorization, and normal replies return through the originating bot.
 - Cross-bot `/resume` transfers only an idle transcript to the current bot route;
   a running target remains rejected.
+- Telegram `/resume` through the real async `SessionStore` facade works for both
+  numbered same-bot resumes and cross-bot transfers, including after route
+  lookup; mock-only Store tests do not protect this integration seam.
 - A named bot enters only its own fatal/reconnect slot and never replaces,
   disconnects, or populates the primary Telegram retry slot.
 - Named bots remain ordinary DM sessions; Telegram DM Topics and per-account
