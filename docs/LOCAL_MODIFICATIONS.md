@@ -328,7 +328,7 @@ Verification after the 2026-08-30 boundary migration:
 Canonical focused gate, rerun on 2026-08-31:
 
 ```bash
-scripts/run_tests.sh tests/fork_features/test_hindsight_recall_cache.py tests/fork/test_hindsight_provider_regressions.py tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/run_agent/test_memory_sync_interrupted.py -q
+scripts/run_tests.sh tests/fork_features/test_hindsight_recall_cache.py tests/fork/test_hindsight_provider_regressions.py tests/plugins/memory/test_hindsight_provider.py tests/agent/test_memory_session_switch.py tests/agent/test_memory_sync_interrupted.py -q
 ```
 
 - Current canonical result: `84 passed`, `0 failed` across `5` files.
@@ -1207,7 +1207,7 @@ Verification after the 2026-07-22 restoration:
 - Current canonical focused command, rerun on 2026-08-31:
 
   ```bash
-  scripts/run_tests.sh tests/fork_features/test_request_context_policy.py tests/fork_features/test_long_task_continuity_recovery.py tests/agent/test_api_content_sidecar.py tests/agent/test_model_metadata.py tests/agent/test_gateway_turn_sidecar.py tests/agent/transports/test_codex_transport.py tests/gateway/test_replay_entry_fields.py tests/run_agent/test_run_agent_codex_responses.py tests/run_agent/test_codex_app_server_integration.py tests/agent/test_codex_request_only_memory_context.py -q
+  scripts/run_tests.sh tests/fork_features/test_request_context_policy.py tests/fork_features/test_long_task_continuity_recovery.py tests/agent/test_api_content_sidecar.py tests/agent/test_model_metadata.py tests/agent/test_gateway_turn_sidecar.py tests/agent/transports/test_codex_transport.py tests/gateway/test_replay_entry_fields.py tests/agent/test_run_agent_codex_responses.py tests/agent/test_codex_app_server_integration.py tests/agent/test_codex_request_only_memory_context.py -q
   ```
 
   Result: `345 passed`, `0 failed` across `10` files.
@@ -2043,8 +2043,7 @@ Merge protection:
 Verification:
 
 ```bash
-./venv/bin/python -m pytest -q -o 'addopts=' tests/agent/test_prompt_builder.py tests/agent/test_memory_write_bridge.py tests/fork/test_memory_changelog_governance.py tests/tools/test_memory_tool.py tests/tools/test_memory_tool_schema.py tests/tools/test_write_approval.py tests/run_agent/test_run_agent.py::TestExecuteToolCalls tests/run_agent/test_background_review_cache_parity.py tests/run_agent/test_background_review_toolset_restriction.py tests/test_background_review_list_shapes.py tests/test_background_review_session_isolation.py
-./venv/bin/python -m pytest -q -o 'addopts=' tests/fork_features/test_memory_governance_boundary.py
+scripts/run_tests.sh tests/agent/test_prompt_builder.py tests/agent/test_memory_write_bridge.py tests/fork/test_memory_changelog_governance.py tests/tools/test_memory_tool.py tests/tools/test_memory_tool_schema.py tests/tools/test_write_approval.py tests/agent/test_run_agent.py tests/agent/test_background_review_cache_parity.py tests/agent/test_background_review_toolset_restriction.py tests/agent/test_background_review_list_shapes.py tests/hermes_state/test_background_review_session_isolation.py tests/fork_features/test_memory_governance_boundary.py -q
 ```
 
 Feature docs: `docs/chantxu64/memory-change-governance/README.md`
@@ -2292,8 +2291,8 @@ Files:
 - `tests/tools/test_delegate_request_overrides.py`
 - `tests/tools/test_delegate_output_schema.py`
 - Native argument forwarding is covered by `tests/tools/test_delegate.py` and
-  `tests/tools/test_delegate_request_overrides.py`; the formerly listed
-  `tests/tools/test_delegate_task_native_args.py` does not exist and is not a runnable gate.
+  `tests/tools/test_delegate_request_overrides.py`; the formerly listed standalone
+  native-argument test file does not exist and is not a runnable gate.
 - `website/docs/user-guide/features/delegation.md`
 - `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features/delegation.md`
 - `docs/chantxu64/delegate-per-call-routing/README.md`
@@ -2835,8 +2834,8 @@ What changed:
   Host-rejected delivery remains eligible for one-time request retry,
   acknowledged only by the matching successful API request; a later accepted
   compression clears older pending deliveries without clearing newer ones.
-  The plugin's `tests/test_delivery_bounds.py` and `tests/test_index_fallback.py`
-  cover these host/plugin contracts.
+  The standalone plugin's `test_delivery_bounds.py` and `test_index_fallback.py`
+  cover these host/plugin contracts in that plugin repository.
 - The central real-user predicate and both user-message merge paths recognize the
   stable runtime-context envelope, so the synthetic row is not treated as user
   evidence or merged into genuine user text. Gateway voice and media current-turn
@@ -2856,8 +2855,9 @@ What changed:
   require evidence-based updates to affected older facts when progress changes,
   preserving unresolved acceptance and valid constraints. This is model guidance,
   not a keyword-based contradiction validator or a new update schedule; empty
-  lists alone do not imply missing tasks. Plugin `tests/test_retry_context.py`
-  covers prompt delivery and the real Fork transport boundary with offline replies.
+  lists alone do not imply missing tasks. The standalone plugin's
+  `test_retry_context.py` covers prompt delivery and the real Fork transport boundary
+  with offline replies in that plugin repository.
 - Every successful Request Fork call emits one fail-open WARNING usage line keyed by
   `request_id`, with total prompt tokens, uncached input, cache read/write tokens,
   and cache-hit percentage. This keeps checkpoint cache behavior locally auditable

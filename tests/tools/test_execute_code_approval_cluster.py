@@ -468,6 +468,7 @@ def test_terminal_public_entry_passes_effective_cwd_and_script_reader_to_guard(
         env_type="local",
         cwd=str(tmp_path / "session-cwd"),
         effective_task_id="task",
+        effective_timeout=30.0,
         promoted_from_foreground_timeout=None,
     )
     monkeypatch.setattr(terminal_module, "_plan_execution", lambda *a, **k: plan)
@@ -500,6 +501,7 @@ def test_terminal_remote_entry_reads_script_from_execution_environment(monkeypat
         env_type="ssh",
         cwd="/remote/session",
         effective_task_id="task",
+        effective_timeout=30.0,
         promoted_from_foreground_timeout=None,
     )
 

@@ -57,6 +57,9 @@ def responses_agent(tmp_path, monkeypatch):
         "hermes_cli.plugins.invoke_hook",
         lambda hook, **kw: [{"context": POLICY}] if hook == "pre_llm_call" else [],
     )
+    # Titling is not under test; its daemon thread would outlive the turn holding ``db`` and race
+    # the close below (a cross-thread sqlite reopen at interpreter shutdown crashed CI: #113186).
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *args, **kwargs: None)
 
     def respond(kwargs, **unused):
         captured.append(deepcopy(kwargs))
@@ -133,7 +136,11 @@ def test_full_builder_to_responses_keeps_cross_turn_prefix(responses_agent, tmp_
     assert result["completed"]
     assert len(captured) == 3
     next_input = captured[2]["input"]
-    assert next_input[:len(continuation)] == continuation
+    # Fork request context is deliberately volatile: replay restores the clean
+    # historical user turn while preserving provider-native continuation items.
+    expected_history = deepcopy(continuation)
+    expected_history[0]["content"] = current
+    assert next_input[:len(expected_history)] == expected_history
     assert not any("api_content" in item or "timestamp" in item for item in next_input)
     assert any(item.get("encrypted_content") == "synthetic-reasoning" for item in next_input)
     assert any(item.get("phase") == "final_answer" for item in next_input)

@@ -183,9 +183,8 @@ class TestGatewayHistoryBuildDropsSidecar:
 
 
 
-def test_gateway_history_keeps_sidecar_only_assistant_row():
-    """A reasoning-only clean stop persists content="" with the promoted reply in ``api_content``
-    (agent/turn_final_response.py); the gateway rebuild must replay it, not drop it (user->user)."""
+def test_gateway_history_drops_sidecar_without_dropping_assistant_row():
+    """Legacy ``api_content`` is request-only, while the durable assistant row and reasoning survive replay."""
     from gateway.run import _build_gateway_agent_history
 
     history = [
@@ -195,5 +194,5 @@ def test_gateway_history_keeps_sidecar_only_assistant_row():
     ]
     agent_history, _ = _build_gateway_agent_history(history)
     assert [m["role"] for m in agent_history] == ["user", "assistant", "user"]
-    assert agent_history[1]["api_content"] == "The answer is 4."
+    assert "api_content" not in agent_history[1]
     assert agent_history[1]["reasoning"] == "The answer is 4."

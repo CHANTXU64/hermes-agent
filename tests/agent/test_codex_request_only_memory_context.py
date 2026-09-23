@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from tests.run_agent.test_run_agent_codex_responses import _build_agent
+from tests.agent.test_run_agent_codex_responses import _build_agent
 
 
 class _MemoryManager:
@@ -49,6 +49,20 @@ def _final_response(text: str):
     )
 
 
+def _input_text(item: dict) -> str:
+    """Flatten a Responses API input item's typed text parts for assertions."""
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in {"input_text", "output_text"}
+        )
+    return ""
+
+
 def test_current_recall_uses_developer_after_clean_user(monkeypatch):
     agent = _build_agent(monkeypatch)
     captured = {}
@@ -66,12 +80,13 @@ def test_current_recall_uses_developer_after_clean_user(monkeypatch):
     input_items = captured["input"]
     user_index = next(
         i for i, item in enumerate(input_items)
-        if item.get("role") == "user" and item.get("content") == prompt
+        if item.get("role") == "user" and _input_text(item) == prompt
     )
     developer = input_items[user_index + 1]
     assert developer["role"] == "developer"
-    assert developer["content"].startswith("<memory-context>")
-    assert f"remembered fact for {prompt}" in developer["content"]
+    developer_text = _input_text(developer)
+    assert developer_text.startswith("<memory-context>")
+    assert f"remembered fact for {prompt}" in developer_text
     assert result["messages"][0]["content"] == prompt
     assert "<memory-context>" not in json.dumps(result["messages"])
 
@@ -100,15 +115,14 @@ def test_lcm_request_context_precedes_memory_in_one_developer_after_clean_user(
     assert result["completed"] is True
     input_items = captured["input"]
     user_index = next(i for i, item in enumerate(input_items) if item.get("role") == "user")
-    assert input_items[user_index]["content"] == prompt
+    assert _input_text(input_items[user_index]) == prompt
     developer_items = [item for item in input_items if item.get("role") == "developer"]
     assert len(developer_items) == 1
     developer = input_items[user_index + 1]
     assert developer["role"] == "developer"
-    assert developer["content"].index(lcm_policy) < developer["content"].index(
-        "<memory-context>"
-    )
-    assert f"remembered fact for {prompt}" in developer["content"]
+    developer_text = _input_text(developer)
+    assert developer_text.index(lcm_policy) < developer_text.index("<memory-context>")
+    assert f"remembered fact for {prompt}" in developer_text
     assert lcm_policy not in json.dumps(result["messages"])
 
 
@@ -134,10 +148,10 @@ def test_ordinary_plugin_context_stays_on_openai_user_request_copy(monkeypatch):
     assert result["completed"] is True
     input_items = captured["input"]
     user_index = next(i for i, item in enumerate(input_items) if item.get("role") == "user")
-    assert input_items[user_index]["content"] == prompt + "\n\n" + plugin_context
+    assert _input_text(input_items[user_index]) == prompt + "\n\n" + plugin_context
     developer = input_items[user_index + 1]
     assert developer["role"] == "developer"
-    assert plugin_context not in developer["content"]
+    assert plugin_context not in _input_text(developer)
     assert plugin_context not in json.dumps(result["messages"])
 
 
@@ -199,11 +213,10 @@ def test_current_recall_developer_position_is_stable_across_tool_loop(monkeypatc
     )
     assert developer_index == user_index + 1
     assert developer_index < function_call_index < function_output_index
-    assert second_input[user_index]["content"] == prompt
-    assert second_input[developer_index]["content"].index(lcm_policy) < second_input[
-        developer_index
-    ]["content"].index("<memory-context>")
-    assert f"remembered fact for {prompt}" in second_input[developer_index]["content"]
+    assert _input_text(second_input[user_index]) == prompt
+    developer_text = _input_text(second_input[developer_index])
+    assert developer_text.index(lcm_policy) < developer_text.index("<memory-context>")
+    assert f"remembered fact for {prompt}" in developer_text
     assert second_input[-1].get("role") != "developer"
 
 
@@ -240,11 +253,12 @@ def test_next_turn_drops_prior_recall_and_keeps_only_current_developer(monkeypat
     first_input = captured[0]["input"]
     first_user_index = next(
         i for i, item in enumerate(first_input)
-        if item.get("role") == "user" and item.get("content") == "first turn"
+        if item.get("role") == "user" and _input_text(item) == "first turn"
     )
     assert first_input[first_user_index + 1]["role"] == "developer"
-    assert "LCM-POLICY-first turn" in first_input[first_user_index + 1]["content"]
-    assert "remembered fact for first turn" in first_input[first_user_index + 1]["content"]
+    first_developer_text = _input_text(first_input[first_user_index + 1])
+    assert "LCM-POLICY-first turn" in first_developer_text
+    assert "remembered fact for first turn" in first_developer_text
 
     second_input = captured[1]["input"]
     serialized_second = json.dumps(second_input)
@@ -256,11 +270,12 @@ def test_next_turn_drops_prior_recall_and_keeps_only_current_developer(monkeypat
     assert len(developer_indices) == 1
     second_user_index = next(
         i for i, item in enumerate(second_input)
-        if item.get("role") == "user" and item.get("content") == "second turn"
+        if item.get("role") == "user" and _input_text(item) == "second turn"
     )
     assert developer_indices[0] == second_user_index + 1
-    assert "LCM-POLICY-second turn" in second_input[developer_indices[0]]["content"]
-    assert "remembered fact for second turn" in second_input[developer_indices[0]]["content"]
+    second_developer_text = _input_text(second_input[developer_indices[0]])
+    assert "LCM-POLICY-second turn" in second_developer_text
+    assert "remembered fact for second turn" in second_developer_text
     assert "<memory-context>" not in json.dumps(second["messages"])
 
 
@@ -297,18 +312,20 @@ def test_max_iteration_summary_keeps_codex_recall_after_clean_user(monkeypatch):
         index
         for index, item in enumerate(input_items)
         if item.get("role") == "user"
-        and "current question" in str(item.get("content"))
+        and "current question" in _input_text(item)
     )
     current_user = input_items[current_user_index]
-    assert "CODEX-SUMMARY-PLUGIN-SENTINEL" in current_user["content"]
-    assert "CODEX-SUMMARY-LCM-SENTINEL" not in current_user["content"]
-    assert "CODEX-SUMMARY-RECALL-SENTINEL" not in current_user["content"]
+    current_user_text = _input_text(current_user)
+    assert "CODEX-SUMMARY-PLUGIN-SENTINEL" in current_user_text
+    assert "CODEX-SUMMARY-LCM-SENTINEL" not in current_user_text
+    assert "CODEX-SUMMARY-RECALL-SENTINEL" not in current_user_text
     developer = input_items[current_user_index + 1]
     assert developer["role"] == "developer"
-    assert developer["content"].index("CODEX-SUMMARY-LCM-SENTINEL") < developer[
-        "content"
-    ].index("<memory-context>")
-    assert "CODEX-SUMMARY-RECALL-SENTINEL" in developer["content"]
+    developer_text = _input_text(developer)
+    assert developer_text.index("CODEX-SUMMARY-LCM-SENTINEL") < developer_text.index(
+        "<memory-context>"
+    )
+    assert "CODEX-SUMMARY-RECALL-SENTINEL" in developer_text
     assert messages[0] == {"role": "user", "content": "current question"}
     assert "CODEX-SUMMARY-RECALL-SENTINEL" not in json.dumps(messages)
 

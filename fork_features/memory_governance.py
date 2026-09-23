@@ -442,11 +442,11 @@ def build_memory_schema() -> Dict[str, Any]:
                 },
                 "content": {
                     "type": "string",
-                    "description": "The entry content. Required for 'add' and 'replace' (single-op shape)."
+                    "description": "The entry content. Required for 'add' and 'replace' (single-op shape). For 'replace', this is the complete new entry; the whole matched entry is overwritten."
                 },
                 "old_text": {
                     "type": "string",
-                    "description": "REQUIRED for 'replace', 'remove', and 'history': a short unique substring identifying the existing entry. Omit only for 'add'."
+                    "description": "REQUIRED for 'replace', 'remove', and 'history': a short unique substring identifying the existing entry. It locates the entry and is not patched in place. Omit only for 'add'."
                 },
                 "reason": {
                     "type": "string",
@@ -485,7 +485,7 @@ def build_memory_schema() -> Dict[str, Any]:
                         "type": "object",
                         "properties": {
                             "action": {"type": "string", "enum": ["add", "replace", "remove"]},
-                            "content": {"type": "string", "description": "Entry content for add/replace."},
+                            "content": {"type": "string", "description": "Entry content for add/replace. For replace, this is the complete new entry."},
                             "old_text": {"type": "string", "description": "Substring identifying the entry for replace/remove."},
                             "reason": {"type": "string", "description": "Why this operation is justified."},
                             "evidence": {"type": "string", "description": "User statement or verified fact supporting it."},

@@ -23,7 +23,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.memory_manager import build_memory_context_block
-from agent.turn_context import build_turn_context
+from agent.turn_context import (
+    _memory_query_text,
+    build_turn_context,
+    compose_multimodal_context_part,
+)
 from fork_features.request_context import compose_user_api_content
 from hermes_state import SessionDB
 
@@ -53,6 +57,30 @@ class TestComposeUserApiContent:
         assert out == "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX"
 
 
+
+
+class TestComposeMultimodalContextPart:
+    def test_is_the_string_sidecar_injection_tail(self):
+        """Both content shapes inject byte-identical context (#71998): the text part a list
+        turn carries is exactly what the string sidecar appends after ``content``."""
+        assert compose_multimodal_context_part("", "") is None
+        sidecar = compose_user_api_content("hello", "likes tea", "CTX")
+        part = compose_multimodal_context_part("likes tea", "CTX")
+        assert sidecar == "hello\n\n" + part
+
+
+class TestMemoryQueryText:
+    def test_list_turn_queries_its_text_and_image_only_stays_trivial(self):
+        """#71998 execution side: a text+image turn must drive prefetch off its text (it used to
+        collapse to ``""`` and skip recall silently); an image-only turn has no text to query."""
+        from agent.memory_provider import is_trivial_prompt
+
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        text_plus_image = [{"type": "text", "text": "remind me what my dog's name is"}, image]
+        assert _memory_query_text(text_plus_image) == "remind me what my dog's name is"
+        assert is_trivial_prompt(_memory_query_text(text_plus_image)) is False
+        assert _memory_query_text([image]) == ""
+        assert is_trivial_prompt(_memory_query_text([image])) is True
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +327,27 @@ class TestPrologueRequestOnlyContext:
         ):
             ctx = _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+
+    def test_multimodal_turn_stays_clean_and_composes_request_copy(self):
+        """Multimodal context belongs only to the provider request copy."""
+        agent = _FakeAgent()
+        blocks = [{"type": "image_url", "image_url": {"url": "data:img"}}]
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = _build(
+                agent,
+                user_message=blocks,
+                summarize_user_message_for_log=lambda _m: "[image]",
+            )
+        content = ctx.messages[ctx.current_turn_user_idx]["content"]
+        assert content == blocks
+        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+        assert compose_user_api_content(content, "", ctx.plugin_user_context) == [
+            *blocks,
+            {"type": "text", "text": "\n\nPLUGIN-CTX"},
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1085,7 +1134,10 @@ class TestMaxIterationsSummaryReplay:
             chat=types.SimpleNamespace(completions=_Completions())
         )
         transport = types.SimpleNamespace(
-            normalize_response=lambda _r: types.SimpleNamespace(content="SUMMARY")
+            build_kwargs=lambda **kwargs: {"messages": kwargs["messages"]},
+            normalize_response=lambda _r: types.SimpleNamespace(
+                content="SUMMARY", tool_calls=[]
+            ),
         )
         messages = [
             {"role": "user", "content": "current question"},
@@ -1133,7 +1185,7 @@ class TestSessionRowExistsBeforePreflightCompaction:
     before the delayed persist. Drives the real ``compress_context`` path
     against a real, empty SessionDB."""
 
-    def _make_agent(self, db, sid, *, in_place):
+    def _make_agent(self, db, sid, *, in_place, current_user_content="hello"):
         from run_agent import AIAgent
 
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
@@ -1164,7 +1216,7 @@ class TestSessionRowExistsBeforePreflightCompaction:
         seen = {}
         compacted = [
             {"role": "assistant", "content": "[CONTEXT COMPACTION] summary"},
-            {"role": "user", "content": "hello"},
+            {"role": "user", "content": current_user_content},
         ]
 
         def _compress(_messages, **_kwargs):
@@ -1218,6 +1270,31 @@ class TestSessionRowExistsBeforePreflightCompaction:
             assert "[CONTEXT COMPACTION] summary" in contents
             # And the live context is the compacted set.
             assert ctx.messages[ctx.current_turn_user_idx]["content"] == "hello"
+        finally:
+            db.close()
+
+    def test_in_place_compaction_multimodal_context_stays_request_only(self, tmp_path):
+        """In-place compaction keeps provider enrichment out of durable history."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "sess-inplace-mm"
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        turn = [{"type": "text", "text": "what is this"}, image]
+        try:
+            agent, _seen = self._make_agent(db, sid, in_place=True, current_user_content=list(turn))
+            with patch("hermes_cli.plugins.invoke_hook", return_value=[{"context": "PLUGIN-CTX"}]):
+                ctx = _build(
+                    agent, user_message=list(turn), conversation_history=self._oversized_history(),
+                    summarize_user_message_for_log=lambda _m: "[image]",
+                )
+            assert agent._last_compaction_in_place is True
+            live = ctx.messages[ctx.current_turn_user_idx]["content"]
+            assert live == turn
+            assert compose_user_api_content(live, "", ctx.plugin_user_context) == [
+                *turn,
+                {"type": "text", "text": "\n\nPLUGIN-CTX"},
+            ]
+            reloaded = [m for m in db.get_messages_as_conversation(sid) if m["role"] == "user"]
+            assert reloaded[-1]["content"] == live
         finally:
             db.close()
 

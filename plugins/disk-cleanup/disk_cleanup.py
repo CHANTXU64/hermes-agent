@@ -368,12 +368,7 @@ def _git_repo_root(directory: str) -> Optional[str]:
 
 
 def _is_git_tracked(path: Path) -> bool:
-    """True when *path* is committed to a git repository.
-
-    A file under version control is authored work, never a disposable artifact — whatever
-    its name. Without this, ``scripts/tests/test_*.py`` style suites are deleted by name
-    alone; being tracked is the strongest available signal that a human meant to keep it.
-    """
+    """True when *path* is committed to a git repository."""
     with contextlib.suppress(Exception):
         directory = str(path.parent)
         if _git_repo_root(directory) is None:
@@ -386,11 +381,25 @@ def _is_git_tracked(path: Path) -> bool:
     return False
 
 
+def _inside_git_worktree(path: Path) -> bool:
+    """True if *path* sits inside a Git checkout, including linked worktrees.
+
+    Only ``.git`` entries strictly below ``HERMES_HOME`` count for in-home paths so a
+    home managed by a dotfiles repository does not make all scratch files permanent.
+    """
+    parents = list(path.resolve().parents)
+    with contextlib.suppress(ValueError):
+        parents = parents[: parents.index(get_hermes_home())]
+    return any((parent / ".git").exists() for parent in parents)
+
+
 def guess_category(path: Path) -> Optional[str]:
     """Category label for *path*, or None if we shouldn't track it (``post_tool_call`` hook)."""
     if not is_safe_path(path):
         return None
-    if _is_git_tracked(path):
+    # A checkout owns both tracked files and untracked work-in-progress. Check the cheap
+    # worktree marker first, then retain the exact tracked-file guard for unusual layouts.
+    if _inside_git_worktree(path) or _is_git_tracked(path):
         return None
     with contextlib.suppress(ValueError):  # not under HERMES_HOME (/tmp/hermes-*) — name rules only
         rel = path.resolve().relative_to(get_hermes_home())
@@ -404,4 +413,6 @@ def guess_category(path: Path) -> Optional[str]:
         if top == "cache":
             return "temp"
     name = path.name
-    return "test" if name.startswith(_TEST_PATTERNS) or name.endswith(_TEST_SUFFIXES) else None
+    if name.startswith(_TEST_PATTERNS) or name.endswith(_TEST_SUFFIXES):
+        return "test"
+    return None

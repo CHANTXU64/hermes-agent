@@ -74,6 +74,9 @@ async def test_gateway_undo_notifies_cached_agent_memory_rewind(store):
             self._agent_cache_lock = threading.Lock()
             self.evicted = []
 
+        def _session_key_for_source(self, source):
+            return build_session_key(source)
+
         def _evict_cached_agent(self, session_key):
             self.evicted.append(session_key)
             self._agent_cache.pop(session_key, None)

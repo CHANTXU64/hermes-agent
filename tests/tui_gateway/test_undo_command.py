@@ -14,6 +14,7 @@ the Ink client drops the message into the composer for editing.
 from __future__ import annotations
 
 import importlib
+import sys
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -44,6 +45,11 @@ def server(hermes_home):
         },
     ):
         mod = importlib.import_module("tui_gateway.server")
+
+    # ``patch.dict`` removes modules first imported inside its scope when the
+    # scope exits. Keep the initialized gateway cached so every test in this
+    # file shares one RPC registry/module state, as the cleanup below assumes.
+    sys.modules.setdefault("tui_gateway.server", mod)
 
     methods = dict(mod._methods)
     yield mod

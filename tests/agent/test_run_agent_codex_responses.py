@@ -2049,7 +2049,9 @@ def test_codex_413_compression_forks_actual_failed_wire_request(monkeypatch):
         assert isinstance(rematerialized, FrozenCodexRequest)
         assert any(
             item.get("role") == "assistant"
-            and item.get("content") == "413 CONCURRENT ROW"
+            and item.get("content") == [
+                {"type": "output_text", "text": "413 CONCURRENT ROW"}
+            ]
             for item in rematerialized.clone_body()["input"]
             if isinstance(item, dict)
         )
@@ -2198,7 +2200,9 @@ def test_codex_auto_compression_receives_provider_ready_parent_request(monkeypat
     assert all("function" not in tool for tool in body["tools"])
     assert any(
         item.get("role") == "assistant"
-        and item.get("content") == "CONCURRENT DURABLE ROW"
+        and item.get("content") == [
+            {"type": "output_text", "text": "CONCURRENT DURABLE ROW"}
+        ]
         for item in body["input"]
         if isinstance(item, dict)
     )
