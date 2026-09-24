@@ -445,6 +445,20 @@ class TelegramAccountRuntime:
         self.live.clear()
 
 
+def replacement_adapter_for(host: Any, adapter: BasePlatformAdapter):
+    """Resolve an old transport's slot without crossing a named-Bot boundary.
+
+    In-flight callbacks retain the old adapter after a fatal rebuild. A named
+    stamp must use the named runtime even while its replacement is unavailable;
+    absence (or an invalid stamp) is never permission to borrow the primary.
+    """
+    account = (getattr(getattr(adapter, "config", None), "extra", None) or {}).get("account_id")
+    if account:
+        runtime = getattr(host, "_telegram_accounts", None)
+        return runtime.adapter_for(account) if runtime is not None else None
+    return (getattr(host, "adapters", None) or {}).get(Platform.TELEGRAM)
+
+
 def _runtime_for(host: Any) -> TelegramAccountRuntime:
     runtime = host.__dict__.get("_telegram_accounts")
     if not isinstance(runtime, TelegramAccountRuntime):
@@ -492,6 +506,7 @@ def telegram_failed_accounts_property() -> property:
 __all__ = [
     "TelegramAccountHost",
     "TelegramAccountRuntime",
+    "replacement_adapter_for",
     "telegram_failed_accounts_property",
     "telegram_live_adapters_property",
     "telegram_runtime_property",

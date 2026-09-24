@@ -1261,7 +1261,8 @@ Fork-owned boundary:
 - `fork_features/multi_telegram_accounts/identity.py`: environment discovery,
   account normalization, and account-aware session-key suffixes.
 - `fork_features/multi_telegram_accounts/runtime.py`: named-adapter lookup,
-  startup, fatal handoff, independent reconnect, and shutdown.
+  startup, fatal handoff, independent reconnect, shutdown, and account-aware
+  replacement lookup for in-flight sends holding a retired transport.
 - `fork_features/multi_telegram_accounts/session_routing.py`: cross-bot resume
   ownership checks, route transfer, and stale-route cleanup.
 
@@ -1303,6 +1304,7 @@ Primary files:
 - `gateway/slash_commands.py`
 - `gateway/run.py`
 - `plugins/platforms/telegram/adapter.py`
+- `tests/fork/test_telegram_account_reconnect_delivery.py`
 - `tests/fork/test_multi_telegram_accounts.py`
 - `tests/fork_features/test_multi_telegram_accounts_boundary.py`
 - `tests/fork_features/test_multi_telegram_accounts_identity.py`
@@ -1338,6 +1340,13 @@ Behavior contract:
   lookup; mock-only Store tests do not protect this integration seam.
 - A named bot enters only its own fatal/reconnect slot and never replaces,
   disconnects, or populates the primary Telegram retry slot.
+- A retired named adapter's text sends (including progress and background/media
+  notices) resolve only that account's replacement, even when the primary is
+  healthy. Unknown, invalid, or unavailable named slots never borrow primary.
+- Native local-file sends share text's bounded reconnect handoff and preserve
+  the file bytes, caption, filename, reply anchor, and notification metadata.
+  A transiently unavailable transport returns a retryable failure; this does
+  not introduce a new durable attachment retry queue.
 - Named bots remain ordinary DM sessions; Telegram DM Topics and per-account
   `/update` lifecycle routing remain outside this feature.
 
@@ -1368,7 +1377,7 @@ Effective exposure and lifecycle evidence:
 Verification:
 
 ```bash
-scripts/run_tests.sh tests/fork_features/test_multi_telegram_accounts_boundary.py tests/fork_features/test_multi_telegram_accounts_identity.py tests/fork_features/test_multi_telegram_accounts_runtime.py tests/fork_features/test_multi_telegram_accounts_session_routing.py tests/fork/test_multi_telegram_accounts.py tests/gateway/test_background_process_notifications.py tests/gateway/test_resume_command.py tests/gateway/test_restart_notification.py tests/gateway/test_runner_fatal_adapter.py tests/gateway/test_platform_reconnect.py tests/gateway/test_shutdown_cache_cleanup.py tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py -q -o 'addopts='
+scripts/run_tests.sh tests/fork_features/test_multi_telegram_accounts_boundary.py tests/fork_features/test_multi_telegram_accounts_identity.py tests/fork_features/test_multi_telegram_accounts_runtime.py tests/fork_features/test_multi_telegram_accounts_session_routing.py tests/fork/test_multi_telegram_accounts.py tests/fork/test_telegram_account_reconnect_delivery.py tests/gateway/test_telegram_send_reconnect_wait.py tests/gateway/test_background_process_notifications.py tests/gateway/test_resume_command.py tests/gateway/test_restart_notification.py tests/gateway/test_runner_fatal_adapter.py tests/gateway/test_platform_reconnect.py tests/gateway/test_shutdown_cache_cleanup.py tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py -q -o 'addopts='
 ```
 
 Merge-time semantic review:

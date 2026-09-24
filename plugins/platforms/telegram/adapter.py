@@ -703,11 +703,10 @@ class TelegramAdapter(BasePlatformAdapter):
         return not bool(getattr(self, "_fatal_error_retryable", True))
 
     def _replacement_telegram_adapter(self) -> Optional["TelegramAdapter"]:
-        """Live adapter if the reconnect watcher replaced us in ``runner.adapters`` (an in-flight
-        ``send()`` still holds the old instance whose ``_bot`` stays None)."""
-        runner = getattr(self, "gateway_runner", None)
-        adapters = getattr(runner, "adapters", None) or {}
-        live = adapters.get(self.platform)
+        """Same-Bot replacement for in-flight sends that still hold a retired adapter."""
+        from fork_features.multi_telegram_accounts.runtime import replacement_adapter_for
+
+        live = replacement_adapter_for(getattr(self, "gateway_runner", None), self)
         if live is not None and live is not self and getattr(live, "_bot", None):
             return live
         return None
@@ -732,6 +731,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 return True
         logger.warning("[%s] Still not connected after %.0fs", self.name, wait_s)
         return False
+
+    async def _connected_send_adapter(self) -> Optional["TelegramAdapter"]:
+        """Share the same bounded reconnect handoff for text and local-file sends."""
+        if self._bot:
+            return self
+        live = self._replacement_telegram_adapter()
+        if live is not None:
+            return live
+        if self._is_permanent_fatal() or not await self._wait_for_reconnection():
+            return None
+        return self if self._bot else self._replacement_telegram_adapter()
 
     def _should_drop_delayed_delivery(self) -> bool:
         """True once teardown/fatal started: delayed flushes must not dispatch onto a torn-down session.
@@ -3624,17 +3634,11 @@ class TelegramAdapter(BasePlatformAdapter):
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a message to a Telegram chat."""
-        if not self._bot:
-            live = self._replacement_telegram_adapter()
-            if live is not None:
-                return await live.send(chat_id, content, reply_to, metadata)
-            if self._is_permanent_fatal() or not await self._wait_for_reconnection():
-                return SendResult(success=False, error="Not connected", retryable=not self._is_permanent_fatal())
-            live = self._replacement_telegram_adapter()
-            if not self._bot and live is not None:
-                return await live.send(chat_id, content, reply_to, metadata)
-            if not self._bot:
-                return SendResult(success=False, error="Not connected", retryable=True)
+        adapter = await self._connected_send_adapter()
+        if adapter is None:
+            return SendResult(success=False, error="Not connected", retryable=not self._is_permanent_fatal())
+        if adapter is not self:
+            return await adapter.send(chat_id, content, reply_to, metadata)
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
@@ -5357,8 +5361,13 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Shared shell for native local-file sends: existence check, open, send with routing, then
         ``await on_error(exc)`` on any failure. ``build_kwargs(f)`` supplies the media kwargs."""
-        if not self._bot:
-            return SendResult(success=False, error="Not connected")
+        adapter = await self._connected_send_adapter()
+        if adapter is None:
+            return SendResult(success=False, error="Not connected", retryable=not self._is_permanent_fatal())
+        if adapter is not self:
+            return await adapter._send_local_file(
+                label, path, chat_id, reply_to, metadata, media_key, build_kwargs, on_error,
+            )
         try:
             if not os.path.exists(path):
                 return SendResult(success=False, error=self._missing_media_path_error(label, path))

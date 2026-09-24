@@ -35,6 +35,7 @@ The Fork-owned package has three explicit responsibilities:
   - live and failed named-adapter ownership
   - exact named-adapter lookup and fail-closed routing
   - named Bot startup, fatal handoff, independent reconnect, and shutdown
+  - replacement lookup for in-flight sends retaining a retired adapter
 - `fork_features/multi_telegram_accounts/session_routing.py`
   - cross-bot `/resume` route discovery
   - running-target rejection
@@ -48,7 +49,9 @@ Upstream-owned host files keep only the seams the feature genuinely needs:
   stable session-key helpers.
 - `gateway/platforms/base.py` carries account provenance through source creation.
 - `plugins/platforms/telegram/adapter.py` stamps account provenance before auth,
-  batching, observation persistence, and session-key computation.
+  batching, observation persistence, and session-key computation. Its reconnect
+  handoff delegates replacement selection to the Fork runtime; text and native
+  local-file sends share the same bounded wait and same-Bot replacement.
 - `gateway/authz_mixin.py` asks the Fork runtime for the exact named adapter and
   restores post-restart account provenance from the trusted durable session key.
 - `gateway/slash_commands.py` delegates cross-bot resume policy and preserves the
@@ -96,6 +99,13 @@ work:    agent:main:telegram:dm:<chat_id>:account:work
   the originating Bot.
 - A configured named Bot that is temporarily unavailable fails closed; traffic
   never falls back to the primary Bot.
+- This also holds after a fatal rebuild: a turn's retired adapter resolves only
+  its original account, whether the replacement is ready, arrives during the
+  bounded wait, or remains unavailable. Progress, background notices, and media
+  failure notices retain the same boundary as ordinary text.
+- Native local-file uploads resume through the same Bot's replacement, preserving
+  payload bytes and delivery metadata. Offline expiry is a retryable failure;
+  there is no new durable attachment retry queue or replay of old attachments.
 - Database peer recovery requires the same account suffix and cannot reuse
   another Bot's active session ID.
 - Each named Bot keeps its own fatal/reconnect state and its own token/config.
@@ -121,6 +131,8 @@ work:    agent:main:telegram:dm:<chat_id>:account:work
 Behavior and boundary tests:
 
 - `tests/fork/test_multi_telegram_accounts.py`
+- `tests/fork/test_telegram_account_reconnect_delivery.py`
+- `tests/gateway/test_telegram_send_reconnect_wait.py`
 - `tests/fork_features/test_multi_telegram_accounts_identity.py`
 - `tests/fork_features/test_multi_telegram_accounts_runtime.py`
 - `tests/fork_features/test_multi_telegram_accounts_session_routing.py`
@@ -142,7 +154,7 @@ text.
 Canonical focused verification:
 
 ```bash
-scripts/run_tests.sh tests/fork_features/test_multi_telegram_accounts_boundary.py tests/fork_features/test_multi_telegram_accounts_identity.py tests/fork_features/test_multi_telegram_accounts_runtime.py tests/fork_features/test_multi_telegram_accounts_session_routing.py tests/fork/test_multi_telegram_accounts.py tests/gateway/test_background_process_notifications.py tests/gateway/test_resume_command.py tests/gateway/test_restart_notification.py tests/gateway/test_runner_fatal_adapter.py tests/gateway/test_platform_reconnect.py tests/gateway/test_shutdown_cache_cleanup.py tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py -q -o 'addopts='
+scripts/run_tests.sh tests/fork_features/test_multi_telegram_accounts_boundary.py tests/fork_features/test_multi_telegram_accounts_identity.py tests/fork_features/test_multi_telegram_accounts_runtime.py tests/fork_features/test_multi_telegram_accounts_session_routing.py tests/fork/test_multi_telegram_accounts.py tests/fork/test_telegram_account_reconnect_delivery.py tests/gateway/test_telegram_send_reconnect_wait.py tests/gateway/test_background_process_notifications.py tests/gateway/test_resume_command.py tests/gateway/test_restart_notification.py tests/gateway/test_runner_fatal_adapter.py tests/gateway/test_platform_reconnect.py tests/gateway/test_shutdown_cache_cleanup.py tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py -q -o 'addopts='
 ```
 
 Refactor evidence before applying to the primary working tree:
@@ -177,6 +189,8 @@ Preserve these semantic contracts during every upstream sync:
    delegation completion after persisted-source reconstruction
 6. cross-bot `/resume` ownership and running-target rejection
 7. per-named-Bot fatal/reconnect ownership and Gateway survival rules
+8. retired-adapter replacement selection for in-flight text and local-file sends;
+   a healthy primary must never satisfy a named account's reconnect wait
 
 If upstream changes a host seam, adapt only the thin handoff. Keep Telegram policy
 inside `fork_features/multi_telegram_accounts/`; do not copy it back into the
