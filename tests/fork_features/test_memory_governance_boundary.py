@@ -61,7 +61,7 @@ def test_mutation_uses_public_store_transaction_after_audit_initialization() -> 
             events.append("read")
             return ["old durable entry"], True
 
-        def apply(self, operations):
+        def apply(self, operations, *, batch=False):
             events.append(("apply", operations))
             return {"success": True, "message": "Entry replaced."}
 

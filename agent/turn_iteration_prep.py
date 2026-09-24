@@ -22,6 +22,21 @@ from agent.turn_context_compaction import _reanchor
 
 logger = logging.getLogger("agent.conversation_loop")
 
+
+def _anchors_current_turn(messages: Any, idx: Any, user_message: Any) -> bool:
+    """True when ``messages[idx]`` is this turn's user row (verbatim, or its user-originated view)."""
+    if not isinstance(idx, int) or not 0 <= idx < len(messages):
+        return False
+    msg = messages[idx]
+    if not (isinstance(msg, dict) and msg.get("role") == "user"):
+        return False
+    if msg.get("content") == user_message:
+        return True
+    from agent.context_compressor import user_originated_turn_view
+
+    view = user_originated_turn_view(msg)
+    return view is not None and view.get("content") == user_message
+
 ITERATION_BUDGET_WARNING_TEMPLATE = (
     "[SYSTEM NOTICE — iteration budget checkpoint] You have used {used} of {maximum} "
     "iterations. Checkpoint durable progress now, then continue the task; do not stop "

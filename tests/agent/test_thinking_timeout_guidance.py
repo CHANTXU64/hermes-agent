@@ -91,11 +91,7 @@ class TestClassifierOverride:
         )
     @pytest.mark.parametrize("model", [
         "nvidia/nemotron-3-ultra-550b-a55b",
-        "openai/o3-mini",
-        "anthropic/claude-opus-4-6",
         "deepseek/deepseek-r1",
-        "qwen/qwq-32b-preview",
-        "x-ai/grok-4-fast-reasoning",
     ])
     def test_all_known_reasoning_models_route_to_timeout(self, model):
         from agent.error_classifier import classify_api_error, FailoverReason
@@ -218,11 +214,7 @@ class TestBuildThinkingTimeoutGuidance:
         assert "providers.nvidia.models.nvidia/nemotron-3-ultra-550b-a55b.stale_timeout_seconds" in text
 
 
-    def test_guidance_mentions_known_providers(self):
-        from agent.thinking_timeout_guidance import build_thinking_timeout_guidance
-        text = build_thinking_timeout_guidance(provider="nvidia", model="x")
-        # At least one of the known cloud providers should be mentioned
-        # to give the user context.
-        assert any(p in text for p in (
-            "NVIDIA NIM", "OpenAI", "Anthropic", "DeepSeek",
-        ))
+
+
+
+

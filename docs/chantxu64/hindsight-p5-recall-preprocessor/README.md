@@ -1,5 +1,12 @@
 # Hindsight P5 Recall Preprocessor
 
+> **Moved 2026-09-24.** Upstream `4cbf862abe` removed the bundled Hindsight plugin. The provider-side
+> code and its regressions now live in the plugin Fork `https://github.com/CHANTXU64/hindsight`
+> (branch `chantxu64/hermes-fork`, directory `hindsight-integrations/hermes`): `plugins/memory/hindsight/X`
+> below is `X` there, `fork_features/hindsight_recall_cache.py` is `recall_cache.py`, and the Fork tests are
+> under `tests_hermes/` (run with `HERMES_AGENT_ROOT=<hermes checkout>`). See entry 1 of
+> `docs/LOCAL_MODIFICATIONS.md` for the pinned commit. Paths below are the pre-move Hermes paths.
+
 ## Purpose
 
 Improve Hindsight `auto_recall` across conversational turns without asking Hindsight to interpret short session-local phrases such as “继续” or “修吧”. Before the current turn receives memory context, a dedicated configurable auxiliary model can conservatively filter the previous real recall and generate one short replacement query when the active long-term-memory target changed or became more specific.

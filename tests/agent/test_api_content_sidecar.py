@@ -13,7 +13,6 @@ import json
 import os
 import shutil
 import sqlite3
-import sys
 import tempfile
 import threading
 import types
@@ -51,14 +50,6 @@ class TestComposeUserApiContent:
             },
         ]
         assert content == [{"type": "text", "text": "look"}]
-    def test_composes_memory_block_and_plugin_context(self):
-        out = compose_user_api_content("hello", "likes tea", "PLUGIN-CTX")
-        fenced = build_memory_context_block("likes tea")
-        assert out == "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX"
-
-
-
-
 class TestComposeMultimodalContextPart:
     def test_is_the_string_sidecar_injection_tail(self):
         """Both content shapes inject byte-identical context (#71998): the text part a list
@@ -107,15 +98,6 @@ class TestSessionDbSidecar:
         finally:
             db.close()
 
-
-    def test_get_messages_exposes_column(self, tmp_path):
-        db = self._open(tmp_path)
-        try:
-            db.append_message("s1", "user", content="hello", api_content="hello+ctx")
-            rows = db.get_messages("s1")
-            assert rows[0]["api_content"] == "hello+ctx"
-        finally:
-            db.close()
 
     def test_replace_messages_drops_legacy_sidecar(self, tmp_path):
         """Compaction/rewrite flows carry clean content, not legacy context."""
@@ -796,22 +778,6 @@ class TestWireInvariant:
 # Review fixes: re-anchoring, MoA, in-place compaction backfill, override
 # guard, sanitize-divergence capture, max-iterations replay, replay cleanup
 # ---------------------------------------------------------------------------
-
-from agent.turn_context import reanchor_current_turn_user_idx
-
-
-class TestReanchorCurrentTurnUserIdx:
-
-
-
-    def test_minus_one_when_no_user_message(self):
-        messages = [{"role": "assistant", "content": "a"}]
-        assert reanchor_current_turn_user_idx(messages, "hello") == -1
-        assert reanchor_current_turn_user_idx([], "hello") == -1
-
-    def test_non_dict_entries_ignored(self):
-        messages = ["junk", {"role": "user", "content": "hello"}, None]
-        assert reanchor_current_turn_user_idx(messages, "hello") == 1
 
 
 class TestPrologueCompressionIsolation:

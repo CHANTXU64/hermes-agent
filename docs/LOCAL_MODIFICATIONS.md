@@ -73,16 +73,26 @@ scripts/run_tests.sh tests/fork/test_daily_heartbeat.py tests/fork/test_todo_fil
 
 ### 1. Hindsight Chinese / Unicode support
 
-Status: production boundary decoupled; fork contract only (2026-08-30)
+Status: active in the external Hindsight plugin Fork (moved out of Hermes core 2026-09-24)
 
-Date: 2026-04-20; contract isolated 2026-08-30
+Date: 2026-04-20; contract isolated 2026-08-30; moved to plugin Fork 2026-09-24
 
 Commit: `7428b0da`
 
-Files:
+Plugin moved out of core: upstream `4cbf862abe` deleted the bundled
+`plugins/memory/hindsight/`. The provider now installs from the plugin Fork
+`https://github.com/CHANTXU64/hindsight`, branch `chantxu64/hermes-fork`,
+subdirectory `hindsight-integrations/hermes`, pinned commit
+`702855c14e3bda42746d5cfc4a535acebeba0f98`, into
+`$HERMES_HOME/plugins/hindsight` for each profile. Do not reinstall the
+unmodified catalog version over it.
 
-- `plugins/memory/hindsight/__init__.py` — production serializer
-- `tests/fork/test_hindsight_unicode_contract.py` — fork behavior contract
+Plugin Fork files:
+
+Paths are relative to `hindsight-integrations/hermes/`.
+
+- `__init__.py` — production serializer
+- `tests_hermes/test_fork_unicode_contract.py` — fork behavior contract
 
 What changed:
 
@@ -109,7 +119,9 @@ Merge protection:
 Verification:
 
 ```bash
-./venv/bin/python -m pytest tests/fork/test_hindsight_unicode_contract.py -q -o 'addopts='
+# From the plugin Fork's hindsight-integrations/hermes directory:
+HERMES_AGENT_ROOT=<hermes checkout> HERMES_HOME=<temp dir> \
+  <hermes venv>/bin/python -m pytest tests_hermes/test_fork_unicode_contract.py -q -o 'addopts='
 ```
 
 Production ownership: normal Hindsight provider path; fork ownership is the
@@ -252,7 +264,8 @@ Upstream status: fork-only.
 
 ### 8. Hindsight synchronous cache-miss recall
 
-Date: 2026-05-22; cache lifecycle boundary migrated 2026-08-30
+Date: 2026-05-22; cache lifecycle boundary migrated 2026-08-30; provider side
+moved to the external plugin Fork 2026-09-24 (see entry 1 for source and pin)
 
 Files:
 
@@ -263,16 +276,24 @@ Files:
 - `tests/fork/test_hindsight_rewind.py`
 - `tests/gateway/test_undo_rewind_session.py`
 - `tests/tui_gateway/test_undo_command.py`
-- `fork_features/hindsight_recall_cache.py`
-- `plugins/memory/hindsight/__init__.py`
-- `tests/fork_features/test_hindsight_recall_cache.py`
-- `tests/fork/test_hindsight_provider_regressions.py`
-- `tests/fork/test_hindsight_recall_preprocessor.py`
-- `tests/fork/test_hindsight_manual_retain_removed.py`
-- `tests/plugins/memory/test_hindsight_provider.py`
 - `tests/agent/test_memory_session_switch.py`
 - `tests/agent/test_memory_sync_interrupted.py`
 - `docs/LOCAL_MODIFICATIONS.md`
+
+Plugin Fork files:
+
+Paths are relative to `hindsight-integrations/hermes/`; Hermes paths before
+2026-09-24 are in parentheses.
+
+- `recall_cache.py` (`fork_features/hindsight_recall_cache.py`)
+- `__init__.py` (`plugins/memory/hindsight/__init__.py`)
+- `tests_hermes/test_fork_recall_cache.py` (`tests/fork_features/test_hindsight_recall_cache.py`)
+- `tests_hermes/test_fork_provider_regressions.py` (`tests/fork/test_hindsight_provider_regressions.py`)
+- `tests_hermes/test_fork_recall_preprocessor.py` (`tests/fork/test_hindsight_recall_preprocessor.py`)
+- `tests_hermes/test_fork_manual_retain_removed.py` (`tests/fork/test_hindsight_manual_retain_removed.py`)
+- `tests_hermes/test_hindsight_provider.py` (`tests/plugins/memory/test_hindsight_provider.py`)
+- `tests_hermes/conftest.py` — loads the plugin as `plugins.memory.hindsight`
+  on top of the Hermes checkout named by `HERMES_AGENT_ROOT`
 
 What changed:
 
@@ -333,6 +354,16 @@ scripts/run_tests.sh tests/fork_features/test_hindsight_recall_cache.py tests/fo
 
 - Current canonical result: `84 passed`, `0 failed` across `5` files.
 
+Verification after the 2026-09-24 move to the plugin Fork (fixed upstream
+`58c896ea4ebaff5425a068f461b6c6fedadb8b40`): the plugin Fork's own `tests/`
+passed `25`; `tests_hermes/` against the merged Hermes candidate passed `174`
+with `0` failures; Ruff on the three plugin source files passed. Paths in the
+"What changed" and "Merge protection" text below that name
+`fork_features/hindsight_recall_cache.py` or `plugins/memory/hindsight/` now
+refer to `recall_cache.py` / `__init__.py` / `recall_preprocessor.py` in the
+plugin Fork; the only code change during the move was the cache import
+becoming the plugin-local `.recall_cache`.
+
 - Seven Fork state contracts were observed RED before each capability existed,
   then GREEN for Session-scoped consume, stale-generation carry rejection,
   matching-turn timeout invalidation, Session rotation, non-invalidating Session
@@ -360,7 +391,8 @@ Upstream status: intentional Fork divergence from upstream's every-turn
 ### 9. Hindsight P5 recall preprocessor
 
 Date: 2026-07-17; external-prefetch timeout compatibility fix 2026-07-19;
-configured model fallback 2026-08-09; orchestration boundary migrated 2026-08-30
+configured model fallback 2026-08-09; orchestration boundary migrated 2026-08-30;
+provider side moved to the external plugin Fork 2026-09-24 (see entry 1)
 
 Files:
 
@@ -371,17 +403,24 @@ Files:
 - `agent/auxiliary_client.py`
 - `hermes_cli/plugins.py`
 - `plugins/memory/__init__.py`
-- `plugins/memory/hindsight/recall_preprocessor.py`
-- `plugins/memory/hindsight/__init__.py`
-- `tests/fork_features/test_hindsight_p5_policy.py`
-- `tests/fork/test_hindsight_recall_preprocessor.py`
 - `tests/agent/test_memory_provider.py`
-- `tests/fork/test_hindsight_provider_regressions.py`
-- `tests/hermes_cli/test_plugin_auxiliary_tasks.py`
+- `tests/hermes_cli/test_plugin_auxiliary_tasks.py` — since 2026-09-24 exercises
+  the auxiliary-task bridge with a user-installed memory plugin source
 - `tests/agent/test_run_agent_codex_responses.py`
 - `tests/agent/test_auxiliary_client.py`
 - `docs/chantxu64/hindsight-p5-recall-preprocessor/README.md`
 - `docs/LOCAL_MODIFICATIONS.md`
+
+Plugin Fork files:
+
+Paths are relative to `hindsight-integrations/hermes/`; Hermes paths before
+2026-09-24 are in parentheses.
+
+- `recall_preprocessor.py` (`plugins/memory/hindsight/recall_preprocessor.py`)
+- `__init__.py` (`plugins/memory/hindsight/__init__.py`)
+- `tests_hermes/test_fork_p5_policy.py` (`tests/fork_features/test_hindsight_p5_policy.py`)
+- `tests_hermes/test_fork_recall_preprocessor.py` (`tests/fork/test_hindsight_recall_preprocessor.py`)
+- `tests_hermes/test_fork_provider_regressions.py` (`tests/fork/test_hindsight_provider_regressions.py`)
 
 What changed:
 
@@ -732,8 +771,10 @@ Retirement decision:
 
 Retirement verification:
 
-- Anti-resurrection regression: `tests/fork/test_hindsight_manual_retain_removed.py`.
-- Recall/P5 fork regressions remain in `tests/fork/test_hindsight_provider_regressions.py`; official provider tests continue to own automatic Retain and tool behavior.
+- Anti-resurrection regression: `tests/fork/test_hindsight_manual_retain_removed.py`
+  (since 2026-09-24: `tests_hermes/test_fork_manual_retain_removed.py` in the plugin Fork, see entry 1).
+- Recall/P5 fork regressions remain in `tests/fork/test_hindsight_provider_regressions.py`
+  (since 2026-09-24: `tests_hermes/test_fork_provider_regressions.py` in the plugin Fork); official provider tests continue to own automatic Retain and tool behavior.
 - Verification completed on 2026-08-25: Hindsight provider, anti-resurrection,
   Recall/P5, and rewind suites passed `74`; adjacent CLI/Gateway/TUI-Gateway
   session-switch/reset/undo suites passed `86`; Fork + command-registry + Slack
@@ -829,7 +870,7 @@ Merge decision:
 
 Verification:
 ```bash
-scripts/run_tests.sh tests/fork/test_telegram_quick_command_menu.py tests/hermes_cli/test_commands.py tests/gateway/test_telegram_forum_commands.py tests/cli/test_quick_commands.py tests/fork/test_gateway_quick_command_session_env.py tests/fork/test_multi_telegram_accounts.py
+scripts/run_tests.sh tests/fork/test_telegram_quick_command_menu.py tests/hermes_cli/test_commands.py tests/gateway/test_telegram_forum_commands.py tests/hermes_cli/test_quick_commands.py tests/fork/test_gateway_quick_command_session_env.py tests/fork/test_multi_telegram_accounts.py
 ```
 - Upstream status: fork-only
 - Last validated: upstream `72a3277cd7937fd0f0a2a3e3fddbed21d7b1c8bd` (local reference, no fetch); Fork based on `85dcb613d4` plus this change. After the user restarted Gateway, Telegram `getMyCommands` confirmed `retain`, `doctor`, `disk` and exactly one built-in `restart` in the default/private menus of all four configured bots; no live command execution was triggered.
@@ -2992,21 +3033,17 @@ Compared with the upstream parent of the latest completed fork sync, active fork
 deltas are expected in these areas:
 
 - Hindsight Unicode support / synchronous cache-miss Recall / P5 Recall and
-  generic memory rewind lifecycle:
+  generic memory rewind lifecycle. Since 2026-09-24 the provider-side files
+  (`__init__.py`, `recall_cache.py`, `recall_preprocessor.py` and their
+  `tests_hermes/` regressions) live in the plugin Fork
+  `CHANTXU64/hindsight` (`hindsight-integrations/hermes`, see entry 1); only
+  the Hermes core touchpoints below remain in this repository:
   - `.gitignore`
   - `agent/memory_manager.py`
   - `agent/memory_provider.py`
-  - `fork_features/hindsight_recall_cache.py`
-  - `plugins/memory/hindsight/__init__.py`
   - `hermes_state.py`
-  - `tests/fork_features/test_hindsight_recall_cache.py`
-  - `tests/fork_features/test_hindsight_p5_policy.py`
-  - `tests/plugins/memory/test_hindsight_provider.py`
-  - `tests/fork/test_hindsight_unicode_contract.py`
   - `tests/hermes_state/test_hermes_state.py`
   - `tests/agent/test_memory_session_switch.py`
-  - `tests/fork/test_hindsight_provider_regressions.py`
-  - `tests/fork/test_hindsight_recall_preprocessor.py`
   - `tests/fork/test_hindsight_rewind.py`
   - `cli.py`
   - `gateway/slash_commands.py`

@@ -232,7 +232,9 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
         gate_result = _apply_write_gate("batch", target, None, None, operations=governed_operations)
         if gate_result is not None:
             return gate_result
-        return json.dumps(governance.apply(store, target, governed_operations), ensure_ascii=False)
+        return json.dumps(
+            governance.apply(store, target, governed_operations, batch=True), ensure_ascii=False,
+        )
     if action not in {"add", "replace", "remove"}:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, history", success=False)
     invalid = _validate_single_op(store, action, target, content, old_text)
@@ -307,7 +309,7 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
         return target_error
     if action == "batch":
         return _build_memory_governance().apply(
-            store, target, payload.get("operations") or []
+            store, target, payload.get("operations") or [], batch=True,
         )
     if action in {"add", "replace", "remove"}:
         operation = {

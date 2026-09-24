@@ -170,9 +170,19 @@ class MemoryGovernance:
         return traces
 
     def apply(
-        self, store: Any, target: str, operations: List[Dict[str, Any]]
+        self,
+        store: Any,
+        target: str,
+        operations: List[Dict[str, Any]],
+        *,
+        batch: bool = False,
     ) -> Dict[str, Any]:
-        """Apply one Store transaction and journal its exact semantic delta."""
+        """Apply one Store transaction and journal its exact semantic delta.
+
+        ``batch`` preserves the caller's request shape: a one-item ``operations``
+        call must still return the batch result fields (``*_entries`` keyed by
+        1-based position) that ``MemoryManager.notify_memory_tool_write`` reads.
+        """
         try:
             normalized = self.normalize_operations(operations)
         except ValueError as exc:
@@ -200,7 +210,7 @@ class MemoryGovernance:
                     ),
                 }
 
-            result = transaction.apply(normalized)
+            result = transaction.apply(normalized, batch=batch)
             if not result.get("success"):
                 return result
 

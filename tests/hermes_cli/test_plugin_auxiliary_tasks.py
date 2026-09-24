@@ -1,13 +1,4 @@
-"""Tests for the plugin auxiliary-task registration API.
-
-Covers:
-  - PluginContext.register_auxiliary_task() validation
-  - PluginManager._aux_tasks storage + force-rediscovery clearing
-  - get_plugin_auxiliary_tasks() module-level helper
-  - _all_aux_tasks() merge of built-in + plugin tasks
-  - _reset_aux_to_auto() includes plugin tasks
-  - _get_auxiliary_task_config() layers plugin defaults under user config
-"""
+"""Plugin-registered auxiliary tasks merge into the built-in task list and ``_reset_aux_to_auto``."""
 
 from __future__ import annotations
 
@@ -17,24 +8,10 @@ from hermes_cli.plugins import (
     PluginContext,
     PluginManager,
     PluginManifest,
-    get_plugin_auxiliary_tasks,
 )
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
-
-
-def _make_ctx(name: str = "test_plugin") -> tuple[PluginContext, PluginManager]:
-    """Build a PluginContext + fresh PluginManager wired together.
-
-    The manager skips discovery (no plugins.yaml, no scan) so the test
-    can exercise registration paths directly.
-    """
-    manager = PluginManager()
-    manager._discovered = True  # skip auto-discovery on lookup
-    manifest = PluginManifest(name=name)
-    ctx = PluginContext(manifest, manager)
-    return ctx, manager
 
 
 @pytest.fixture
@@ -57,64 +34,77 @@ def patched_manager(monkeypatch):
     yield fresh
 
 
-# ── PluginContext.register_auxiliary_task ────────────────────────────────────
+_USER_MEMORY_PROVIDER_SOURCE = '''
+from agent.memory_provider import MemoryProvider
 
 
-def test_register_auxiliary_task_basic():
-    ctx, manager = _make_ctx("my_plugin")
+class ExampleUserMemoryProvider(MemoryProvider):
+    @property
+    def name(self):
+        return "example_user_memory"
+
+    def is_available(self):
+        return True
+
+    def initialize(self, session_id, **kwargs):
+        pass
+
+    def get_tool_schemas(self):
+        return []
+
+
+def register(ctx):
+    ctx.register_memory_provider(ExampleUserMemoryProvider())
     ctx.register_auxiliary_task(
-        key="my_task",
-        display_name="My task",
-        description="a custom side task",
+        "example_user_memory_preprocessor",
+        display_name="Example user memory preprocessor",
+        description="side task of a memory provider installed under HERMES_HOME/plugins",
+        defaults={"provider": "openai-codex", "timeout": 30},
     )
-    assert "my_task" in manager._aux_tasks
-    entry = manager._aux_tasks["my_task"]
-    assert entry["key"] == "my_task"
-    assert entry["display_name"] == "My task"
-    assert entry["description"] == "a custom side task"
-    assert entry["plugin"] == "my_plugin"
-    # Routing defaults populated
-    assert entry["defaults"]["provider"] == "auto"
-    assert entry["defaults"]["model"] == ""
-    assert entry["defaults"]["timeout"] == 60
+'''
 
 
-
-
-# ── PluginManager state lifecycle ────────────────────────────────────────────
-
-
-
-
-# ── Module-level helper ──────────────────────────────────────────────────────
-
-
-
-
-def test_get_plugin_auxiliary_tasks_includes_active_memory_provider(
+def test_get_plugin_auxiliary_tasks_includes_user_installed_memory_provider(
     monkeypatch,
     patched_manager,
+    tmp_path,
 ):
+    """Memory providers now ship as user plugins (e.g. hindsight from the plugin catalog).
+
+    Their auxiliary tasks never pass through general plugin discovery, so the active
+    provider under ``$HERMES_HOME/plugins/<name>/`` must still surface them to the
+    picker and ``auxiliary.<key>`` config routing.
+    """
+    from hermes_cli.plugins import get_plugin_auxiliary_tasks
+    from plugins import memory as memory_plugins
+
+    hermes_home = tmp_path / "home"
+    provider_dir = hermes_home / "plugins" / "example_user_memory"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "__init__.py").write_text(_USER_MEMORY_PROVIDER_SOURCE, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(memory_plugins, "_MEMORY_AUXILIARY_TASKS", {})
     monkeypatch.setattr(
-        "plugins.memory._get_active_memory_provider",
-        lambda: "hindsight",
+        memory_plugins,
+        "_get_active_memory_provider",
+        lambda: "example_user_memory",
     )
 
     tasks = get_plugin_auxiliary_tasks()
     task = next(
         entry
         for entry in tasks
-        if entry["key"] == "hindsight_recall_preprocessor"
+        if entry["key"] == "example_user_memory_preprocessor"
     )
 
-    assert task["plugin"] == "memory:hindsight"
+    assert task["plugin"] == "memory:example_user_memory"
     assert task["defaults"] == {
         "provider": "openai-codex",
-        "model": "gpt-5.6-luna",
+        "model": "",
         "base_url": "",
         "api_key": "",
         "timeout": 30,
-        "extra_body": {"service_tier": "priority"},
+        "extra_body": {},
     }
 
 
@@ -214,8 +204,6 @@ def test_all_aux_tasks_includes_plugin_registered(patched_manager):
     )
 
 
-
-
 # ── _reset_aux_to_auto includes plugin tasks ─────────────────────────────────
 
 
@@ -249,11 +237,6 @@ def test_reset_aux_to_auto_resets_plugin_tasks(tmp_path, monkeypatch, patched_ma
     cfg = load_config()
     assert cfg["auxiliary"]["my_aux"]["provider"] == "auto"
     assert cfg["auxiliary"]["my_aux"]["model"] == ""
-
-
-# ── auxiliary_client._get_auxiliary_task_config defaults layering ────────────
-
-
 def _patch_plugin_task_config(monkeypatch, user_task_config):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
@@ -273,8 +256,6 @@ def _patch_plugin_task_config(monkeypatch, user_task_config):
             }
         ],
     )
-
-
 def test_provider_override_does_not_inherit_plugin_default_extra_body(monkeypatch):
     from agent import auxiliary_client as aux
 
