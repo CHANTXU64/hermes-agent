@@ -60,6 +60,12 @@ Upstream-owned host files keep only the seams the feature genuinely needs:
   shutdown, and status handoffs.
 - `gateway/run_notifications.py` reconstructs async-completion sources with the
   account suffix and resolves the exact named adapter rather than the primary.
+  Restart notices share configuration and ACK checks, with serialized boot/reconnect consumers.
+- `gateway/run_startup.py` resolves ledger rows from their durable account suffix;
+  `gateway/delivery_ledger.py` accepts a live-route predicate before claims/timers.
+- `tools/kanban_tools.py` persists the creator account in existing delivery metadata;
+  `gateway/kanban_watchers_notifier.py` restores that account for both notify and wake.
+- `gateway/run_shutdown.py` restores the source identity and deduplicates per account.
 
 ## Configuration / Usage
 
@@ -106,6 +112,18 @@ work:    agent:main:telegram:dm:<chat_id>:account:work
 - Native local-file uploads resume through the same Bot's replacement, preserving
   payload bytes and delivery metadata. Offline expiry is a retryable failure;
   there is no new durable attachment retry queue or replay of old attachments.
+- Final-reply ledger recovery (boot, runtime retry, flood backoff) uses the saved
+  account suffix. An offline named account spends no attempt merely because
+  primary is online; named reconnect re-arms the existing recovery paths.
+- Kanban creator subscriptions preserve the originating account for notifications,
+  artifacts and wakes. Legacy subscriptions with no account provenance keep their
+  legacy primary route; missing historical identity is never guessed. This uses
+  existing metadata, without changing subscription uniqueness or database schema.
+- Restart notices honor the notification switch and require a successful send.
+  Offline/retryable named notices stay pending for reconnect; boot and reconnect
+  cannot concurrently send the same marker. This adds no timed notification queue.
+- Shutdown notices recover persisted account provenance, fail closed while that
+  bot is unavailable, and do not deduplicate two bots merely sharing a chat ID.
 - Database peer recovery requires the same account suffix and cannot reuse
   another Bot's active session ID.
 - Each named Bot keeps its own fatal/reconnect state and its own token/config.
@@ -132,6 +150,9 @@ Behavior and boundary tests:
 
 - `tests/fork/test_multi_telegram_accounts.py`
 - `tests/fork/test_telegram_account_reconnect_delivery.py`
+- `tests/fork/test_telegram_account_recovery_routes.py`
+- `tests/fork/test_telegram_account_kanban_routes.py`
+- `tests/fork/test_telegram_account_lifecycle_notices.py`
 - `tests/gateway/test_telegram_send_reconnect_wait.py`
 - `tests/fork_features/test_multi_telegram_accounts_identity.py`
 - `tests/fork_features/test_multi_telegram_accounts_runtime.py`
@@ -154,7 +175,7 @@ text.
 Canonical focused verification:
 
 ```bash
-scripts/run_tests.sh tests/fork_features/test_multi_telegram_accounts_boundary.py tests/fork_features/test_multi_telegram_accounts_identity.py tests/fork_features/test_multi_telegram_accounts_runtime.py tests/fork_features/test_multi_telegram_accounts_session_routing.py tests/fork/test_multi_telegram_accounts.py tests/fork/test_telegram_account_reconnect_delivery.py tests/gateway/test_telegram_send_reconnect_wait.py tests/gateway/test_background_process_notifications.py tests/gateway/test_resume_command.py tests/gateway/test_restart_notification.py tests/gateway/test_runner_fatal_adapter.py tests/gateway/test_platform_reconnect.py tests/gateway/test_shutdown_cache_cleanup.py tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py -q -o 'addopts='
+scripts/run_tests.sh tests/fork_features/test_multi_telegram_accounts_boundary.py tests/fork_features/test_multi_telegram_accounts_identity.py tests/fork_features/test_multi_telegram_accounts_runtime.py tests/fork_features/test_multi_telegram_accounts_session_routing.py tests/fork/test_multi_telegram_accounts.py tests/fork/test_telegram_account_reconnect_delivery.py tests/fork/test_telegram_account_recovery_routes.py tests/fork/test_telegram_account_kanban_routes.py tests/fork/test_telegram_account_lifecycle_notices.py tests/gateway/test_telegram_send_reconnect_wait.py tests/gateway/test_background_process_notifications.py tests/gateway/test_resume_command.py tests/gateway/test_restart_notification.py tests/gateway/test_runner_fatal_adapter.py tests/gateway/test_platform_reconnect.py tests/gateway/test_shutdown_cache_cleanup.py tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py -q -o 'addopts='
 ```
 
 Refactor evidence before applying to the primary working tree:

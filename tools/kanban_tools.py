@@ -1086,6 +1086,10 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
             ("scope_id", env("HERMES_SESSION_SCOPE_ID", "")),
             ("parent_chat_id", env("HERMES_SESSION_PARENT_CHAT_ID", "")),
         ) if v}
+    from fork_features.multi_telegram_accounts import split_account_session_key
+    _, account_id = split_account_session_key(env("HERMES_SESSION_KEY", ""))
+    if platform.lower() == "telegram" and account_id:
+        delivery_metadata["telegram_account_id"] = account_id
     if (platform.lower() == "telegram" and thread_id
             and (chat_type or "").lower() in {"dm", "direct", "private"}):
         delivery_metadata["telegram_dm_topic_reply_fallback"] = True

@@ -332,6 +332,8 @@ class GatewayStartupMixin:
             _profile_adapters = getattr(self, "_profile_adapters", None) or {}
             _pval = lambda p: getattr(p, "value", str(p))  # noqa: E731
             _deliverable_targets = {(_pval(p), "default") for p in self.adapters}
+            if self._telegram_accounts.live:
+                _deliverable_targets.add(("telegram", "default"))
             # Legacy rows (no adapter_profile) are unambiguous only without multiplexing; else fail closed.
             if not _profile_adapters:
                 _deliverable_targets.update((_pval(p), None) for p in self.adapters)
@@ -341,6 +343,7 @@ class GatewayStartupMixin:
                 sweep_recoverable, None,
                 deliverable_platforms={platform for platform, _ in _deliverable_targets},
                 deliverable_targets=_deliverable_targets,
+                can_deliver_session=self._can_deliver_obligation_session,
             )
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
@@ -387,7 +390,8 @@ class GatewayStartupMixin:
             try:
                 while getattr(self, "_running", False):
                     wake.clear()
-                    waiting = await asyncio.to_thread(pending_retries)
+                    waiting = await asyncio.to_thread(
+                        pending_retries, can_deliver_session=self._can_deliver_obligation_session)
                     deadlines = [r["not_before"] for r in waiting
                                  if (r["platform"], r["profile"]) == key]
                     if not deadlines:
@@ -416,7 +420,8 @@ class GatewayStartupMixin:
     async def _arm_flood_timers_for_waiting_rows(self) -> None:
         """Recover adopted, newly refused/rejected and unsent released rows without blocking the loop."""
         from gateway.delivery_ledger import pending_retries
-        for row in await asyncio.to_thread(pending_retries):
+        for row in await asyncio.to_thread(
+                pending_retries, can_deliver_session=self._can_deliver_obligation_session):
             self._schedule_flood_redelivery(row["platform"], profile=row["profile"])
 
     async def _redeliver_claimed_obligations(self, claimed: list) -> int:
@@ -466,6 +471,15 @@ class GatewayStartupMixin:
             await self._arm_flood_timers_for_waiting_rows()
         return redelivered
 
+    def _can_deliver_obligation_session(self, session_key: str, adapter_profile: Optional[str] = None) -> bool:
+        named, adapter = self._telegram_accounts.resolve_session_adapter(session_key)
+        if named:
+            return adapter is not None
+        # Named bots can keep this platform deliverable while its primary is down.
+        if session_key.split(":", 3)[2:3] == ["telegram"]:
+            return self._authorization_adapter(Platform.TELEGRAM, adapter_profile) is not None
+        return True
+
     async def _obligation_adapter(self, row: dict):
         """Resolve the adapter for a claimed ledger row, or None when it cannot be delivered now."""
         try:
@@ -473,11 +487,13 @@ class GatewayStartupMixin:
         except Exception:
             logger.debug("obligation %s: unknown platform %r", row["obligation_id"], row.get("platform"))
             return None
-        if "profile" in row:
-            adapter = self._authorization_adapter(platform, row.get("profile"))
-        else:
-            # Startup rows preserve the historical default-adapter route.
-            adapter = self.adapters.get(platform)
+        named, adapter = self._telegram_accounts.resolve_session_adapter(row.get("session_key", ""))
+        if not named:
+            if "profile" in row:
+                adapter = self._authorization_adapter(platform, row.get("profile"))
+            else:
+                # Legacy startup rows preserve the historical default-adapter route.
+                adapter = self.adapters.get(platform)
         # A runtime claim whose reconnect vanished before dispatch is released without spending an
         # attempt; startup claims keep their state (attempts cap + stale cutoff bound retries).
         # Only a flood row keeps its error (the platform's wait must be honoured); any other row
@@ -508,7 +524,9 @@ class GatewayStartupMixin:
             from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
             if not await asyncio.to_thread(ledger_enabled):
                 return 0
-            claimed = await asyncio.to_thread(sweep_failed_for_runtime, platform.value, profile=profile)
+            claimed = await asyncio.to_thread(
+                sweep_failed_for_runtime, platform.value, profile=profile,
+                can_deliver_session=self._can_deliver_obligation_session)
         except Exception:
             logger.debug(
                 "runtime delivery ledger sweep failed after %s reconnect", platform.value, exc_info=True,

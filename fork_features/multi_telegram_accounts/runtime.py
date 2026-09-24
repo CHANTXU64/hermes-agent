@@ -107,6 +107,15 @@ class TelegramAccountRuntime:
         _recognized, adapter = self.resolve_stamped_adapter(account_id)
         return adapter
 
+    def resolve_session_adapter(self, session_key: str) -> tuple[bool, Any]:
+        """Resolve a durable Telegram account suffix, retaining an offline boundary."""
+        from .identity import split_account_session_key
+
+        base, account = split_account_session_key(session_key)
+        if account is None or base.split(":", 3)[2:3] != ["telegram"]:
+            return False, None
+        return True, self.adapter_for(account)
+
     def has_live_or_queued(self) -> bool:
         return bool(self.live or self.failed)
 
@@ -380,6 +389,7 @@ class TelegramAccountRuntime:
                         error_message=None,
                     )
                     logger.info("✓ telegram[%s] reconnected successfully", account)
+                    await self._recover_deliveries()
                     continue
 
                 await self.host._safe_adapter_disconnect(
@@ -433,6 +443,21 @@ class TelegramAccountRuntime:
                 info["next_retry"] = current_time + min(
                     300, 30 * (2 ** min(attempt - 1, 4))
                 )
+
+    async def _recover_deliveries(self) -> None:
+        """Re-arm existing durable delivery paths; failures must not retire a healthy bot."""
+        for name, args in (
+            ("_send_restart_notification", ()),
+            ("_redeliver_pending_obligations", ()),
+            ("_redeliver_failed_obligations_for_platform", (Platform.TELEGRAM,)),
+            ("_arm_flood_timers_for_waiting_rows", ()),
+        ):
+            recover = getattr(self.host, name, None)
+            if callable(recover):
+                try:
+                    await recover(*args)
+                except Exception:
+                    logger.warning("Telegram account recovery failed: %s", name, exc_info=True)
 
     async def stop(self) -> None:
         """Bounded teardown for live named bots and retirement of retry state."""

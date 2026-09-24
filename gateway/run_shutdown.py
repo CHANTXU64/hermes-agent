@@ -140,9 +140,10 @@ def _send_error(result: Any) -> str:
     return getattr(result, "error", "send returned success=False")
 
 
-def _notice_target_key(platform_value: str, chat_id, thread_id) -> tuple:
-    """Dedup key for one notice destination: thread/topic platforms share a chat but route apart."""
-    return (platform_value, str(chat_id), str(thread_id) if thread_id else None)
+def _notice_target_key(platform_value: str, chat_id, thread_id, account_id=None) -> tuple:
+    """Dedup one transport/chat/thread destination; legacy primary keys remain unchanged."""
+    key = (platform_value, str(chat_id), str(thread_id) if thread_id else None)
+    return (*key, account_id) if account_id else key
 
 
 def _effective_watchdog_leash(runner: object) -> float:
@@ -964,17 +965,31 @@ class GatewayShutdownMixin:
             if getattr(self, "session_store", None) is not None:
                 await self.async_session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
-                source = getattr(entry, "origin", None) if entry else None
+                if entry is not None and getattr(entry, "origin", None) is not None:
+                    source = self._restored_source(entry)
+                    if source is None:
+                        return None
         except Exception as e:
             logger.debug("Failed to load session origin for shutdown notification %s: %s", session_key, e)
         if source is None:
             source = self._get_cached_session_source(session_key)
         if source is not None:
+            from fork_features.multi_telegram_accounts import restore_account_session_source
+            source = restore_account_session_source(source, session_key)
+            if source is None:
+                return None
             return source, source.platform.value, str(source.chat_id), source.thread_id, getattr(source, "profile", None)
         _parsed = _parse_session_key(session_key)
         if not _parsed:
             return None
-        return None, _parsed["platform"], _parsed["chat_id"], _parsed.get("thread_id"), _parsed.get("profile")
+        if _parsed.get("account_id"):
+            from gateway.session import SessionSource
+            source = SessionSource(
+                platform=Platform(_parsed["platform"]), chat_id=_parsed["chat_id"],
+                chat_type=_parsed["chat_type"], thread_id=_parsed.get("thread_id"),
+                profile=_parsed.get("profile"), account_id=_parsed["account_id"],
+            )
+        return source, _parsed["platform"], _parsed["chat_id"], _parsed.get("thread_id"), _parsed.get("profile")
 
     async def _send_shutdown_notice(
         self, adapter, chat_id: str, msg: str, kind: str, platform_str: str, **send_kwargs
@@ -1022,15 +1037,16 @@ class GatewayShutdownMixin:
         if restart_source is not None:
             with suppress(Exception):
                 restart_key = _notice_target_key(
-                    restart_source.platform.value, restart_source.chat_id, restart_source.thread_id
+                    restart_source.platform.value, restart_source.chat_id, restart_source.thread_id,
+                    getattr(restart_source, "account_id", None),
                 )
-        notified: set[tuple[str, str, Optional[str]]] = set()
+        notified: set[tuple] = set()
         for session_key in self._snapshot_running_agents():
             target = await self._shutdown_notification_target(session_key)
             if target is None:
                 continue
             source, platform_str, chat_id, thread_id, profile = target
-            dedup_key = _notice_target_key(platform_str, chat_id, thread_id)
+            dedup_key = _notice_target_key(platform_str, chat_id, thread_id, getattr(source, "account_id", None))
             if dedup_key in notified:
                 continue
             try:
@@ -1039,7 +1055,7 @@ class GatewayShutdownMixin:
                 # self.adapters hit: under multiplex that is the default bot, so a secondary session's
                 # "Gateway shutting down" would land in the user's chat with the wrong bot.
                 adapter = self._delivery_adapter_for(source) if source is not None else None
-                if adapter is None:
+                if adapter is None and source is None:
                     adapter = self._authorization_adapter(platform, profile)
                 if not adapter:
                     continue

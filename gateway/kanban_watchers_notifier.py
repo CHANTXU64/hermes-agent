@@ -150,6 +150,9 @@ def _platform_names(mapping: Any) -> set[str]:
 
 def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profile: Optional[str]) -> Any:
     """Resolve a durable route without turning a missing secondary bot into primary authority."""
+    account_id = (sub.get("delivery_metadata") or {}).get("telegram_account_id")
+    if getattr(platform, "value", platform) == "telegram" and account_id:
+        return runner._telegram_accounts.adapter_for(account_id)
     adapter = runner._authorization_adapter(platform, owner_profile)
     config = getattr(runner, "config", None)
     if not getattr(config, "multiplex_profiles", False):
@@ -647,6 +650,9 @@ class _KanbanNotification:
             profile=self.sub_profile or None, scope_id=_wake_scope_id(self.adapter, sub),
             parent_chat_id=_delivery_meta.get("parent_chat_id"),
         )
+        if self.platform_str == "telegram":
+            from fork_features.multi_telegram_accounts import normalize_account_id
+            _source.account_id = normalize_account_id(_delivery_meta.get("telegram_account_id"))
         _source._transport_adapter_ref = weakref.ref(self.adapter)
         from gateway.run import _async_profile_runtime_scope
         if self.sub_profile and getattr(getattr(self.runner, "config", None), "multiplex_profiles", False):

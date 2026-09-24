@@ -1293,6 +1293,13 @@ Primary files:
 - `gateway/config_env.py`
 - `gateway/run_startup.py`
 - `gateway/run_notifications.py`
+- `gateway/run_shutdown.py`
+- `gateway/delivery_ledger.py`
+- `gateway/kanban_watchers_notifier.py`
+- `tools/kanban_tools.py`
+- `tests/fork/test_telegram_account_recovery_routes.py`
+- `tests/fork/test_telegram_account_kanban_routes.py`
+- `tests/fork/test_telegram_account_lifecycle_notices.py`
 - `fork_features/multi_telegram_accounts/__init__.py`
 - `fork_features/multi_telegram_accounts/identity.py`
 - `fork_features/multi_telegram_accounts/runtime.py`
@@ -1347,6 +1354,14 @@ Behavior contract:
   the file bytes, caption, filename, reply anchor, and notification metadata.
   A transiently unavailable transport returns a retryable failure; this does
   not introduce a new durable attachment retry queue.
+- Final-reply ledger recovery resolves the durable account suffix; unavailable
+  named accounts spend no send attempt, and reconnect re-arms existing recovery.
+- Kanban creator notifications, artifacts and wakes retain account provenance in
+  existing metadata. Legacy unstamped subscriptions keep their primary route;
+  historical account identity is not guessed and subscription uniqueness is unchanged.
+- Restart notices share configuration and success checks; unavailable/retryable
+  named notices wait for reconnect without borrowing primary. Marker consumption
+  is serialized, while shutdown notices restore identity and deduplicate per bot.
 - Named bots remain ordinary DM sessions; Telegram DM Topics and per-account
   `/update` lifecycle routing remain outside this feature.
 
@@ -1377,7 +1392,7 @@ Effective exposure and lifecycle evidence:
 Verification:
 
 ```bash
-scripts/run_tests.sh tests/fork_features/test_multi_telegram_accounts_boundary.py tests/fork_features/test_multi_telegram_accounts_identity.py tests/fork_features/test_multi_telegram_accounts_runtime.py tests/fork_features/test_multi_telegram_accounts_session_routing.py tests/fork/test_multi_telegram_accounts.py tests/fork/test_telegram_account_reconnect_delivery.py tests/gateway/test_telegram_send_reconnect_wait.py tests/gateway/test_background_process_notifications.py tests/gateway/test_resume_command.py tests/gateway/test_restart_notification.py tests/gateway/test_runner_fatal_adapter.py tests/gateway/test_platform_reconnect.py tests/gateway/test_shutdown_cache_cleanup.py tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py -q -o 'addopts='
+scripts/run_tests.sh tests/fork_features/test_multi_telegram_accounts_boundary.py tests/fork_features/test_multi_telegram_accounts_identity.py tests/fork_features/test_multi_telegram_accounts_runtime.py tests/fork_features/test_multi_telegram_accounts_session_routing.py tests/fork/test_multi_telegram_accounts.py tests/fork/test_telegram_account_reconnect_delivery.py tests/fork/test_telegram_account_recovery_routes.py tests/fork/test_telegram_account_kanban_routes.py tests/fork/test_telegram_account_lifecycle_notices.py tests/gateway/test_telegram_send_reconnect_wait.py tests/gateway/test_background_process_notifications.py tests/gateway/test_resume_command.py tests/gateway/test_restart_notification.py tests/gateway/test_runner_fatal_adapter.py tests/gateway/test_platform_reconnect.py tests/gateway/test_shutdown_cache_cleanup.py tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py -q -o 'addopts='
 ```
 
 Merge-time semantic review:

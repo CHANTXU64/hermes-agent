@@ -19,7 +19,7 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from gateway.dead_targets import classify_dead_error
 from hermes_cli.sqlite_util import add_column_if_missing
@@ -355,7 +355,8 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
 
 
 def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Optional[set] = None,
-                      deliverable_targets: Optional[set] = None) -> List[Dict[str, Any]]:
+                      deliverable_targets: Optional[set] = None,
+                      can_deliver_session: Optional[Callable[[str, Optional[str]], bool]] = None) -> List[Dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for redelivery.
 
     Claiming atomically re-stamps the owner to THIS process and increments ``attempts`` (the UPDATE is
@@ -395,6 +396,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
             if ((deliverable_platforms is not None and platform not in deliverable_platforms)
                     or (deliverable_targets is not None and (platform, adapter_profile) not in deliverable_targets)):
                 continue  # no adapter this boot — claiming would spend an attempt on a no-op
+            if can_deliver_session is not None and not can_deliver_session(session_key, adapter_profile):
+                continue  # an offline account must not spend another bot's delivery budget
             flood_row = state == "failed" and is_flood_error(last_error)
             if flood_row and now < flood_not_before(updated_at, last_error):
                 # Still inside the platform's wait: adopt the dead owner's row without spending an attempt
@@ -433,7 +436,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
 
 
 def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
-                             profile: Optional[str] = None) -> List[Dict[str, Any]]:
+                             profile: Optional[str] = None,
+                             can_deliver_session: Optional[Callable[[str, Optional[str]], bool]] = None) -> List[Dict[str, Any]]:
     """Claim this process's failed rows that are due for another send, for one adapter.
 
     ``profile`` scopes multiplexed gateways to the bot identity that owned the failed send (``None`` =
@@ -472,6 +476,8 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                        WHERE obligation_id=? AND state='failed'
                          AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
                 continue
+            if can_deliver_session is not None and not can_deliver_session(session_key, adapter_profile):
+                continue
             if now < due:
                 continue  # the platform's wait or the backoff has not passed; the timer comes back for it
             # The claim clears the stale error: this is a fresh attempt, and if it is interrupted the next
@@ -491,7 +497,8 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
     return claimed
 
 
-def pending_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
+def pending_retries(now: Optional[float] = None, *,
+                    can_deliver_session: Optional[Callable[[str, Optional[str]], bool]] = None) -> List[Dict[str, Any]]:
     """This process's failed rows that still await redelivery, one entry per adapter identity with the
     earliest deadline (``not_before``). The runner arms one redelivery timer per entry, so a row adopted
     at boot, skipped because its wait had not passed, or rejected again is never stranded. Rows past the
@@ -501,11 +508,13 @@ def pending_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
         return []
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT platform, adapter_profile, updated_at, last_error, attempts, created_at
+            """SELECT platform, adapter_profile, updated_at, last_error, attempts, created_at, session_key
                FROM delivery_obligations
                WHERE state='failed' AND owner_pid IS ? AND owner_started_at IS ?""", (pid, started)).fetchall()
     earliest: Dict[tuple, float] = {}
-    for platform, adapter_profile, updated_at, last_error, attempts, created_at in rows:
+    for platform, adapter_profile, updated_at, last_error, attempts, created_at, session_key in rows:
+        if can_deliver_session is not None and not can_deliver_session(session_key, adapter_profile):
+            continue
         # Reconnect-only rows (a claim released because the adapter was gone) are re-claimed by the
         # reconnect sweep; a timer would claim and release them every tick until the adapter is back.
         if is_reconnect_only(last_error):
