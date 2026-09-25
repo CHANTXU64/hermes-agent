@@ -55,7 +55,7 @@ def _make_mock_parent(depth=0):
     return parent
 
 
-
+class TestDelegateRequirements(unittest.TestCase):
     @patch(
         "hermes_cli.inventory.build_models_payload",
         side_effect=AssertionError("model catalog must not enter persistent tool schema"),
