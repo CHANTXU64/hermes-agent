@@ -95,9 +95,9 @@ def perform_api_call(
         try:
             from agent.conversation_loop import _canonicalize_api_tool_calls
             from fork_features.request_fork.prepared_request import build_adopt_rematerializer
-            from fork_features.request_fork import freeze_codex_request_for_compression
+            from fork_features.request_fork import freeze_request_for_compression
 
-            frozen = freeze_codex_request_for_compression(
+            frozen = freeze_request_for_compression(
                 agent, physical_api_kwargs, fidelity="failed_wire"
             )
             rematerializer = build_adopt_rematerializer(
@@ -134,7 +134,8 @@ def perform_api_call(
                     on_physical_request=_capture_physical_request,
                 )
             return agent._interruptible_streaming_api_call(
-                next_api_kwargs, on_first_delta=_stop_spinner
+                next_api_kwargs, on_first_delta=_stop_spinner,
+                on_physical_request=_capture_physical_request,
             )
         from agent import relay_llm
 

@@ -106,7 +106,7 @@ async def test_compress_command_works_when_auto_compaction_disabled():
 
 @pytest.mark.asyncio
 async def test_gateway_manual_compress_passes_full_request_fork_snapshot():
-    from fork_features.request_fork import FrozenCodexRequest
+    from fork_features.request_fork import FrozenRequest
 
     history = _make_history()
     compressed = [
@@ -137,7 +137,7 @@ async def test_gateway_manual_compress_passes_full_request_fork_snapshot():
     agent_instance.session_id = "sess-1"
     agent_instance._compress_context.return_value = (compressed, "")
     agent_instance._compression_skipped_due_to_lock = False
-    reconstructed = FrozenCodexRequest(
+    reconstructed = FrozenRequest(
         body={
             "model": "test-model",
             "instructions": "PERSISTED LIVE SYSTEM",

@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent.message_sanitization import _sanitize_messages_surrogates
 from utils import base_url_host_matches
-from fork_features.request_fork import rematerialize_codex_request_after_adopt
+from fork_features.request_fork import rematerialize_request_after_adopt
 
 
 def build_adopt_rematerializer(
@@ -25,6 +25,13 @@ def build_adopt_rematerializer(
         0 <= current_turn_user_idx < len(original_messages)
     ):
         return None
+    if prepared_request.api_mode != "codex_responses":
+        from .message_protocols import build_messages_adopt_rematerializer
+
+        return build_messages_adopt_rematerializer(
+            agent, prepared_request=prepared_request, original_messages=original_messages,
+            current_turn_user_idx=current_turn_user_idx, canonicalize_tool_calls=canonicalize_tool_calls,
+        )
     prepared_body = prepared_request.clone_body()
     prepared_input = prepared_body.get("input")
     if not isinstance(prepared_input, list):
@@ -98,7 +105,7 @@ def build_adopt_rematerializer(
     current_user_input = [current_user_item]
 
     def _rematerialize(adopted_messages: list) -> Any:
-        return rematerialize_codex_request_after_adopt(
+        return rematerialize_request_after_adopt(
             prepared_request,
             original_messages=original_snapshot,
             adopted_messages=adopted_messages,

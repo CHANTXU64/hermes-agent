@@ -73,7 +73,9 @@ class CompressionLifecycle:
             if not has_hook("on_compression_start"):
                 return
             frozen_body = self.request_fork.clone_body() if self.request_fork is not None else {}
-            request_messages = frozen_body.get("input")
+            request_messages = frozen_body.get(
+                self.request_fork.input_key if self.request_fork is not None else "input"
+            )
             tools = frozen_body.get("tools")
             payload = {
                 "compression_id": self.attempt_id,

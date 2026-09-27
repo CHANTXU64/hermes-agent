@@ -193,9 +193,9 @@ def handle_api_error(
         try:
             from agent.conversation_loop import _canonicalize_api_tool_calls
             from fork_features.request_fork.prepared_request import build_adopt_rematerializer
-            from fork_features.request_fork import freeze_codex_request_for_compression
+            from fork_features.request_fork import freeze_request_for_compression
 
-            request_fork = freeze_codex_request_for_compression(
+            request_fork = freeze_request_for_compression(
                 agent, api_kwargs or {}, fidelity="failed_wire"
             )
             request_fork_rematerializer = build_adopt_rematerializer(

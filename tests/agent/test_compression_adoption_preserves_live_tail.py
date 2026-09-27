@@ -129,9 +129,9 @@ def test_adoption_preserves_unpersisted_live_user_tail(tmp_path: Path) -> None:
     lifecycle_events = []
     rematerialized = []
 
-    from fork_features.request_fork import FrozenCodexRequest
+    from fork_features.request_fork import FrozenRequest
 
-    stale_request = FrozenCodexRequest(
+    stale_request = FrozenRequest(
         body={
             "model": "test",
             "input": [
@@ -145,7 +145,7 @@ def test_adoption_preserves_unpersisted_live_user_tail(tmp_path: Path) -> None:
 
     def _rematerialize(adopted_messages):
         rematerialized.append(copy.deepcopy(adopted_messages))
-        return FrozenCodexRequest(
+        return FrozenRequest(
             body={
                 "model": "test",
                 "input": copy.deepcopy(adopted_messages),
@@ -167,7 +167,7 @@ def test_adoption_preserves_unpersisted_live_user_tail(tmp_path: Path) -> None:
             ),
         ),
         patch(
-            "fork_features.request_fork.materialize_codex_request_for_compression",
+            "fork_features.request_fork.materialize_request_for_compression",
             side_effect=AssertionError(
                 "durable adoption must use the host-owned prepared factory"
             ),

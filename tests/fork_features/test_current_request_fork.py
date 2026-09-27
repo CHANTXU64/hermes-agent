@@ -11,13 +11,13 @@ from types import SimpleNamespace
 import pytest
 
 from fork_features.request_fork import (
-    FrozenCodexRequest,
+    FrozenRequest,
     RequestForkService,
     build_out_of_turn_compression_request_snapshot,
-    rematerialize_codex_request_after_adopt,
+    rematerialize_request_after_adopt,
     compression_request_fork_enabled,
     current_request_fork_scope,
-    freeze_codex_request_for_compression,
+    freeze_request_for_compression,
 )
 
 
@@ -128,7 +128,7 @@ def test_freeze_accepts_sdk_transform_bypassed_physical_request(monkeypatch):
     assert "input" not in physical
     assert isinstance(physical["extra_body"]["input"], list)
 
-    frozen = freeze_codex_request_for_compression(
+    frozen = freeze_request_for_compression(
         SimpleNamespace(session_id="physical-session"),
         physical,
         fidelity="failed_wire",
@@ -193,7 +193,7 @@ def test_frozen_responses_request_reaches_transport_without_second_conversion(
         return "RAW RESPONSE"
 
     monkeypatch.setattr(codex_runtime, "run_codex_stream", _capture_transport)
-    frozen = FrozenCodexRequest(
+    frozen = FrozenRequest(
         body=body,
         fidelity="failed_wire",
         captured_session_id="physical-session-before-rotation",
@@ -241,7 +241,7 @@ def test_request_fork_logs_prompt_cache_usage(monkeypatch, caplog):
         "run_codex_stream",
         lambda runtime, api_kwargs, client=None: "RAW RESPONSE",
     )
-    frozen = FrozenCodexRequest(
+    frozen = FrozenRequest(
         body={
             "model": "gpt-test",
             "input": [{"role": "user", "content": "FULL PREFIX"}],
@@ -285,7 +285,7 @@ def test_request_fork_uses_host_api_attempt_limit_for_transient_connection_error
 
     monkeypatch.setattr(codex_runtime, "run_codex_stream", _fail_then_succeed)
     monkeypatch.setattr(time, "sleep", lambda _seconds: None)
-    frozen = FrozenCodexRequest(
+    frozen = FrozenRequest(
         body={
             "model": "gpt-test",
             "input": [{"role": "user", "content": "FULL PREFIX"}],
@@ -330,8 +330,13 @@ def test_request_fork_snapshot_is_enabled_only_for_verified_codex_path(monkeypat
 
     assert compression_request_fork_enabled(agent) is True
     agent.api_mode = "chat_completions"
-    assert compression_request_fork_enabled(agent) is False
+    assert compression_request_fork_enabled(agent) is True
     agent.api_mode = "anthropic_messages"
+    assert compression_request_fork_enabled(agent) is True
+    agent.api_mode = "bedrock_converse"
+    assert compression_request_fork_enabled(agent) is False
+    agent.api_mode = "chat_completions"
+    agent.is_subagent = True
     assert compression_request_fork_enabled(agent) is False
 
 
@@ -356,7 +361,7 @@ def test_in_flight_fork_owns_client_independent_of_parent_close(monkeypatch):
 
     monkeypatch.setattr(codex_runtime, "run_codex_stream", _blocking_transport)
     agent = _BlockingAgent()
-    frozen = FrozenCodexRequest(
+    frozen = FrozenRequest(
         body={
             "model": "gpt-test",
             "input": [{"role": "user", "content": "FULL PREFIX"}],
@@ -418,7 +423,7 @@ def test_request_fork_callbacks_do_not_retain_or_reread_parent_agent(monkeypatch
         "run_codex_stream",
         _capture,
     )
-    frozen = FrozenCodexRequest(
+    frozen = FrozenRequest(
         body={
             "model": "gpt-test",
             "input": [{"role": "user", "content": "FULL PREFIX"}],
@@ -555,7 +560,7 @@ def test_out_of_turn_snapshot_uses_full_history_cached_system_and_final_tools(
 
 
 def test_adopt_rematerialization_splices_only_new_rows_into_prepared_body():
-    prepared = FrozenCodexRequest(
+    prepared = FrozenRequest(
         body={
             "model": "gpt-test",
             "instructions": "STABLE SYSTEM",
@@ -605,7 +610,7 @@ def test_adopt_rematerialization_splices_only_new_rows_into_prepared_body():
         converter_calls.append(copy.deepcopy(rows))
         return copy.deepcopy(rows)
 
-    rematerialized = rematerialize_codex_request_after_adopt(
+    rematerialized = rematerialize_request_after_adopt(
         prepared,
         original_messages=original,
         adopted_messages=adopted,

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from fork_features.request_fork import FrozenCodexRequest
+from fork_features.request_fork import FrozenRequest
 
 
 def lifecycle_module():
@@ -61,7 +61,7 @@ def test_adoption_replaces_frozen_request_and_hook_cannot_mutate_history(monkeyp
     agent = SimpleNamespace(session_id="old", api_mode="codex_responses", tools=[],
                             _get_transport=ResponsesApiTransport)
     body = {"input": [{"role": "user", "content": "adopted request"}], "tools": []}
-    frozen = FrozenCodexRequest(body=body, fidelity="prepared_parent", captured_session_id="old")
+    frozen = FrozenRequest(body=body, fidelity="prepared_parent", captured_session_id="old")
     lifecycle = module.CompressionLifecycle(
         agent, attempt_id="attempt", in_place=False, trigger_source="auto",
         request_fork=None, request_fork_rematerializer=lambda messages: frozen,

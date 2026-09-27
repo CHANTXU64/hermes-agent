@@ -22,11 +22,11 @@ from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_ST
 from hermes_state import SessionDB
 from run_agent import AIAgent
 import run_agent
-from fork_features.request_fork import FrozenCodexRequest
+from fork_features.request_fork import FrozenRequest
 
 
 def _frozen_request(messages, tools):
-    return FrozenCodexRequest(
+    return FrozenRequest(
         body={"model": "test", "input": messages, "tools": tools},
         fidelity="prepared_parent",
         captured_session_id="test-session",
@@ -1786,7 +1786,7 @@ class TestToolResultPreflightCompression:
 
         mock_compress.assert_called_once()
         frozen = mock_compress.call_args.kwargs["request_fork"]
-        assert isinstance(frozen, FrozenCodexRequest)
+        assert isinstance(frozen, FrozenRequest)
         assert frozen.fidelity == "prepared_parent"
         frozen_body = frozen.clone_body()
         assert frozen_body["model"] == agent.model
@@ -1904,7 +1904,7 @@ class TestToolResultPreflightCompression:
                 side_effect=lambda name: name == "on_compression_start",
             ),
             patch(
-                "agent.conversation_loop.freeze_codex_request_for_compression",
+                "agent.conversation_loop.freeze_request_for_compression",
                 return_value=None,
             ) as freeze_request,
             patch.object(

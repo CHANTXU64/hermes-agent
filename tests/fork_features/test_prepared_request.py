@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from fork_features.request_fork import FrozenCodexRequest
+from fork_features.request_fork import FrozenRequest
 
 
 def test_adoption_factory_captures_history_and_preserves_request_only_context():
@@ -20,7 +20,7 @@ def test_adoption_factory_captures_history_and_preserves_request_only_context():
     original = [{"role": "user", "content": "prior"}, {"role": "user", "content": "live"}]
     body = {"input": [*copy.deepcopy(original), {"role": "developer", "content": "this request only"}],
             "tools": [{"type": "function", "name": "test"}], "prompt_cache_key": "stable"}
-    frozen = FrozenCodexRequest(body=body, fidelity="prepared_parent", captured_session_id="s")
+    frozen = FrozenRequest(body=body, fidelity="prepared_parent", captured_session_id="s")
     canonicalized = []
     rebuild = module.build_adopt_rematerializer(
         agent, prepared_request=frozen, original_messages=original, current_turn_user_idx=1,

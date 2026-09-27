@@ -1667,7 +1667,7 @@ def test_codex_413_compression_forks_actual_failed_wire_request(monkeypatch):
 
     import agent.codex_runtime as codex_runtime
     from fork_features.request_fork import (
-        FrozenCodexRequest,
+        FrozenRequest,
         RequestForkService,
         current_request_fork_scope,
     )
@@ -1774,7 +1774,7 @@ def test_codex_413_compression_forks_actual_failed_wire_request(monkeypatch):
         request_fork_rematerializer=None,
         **_kwargs,
     ):
-        assert isinstance(request_fork, FrozenCodexRequest)
+        assert isinstance(request_fork, FrozenRequest)
         assert callable(request_fork_rematerializer), request_fork.clone_body()["input"]
         rematerialized = request_fork_rematerializer(
             [
@@ -1783,7 +1783,7 @@ def test_codex_413_compression_forks_actual_failed_wire_request(monkeypatch):
                 messages[-1],
             ]
         )
-        assert isinstance(rematerialized, FrozenCodexRequest)
+        assert isinstance(rematerialized, FrozenRequest)
         assert any(
             item.get("role") == "assistant"
             and item.get("content") == [
@@ -1851,7 +1851,7 @@ def test_codex_413_compression_forks_actual_failed_wire_request(monkeypatch):
 
 
 def test_codex_auto_compression_receives_provider_ready_parent_request(monkeypatch):
-    from fork_features.request_fork import FrozenCodexRequest
+    from fork_features.request_fork import FrozenRequest
 
     agent = _build_agent(monkeypatch)
     setattr(agent, "compression_enabled", True)
@@ -1879,7 +1879,7 @@ def test_codex_auto_compression_receives_provider_ready_parent_request(monkeypat
         request_fork_rematerializer=None,
         **_kwargs,
     ):
-        assert isinstance(request_fork, FrozenCodexRequest)
+        assert isinstance(request_fork, FrozenRequest)
         assert callable(request_fork_rematerializer)
         adopted = [
             *messages[:-1],
@@ -1887,7 +1887,7 @@ def test_codex_auto_compression_receives_provider_ready_parent_request(monkeypat
             messages[-1],
         ]
         rematerialized = request_fork_rematerializer(adopted)
-        assert isinstance(rematerialized, FrozenCodexRequest)
+        assert isinstance(rematerialized, FrozenRequest)
         captured.append((request_fork, rematerialized))
         setattr(compressor, "threshold_tokens", 10_000)
         return [

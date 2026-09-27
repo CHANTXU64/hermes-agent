@@ -10,6 +10,7 @@ forwarders. Symbols tests patch on ``run_agent`` (``cleanup_vm`` /
 from __future__ import annotations
 
 import contextlib
+import copy
 import contextvars
 import json
 import logging
@@ -2771,10 +2772,11 @@ class _StreamingCall(StreamingWaitMonitor):
     State shared between the request worker and the poll-loop monitor (heartbeat,
     stale kill, interrupt abort) lives on the instance, mutated from both threads."""
 
-    def __init__(self, agent, api_kwargs: dict, on_first_delta):
+    def __init__(self, agent, api_kwargs: dict, on_first_delta, on_physical_request=None):
         self.agent = agent
         self.api_kwargs = api_kwargs
         self.on_first_delta = on_first_delta
+        self.on_physical_request = on_physical_request
         self.worker = None  # request thread; None in inline mode
         self.result = {"response": None, "error": None, "partial_tool_names": []}
         self.clients = _RequestClientRegistry(agent)
@@ -2991,6 +2993,8 @@ class _StreamingCall(StreamingWaitMonitor):
         # #93650: as above — the streaming path carries the same bulk
         # messages/tools payload and pays the same client-side walk.
         stream_kwargs = bypass_chat_sdk_request_transform(stream_kwargs, request_client)
+        if self.on_physical_request is not None:
+            self._quiet(self.on_physical_request, copy.deepcopy(stream_kwargs))
         return request_client.chat.completions.create(**stream_kwargs)
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
@@ -3348,6 +3352,8 @@ class _StreamingCall(StreamingWaitMonitor):
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
             final_kwargs = dict(next_api_kwargs)
             sanitize_anthropic_kwargs(final_kwargs, log_prefix=getattr(self.agent, "log_prefix", ""))
+            if self.on_physical_request is not None:
+                self._quiet(self.on_physical_request, copy.deepcopy(final_kwargs))
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()
@@ -3830,7 +3836,7 @@ def interruptible_streaming_api_call(
         return _BedrockStream(agent, api_kwargs, on_first_delta).run()
     # Cross-turn stale-stream circuit breaker (see ``_stale_streak()``).
     _check_stale_giveup(agent)
-    return _StreamingCall(agent, api_kwargs, on_first_delta).run()
+    return _StreamingCall(agent, api_kwargs, on_first_delta, on_physical_request).run()
 
 
 __all__ = ["interruptible_api_call", "build_api_kwargs", "build_assistant_message", "try_activate_fallback",

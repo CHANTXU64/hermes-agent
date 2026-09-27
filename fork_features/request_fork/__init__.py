@@ -1,8 +1,8 @@
-"""Request-local Fork of one frozen provider-native Codex request.
+"""Request-local Fork of one frozen provider-native request.
 
 The service is available to plugins only while Hermes emits
 ``on_compression_start``. Captured forks keep an immutable request prefix and
-final tool schemas, call the current Codex Responses transport directly, and
+final tool schemas, call the current provider transport directly, and
 never write to the parent transcript or execute returned tool calls.
 """
 
@@ -28,16 +28,17 @@ class RequestForkResult:
 
 
 @dataclass(frozen=True, init=False)
-class FrozenCodexRequest:
+class FrozenRequest:
     """Mutation-safe provider-native request value captured by the host.
 
-    The body contains only kwargs already prepared for the Codex Responses
+    The body contains only kwargs already prepared for the provider
     transport.  Runtime objects (agent/client/locks/callbacks/SessionDB) are
     deliberately excluded and are created independently when the Fork sends.
     """
 
     fidelity: str
     captured_session_id: str
+    api_mode: str
     _body: dict[str, Any] = field(repr=False)
 
     def __init__(
@@ -46,15 +47,19 @@ class FrozenCodexRequest:
         body: Mapping[str, Any],
         fidelity: str,
         captured_session_id: str = "",
+        api_mode: str = "codex_responses",
     ) -> None:
         frozen_body = copy.deepcopy(dict(body))
-        request_input = frozen_body.get("input")
+        if api_mode not in {"codex_responses", "anthropic_messages", "chat_completions"}:
+            raise ValueError("Unsupported frozen request protocol")
+        request_input = frozen_body.get("input" if api_mode == "codex_responses" else "messages")
         if not isinstance(request_input, list):
             raise ValueError("Frozen Codex request requires a list input")
         fidelity_text = str(fidelity or "").strip()
         if not fidelity_text:
             raise ValueError("Frozen Codex request requires fidelity")
         object.__setattr__(self, "fidelity", fidelity_text)
+        object.__setattr__(self, "api_mode", api_mode)
         object.__setattr__(self, "captured_session_id", str(captured_session_id or ""))
         object.__setattr__(self, "_body", frozen_body)
 
@@ -62,6 +67,10 @@ class FrozenCodexRequest:
         """Return a fresh mutable body for exactly one transport send."""
 
         return copy.deepcopy(self._body)
+
+    @property
+    def input_key(self) -> str:
+        return "input" if self.api_mode == "codex_responses" else "messages"
 
 
 def _usage_mapping(value: Any) -> dict[str, Any]:
@@ -89,6 +98,7 @@ def _log_request_fork_usage(
     request_id: str,
     usage: Mapping[str, Any],
     provider: str,
+    api_mode: str = "codex_responses",
 ) -> None:
     if not usage:
         logger.warning(
@@ -102,7 +112,7 @@ def _log_request_fork_usage(
         canonical = normalize_usage(
             usage,
             provider=provider,
-            api_mode="codex_responses",
+            api_mode=api_mode,
         )
         prompt_tokens = canonical.prompt_tokens
         cache_hit_rate = (
@@ -131,7 +141,7 @@ def _log_request_fork_usage(
 
 @dataclass(frozen=True)
 class _RequestForkTemplate:
-    frozen_request: FrozenCodexRequest
+    frozen_request: FrozenRequest
     client_factory: Callable[[], Any]
     client_close: Callable[[Any], None]
     normalize_response: Callable[[Any], Any]
@@ -193,7 +203,7 @@ class CurrentRequestFork:
         max_attempts = max(1, int(self._template.max_attempts))
         for attempt in range(1, max_attempts + 1):
             api_kwargs = self._template.frozen_request.clone_body()
-            request_input = api_kwargs.get("input")
+            request_input = api_kwargs.get(self._template.frozen_request.input_key)
             if not isinstance(request_input, list):
                 raise RuntimeError("Frozen Codex request input is unavailable")
             request_input.append(copy.deepcopy(dict(append_message)))
@@ -204,7 +214,16 @@ class CurrentRequestFork:
             )
             owned_client = self._template.client_factory()
             try:
-                response = run_codex_stream(runtime, api_kwargs, client=owned_client)
+                mode = self._template.frozen_request.api_mode
+                if mode == "codex_responses":
+                    response = run_codex_stream(runtime, api_kwargs, client=owned_client)
+                else:
+                    from .message_protocols import send_messages
+
+                    response = send_messages(
+                        owned_client, api_kwargs, mode=mode,
+                        progress=self._template.progress_callback,
+                    )
                 normalized = self._template.normalize_response(response)
                 content = getattr(normalized, "content", None)
                 tool_calls = getattr(normalized, "tool_calls", None)
@@ -215,6 +234,7 @@ class CurrentRequestFork:
                     request_id=str(request_id or "request-fork"),
                     usage=usage,
                     provider=self._template.provider,
+                    api_mode=mode,
                 )
                 return RequestForkResult(
                     raw_output=(
@@ -337,7 +357,11 @@ def compression_request_fork_enabled(agent: Any) -> bool:
     api_mode = str(
         getattr(agent, "api_mode", "") or "chat_completions"
     ).strip().lower()
-    if api_mode != "codex_responses":
+    if api_mode not in {"codex_responses", "anthropic_messages", "chat_completions"}:
+        return False
+    # These backends have no independently owned native SDK client.
+    base_url = str(getattr(agent, "base_url", "") or "")
+    if base_url.startswith(("acp://", "acp+tcp://")) or getattr(agent, "provider", "") in {"moa", "bedrock"}:
         return False
     try:
         from hermes_cli.lifecycle import has_hook
@@ -347,30 +371,32 @@ def compression_request_fork_enabled(agent: Any) -> bool:
         return False
 
 
-def freeze_codex_request_for_compression(
+def freeze_request_for_compression(
     agent: Any,
     body: Mapping[str, Any],
     *,
     fidelity: str,
-) -> FrozenCodexRequest | None:
+) -> FrozenRequest | None:
     """Freeze a prepared Codex request only when a real consumer is active."""
 
     if not compression_request_fork_enabled(agent):
         return None
     canonical_body = copy.deepcopy(dict(body))
+    api_mode = str(getattr(agent, "api_mode", "codex_responses"))
     extra_body = canonical_body.get("extra_body")
     if isinstance(extra_body, Mapping):
         remaining_extra_body = dict(extra_body)
-        for field_name in ("input", "tools"):
+        for field_name in ("input" if api_mode == "codex_responses" else "messages", "tools"):
             if field_name in remaining_extra_body:
                 canonical_body[field_name] = remaining_extra_body.pop(field_name)
         if remaining_extra_body:
             canonical_body["extra_body"] = remaining_extra_body
         else:
             canonical_body.pop("extra_body", None)
-    return FrozenCodexRequest(
+    return FrozenRequest(
         body=canonical_body,
         fidelity=fidelity,
+        api_mode=api_mode,
         captured_session_id=str(getattr(agent, "session_id", "") or ""),
     )
 
@@ -404,8 +430,8 @@ def _contains_image_content(messages: Sequence[Mapping[str, Any]]) -> bool:
     return False
 
 
-def rematerialize_codex_request_after_adopt(
-    prepared_request: FrozenCodexRequest,
+def rematerialize_request_after_adopt(
+    prepared_request: FrozenRequest,
     *,
     original_messages: Sequence[Mapping[str, Any]],
     adopted_messages: Sequence[Mapping[str, Any]],
@@ -414,7 +440,7 @@ def rematerialize_codex_request_after_adopt(
     convert_added_messages: Callable[
         [list[dict[str, Any]]], Sequence[Mapping[str, Any]]
     ],
-) -> FrozenCodexRequest | None:
+) -> FrozenRequest | None:
     """Splice a proven append-before-live-tail adoption into a prepared body.
 
     The already-prepared body remains the authority for request-only context,
@@ -471,7 +497,7 @@ def rematerialize_codex_request_after_adopt(
         return None
 
     body = prepared_request.clone_body()
-    request_input = body.get("input")
+    request_input = body.get(prepared_request.input_key)
     anchor = [copy.deepcopy(dict(item)) for item in current_user_input]
     if not isinstance(request_input, list) or not anchor:
         return None
@@ -482,26 +508,27 @@ def rematerialize_codex_request_after_adopt(
             break
     if anchor_index is None:
         return None
-    body["input"] = [
+    body[prepared_request.input_key] = [
         *request_input[:anchor_index],
         *converted_added,
         *request_input[anchor_index:],
     ]
-    return FrozenCodexRequest(
+    return FrozenRequest(
         body=body,
         fidelity="rematerialized_after_adopt",
         captured_session_id=prepared_request.captured_session_id,
+        api_mode=prepared_request.api_mode,
     )
 
 
-def materialize_codex_request_for_compression(
+def materialize_request_for_compression(
     agent: Any,
     messages: Sequence[Mapping[str, Any]],
     *,
     fidelity: str,
     system_prompt: str | None = None,
     tools: Sequence[Mapping[str, Any]] | None = None,
-) -> FrozenCodexRequest | None:
+) -> FrozenRequest | None:
     """Build a provider-native request when no prepared parent exists.
 
     This narrow reconstruction path is only for out-of-turn manual compression.
@@ -540,26 +567,23 @@ def materialize_codex_request_for_compression(
     _sanitize_structure_surrogates(body)
     if bool(getattr(agent, "_force_ascii_payload", False)):
         _sanitize_structure_non_ascii(body)
-    body = agent._get_transport().preflight_kwargs(
-        body,
-        allow_stream=False,
-        is_github_responses=agent._is_copilot_url(),
-        sanitize_harmony_tokens=agent._is_codex_backend(),
-    )
-    return FrozenCodexRequest(
-        body=body,
-        fidelity=fidelity,
-        captured_session_id=str(getattr(agent, "session_id", "") or ""),
-    )
+    if str(getattr(agent, "api_mode", "codex_responses")) == "codex_responses":
+        body = agent._get_transport().preflight_kwargs(
+            body,
+            allow_stream=False,
+            is_github_responses=agent._is_copilot_url(),
+            sanitize_harmony_tokens=agent._is_codex_backend(),
+        )
+    return freeze_request_for_compression(agent, body, fidelity=fidelity)
 
 
 def build_out_of_turn_compression_request_snapshot(
     agent: Any,
     messages: Sequence[Mapping[str, Any]],
-) -> FrozenCodexRequest | None:
+) -> FrozenRequest | None:
     """Reconstruct a truthful provider-native manual-compression request."""
 
-    return materialize_codex_request_for_compression(
+    return materialize_request_for_compression(
         agent,
         messages,
         fidelity="reconstructed_out_of_turn",
@@ -570,7 +594,7 @@ def build_out_of_turn_compression_request_snapshot(
 def current_request_fork_scope(
     agent: Any,
     *,
-    frozen_request: FrozenCodexRequest,
+    frozen_request: FrozenRequest,
     progress_callback: Callable[[], None] | None = None,
     client_factory: Callable[[], Any] | None = None,
     client_close: Callable[[Any], None] | None = None,
@@ -599,6 +623,11 @@ def current_request_fork_scope(
         )
     except (TypeError, ValueError):
         context_length = 200000
+
+    if client_factory is None and frozen_request.api_mode == "anthropic_messages":
+        from .message_protocols import freeze_anthropic_client_factory
+
+        client_factory = freeze_anthropic_client_factory(agent)
 
     if client_factory is None:
 

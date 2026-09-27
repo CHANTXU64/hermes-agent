@@ -64,7 +64,7 @@ from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches
 from fork_features.request_fork import (
-    freeze_codex_request_for_compression,
+    freeze_request_for_compression,
 )
 from fork_features.request_fork.prepared_request import build_adopt_rematerializer
 from fork_features.request_context import (
@@ -1457,7 +1457,7 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
         try:
             _run_phase(build_api_request, agent, s)
             if getattr(agent, "_compression_request_fork_pending", False):
-                frozen = freeze_codex_request_for_compression(
+                frozen = freeze_request_for_compression(
                     agent, s.api_kwargs or {}, fidelity="prepared_parent",
                 )
                 agent._compression_request_fork_pending = False

@@ -2866,15 +2866,18 @@ What changed:
   attempt. Adjacent turn-state tests pin the new host contract instead of keeping
   the dead pre-split field.
 
-- A scoped `FrozenCodexRequest` carries a deep-copied, provider-native Codex
-  Responses request body and fidelity metadata. The private checkpoint Fork
+- A scoped `FrozenRequest` carries a deep-copied, provider-native Codex
+  Responses, Anthropic Messages, or OpenAI Chat Completions request body and
+  fidelity metadata. Protocol selection uses `api_mode`, not a model whitelist.
+  ACP, MOA and Bedrock routes without an independently owned compatible SDK client
+  remain unavailable. The private checkpoint Fork
   clones that body, appends exactly one synthetic `role=user` checkpoint item,
   and sends it with an explicitly owned client created from a frozen provider/
   client-construction spec. It does not retain or reread the parent agent, nor
   rerun chat conversion, request build, transport preflight,
   plugin middleware, tools, transcript persistence, Memory, Retain, or normal
   parent-request hooks.
-- Automatic Codex Responses compression defers only the continuity-aware pending
+- Automatic compression for these three protocols defers only the continuity-aware pending
   trigger until the parent request has completed normal request-only context,
   cache decoration, request build, sanitization, transport preflight, and
   one-shot request-header preparation. It captures `prepared_parent` before
@@ -2887,6 +2890,14 @@ What changed:
   Responses function-call items, function-call outputs, flat tool
   schemas, cache identity, and final headers therefore survive the Fork without
   a second conversion.
+- Native Messages/Chat Completions streams capture the final physical body for
+  overflow recovery, aggregate text/tool fragments and usage through the existing
+  provider SDK, and never dispatch returned tools. Anthropic forks freeze the
+  direct client route, credentials and profile context; all clients are independently
+  owned and closed. Manual reconstruction runs Codex-only preflight only for Codex.
+  `message_protocols.py` owns the native message adapters;
+  `test_request_fork_messages.py` and `test_request_fork_messages_transport.py`
+  cover protocol fidelity, client ownership, manual snapshots, adoption and streaming.
 - A longer durable parent adopted under the compression lease invalidates the
   earlier prepared request. The Fork-owned pure rematerializer preserves the frozen
   request-only body and inserts only a proven concurrent durable append before

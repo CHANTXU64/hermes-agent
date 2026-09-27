@@ -22,11 +22,11 @@ import pytest
 from agent.conversation_compression import (
     finalize_context_engine_compression_notification,
 )
-from fork_features.request_fork import FrozenCodexRequest
+from fork_features.request_fork import FrozenRequest
 
 
 def _frozen_request(messages, tools):
-    return FrozenCodexRequest(
+    return FrozenRequest(
         body={"model": "test", "input": messages, "tools": tools},
         fidelity="prepared_parent",
         captured_session_id="original-session",
