@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import fcntl
 import os
@@ -386,6 +387,121 @@ def _session_exists(state_db_path: Path, session_id: str) -> bool:
     return _state_db_for_session(state_db_path, session_id) is not None
 
 
+_EXPORT_RULES_MODULE = None
+
+
+def _export_rules():
+    """Load the exporter so the pre-submit count applies its exact copy rules.
+
+    The lower bound in ``_state_snapshot`` must agree with how the exporter
+    collapses compaction copies; otherwise a correctly deduplicated candidate
+    is blocked as "missing" the copies. Always the real exporter: callers may
+    pass a stub ``export_script`` to ``run_export`` in tests.
+    """
+    global _EXPORT_RULES_MODULE
+    if _EXPORT_RULES_MODULE is None:
+        spec = importlib.util.spec_from_file_location(
+            "_hindsight_retain_export_rules", DEFAULT_EXPORT_SCRIPT
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load exporter rules from {DEFAULT_EXPORT_SCRIPT}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _EXPORT_RULES_MODULE = module
+    return _EXPORT_RULES_MODULE
+
+
+def _joined_user_copy_ids(rows) -> set[int]:
+    """Recognize alternation-repair joins only while both originals still count.
+
+    The producer joins adjacent user strings with two newlines and retains the
+    first timestamp. A new timestamp, platform id or missing constituent is not
+    proof of a copy. Never infer this from a substring somewhere in the session.
+    """
+    originals_by_time: dict[Any, list[int]] = {}
+    for index, row in enumerate(rows):
+        if (row["role"] == "user" and row["compacted"]
+                and row["platform_message_id"]
+                and row["display_kind"] not in {"hidden", "internal_notification"}):
+            originals_by_time.setdefault(row["timestamp"], []).append(index)
+    copies = set()
+    for row in rows:
+        if row["role"] != "user" or row["platform_message_id"]:
+            continue
+        target = str(row["content"] or "")
+        for start in originals_by_time.get(row["timestamp"], []):
+            parts = []
+            identities = set()
+            for original in rows[start:]:
+                identity = original["platform_message_id"]
+                if (original["id"] >= row["id"] or original["role"] != "user"
+                        or not original["compacted"] or not identity
+                        or identity in identities
+                        or original["display_kind"] in {"hidden", "internal_notification"}
+                        or not original["content"]):
+                    break
+                identities.add(identity)
+                parts.append(original["content"])
+                joined = "\n\n".join(parts)
+                if len(parts) >= 2 and joined == target:
+                    copies.add(int(row["id"]))
+                    break
+                if not target.startswith(joined + "\n\n"):
+                    break
+    return copies
+
+
+def _delegated_seed_copy_key(conn, session_id: str) -> tuple | None:
+    """Exclude an agent-authored seed only with session and parent-call evidence."""
+    session_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")}
+    message_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(messages)")}
+    if (not {"model_config", "parent_session_id"}.issubset(session_columns)
+            or not {"tool_calls", "platform_message_id", "display_kind"}.issubset(message_columns)):
+        return None
+    session = conn.execute(
+        "SELECT model_config, parent_session_id FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if session is None:
+        return None
+    try:
+        config = json.loads(session["model_config"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    parent_id = session["parent_session_id"]
+    if not isinstance(config, dict) or not parent_id or config.get("_delegate_from") != parent_id:
+        return None
+    seed = conn.execute(
+        "SELECT id, content, timestamp, platform_message_id, display_kind FROM messages "
+        "WHERE session_id = ? AND role = 'user' ORDER BY id LIMIT 1", (session_id,)
+    ).fetchone()
+    if seed is None or seed["platform_message_id"] or seed["display_kind"] or not seed["content"]:
+        return None
+    parent_rows = conn.execute(
+        "SELECT tool_calls FROM messages WHERE session_id = ? AND role = 'assistant' "
+        "AND id < ? AND timestamp <= ? AND tool_calls IS NOT NULL",
+        (parent_id, seed["id"], seed["timestamp"]),
+    ).fetchall()
+    for row in parent_rows:
+        for call in _export_rules()._decoded_tool_calls(row["tool_calls"]):
+            function = call.get("function") or {}
+            if not isinstance(function, dict) or function.get("name") != "delegate_task":
+                continue
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except (TypeError, ValueError):
+                    continue
+            if not isinstance(arguments, dict):
+                continue
+            tasks = arguments.get("tasks", [arguments])
+            if not isinstance(tasks, list):
+                continue
+            if any(isinstance(task, dict) and task.get("goal") == seed["content"] for task in tasks):
+                return seed["content"], seed["timestamp"]
+    return None
+
+
 def _state_snapshot(
     state_db_path: Path,
     session_id: str,
@@ -415,6 +531,10 @@ def _state_snapshot(
                 str(row[1]) for row in conn.execute("PRAGMA table_info(messages)")
             }
             optional = {
+                "platform_message_id": (
+                    "platform_message_id" if "platform_message_id" in columns
+                    else "NULL AS platform_message_id"
+                ),
                 "tool_calls": "tool_calls" if "tool_calls" in columns else "NULL AS tool_calls",
                 "finish_reason": (
                     "finish_reason" if "finish_reason" in columns else "NULL AS finish_reason"
@@ -422,20 +542,35 @@ def _state_snapshot(
                 "display_kind": (
                     "display_kind" if "display_kind" in columns else "NULL AS display_kind"
                 ),
+                "display_identity": (
+                    "display_identity"
+                    if "display_identity" in columns
+                    else "NULL AS display_identity"
+                ),
+                "codex_message_items": (
+                    "codex_message_items"
+                    if "codex_message_items" in columns
+                    else "NULL AS codex_message_items"
+                ),
             }
             rows = conn.execute(
                 f"""
                 SELECT id, role, content, timestamp, compacted,
                        {optional['tool_calls']},
                        {optional['finish_reason']},
-                       {optional['display_kind']}
+                       {optional['display_kind']},
+                       {optional['display_identity']},
+                       {optional['codex_message_items']},
+                       {optional['platform_message_id']}
                 FROM messages
                 WHERE session_id = ? AND (active = 1 OR compacted = 1)
-                  AND role IN ('user', 'assistant')
                 ORDER BY id
                 """,
                 (session_id,),
             ).fetchall()
+            platform_ids_by_copy = _export_rules()._state_platform_copy_ids(conn, session_id)
+            redirect_ids_by_copy = _export_rules()._state_redirect_copy_ids(conn, session_id)
+            delegated_seed_key = _delegated_seed_copy_key(conn, session_id)
     except sqlite3.Error:
         return empty
 
@@ -478,9 +613,13 @@ def _state_snapshot(
         "[CONTEXT COMPACTION —",
         "[Durable Summary (",
     )
-    visible: list[tuple[str, str, Any]] = []
+    export_rules = _export_rules()
+    joined_copy_ids = _joined_user_copy_ids(rows)
+    visible: list[tuple] = []
     for row in rows:
         role = str(row["role"] or "")
+        if role not in {"user", "assistant"} or row["id"] in joined_copy_ids:
+            continue
         display_kind = str(row["display_kind"] or "")
         if display_kind in {"hidden", "internal_notification"}:
             continue
@@ -489,8 +628,27 @@ def _state_snapshot(
             or str(row["finish_reason"] or "") == "tool_calls"
         ):
             continue
+        raw_content = str(row["content"] or "")
+        if (role == "user" and not row["platform_message_id"]
+                and (raw_content, row["timestamp"]) == delegated_seed_key):
+            continue
+        if role == "assistant":
+            # The failed-turn notice is a transcript boundary the exporter drops.
+            if export_rules._is_failed_turn_boundary(display_kind, raw_content):
+                continue
+            # A merged compaction row counts only for the reply it carries.
+            carried = export_rules._merged_carrier_prior_content(raw_content.strip())
+            if carried is not None:
+                raw_content = carried
+        else:
+            # The exporter's own user cleaning: drops heartbeats, surface-switch
+            # notes and routing wrappers, and keeps only the live words after a
+            # compaction summary, so both sides count the same user messages.
+            raw_content = export_rules._clean_user_content(
+                export_rules._decode_state_content(raw_content)
+            )
         content = " ".join(
-            unicodedata.normalize("NFKC", str(row["content"] or ""))
+            unicodedata.normalize("NFKC", raw_content)
             .replace("\r\n", "\n")
             .split()
         )
@@ -500,22 +658,44 @@ def _state_snapshot(
             re.match(r"\[Depth-\d+ Summary \(", content)
         ):
             continue
-        visible.append((role, content, row["timestamp"]))
+        if role == "assistant":
+            # Same logical key the exporter uses, so compaction clones count once.
+            key = export_rules._state_assistant_logical_key(
+                content,
+                export_rules._utc_timestamp(row["timestamp"]),
+                row["display_identity"],
+                row["codex_message_items"],
+            )
+            visible.append((role, key))
+        else:
+            identity = export_rules._state_platform_user_id(
+                row, raw_content, platform_ids_by_copy
+            )
+            copy_key = (row["timestamp"], raw_content)
+            redirect_id = redirect_ids_by_copy.get(copy_key)
+            if identity:
+                key = ("platform_user", identity)
+            elif not platform_ids_by_copy.get(copy_key) and redirect_id is not None:
+                key = ("redirect_user", redirect_id)
+            else:
+                key = (content, row["timestamp"])
+            visible.append((role, key))
 
-    # StateDB can retain duplicate physical copies around compression. The
-    # existing monitor treats identical role/content/timestamp rows as one
-    # logical occurrence for coarse completeness checks.
+    # Known identities collapse physical compaction copies. Unproven user rows
+    # retain the conservative content/timestamp bound; they are not silently
+    # discarded just because the exporter cannot supplement them.
     logical = list(dict.fromkeys(visible))
-    user_count = sum(1 for role, _content, _timestamp in logical if role == "user")
-    assistant_count = sum(
-        1 for role, _content, _timestamp in logical if role == "assistant"
-    )
+    user_count = sum(1 for entry in logical if entry[0] == "user")
+    assistant_count = sum(1 for entry in logical if entry[0] == "assistant")
     return {
         "session_found": session_found,
         "active_user_count": user_count,
         "active_assistant_count": assistant_count,
         "active_message_count": user_count + assistant_count,
-        "max_message_id": max((int(row["id"]) for row in rows), default=None),
+        "max_message_id": max(
+            (int(row["id"]) for row in rows if row["role"] in {"user", "assistant"}),
+            default=None,
+        ),
     }
 
 
@@ -1416,6 +1596,69 @@ def _remote_gap_is_severe(candidate: dict[str, int], remote: dict[str, int]) -> 
     return missing >= 6 and remote["total"] < candidate["total"] * 0.85
 
 
+def _annotate_recovered_export_failures(
+    alerts: list[dict[str, Any]],
+    attempts: dict[str, list[dict[str, Any]]],
+    confirmed: list[dict[str, Any]],
+) -> None:
+    """Keep historical failures visible, but distinguish verified later recovery.
+
+    Reuse this scan's operation/content verification, never delivery-key age or
+    mere document existence. This proves a later save, not source completeness.
+    """
+    starts = {
+        attempt_id: event
+        for attempt_id, events in attempts.items()
+        for event in events
+        if event.get("event") == "started"
+    }
+    confirmed_by_document = {item["document_id"]: item for item in confirmed}
+    for alert in alerts:
+        if alert.get("type") != "retain_export_failed":
+            continue
+        recovery = confirmed_by_document.get(alert["document_id"])
+        if recovery is None or recovery["session_id"] != alert["session_id"]:
+            continue
+        old = starts[alert["attempt_id"]]
+        new = starts[recovery["attempt_id"]]
+        if old.get("remote_expectation") != "expected" or any(
+            event.get("repair_scope") == "confirmed_missing_only"
+            for event in attempts[recovery["attempt_id"]]
+        ):
+            continue
+        try:
+            old_cutoff = _parse_time(old.get("cutoff_at") or old["recorded_at"])
+            new_cutoff = _parse_time(new.get("cutoff_at") or new["recorded_at"])
+            failure_at = max(
+                _parse_time(event["recorded_at"])
+                for event in attempts[alert["attempt_id"]]
+                if event.get("event") == "export_failed"
+            )
+            recovery_started_at = _parse_time(new["recorded_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if recovery_started_at <= failure_at or new_cutoff < old_cutoff:
+            continue
+        original_key = alert["alert_key"]
+        alert.update({
+            "alert_key": (
+                f"retain:{alert['attempt_id']}:export_recovered:{recovery['attempt_id']}"
+            ),
+            "original_alert_key": original_key,
+            "type": "retain_export_recovered",
+            "severity": "info",
+            "failed_at": failure_at.isoformat(),
+            "recovered_by_attempt_id": recovery["attempt_id"],
+            "recovery_started_at": recovery_started_at.isoformat(),
+            "operation_id": recovery["operation_id"],
+            "remote_document_matches_candidate": True,
+            "message": (
+                "历史本地候选生成失败；同一会话后来已完成保存，当前远端正文与后续候选一致。"
+                "这只证明后续保存成功，不代表原始会话完整性已全部验证。"
+            ),
+        })
+
+
 def scan_attempts(
     *,
     journal_path: Path = DEFAULT_JOURNAL_PATH,
@@ -2226,6 +2469,7 @@ def scan_attempts(
                         }
                     )
 
+    _annotate_recovered_export_failures(alerts, attempts, remote_confirmed_attempts)
     return {
         "status": "ok",
         "journal_torn_tail": torn_tail is not None,

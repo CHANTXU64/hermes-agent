@@ -1550,6 +1550,74 @@ def test_export_langfuse_fetches_v4_session_observations_with_cursor(
     assert shutdown_calls == [True]
 
 
+def test_v4_traces_keep_observation_task_id_so_background_turns_are_excluded(
+    tmp_path,
+):
+    module = load_script_module(tmp_path)
+    session_id = "session-v4"
+
+    def observation(obs_id, trace_id, start, content, answer, metadata):
+        row = {
+            "id": obs_id,
+            "traceId": trace_id,
+            "sessionId": session_id,
+            "isRootObservation": True,
+            "type": "CHAIN",
+            "name": "Hermes turn",
+            "startTime": start,
+            "endTime": start,
+            "input": {"role": "user", "content": content},
+            "output": {"content": answer, "tool_calls": []},
+        }
+        if metadata is not None:
+            row["metadata"] = metadata
+        return row
+
+    traces = module._session_observations_to_traces(
+        [
+            observation(
+                "main-turn",
+                "trace-main",
+                "2026-09-02T01:00:00Z",
+                "真实用户消息",
+                "真实回复",
+                {"task_id": session_id},
+            ),
+            observation(
+                "review-turn",
+                "trace-review",
+                "2026-09-02T01:05:00Z",
+                "Review the conversation and autonomously maintain built-in memory.",
+                "Nothing to save.",
+                {"task_id": "1f2e3d4c-review"},
+            ),
+            observation(
+                "legacy-turn",
+                "trace-legacy",
+                "2026-09-02T01:10:00Z",
+                "旧格式轮次",
+                "旧格式回复",
+                None,
+            ),
+        ],
+        session_id,
+    )
+
+    assert {trace["id"]: trace["metadata"]["task_id"] for trace in traces} == {
+        "trace-main": session_id,
+        "trace-review": "1f2e3d4c-review",
+        "trace-legacy": session_id,
+    }
+    candidate = module.build_candidate_document(
+        {"session_id": session_id, "traces": traces}, session_id
+    )
+    contents = [message["content"] for turn in candidate["turns"] for message in turn]
+    assert "User: 真实用户消息" in contents
+    assert "User: 旧格式轮次" in contents
+    assert not any("Review the conversation" in content for content in contents)
+    assert "Assistant: Nothing to save." not in contents
+
+
 def _create_reconciliation_state_db(path: Path, session_id: str) -> None:
     with sqlite3.connect(path) as conn:
         conn.executescript(
@@ -1648,6 +1716,7 @@ def test_state_reconciliation_restores_real_user_before_continuity_answer(tmp_pa
         "added_event_count": 1,
         "uncovered_event_count": 0,
         "platform_user_event_count": 1,
+        "redirect_user_event_count": 0,
         "visible_assistant_event_count": 0,
         "clarify_question_event_count": 0,
         "clarify_response_event_count": 0,
@@ -1871,10 +1940,270 @@ def test_state_reconciliation_restores_gateway_origin_user_without_platform_id(t
         "added_event_count": 1,
         "uncovered_event_count": 0,
         "platform_user_event_count": 1,
+        "redirect_user_event_count": 0,
         "visible_assistant_event_count": 1,
         "clarify_question_event_count": 0,
         "clarify_response_event_count": 0,
     }
+
+
+def _insert_redirect_rows(state_db: Path, session_id: str, rows: list[tuple]) -> None:
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, finish_reason, timestamp, active,
+                compacted, display_kind, platform_message_id, display_order
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [(row[0], session_id, *row[1:]) for row in rows],
+        )
+
+
+def _redirect_export(session_id: str, observations: list[dict]) -> dict:
+    return {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id, "capture_mode": "sanitized"},
+                "observations": observations,
+            }
+        ],
+    }
+
+
+def test_active_turn_redirect_writes_the_pair_reconciliation_recognizes():
+    """Pins the producer shape the redirect_user rule depends on."""
+    from agent import conversation_loop
+
+    class _Agent:
+        _current_streamed_assistant_text = ""
+        _stream_needs_break = False
+
+        @staticmethod
+        def _strip_think_blocks(text):
+            return text
+
+    messages = [{"role": "user", "content": "先查一下", "timestamp": 1.0}]
+    conversation_loop._apply_active_turn_redirect(_Agent(), messages, "停，换个方向")
+
+    placeholder, correction = messages[-2], messages[-1]
+    assert placeholder["role"] == "assistant"
+    assert placeholder["content"] == ""
+    assert placeholder["display_kind"] == "hidden"
+    assert correction["role"] == "user"
+    assert correction["content"] == "停，换个方向"
+    assert "display_kind" not in correction
+    assert "platform_message_id" not in correction
+    gap = correction["timestamp"] - placeholder["timestamp"]
+    assert 0 <= gap < 0.001
+
+
+def test_state_reconciliation_restores_active_turn_redirect_user(tmp_path):
+    """Regression for session 20260902_001539_d1ce8d22.
+
+    A user correction sent while the model was answering is written by
+    _apply_active_turn_redirect as a hidden empty placeholder plus the user's
+    own words, with no platform id and absent from Langfuse. Compaction parked
+    the original at active=0/compacted=0 and re-inserted a copy after a hidden
+    summary carrier; only the original's placeholder proves the redirect, and
+    the copy must collapse onto it.
+    """
+    module = load_script_module(tmp_path)
+    session_id = "session-active-turn-redirect"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    correction = "你抓包之前，就同步了，啥情况"
+    _insert_redirect_rows(
+        state_db,
+        session_id,
+        [
+            (1, "user", "查同步", None, 1000.0, 0, 1, None, "telegram-1", 1),
+            (2, "assistant", "", None, 1005.000001, 0, 0, "hidden", None, 2),
+            (3, "user", correction, None, 1005.000003, 0, 0, None, None, 3),
+            (4, "assistant", "[PRIOR CONTEXT — summary]", None, 1005.000001, 0, 1,
+             "hidden", None, 4),
+            (5, "user", correction, None, 1005.000003, 0, 1, None, None, 5),
+            (6, "assistant", "是时间差导致的。", "stop", 1010.0, 1, 0, None, None, 6),
+        ],
+    )
+    export = _redirect_export(
+        session_id,
+        [
+            hermes_turn(
+                "turn-1",
+                "1970-01-01T00:16:40Z",
+                "1970-01-01T00:16:50Z",
+                "查同步",
+                "是时间差导致的。",
+            )
+        ],
+    )
+    cutoff = datetime.fromtimestamp(1011, tz=timezone.utc)
+
+    state_reconciliation = module.load_state_reconciliation(
+        session_id, state_db, cutoff_at=cutoff
+    )
+    candidate = module.build_candidate_document(
+        export,
+        session_id,
+        state_reconciliation=state_reconciliation,
+        cutoff_at=cutoff,
+    )
+
+    contents = [message["content"] for turn in candidate["turns"] for message in turn]
+    assert contents == [
+        "User: 查同步",
+        f"User: {correction}",
+        "Assistant: 是时间差导致的。",
+    ]
+    audit = candidate["audit"]["state_reconciliation"]
+    assert audit["redirect_user_event_count"] == 1
+    assert audit["added_event_count"] == 1
+    assert audit["uncovered_event_count"] == 0
+
+
+def test_state_reconciliation_does_not_duplicate_redirect_user_present_in_langfuse(
+    tmp_path,
+):
+    module = load_script_module(tmp_path)
+    session_id = "session-redirect-present"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    _insert_redirect_rows(
+        state_db,
+        session_id,
+        [
+            (1, "assistant", "", None, 1000.000001, 1, 0, "hidden", None, 1),
+            (2, "user", "别审查了", None, 1000.000002, 1, 0, None, None, 2),
+            (3, "assistant", "好，停止审查。", "stop", 1001.0, 1, 0, None, None, 3),
+        ],
+    )
+    export = _redirect_export(
+        session_id,
+        [
+            hermes_turn(
+                "turn-1",
+                "1970-01-01T00:16:40Z",
+                "1970-01-01T00:16:41Z",
+                "别审查了",
+                "好，停止审查。",
+            )
+        ],
+    )
+    cutoff = datetime.fromtimestamp(1002, tz=timezone.utc)
+    candidate = module.build_candidate_document(
+        export,
+        session_id,
+        state_reconciliation=module.load_state_reconciliation(
+            session_id, state_db, cutoff_at=cutoff
+        ),
+        cutoff_at=cutoff,
+    )
+
+    contents = [message["content"] for turn in candidate["turns"] for message in turn]
+    assert contents == ["User: 别审查了", "Assistant: 好，停止审查。"]
+    audit = candidate["audit"]["state_reconciliation"]
+    assert audit["redirect_user_event_count"] == 1
+    assert audit["matched_event_count"] == 2
+    assert audit["added_event_count"] == 0
+
+
+def test_state_reconciliation_collapses_redirect_copy_with_fresh_timestamp(tmp_path):
+    """Regression for sessions 20260824_205339_b18957b9 / 20260828_082659_6f3805be.
+
+    Compaction re-inserted a whole tool run, redirect pair included, with fresh
+    timestamps. The copied pair repeats the tool_call_id of the row before its
+    placeholder; a later genuine repeat of the same words follows another call.
+    """
+    module = load_script_module(tmp_path)
+    session_id = "session-redirect-fresh-copy"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    words = "继续搞，搞完自己验证下"
+    rows = [
+        (1, "user", "开始", None, None, None, 1000.0, 0, 1, None, "telegram-1", 1),
+        (2, "assistant", "", None, None, "[{\"id\": \"call-a\"}]", 1001.0, 0, 1, None, None, 2),
+        (3, "tool", "ok-a", "terminal", "call-a", None, 1002.0, 0, 1, None, None, 3),
+        (4, "assistant", "", None, None, None, 1002.000001, 0, 1, "hidden", None, 4),
+        (5, "user", words, None, None, None, 1002.000002, 0, 1, None, None, 5),
+        # compaction copy of rows 2-5 with fresh timestamps
+        (6, "assistant", "", None, None, "[{\"id\": \"call-a\"}]", 1600.0, 0, 1, None, None, 6),
+        (7, "tool", "ok-a", "terminal", "call-a", None, 1600.000001, 0, 1, None, None, 7),
+        (8, "assistant", "", None, None, None, 1600.000002, 0, 1, "hidden", None, 8),
+        (9, "user", words, None, None, None, 1600.000003, 0, 1, None, None, 9),
+        # a genuine later repeat after a different tool call
+        (10, "assistant", "", None, None, "[{\"id\": \"call-b\"}]", 1700.0, 1, 0, None, None, 10),
+        (11, "tool", "ok-b", "terminal", "call-b", None, 1701.0, 1, 0, None, None, 11),
+        (12, "assistant", "", None, None, None, 1701.000001, 1, 0, "hidden", None, 12),
+        (13, "user", words, None, None, None, 1701.000002, 1, 0, None, None, 13),
+    ]
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, tool_name, tool_call_id,
+                tool_calls, timestamp, active, compacted, display_kind,
+                platform_message_id, display_order
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [(row[0], session_id, *row[1:]) for row in rows],
+        )
+    cutoff = datetime.fromtimestamp(1800, tz=timezone.utc)
+    state_reconciliation = module.load_state_reconciliation(
+        session_id, state_db, cutoff_at=cutoff
+    )
+
+    redirect_events = [
+        event
+        for event in state_reconciliation["events"]
+        if event["source_kind"] == "redirect_user"
+    ]
+    assert [(event["content"], event["source_key"]) for event in redirect_events] == [
+        (words, "redirect_user:5"),
+        (words, "redirect_user:13"),
+    ]
+
+
+def test_state_reconciliation_needs_the_redirect_pair_for_unidentified_user(tmp_path):
+    """No platform id alone proves nothing: every other shape stays unproven."""
+    module = load_script_module(tmp_path)
+    session_id = "session-redirect-negative"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    kanban_notice = (
+        "[kanban] 任务 t_8e672585 被阻塞，需要处理。\n标题: 复核目录\n\n"
+        "这是自动任务状态通知，不是再次分解任务的请求。创建后续任务前请先检查当前看板；"
+        "不要重复创建已存在的任务或任务图。"
+    )
+    _insert_redirect_rows(
+        state_db,
+        session_id,
+        [
+            # placeholder too far before the user row: not the same step
+            (1, "assistant", "", None, 1000.0, 1, 0, "hidden", None, 1),
+            (2, "user", "间隔过长的消息", None, 1000.5, 1, 0, None, None, 2),
+            # previous row is visible text, not the hidden empty placeholder
+            (3, "assistant", "可见回复", "stop", 1001.0, 1, 0, None, None, 3),
+            (4, "user", "紧跟可见回复的消息", None, 1001.0000005, 1, 0, None, None, 4),
+            # previous row is hidden but not empty (summary carrier)
+            (5, "assistant", "[PRIOR CONTEXT — summary]", None, 1002.0, 1, 0,
+             "hidden", None, 5),
+            (6, "user", "紧跟摘要的消息", None, 1002.0000005, 1, 0, None, None, 6),
+            # redirect shape, but Hermes' automatic kanban wake notice
+            (7, "assistant", "", None, 1003.0, 1, 0, "hidden", None, 7),
+            (8, "user", kanban_notice, None, 1003.0000005, 1, 0, None, None, 8),
+        ],
+    )
+    cutoff = datetime.fromtimestamp(1004, tz=timezone.utc)
+    state_reconciliation = module.load_state_reconciliation(
+        session_id, state_db, cutoff_at=cutoff
+    )
+
+    user_events = [
+        event for event in state_reconciliation["events"] if event["role"] == "user"
+    ]
+    assert user_events == []
 
 
 def test_state_reconciliation_restores_visible_assistant_missing_from_langfuse(tmp_path):
@@ -1942,6 +2271,7 @@ def test_state_reconciliation_restores_visible_assistant_missing_from_langfuse(t
         "added_event_count": 1,
         "uncovered_event_count": 0,
         "platform_user_event_count": 1,
+        "redirect_user_event_count": 0,
         "visible_assistant_event_count": 2,
         "clarify_question_event_count": 0,
         "clarify_response_event_count": 0,
@@ -2020,6 +2350,281 @@ def test_state_reconciliation_deduplicates_physical_assistant_copies(tmp_path):
     ]
     assert len(assistant_events) == 1
     assert assistant_events[0]["content"] == "同一条正式回复"
+
+
+def test_state_reconciliation_drops_failed_turn_notice_but_keeps_user(tmp_path):
+    module = load_script_module(tmp_path)
+    session_id = "session-failed-turn"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    notice = (
+        "Your request was not processed. Send it again if you still want me to "
+        "carry it out."
+    )
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, finish_reason, timestamp,
+                active, compacted, display_kind, platform_message_id, display_order
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, session_id, "user", "没被处理的请求", None, 1000, 1, 0, None, "p-1", 1),
+                (2, session_id, "assistant", notice, "stop", 1001, 1, 0, None, None, 2),
+                (3, session_id, "assistant", notice, "stop", 1002, 0, 1, "failed_turn", None, 3),
+                (4, session_id, "assistant", f"用户问的是：{notice}", "stop", 1003, 1, 0, None, None, 4),
+            ],
+        )
+
+    reconciliation = module.load_state_reconciliation(
+        session_id,
+        state_db,
+        cutoff_at=datetime.fromtimestamp(1004, tz=timezone.utc),
+    )
+
+    contents = [(event["role"], event["content"]) for event in reconciliation["events"]]
+    assert ("user", "没被处理的请求") in contents
+    assert [content for role, content in contents if role == "assistant"] == [
+        f"用户问的是：{notice}"
+    ]
+
+
+def test_failed_turn_notices_match_agent_constants(tmp_path):
+    from agent import turn_failure_copy
+
+    module = load_script_module(tmp_path)
+
+    assert module._FAILED_TURN_DISPLAY_KIND == turn_failure_copy.FAILED_TURN_DISPLAY_KIND
+    assert set(module._FAILED_TURN_NOTICES) == {
+        turn_failure_copy.FAILED_TURN_NOTICE,
+        turn_failure_copy.PARTIAL_FAILED_TURN_NOTICE,
+    }
+
+
+_MERGED_PRIOR_CONTEXT_HEADER = "[PRIOR CONTEXT — for reference only; not a new message]"
+_MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
+_SUMMARY_END_MARKER = (
+    "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+)
+
+
+def _add_codex_message_items_column(state_db: Path) -> None:
+    with sqlite3.connect(state_db) as conn:
+        conn.execute("ALTER TABLE messages ADD COLUMN codex_message_items TEXT")
+
+
+def _codex_message_items(message_id: str, text: str) -> str:
+    return json.dumps(
+        [
+            {
+                "type": "message",
+                "id": message_id,
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        ],
+        ensure_ascii=False,
+    )
+
+
+def _merged_prior_context_carrier(prior: str) -> str:
+    """Build the row shape written when compaction folds its summary into a tail row."""
+    return (
+        f"{_MERGED_PRIOR_CONTEXT_HEADER}\n{prior}\n\n{_MERGED_SUMMARY_DELIMITER}\n\n"
+        "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into "
+        "the summary below.\n## Goal\n压缩摘要正文不应进入 Retain。\n\n"
+        f"{_SUMMARY_END_MARKER}"
+    )
+
+
+def test_state_reconciliation_collapses_compaction_copies_by_provider_message_id(
+    tmp_path,
+):
+    """Compaction clones may get fresh timestamps and fresh display identities.
+
+    Regression for session 20260923_160931_4eaf17f7: two compactions one minute
+    apart cloned one reply; every clone had a new timestamp and a new
+    display_identity, so reconciliation added both clones next to the single
+    Langfuse copy. The provider output-message id is shared by all clones and is
+    new for a later real reply, even when that reply repeats the same text.
+    """
+    module = load_script_module(tmp_path)
+    session_id = "session-provider-message-copies"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    _add_codex_message_items_column(state_db)
+    reply = "建议分别设置：会话压缩用 xhigh，Hindsight Retain 用 high。"
+    rows = [
+        (1, "user", "怎么设置？", 1000, 1, 0, "telegram-1", b"user-1", None),
+        (2, "assistant", reply, 1001, 0, 1, None, b"assistant-original",
+         _codex_message_items("msg_reply", reply)),
+        (3, "assistant", reply, 1060, 0, 1, None, b"assistant-clone-1",
+         _codex_message_items("msg_reply", reply)),
+        (4, "assistant", reply, 1120, 1, 0, None, b"assistant-clone-2",
+         _codex_message_items("msg_reply", reply)),
+        (5, "user", "再说一遍", 1200, 1, 0, "telegram-2", b"user-2", None),
+        (6, "assistant", reply, 1201, 1, 0, None, b"assistant-repeat",
+         _codex_message_items("msg_repeat", reply)),
+    ]
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, finish_reason, timestamp, active,
+                compacted, platform_message_id, display_order, display_identity,
+                codex_message_items
+            ) VALUES (?, ?, ?, ?, 'stop', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (row_id, session_id, role, content, ts, active, compacted,
+                 platform_id, row_id, identity, items)
+                for row_id, role, content, ts, active, compacted, platform_id,
+                identity, items in rows
+            ],
+        )
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id, "capture_mode": "sanitized"},
+                "observations": [
+                    hermes_turn(
+                        "turn-1",
+                        "1970-01-01T00:16:40Z",
+                        "1970-01-01T00:16:41Z",
+                        "怎么设置？",
+                        reply,
+                    ),
+                    hermes_turn(
+                        "turn-2",
+                        "1970-01-01T00:20:00Z",
+                        "1970-01-01T00:20:01Z",
+                        "再说一遍",
+                        reply,
+                    ),
+                ],
+            }
+        ],
+    }
+    cutoff = datetime.fromtimestamp(1300, tz=timezone.utc)
+
+    reconciliation = module.load_state_reconciliation(
+        session_id, state_db, cutoff_at=cutoff
+    )
+    candidate = module.build_candidate_document(
+        export,
+        session_id,
+        state_reconciliation=reconciliation,
+        cutoff_at=cutoff,
+    )
+
+    assert [
+        (event["content"], event["timestamp"])
+        for event in reconciliation["events"]
+        if event["source_kind"] == "visible_assistant"
+    ] == [
+        (reply, datetime.fromtimestamp(1001, tz=timezone.utc).isoformat()),
+        (reply, datetime.fromtimestamp(1201, tz=timezone.utc).isoformat()),
+    ]
+    assert [
+        message["content"] for turn in candidate["turns"] for message in turn
+    ] == [
+        "User: 怎么设置？",
+        f"Assistant: {reply}",
+        "User: 再说一遍",
+        f"Assistant: {reply}",
+    ]
+    audit = candidate["audit"]["state_reconciliation"]
+    assert audit["status"] == "verified"
+    assert audit["source_event_count"] == 4
+    assert audit["matched_event_count"] == 4
+    assert audit["added_event_count"] == 0
+
+
+def test_state_reconciliation_keeps_only_prior_reply_of_merged_summary_carrier(
+    tmp_path,
+):
+    """A merged compaction carrier contributes its prior reply, never the summary.
+
+    Regression for session 20260923_160931_4eaf17f7, whose candidate contained an
+    18k-character assistant message: the carried reply followed by the complete
+    compaction summary. The carried reply is itself a clone of an earlier row.
+    """
+    module = load_script_module(tmp_path)
+    session_id = "session-merged-summary-carrier"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    _add_codex_message_items_column(state_db)
+    first = "第一条回复"
+    last = "压缩前最后一条回复"
+    rows = [
+        (1, "assistant", first, 1000, 0, 1, b"assistant-1",
+         _codex_message_items("msg_first", first)),
+        # Carrier cloned from row 1: same provider message, new identity/time.
+        (2, "assistant", _merged_prior_context_carrier(first), 1100, 0, 1,
+         b"carrier-1", _codex_message_items("msg_first", first)),
+        # Carrier whose prior part is empty holds only the summary.
+        (3, "assistant", _merged_prior_context_carrier(""), 1200, 0, 1,
+         b"carrier-2", None),
+        # Carrier for a reply with no earlier row keeps just that reply.
+        (4, "assistant", _merged_prior_context_carrier(last), 1300, 1, 0,
+         b"carrier-3", _codex_message_items("msg_last", last)),
+    ]
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, finish_reason, timestamp, active,
+                compacted, display_order, display_identity, codex_message_items
+            ) VALUES (?, ?, ?, ?, 'stop', ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (row_id, session_id, role, content, ts, active, compacted, row_id,
+                 identity, items)
+                for row_id, role, content, ts, active, compacted, identity, items
+                in rows
+            ],
+        )
+
+    reconciliation = module.load_state_reconciliation(session_id, state_db)
+
+    assert [
+        event["content"]
+        for event in reconciliation["events"]
+        if event["source_kind"] == "visible_assistant"
+    ] == [first, last]
+
+
+def test_merged_carrier_markers_match_context_compressor(tmp_path):
+    """The exporter keeps literal copies of the compressor's carrier markers."""
+    from agent import context_compressor
+
+    module = load_script_module(tmp_path)
+
+    assert module._MERGED_PRIOR_CONTEXT_HEADER == (
+        context_compressor._MERGED_PRIOR_CONTEXT_HEADER
+    )
+    assert module._MERGED_SUMMARY_DELIMITER == (
+        context_compressor._MERGED_SUMMARY_DELIMITER
+    )
+    assert context_compressor.SUMMARY_PREFIX.startswith(
+        module._COMPACTION_MARKER_PREFIX
+    )
+    compressor = context_compressor.ContextCompressor.__new__(
+        context_compressor.ContextCompressor
+    )
+    compressor._summary_has_user_turn = True
+    row = {"role": "assistant", "content": "被保留的上一条回复"}
+    compressor._merge_summary_into_tail_row(
+        row,
+        context_compressor.SUMMARY_PREFIX + "\n## Goal\n摘要正文",
+        "assistant",
+        False,
+    )
+
+    assert module._merged_carrier_prior_content(row["content"]) == "被保留的上一条回复"
 
 
 def test_state_reconciliation_projects_clarify_when_v4_has_only_chain(tmp_path):
@@ -2141,10 +2746,202 @@ def test_state_reconciliation_projects_clarify_when_v4_has_only_chain(tmp_path):
         "added_event_count": 2,
         "uncovered_event_count": 0,
         "platform_user_event_count": 1,
+        "redirect_user_event_count": 0,
         "visible_assistant_event_count": 0,
         "clarify_question_event_count": 1,
         "clarify_response_event_count": 1,
     }
+
+
+def test_state_reconciliation_drops_clarify_timeout_answer(tmp_path):
+    """A timed-out clarify keeps its question; Hermes' placeholder is not a user reply."""
+    module = load_script_module(tmp_path)
+    session_id = "session-clarify-timeout-state"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    tool_call_id = "call-clarify-timeout"
+    tool_calls = json.dumps(
+        [
+            {
+                "id": tool_call_id,
+                "call_id": tool_call_id,
+                "function": {
+                    "name": "clarify",
+                    "arguments": json.dumps(
+                        {"questions": [{"question": "是否抓包？", "choices": ["允许", "暂不"]}]},
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+        ],
+        ensure_ascii=False,
+    )
+    tool_result = json.dumps(
+        {
+            "responses": [
+                {
+                    "question": "是否抓包？",
+                    "choices_offered": ["允许", "暂不"],
+                    "user_response": "[user did not respond within 15m]",
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, tool_name, tool_call_id,
+                tool_calls, finish_reason, timestamp, platform_message_id,
+                display_order
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, session_id, "user", "继续诊断", None, None, None, None, 1000, "telegram-1", 1),
+                (2, session_id, "assistant", "", None, None, tool_calls, "tool_calls", 1001, None, 2),
+                (3, session_id, "tool", tool_result, "clarify", tool_call_id, None, None, 1002, None, 3),
+            ],
+        )
+    chain = hermes_turn(
+        "turn-1",
+        "1970-01-01T00:16:40Z",
+        "1970-01-01T00:16:43Z",
+        "继续诊断",
+        "未执行抓包，等待你的明确授权。",
+    )
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id, "capture_mode": "sanitized"},
+                "observations": [chain],
+            }
+        ],
+    }
+    cutoff = datetime.fromtimestamp(1004, tz=timezone.utc)
+
+    state_reconciliation = module.load_state_reconciliation(
+        session_id, state_db, cutoff_at=cutoff
+    )
+    candidate = module.build_candidate_document(
+        export,
+        session_id,
+        state_reconciliation=state_reconciliation,
+        cutoff_at=cutoff,
+    )
+
+    contents = [message["content"] for turn in candidate["turns"] for message in turn]
+    assert contents == [
+        "User: 继续诊断",
+        "Assistant: 是否抓包？\n\nChoices offered:\n- 允许\n- 暂不",
+        "Assistant: 未执行抓包，等待你的明确授权。",
+    ]
+    audit = candidate["audit"]["state_reconciliation"]
+    assert audit["clarify_question_event_count"] == 1
+    assert audit["clarify_response_event_count"] == 0
+    assert audit["uncovered_event_count"] == 0
+
+
+def test_clarify_cli_timeout_sentinel_is_not_rendered_as_user_response(tmp_path):
+    module = load_script_module(tmp_path)
+    from tools import clarify_tool
+
+    assert module._CLARIFY_CLI_TIMEOUT_RESPONSE == clarify_tool.TIMEOUT_RESPONSE
+    session_id = "session-clarify-cli-timeout"
+    chain = hermes_turn(
+        "turn-1",
+        "2026-08-24T01:00:00Z",
+        "2026-08-24T01:02:00Z",
+        "用户问题",
+        "按推荐方案继续",
+    )
+    clarify = {
+        "id": "clarify-cli-timeout",
+        "parentObservationId": "turn-1",
+        "type": "TOOL",
+        "name": "Tool: clarify",
+        "startTime": "2026-08-24T01:00:30Z",
+        "endTime": "2026-08-24T01:01:30Z",
+        "input": {"question": "请选择", "choices": ["甲", "乙"]},
+        "output": {"user_response": clarify_tool.TIMEOUT_RESPONSE},
+    }
+    real = dict(
+        clarify,
+        id="clarify-real",
+        startTime="2026-08-24T01:01:40Z",
+        endTime="2026-08-24T01:01:50Z",
+        output={"user_response": "The user did not respond within 15m, so I chose 甲"},
+    )
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {"metadata": {"task_id": session_id}, "observations": [chain, clarify, real]}
+        ],
+    }
+
+    candidate = module.build_candidate_document(export, session_id)
+
+    contents = [message["content"] for turn in candidate["turns"] for message in turn]
+    assert all(clarify_tool.TIMEOUT_RESPONSE not in content for content in contents)
+    assert "User: The user did not respond within 15m, so I chose 甲" in contents
+
+
+def test_kanban_wake_guidance_literals_match_locales():
+    import yaml
+
+    locales = Path(__file__).resolve().parents[2] / "locales"
+    module = load_script_module(Path("."))
+    guidance = set()
+    for path in locales.glob("*.yaml"):
+        wake = yaml.safe_load(path.read_text(encoding="utf-8"))["gateway"]["kanban"]["wake"]
+        assert wake["message"].startswith("[kanban] ")
+        assert "{task_id}" in wake["message"].split("\n", 1)[0]
+        guidance.add(wake["guidance"])
+    assert guidance == set(module._KANBAN_WAKE_GUIDANCE)
+
+
+def test_kanban_wake_turn_is_excluded_but_user_kanban_text_is_kept(tmp_path):
+    module = load_script_module(tmp_path)
+    session_id = "session-kanban-wake"
+    wake = (
+        "[kanban] 任务 t_8e672585 被阻塞，需要处理。\n标题: 复核目录\n执行者: @default\n"
+        "看板: default\n\n请检查结果或决定下一步动作。\n\n"
+        + module._KANBAN_WAKE_GUIDANCE[1]
+    )
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id},
+                "observations": [
+                    hermes_turn(
+                        "turn-wake",
+                        "2026-09-02T08:00:00Z",
+                        "2026-09-02T08:00:10Z",
+                        wake,
+                        "任务被阻塞，我先检查看板。",
+                    ),
+                    hermes_turn(
+                        "turn-user",
+                        "2026-09-02T08:01:00Z",
+                        "2026-09-02T08:01:10Z",
+                        "[kanban] 任务 t_8e672585 为什么被阻塞？",
+                        "因为目录名不一致。",
+                    ),
+                ],
+            }
+        ],
+    }
+
+    candidate = module.build_candidate_document(export, session_id)
+
+    contents = [message["content"] for turn in candidate["turns"] for message in turn]
+    assert contents == [
+        "Assistant: 任务被阻塞，我先检查看板。",
+        "User: [kanban] 任务 t_8e672585 为什么被阻塞？",
+        "Assistant: 因为目录名不一致。",
+    ]
 
 
 def test_cli_applies_state_reconciliation_to_generated_candidate(tmp_path, monkeypatch):

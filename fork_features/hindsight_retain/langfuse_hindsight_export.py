@@ -284,7 +284,22 @@ def _session_observations_to_traces(
             if isinstance(observation.get("metadata"), dict)
             and (observation.get("metadata") or {}).get("capture_mode")
         }
-        trace_metadata = {"task_id": session_id}
+        # Every observation records the task that produced it: a background
+        # memory review or a subagent runs under its own task id inside the
+        # parent session. Keep that id so build_candidate_document can exclude
+        # those turns; only id-less legacy traces default to the session.
+        own_task_ids = {
+            str((observation.get("metadata") or {}).get("task_id") or "").strip()
+            for observation in ordered
+            if isinstance(observation.get("metadata"), dict)
+        } - {""}
+        root_metadata = root.get("metadata")
+        if not isinstance(root_metadata, dict):
+            root_metadata = {}
+        task_id = str(root_metadata.get("task_id") or "").strip() or (
+            next(iter(own_task_ids)) if len(own_task_ids) == 1 else session_id
+        )
+        trace_metadata = {"task_id": task_id}
         if "sanitized" in capture_modes:
             trace_metadata["capture_mode"] = "sanitized"
         elif len(capture_modes) == 1:
@@ -426,6 +441,9 @@ _INTERRUPTED_USER_PREFIX_RE = re.compile(
     r"|\[This response was interrupted by a user correction\.\])\s*)+",
     flags=re.IGNORECASE,
 )
+# _apply_active_turn_redirect writes its hidden placeholder and the user row
+# back to back (observed gap: microseconds); 1 ms bounds "same step".
+_REDIRECT_PAIR_MAX_GAP_SECONDS = 0.001
 _IMAGE_ATTACHMENT_RE = re.compile(
     r"\[Image attached at:[^\]\n]+\]",
     flags=re.IGNORECASE,
@@ -448,11 +466,41 @@ _SYNTHETIC_USER_PREFIXES = (
     "## Hermes-LCM Recall Policy",
     "<memory-context>",
 )
+# Hermes-authored clarify answers that mean "nobody answered": the gateway's
+# ``[user did not respond within Nm]`` (gateway/run_turn_runner_clarify_delivery.py)
+# and the literal CLI sentinel tools/clarify_tool.py::TIMEOUT_RESPONSE (pinned by
+# a test). Only the exact whole answer matches; a real reply is never touched.
+_CLARIFY_GATEWAY_TIMEOUT_RE = re.compile(r"\[user did not respond within \d+m\]")
+_CLARIFY_CLI_TIMEOUT_RESPONSE = (
+    "The user did not provide a response within the time limit. "
+    "Use your best judgement to make the choice and proceed."
+)
+# gateway/kanban_watchers_notifier.py injects every automatic task-status wake
+# turn as ``gateway.kanban.wake.message`` (a ``[kanban]`` header line naming the
+# task id) ... ``gateway.kanban.wake.guidance``. Literal copies of the distinct
+# localized guidance values in locales/*.yaml (pinned by a test): the header plus
+# a guidance ending proves the whole row is the notifier's, not the user's.
+_KANBAN_WAKE_HEADER_RE = re.compile(r"\A\[kanban\] [^\n]*\bt_[0-9a-f]{8}\b")
+_KANBAN_WAKE_GUIDANCE = (
+    "This is an automatic task-status notification, not a request to decompose "
+    "the task again. Inspect the current board before creating follow-up tasks; "
+    "do not recreate tasks or graphs that already exist.",
+    "这是自动任务状态通知，不是再次分解任务的请求。创建后续任务前请先检查当前看板；"
+    "不要重复创建已存在的任务或任务图。",
+    "這是自動任務狀態通知，不是再次分解任務的請求。建立後續任務前請先檢查目前看板；"
+    "不要重複建立已存在的任務或任務圖。",
+)
 _NON_USER_RUNTIME_CONTEXT_RE = re.compile(
     r"^<hermes-runtime-context\b"
     r"(?=[^>]*\buser-authored\s*=\s*['\"]false['\"])"
     r"[^>]*>",
     flags=re.IGNORECASE,
+)
+# Literal copy of agent/surface_switch.py::_SURFACE_SWITCH_NOTE_PREFIX. The
+# one-shot turn notes ride at the END of the user's message, so everything from
+# this note on is Hermes-authored; a test pins it to the agent constant.
+_SURFACE_SWITCH_NOTE_PREFIX = (
+    "[System: This conversation is now being answered on a different interface: "
 )
 _USER_RUNTIME_SUFFIX_MARKERS = (
     "\n\n[Your active task list was preserved across context compression]",
@@ -461,7 +509,45 @@ _USER_RUNTIME_SUFFIX_MARKERS = (
     "\n\n[Durable Summary",
     "\n\n## Hermes-LCM Recall Policy",
     "\n\n<memory-context>",
+    "\n\n" + _SURFACE_SWITCH_NOTE_PREFIX,
 )
+# Literal copies of agent/context_compressor.py constants (pinned by a test).
+# A compaction carrier is ``summary + END marker + the user's live words``; the
+# in-flight replay header marks a restatement of a user row kept elsewhere.
+_SUMMARY_END_MARKER = (
+    "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+)
+_INFLIGHT_TASK_REPLAY_HEADER = (
+    "[STILL IN PROGRESS — this is the active request, restated after the "
+    "compaction boundary because it was not finished yet. Continue it; do not "
+    "start over.]"
+)
+# tools/process_registry_notifications.py::format_process_notification heartbeat.
+_PROCESS_HEARTBEAT_RE = re.compile(
+    r"^\[Background process \S+ heartbeat #\S+ — still running after "
+)
+
+
+def _user_payload_after_framework(content: str) -> str:
+    """Drop Hermes-authored blocks that precede the user's own words in one row.
+
+    Compaction folds the summary in front of the live user turn, and the
+    alternation repair joins a heartbeat notice in front of the next gateway
+    message. Only the exact generated shapes are cut; a heartbeat without a
+    following gateway message has no delimitable user text and is dropped.
+    """
+    text = content
+    if text.lstrip().startswith(_COMPACTION_MARKER_PREFIX):
+        _, marker, text = text.partition(_SUMMARY_END_MARKER)
+        if not marker:
+            return ""
+        text = text.lstrip()
+    if text.startswith(_INFLIGHT_TASK_REPLAY_HEADER):
+        return ""
+    if _PROCESS_HEARTBEAT_RE.match(text):
+        index = text.find("\n\n" + _GATEWAY_ORIGIN_PREFIX)
+        return text[index + 2 :] if index >= 0 else ""
+    return text
 
 
 def _trailing_voice_block(content: str) -> str:
@@ -475,6 +561,22 @@ def _trailing_voice_block(content: str) -> str:
             break
         first_index -= 1
     return content[matches[first_index].start() : matches[-1].end()].strip()
+
+
+def _is_kanban_wake_notice(content: str) -> bool:
+    """True only for a whole automatic kanban wake turn (header + guidance ending)."""
+    text = content.strip()
+    return bool(_KANBAN_WAKE_HEADER_RE.match(text)) and text.endswith(
+        _KANBAN_WAKE_GUIDANCE
+    )
+
+
+def _is_clarify_timeout_response(value) -> bool:
+    """True when a clarify answer is Hermes' own "nobody answered" placeholder."""
+    text = str(value or "").strip()
+    return bool(_CLARIFY_GATEWAY_TIMEOUT_RE.fullmatch(text)) or (
+        text == _CLARIFY_CLI_TIMEOUT_RESPONSE
+    )
 
 
 def _clean_user_content(value) -> str:
@@ -495,6 +597,10 @@ def _clean_user_content(value) -> str:
         content = "\n\n".join(text_parts)
     else:
         return ""
+    content = _user_payload_after_framework(content)
+    gateway_split = _split_gateway_origin(content)
+    if gateway_split is not None:
+        content = gateway_split[1]
     content = _IMAGE_ATTACHMENT_RE.sub(_IMAGE_SENT_MARKER, content)
     content = _NEW_MESSAGE_WRAPPER_RE.sub("", content).strip()
     content = _MODEL_SWITCH_NOTE_RE.sub("", content).strip()
@@ -509,6 +615,8 @@ def _clean_user_content(value) -> str:
         marker_index = content.find(marker)
         if marker_index >= 0:
             content = content[:marker_index].rstrip()
+    if _is_kanban_wake_notice(content):
+        return ""
     missing_image_markers = max(0, image_count - content.count(_IMAGE_SENT_MARKER))
     if missing_image_markers:
         suffix = "\n\n".join([_IMAGE_SENT_MARKER] * missing_image_markers)
@@ -536,8 +644,8 @@ _GATEWAY_ORIGIN_SEPARATOR = (
 )
 
 
-def _gateway_origin_user_event(value) -> tuple[str, str] | None:
-    """Recover one canonical gateway busy-steer without retaining routing metadata."""
+def _split_gateway_origin(value) -> tuple[dict, str] | None:
+    """``(origin, user_text)`` of gateway/run_busy.py's routing wrapper, else None."""
     if not isinstance(value, str) or not value.startswith(_GATEWAY_ORIGIN_PREFIX):
         return None
     encoded_origin, separator, user_content = value[len(_GATEWAY_ORIGIN_PREFIX) :].partition(
@@ -551,6 +659,17 @@ def _gateway_origin_user_event(value) -> tuple[str, str] | None:
         return None
     if not isinstance(origin, dict) or not str(origin.get("platform") or "").strip():
         return None
+    return origin, user_content
+
+
+def _gateway_origin_user_event(value) -> tuple[str, str] | None:
+    """Recover one canonical gateway busy-steer without retaining routing metadata."""
+    if isinstance(value, str):
+        value = _user_payload_after_framework(value)
+    split = _split_gateway_origin(value)
+    if split is None:
+        return None
+    origin, user_content = split
     message_id = str(
         origin.get("message_id") or origin.get("source_message_id") or ""
     ).strip()
@@ -560,11 +679,104 @@ def _gateway_origin_user_event(value) -> tuple[str, str] | None:
     return message_id, content
 
 
+# Literal copies of agent/turn_failure_copy.py: the Hermes-authored assistant row
+# that closes a failed turn. It is a transcript boundary, not the model's reply.
+# Rows written before the closers typed them carry no display_kind, so, like
+# untyped_failed_turn_display_kind, match the exact stripped notice text only;
+# a real reply that merely quotes the notice stays a reply. A test pins these
+# values to the agent constants.
+_FAILED_TURN_DISPLAY_KIND = "failed_turn"
+_FAILED_TURN_NOTICES = (
+    "Your request was not processed. Send it again if you still want me to carry it out.",
+    "This turn did not complete. Some actions may already have run; verify their effects "
+    "before resending.",
+)
+
+
+def _is_failed_turn_boundary(display_kind, content) -> bool:
+    if str(display_kind or "") == _FAILED_TURN_DISPLAY_KIND:
+        return True
+    return isinstance(content, str) and content.strip() in _FAILED_TURN_NOTICES
+
+
 def _is_state_framework_content(value: str) -> bool:
     normalized = " ".join(unicodedata.normalize("NFKC", str(value)).split())
     return any(normalized.startswith(prefix) for prefix in _STATE_FRAMEWORK_PREFIXES) or bool(
         re.match(r"\[Depth-\d+ Summary \(", normalized)
     )
+
+
+# Literal copies of the merged-carrier format written by
+# ContextCompressor._merge_summary_into_tail_row (agent/context_compressor.py).
+# This script runs without importing the agent package; a test pins both values
+# to the compressor's constants.
+_MERGED_PRIOR_CONTEXT_HEADER = "[PRIOR CONTEXT — for reference only; not a new message]"
+_MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
+
+
+def _merged_carrier_prior_content(content: str) -> str | None:
+    """Return the carried reply of a merged compaction row, or None if not one.
+
+    When no standalone summary row fits the role alternation, compaction folds
+    the summary into the last kept row as ``header + prior reply + delimiter +
+    summary + end marker``. Only the prior reply is conversation; it may be
+    empty. Like the compressor, require the summary prefix after the delimiter.
+    """
+    text = content.lstrip()
+    if not text.startswith(_MERGED_PRIOR_CONTEXT_HEADER):
+        return None
+    prior, delimiter, summary = text.partition(_MERGED_SUMMARY_DELIMITER)
+    if not delimiter or not summary.lstrip().startswith(_COMPACTION_MARKER_PREFIX):
+        return None
+    return prior[len(_MERGED_PRIOR_CONTEXT_HEADER) :].strip()
+
+
+def _provider_output_message_ids(value) -> tuple[str, ...]:
+    """Return the provider output-message ids stored with an assistant row.
+
+    Responses-API providers give every output message a unique id. Compaction
+    copies these items verbatim into each clone, even though a clone gets a new
+    timestamp and display identity, while a later real reply gets new ids even
+    when its text repeats. Rows from providers without such ids return ().
+    """
+    if not isinstance(value, str) or not value.strip():
+        return ()
+    try:
+        items = json.loads(value)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(items, list):
+        return ()
+    return tuple(
+        item["id"]
+        for item in items
+        if isinstance(item, dict)
+        and item.get("type") == "message"
+        and isinstance(item.get("id"), str)
+        and item["id"].strip()
+    )
+
+
+def _state_assistant_logical_key(
+    body: str,
+    timestamp: str,
+    display_identity,
+    codex_message_items,
+) -> tuple:
+    """Identify one logical visible assistant message across physical copies."""
+    provider_ids = _provider_output_message_ids(codex_message_items)
+    if provider_ids:
+        return ("provider_message", provider_ids)
+    if isinstance(display_identity, memoryview):
+        display_identity = display_identity.tobytes()
+    if display_identity:
+        # StateDB assigns the same durable identity to physical clones made by
+        # compaction while assigning a new identity to a later real message,
+        # even when its visible text is identical.
+        return ("display_identity", display_identity)
+    # Legacy databases have no durable identity. Fail open: only collapse
+    # exact physical copies, never infer replay from text or marker position.
+    return (body, timestamp)
 
 
 def load_undo_filter(
@@ -960,6 +1172,96 @@ def _render_clarify_question(question: str, choices) -> str:
     return rendered
 
 
+def _state_platform_copy_ids(conn, session_id: str) -> dict[tuple, set[str]]:
+    """Identity evidence includes originals parked by compaction, not undo output."""
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(messages)")}
+    if "platform_message_id" not in columns:
+        return {}
+    rows = conn.execute(
+        "SELECT timestamp, content, platform_message_id FROM messages "
+        "WHERE session_id = ? AND role = 'user' "
+        "AND platform_message_id IS NOT NULL AND TRIM(platform_message_id) != ''",
+        (session_id,),
+    ).fetchall()
+    identities: dict[tuple, set[str]] = {}
+    for row in rows:
+        content = _clean_user_content(_decode_state_content(row["content"]))
+        if content:
+            identities.setdefault((row["timestamp"], content), set()).add(
+                str(row["platform_message_id"]).strip()
+            )
+    return identities
+
+
+def _state_platform_user_id(row, content: str, copy_ids: dict) -> str | None:
+    identity = str(row["platform_message_id"] or "").strip()
+    if identity:
+        return identity
+    gateway_event = _gateway_origin_user_event(row["content"])
+    if gateway_event is not None:
+        return gateway_event[0]
+    identities = copy_ids.get((row["timestamp"], content), set())
+    return next(iter(identities)) if len(identities) == 1 else None
+
+
+def _state_redirect_copy_ids(conn, session_id: str) -> dict[tuple, int]:
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(messages)")}
+    if not {"platform_message_id", "display_kind", "tool_call_id"}.issubset(columns):
+        return {}
+    # agent/conversation_loop.py::_apply_active_turn_redirect appends a
+    # hidden empty assistant placeholder and then the user's own words
+    # in one step; the correction carries no platform id. Read the
+    # pair in every state (compaction parks it at active=0/compacted=0
+    # and re-inserts copies elsewhere). The row before the placeholder
+    # anchors the pair: compaction re-inserts a whole tool run with
+    # fresh timestamps, so a copied pair shares the anchor's
+    # tool_call_id with its original, not the timestamp.
+    redirect_rows = conn.execute(
+        """
+        SELECT u.id, u.timestamp, u.content,
+               a.role AS anchor_role, a.tool_call_id AS anchor_call_id
+        FROM messages AS u
+        JOIN messages AS p
+          ON p.session_id = u.session_id
+         AND p.id = (
+             SELECT MAX(x.id) FROM messages AS x
+             WHERE x.session_id = u.session_id AND x.id < u.id
+         )
+        LEFT JOIN messages AS a
+          ON a.session_id = u.session_id
+         AND a.id = (
+             SELECT MAX(y.id) FROM messages AS y
+             WHERE y.session_id = u.session_id AND y.id < p.id
+         )
+        WHERE u.session_id = ? AND u.role = 'user'
+          AND (u.platform_message_id IS NULL
+               OR TRIM(u.platform_message_id) = '')
+          AND COALESCE(u.display_kind, '') = ''
+          AND p.role = 'assistant' AND p.display_kind = 'hidden'
+          AND COALESCE(p.content, '') = ''
+          AND u.timestamp >= p.timestamp
+          AND u.timestamp - p.timestamp < ?
+        ORDER BY u.id
+        """,
+        (session_id, _REDIRECT_PAIR_MAX_GAP_SECONDS),
+    ).fetchall()
+    redirect_originals_by_copy: dict[tuple, int] = {}
+    redirect_original_by_anchor: dict[tuple, int] = {}
+    for row in redirect_rows:
+        content = _clean_user_content(_decode_state_content(row["content"]))
+        if not content:
+            continue
+        anchor_call_id = str(row["anchor_call_id"] or "").strip()
+        if row["anchor_role"] == "tool" and anchor_call_id:
+            anchor = ("tool_call", anchor_call_id, content)
+        else:
+            anchor = ("timestamp", row["timestamp"], content)
+        original_id = redirect_original_by_anchor.setdefault(anchor, int(row["id"]))
+        redirect_originals_by_copy.setdefault((row["timestamp"], content), original_id)
+
+    return redirect_originals_by_copy
+
+
 def load_state_reconciliation(
     session_id: str,
     state_db_path: Path,
@@ -1007,10 +1309,16 @@ def load_state_reconciliation(
                 if "display_identity" in columns
                 else "NULL AS display_identity"
             )
+            provider_items_projection = (
+                "codex_message_items"
+                if "codex_message_items" in columns
+                else "NULL AS codex_message_items"
+            )
             query = f"""
                 SELECT id, role, content, timestamp, display_kind,
                        platform_message_id, display_order, tool_name,
-                       tool_call_id, tool_calls, {identity_projection}
+                       tool_call_id, tool_calls, {identity_projection},
+                       {provider_items_projection}
                 FROM messages
                 WHERE session_id = ?
                   AND (active = 1 OR compacted = 1)
@@ -1021,6 +1329,11 @@ def load_state_reconciliation(
                 parameters.append(cutoff_seconds)
             query += " ORDER BY COALESCE(display_order, id), id"
             rows = conn.execute(query, parameters).fetchall()
+            # Compaction re-inserts carried/tail rows as fresh copies without
+            # the platform id and parks the original at active=0/compacted=0,
+            # so read platform-id rows in every state as identity evidence.
+            platform_ids_by_copy = _state_platform_copy_ids(conn, session_id)
+            redirect_originals_by_copy = _state_redirect_copy_ids(conn, session_id)
     except (OSError, sqlite3.Error) as exc:
         result["reason"] = f"state_db_error:{type(exc).__name__}"
         return result
@@ -1032,21 +1345,26 @@ def load_state_reconciliation(
             continue
         if str(row["display_kind"] or "") in {"hidden", "internal_notification"}:
             continue
-        platform_message_id = str(row["platform_message_id"] or "").strip()
+        content = _clean_user_content(_decode_state_content(row["content"]))
+        platform_message_id = _state_platform_user_id(row, content, platform_ids_by_copy)
+        source_kind = "platform_user"
         if platform_message_id:
-            content = _clean_user_content(_decode_state_content(row["content"]))
+            identity = f"platform_user:{platform_message_id}"
         else:
-            gateway_event = _gateway_origin_user_event(row["content"])
-            if gateway_event is None:
+            copy_key = (row["timestamp"], content)
+            redirect_id = redirect_originals_by_copy.get(copy_key)
+            if not platform_ids_by_copy.get(copy_key) and redirect_id is not None:
+                source_kind = "redirect_user"
+                identity = f"redirect_user:{redirect_id}"
+            else:
                 continue
-            platform_message_id, content = gateway_event
-        if platform_message_id in seen_platform_messages or not content:
+        if identity in seen_platform_messages or not content:
             continue
-        seen_platform_messages.add(platform_message_id)
+        seen_platform_messages.add(identity)
         events.append(
             {
-                "source_kind": "platform_user",
-                "source_key": f"platform_user:{platform_message_id}",
+                "source_kind": source_kind,
+                "source_key": identity,
                 "role": "user",
                 "content": _external_safe_text(content),
                 "timestamp": _utc_timestamp(row["timestamp"]),
@@ -1054,7 +1372,7 @@ def load_state_reconciliation(
             }
         )
 
-    seen_visible_assistants: set[tuple[str, object]] = set()
+    seen_visible_assistants: set[tuple] = set()
     for row in rows:
         if row["role"] != "assistant":
             continue
@@ -1065,23 +1383,22 @@ def load_state_reconciliation(
         content = _decode_state_content(row["content"])
         if not isinstance(content, str):
             continue
+        if _is_failed_turn_boundary(row["display_kind"], content):
+            continue
         content = content.strip()
+        carried = _merged_carrier_prior_content(content)
+        if carried is not None:
+            content = carried
         if not content or _is_state_framework_content(content):
             continue
         timestamp = _utc_timestamp(row["timestamp"])
         body = " ".join(unicodedata.normalize("NFKC", content).split())
-        display_identity = row["display_identity"]
-        if isinstance(display_identity, memoryview):
-            display_identity = display_identity.tobytes()
-        if display_identity:
-            # StateDB assigns the same durable identity to physical clones made by
-            # compaction while assigning a new identity to a later real message,
-            # even when its visible text is identical.
-            logical_key = ("display_identity", display_identity)
-        else:
-            # Legacy databases have no durable identity. Fail open: only collapse
-            # exact physical copies, never infer replay from text or marker position.
-            logical_key = (body, timestamp)
+        logical_key = _state_assistant_logical_key(
+            body,
+            timestamp,
+            row["display_identity"],
+            row["codex_message_items"],
+        )
         if logical_key in seen_visible_assistants:
             continue
         seen_visible_assistants.add(logical_key)
@@ -1147,6 +1464,8 @@ def load_state_reconciliation(
                         }
                     )
                 user_response = response_record.get("user_response")
+                if _is_clarify_timeout_response(user_response):
+                    user_response = ""
                 if isinstance(user_response, str) and user_response.strip():
                     events.append(
                         {
@@ -1291,6 +1610,7 @@ def _apply_state_reconciliation(
         "added_event_count": 0,
         "uncovered_event_count": 0,
         "platform_user_event_count": 0,
+        "redirect_user_event_count": 0,
         "visible_assistant_event_count": 0,
         "clarify_question_event_count": 0,
         "clarify_response_event_count": 0,
@@ -1357,6 +1677,8 @@ def _clarify_events(observation: dict) -> list[tuple[str, int, dict]]:
             )
         )
     user_response = _clean_user_content(clarify_output.get("user_response"))
+    if _is_clarify_timeout_response(user_response):
+        user_response = ""
     if user_response:
         timestamp = str(observation.get("endTime") or "")
         events.append(

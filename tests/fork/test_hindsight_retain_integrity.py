@@ -487,6 +487,282 @@ def test_state_snapshot_counts_compacted_visible_assistant(tmp_path: Path) -> No
     assert snapshot["active_message_count"] == 3
 
 
+def test_state_snapshot_counts_compaction_copies_like_exporter(tmp_path: Path) -> None:
+    """The pre-submit lower bound must use the exporter's copy rules.
+
+    Otherwise a candidate that correctly keeps one compaction-cloned reply is
+    blocked as missing the clones. Regression for session
+    20260923_160931_4eaf17f7.
+    """
+    module = load_module()
+    exporter = load_path_module(
+        "langfuse_hindsight_export_for_snapshot",
+        MODULE_PATH.with_name("langfuse_hindsight_export.py"),
+    )
+    session_id = "20260924_122600_4eaf17f7"
+    state_db = tmp_path / "state.db"
+    header = "[PRIOR CONTEXT — for reference only; not a new message]"
+    delimiter = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
+    end_marker = (
+        "--- END OF CONTEXT SUMMARY — respond to the message below, "
+        "not the summary above ---"
+    )
+
+    def carrier(prior: str) -> str:
+        return (
+            f"{header}\n{prior}\n\n{delimiter}\n\n"
+            "[CONTEXT COMPACTION — REFERENCE ONLY] summary body\n\n"
+            f"{end_marker}"
+        )
+
+    def items(message_id: str, text: str) -> str:
+        return json.dumps(
+            [
+                {
+                    "type": "message",
+                    "id": message_id,
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                }
+            ],
+            ensure_ascii=False,
+        )
+
+    reply = "建议分别设置：会话压缩用 xhigh。"
+    with sqlite3.connect(state_db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE sessions (id TEXT PRIMARY KEY);
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_name TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                finish_reason TEXT,
+                timestamp REAL,
+                active INTEGER NOT NULL DEFAULT 1,
+                compacted INTEGER NOT NULL DEFAULT 0,
+                display_kind TEXT,
+                platform_message_id TEXT,
+                display_order INTEGER,
+                display_identity BLOB,
+                codex_message_items TEXT
+            );
+            """
+        )
+        conn.execute("INSERT INTO sessions VALUES (?)", (session_id,))
+        conn.executemany(
+            """
+            INSERT INTO messages (
+                id, session_id, role, content, finish_reason, timestamp, active,
+                compacted, platform_message_id, display_order, display_identity,
+                codex_message_items
+            ) VALUES (?, ?, ?, ?, 'stop', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, session_id, "user", "怎么设置？", 1000, 0, 1, "tg-1", 1,
+                 b"user-1", None),
+                (2, session_id, "assistant", reply, 1001, 0, 1, None, 2,
+                 b"original", items("msg_reply", reply)),
+                (3, session_id, "assistant", reply, 1060, 0, 1, None, 3,
+                 b"clone-1", items("msg_reply", reply)),
+                (4, session_id, "assistant", carrier(reply), 1120, 0, 1, None, 4,
+                 b"carrier", items("msg_reply", reply)),
+                (5, session_id, "assistant", carrier(""), 1130, 0, 1, None, 5,
+                 b"empty-carrier", None),
+                (6, session_id, "assistant", reply, 1140, 1, 0, None, 6,
+                 b"clone-2", items("msg_reply", reply)),
+                (7, session_id, "assistant", reply, 1200, 1, 0, None, 7,
+                 b"real-repeat", items("msg_repeat", reply)),
+                (8, session_id, "assistant", "旧库回复", 1300, 1, 0, None, 8,
+                 None, None),
+                (9, session_id, "assistant", "旧库回复", 1300, 0, 1, None, 9,
+                 None, None),
+            ],
+        )
+    cutoff = datetime.fromtimestamp(1400, tz=timezone.utc)
+
+    snapshot = module._state_snapshot(state_db, session_id, cutoff_at=cutoff)
+    reconciliation = exporter.load_state_reconciliation(
+        session_id, state_db, cutoff_at=cutoff
+    )
+    exported_assistants = [
+        event["content"]
+        for event in reconciliation["events"]
+        if event["source_kind"] == "visible_assistant"
+    ]
+
+    assert exported_assistants == [reply, reply, "旧库回复"]
+    assert snapshot["active_assistant_count"] == len(exported_assistants)
+    assert snapshot["active_user_count"] == 1
+    assert snapshot["active_message_count"] == 4
+
+
+@pytest.mark.parametrize("origin_wrapper", [False, True])
+def test_state_snapshot_counts_user_identities_not_copy_timestamps(
+    tmp_path: Path, origin_wrapper: bool,
+) -> None:
+    module = load_module()
+    exporter = module._export_rules()
+    session_id = "user-copy-count"
+    state_db = tmp_path / "state.db"
+    create_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        for name, kind in (("platform_message_id", "TEXT"), ("display_order", "INTEGER"),
+                           ("tool_name", "TEXT"), ("tool_call_id", "TEXT"),
+                           ("tool_calls", "TEXT")):
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {name} {kind}")
+        conn.execute("DELETE FROM messages")
+        def wrapped(message_id):
+            return (exporter._GATEWAY_ORIGIN_PREFIX
+                    + json.dumps({"platform": "telegram", "message_id": message_id})
+                    + exporter._GATEWAY_ORIGIN_SEPARATOR + "继续")
+        conn.executemany(
+            "INSERT INTO messages (id, session_id, role, content, timestamp, active, "
+            "compacted, platform_message_id) VALUES (?, ?, 'user', ?, ?, ?, ?, ?)",
+            [
+                (1, session_id, "继续", 1000, 0, 0, "p1"),
+                (2, session_id, wrapped("p1") if origin_wrapper else "继续",
+                 1010, 0, 1, None if origin_wrapper else "p1"),
+                (3, session_id, "继续", 1000, 1, 0, None),
+                # Same words, different real platform message: keep it.
+                (4, session_id, "继续", 1020, 1, 0, "p2"),
+                # No provenance: still contributes to the independent lower bound.
+                (5, session_id, "未识别的真实话", 1030, 1, 0, None),
+                (6, session_id, "截止之后", 2000, 1, 0, "p3"),
+            ],
+        )
+    cutoff = datetime.fromtimestamp(1100, tz=timezone.utc)
+    snapshot = module._state_snapshot(state_db, session_id, cutoff_at=cutoff)
+    assert snapshot["active_user_count"] == 3
+    assert module._candidate_visible_event_gap(
+        snapshot, {"user": 2, "assistant": 0, "total": 2},
+        {"state_reconciliation": {"clarify_response_event_count": 0}},
+    )["missing_user_count"] == 1
+
+
+def test_state_snapshot_counts_redirect_anchors_like_exporter(tmp_path: Path) -> None:
+    module = load_module()
+    session_id = "redirect-copy-count"
+    state_db = tmp_path / "state.db"
+    create_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        for name in ("platform_message_id", "tool_call_id"):
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {name} TEXT")
+        conn.execute("DELETE FROM messages")
+        for index, (stamp, anchor) in enumerate([(1000, "call-1"), (1100, "call-1"),
+                                                  (1200, "call-2")]):
+            base = index * 3
+            conn.executemany(
+                "INSERT INTO messages (id, session_id, role, content, timestamp, "
+                "active, compacted, display_kind, tool_call_id) VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?)",
+                [(base + 1, session_id, "tool", "done", stamp, None, anchor),
+                 (base + 2, session_id, "assistant", "", stamp + .1, "hidden", None),
+                 (base + 3, session_id, "user", "停一下", stamp + .1001, None, None)],
+            )
+    snapshot = module._state_snapshot(state_db, session_id)
+    assert snapshot["active_user_count"] == 2
+
+
+@pytest.mark.parametrize("variant", ["copy", "new_time", "new_platform", "intervening", "missing_original"])
+def test_state_snapshot_only_excludes_proven_joined_user_copies(tmp_path: Path, variant: str) -> None:
+    module = load_module()
+    session_id = "joined-user-count"
+    state_db = tmp_path / "state.db"
+    create_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.execute("ALTER TABLE messages ADD COLUMN platform_message_id TEXT")
+        conn.execute("DELETE FROM messages")
+        conn.executemany(
+            "INSERT INTO messages (id, session_id, role, content, timestamp, active, "
+            "compacted, platform_message_id) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            [(1, session_id, "user", "长消息一", 1000, 1, "p1"),
+             (3, session_id, "user", "长消息二", 1001, 0 if variant == "missing_original" else 1, "p2"),
+             (4, session_id, "user", "长消息一\n\n长消息二",
+              1100 if variant == "new_time" else 1000, 1,
+              "p3" if variant == "new_platform" else None)],
+        )
+        if variant == "intervening":
+            conn.execute("INSERT INTO messages (id, session_id, role, content, timestamp, active, compacted) "
+                         "VALUES (2, ?, 'assistant', '间隔回复', 1000.5, 0, 1)", (session_id,))
+    snapshot = module._state_snapshot(state_db, session_id)
+    expected = 2 if variant in {"copy", "missing_original"} else 3
+    assert snapshot["active_user_count"] == expected
+    # Removing either original from a supposedly complete candidate must still fail.
+    assert module._candidate_visible_event_gap(
+        snapshot, {"user": 1, "assistant": 1, "total": 2},
+        {"state_reconciliation": {}},
+    )["missing_user_count"] == expected - 1
+
+
+@pytest.mark.parametrize("variant", ["delegated", "reset", "wrong_goal", "no_parent_call"])
+def test_state_snapshot_excludes_only_parent_proven_delegate_seed(tmp_path: Path, variant: str) -> None:
+    module = load_module()
+    session_id = "delegate-seed-count"
+    state_db = tmp_path / "state.db"
+    create_state_db(state_db, session_id)
+    goal = "检查这个改动"
+    with sqlite3.connect(state_db) as conn:
+        conn.execute("ALTER TABLE sessions ADD COLUMN model_config TEXT")
+        conn.execute("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT")
+        conn.execute("ALTER TABLE messages ADD COLUMN platform_message_id TEXT")
+        conn.execute("ALTER TABLE messages ADD COLUMN tool_calls TEXT")
+        conn.execute("DELETE FROM messages")
+        marker = "_reset_from" if variant == "reset" else "_delegate_from"
+        conn.execute("UPDATE sessions SET model_config=?, parent_session_id='parent' WHERE id=?",
+                     (json.dumps({marker: "parent"}), session_id))
+        call = json.dumps([{"id": "call1", "type": "function", "function": {
+            "name": "delegate_task", "arguments": json.dumps({"tasks": [{
+                "goal": "另一个任务" if variant == "wrong_goal" else goal,
+            }]})}}])
+        if variant != "no_parent_call":
+            conn.execute("INSERT INTO messages (id, session_id, role, timestamp, active, compacted, tool_calls) "
+                         "VALUES (1, 'parent', 'assistant', 999, 1, 0, ?)", (call,))
+        conn.executemany(
+            "INSERT INTO messages (id, session_id, role, content, timestamp, active, compacted, platform_message_id) "
+            "VALUES (?, ?, 'user', ?, ?, 0, 1, ?)",
+            [(2, session_id, goal, 1000, None), (3, session_id, goal, 1000, None),
+             # A real user may later repeat the agent's task verbatim.
+             (4, session_id, goal, 1100, "p1"),
+             (5, session_id, goal, 1200, None)],
+        )
+    snapshot = module._state_snapshot(state_db, session_id)
+    assert snapshot["active_user_count"] == (2 if variant == "delegated" else 3)
+
+
+def test_state_snapshot_skips_failed_turn_notice_like_exporter(tmp_path: Path) -> None:
+    module = load_module()
+    session_id = "20260921_101213_e774235e"
+    state_db = tmp_path / "state.db"
+    create_state_db(state_db, session_id)
+    notice = (
+        "Your request was not processed. Send it again if you still want me to "
+        "carry it out."
+    )
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (3, session_id, "user", "没被处理的请求", 1003.0, 1, 0, None),
+                (4, session_id, "assistant", notice, 1004.0, 1, 0, None),
+                (5, session_id, "assistant", notice, 1005.0, 0, 1, "failed_turn"),
+            ],
+        )
+
+    snapshot = module._state_snapshot(
+        state_db,
+        session_id,
+        cutoff_at=datetime.fromtimestamp(1006, tz=timezone.utc),
+    )
+
+    assert snapshot["active_user_count"] == 2
+    assert snapshot["active_assistant_count"] == 1
+    assert snapshot["active_message_count"] == 3
+
+
 def test_blocked_incomplete_candidate_scans_as_one_explicit_alert(
     tmp_path: Path,
 ) -> None:
@@ -2550,6 +2826,155 @@ print(json.dumps({"session_id": args.session_id}))
     )
 
     assert result["alerts"] == []
+
+
+@pytest.mark.parametrize("reverse_journal", [False, True])
+def test_export_failure_becomes_recovery_notice_only_after_verified_later_save(
+    tmp_path: Path, reverse_journal: bool,
+) -> None:
+    module = load_module()
+    later_at = datetime(2026, 8, 27, 15, 21, tzinfo=timezone.utc)
+    session_id = "20260824_205339_b18957b9"
+    later_id = "8a41dfff-47b0-4d71-9cb5-d95215a573df"
+    failed_id = "2e9ad449-8a33-4d77-908d-94cdc35d5ad2"
+    state_db, journal, result = create_accepted_attempt(
+        module, tmp_path, session_id=session_id,
+        attempt_id=later_id, started_at=later_at,
+    )
+    failed_at = later_at - timedelta(days=1)
+    for event in ("started", "export_failed"):
+        module.append_event_durable(journal, {
+            "attempt_id": failed_id, "event": event,
+            "recorded_at": failed_at.isoformat(), "session_id": session_id,
+            "document_id": session_id, "remote_expectation": "expected",
+            "cutoff_at": failed_at.isoformat(), "failure_type": "ExportFailure",
+        })
+    if reverse_journal:
+        journal.write_text("\n".join(reversed(journal.read_text().splitlines())) + "\n")
+    before = journal.read_bytes()
+    candidate = json.loads(
+        (Path(result["output_dir"]) / f"candidate_document_{session_id}.json").read_text()
+    )
+    scan = module.scan_attempts(
+        journal_path=journal, state_db_path=state_db,
+        now=later_at + timedelta(days=40),  # no dependence on 30-day delivery memory
+        operation_fetcher=lambda operation_id: {
+            "status": "found", "operation": {
+                "id": operation_id, "task_type": "batch_retain",
+                "status": "completed", "document_id": session_id,
+                "extraction_errors_count": 0,
+            },
+        },
+        document_fetcher=lambda document_id: {
+            "status": "found", "document": {
+                "id": document_id, "original_text": candidate["document_content"],
+            },
+        },
+    )
+    assert [a["type"] for a in scan["alerts"]] == ["retain_export_recovered"]
+    notice = scan["alerts"][0]
+    assert notice["severity"] == "info"
+    assert notice["original_alert_key"] == f"retain:{failed_id}:export_failed"
+    assert notice["alert_key"] != notice["original_alert_key"]
+    assert notice["recovered_by_attempt_id"] == later_id
+    assert notice["recovery_started_at"] == later_at.isoformat()
+    assert notice["started_at"] == failed_at.isoformat()
+    assert notice["remote_document_matches_candidate"] is True
+    assert "完整" in notice["message"]  # explicit limit: not full-source completeness
+    assert journal.read_bytes() == before
+
+
+@pytest.mark.parametrize("case", [
+    "operation_pending", "operation_failed", "operation_missing", "operation_unavailable",
+    "extraction_errors", "operation_identity", "document_missing", "document_unavailable",
+    "document_mismatch", "document_identity", "not_later", "same_time",
+    "cutoff_too_early", "bad_cutoff", "different_document", "local_only",
+    "artifacts_missing", "newer_write_unfinished", "partial_repair",
+])
+def test_export_failure_stays_unresolved_without_matching_later_save(
+    tmp_path: Path, case: str,
+) -> None:
+    module = load_module()
+    later_at = datetime(2026, 8, 27, 15, 21, tzinfo=timezone.utc)
+    failed_at = later_at - timedelta(days=1)
+    session_id = "20260824_205339_b18957b9"
+    later_id = "8a41dfff-47b0-4d71-9cb5-d95215a573df"
+    failed_id = "2e9ad449-8a33-4d77-908d-94cdc35d5ad2"
+    state_db, journal, result = create_accepted_attempt(
+        module, tmp_path, session_id=session_id,
+        attempt_id=later_id, started_at=later_at,
+    )
+    candidate_path = Path(result["output_dir"]) / f"candidate_document_{session_id}.json"
+    candidate = json.loads(candidate_path.read_text())
+    operation = {
+        "status": "found", "operation": {
+            "id": later_id, "task_type": "batch_retain", "status": "completed",
+            "document_id": session_id, "extraction_errors_count": 0,
+        },
+    }
+    document = {
+        "status": "found", "document": {
+            "id": session_id, "original_text": candidate["document_content"],
+        },
+    }
+    if case.startswith("operation_") and case != "operation_identity":
+        status = case.removeprefix("operation_")
+        if status in {"pending", "failed"}:
+            operation["operation"]["status"] = status
+        else:
+            operation = {"status": status}
+    elif case == "operation_identity":
+        operation["operation"]["document_id"] = "other-document"
+    elif case == "extraction_errors":
+        operation["operation"]["extraction_errors_count"] = 1
+    elif case in {"document_missing", "document_unavailable"}:
+        document = {"status": case.removeprefix("document_")}
+    elif case == "document_mismatch":
+        document["document"]["original_text"] += " different"
+    elif case == "document_identity":
+        document["document"]["id"] = "other-document"
+    elif case == "not_later":
+        failed_at = later_at + timedelta(minutes=1)
+    elif case == "same_time":
+        failed_at = later_at
+    elif case == "artifacts_missing":
+        candidate_path.unlink()
+    events = [json.loads(line) for line in journal.read_text().splitlines()]
+    for event in events:
+        if event["event"] == "started":
+            if case == "cutoff_too_early":
+                event["cutoff_at"] = (failed_at - timedelta(minutes=1)).isoformat()
+            elif case == "bad_cutoff":
+                event["cutoff_at"] = "not-a-time"
+            elif case == "local_only":
+                event["remote_expectation"] = "not_expected"
+            elif case == "partial_repair":
+                event["repair_scope"] = "confirmed_missing_only"
+    journal.write_text("".join(json.dumps(event) + "\n" for event in events))
+    for event in ("started", "export_failed"):
+        module.append_event_durable(journal, {
+            "attempt_id": failed_id, "event": event,
+            "recorded_at": failed_at.isoformat(), "session_id": session_id,
+            "document_id": "different-document" if case == "different_document" else session_id,
+            "remote_expectation": "expected", "cutoff_at": failed_at.isoformat(),
+        })
+    if case == "newer_write_unfinished":
+        for event in ("started", "remote_write_started"):
+            module.append_event_durable(journal, {
+                "attempt_id": "newer-attempt", "event": event,
+                "recorded_at": (later_at + timedelta(minutes=1)).isoformat(),
+                "session_id": session_id, "document_id": session_id,
+                "remote_expectation": "expected",
+            })
+    scan = module.scan_attempts(
+        journal_path=journal, state_db_path=state_db,
+        now=later_at + timedelta(days=40),
+        operation_fetcher=lambda _operation_id: operation,
+        document_fetcher=lambda _document_id: document,
+    )
+    failures = [a for a in scan["alerts"] if a.get("attempt_id") == failed_id]
+    assert [a["type"] for a in failures] == ["retain_export_failed"]
+    assert not any(a["type"] == "retain_export_recovered" for a in scan["alerts"])
 
 
 def test_exact_remote_candidate_is_confirmed_without_alert(tmp_path: Path) -> None:
