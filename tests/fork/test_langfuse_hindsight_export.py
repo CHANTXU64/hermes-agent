@@ -2753,6 +2753,115 @@ def test_state_reconciliation_projects_clarify_when_v4_has_only_chain(tmp_path):
     }
 
 
+@pytest.mark.parametrize("original_source", ["both", "call", "result"])
+def test_state_clarify_uses_same_call_original_after_compaction(tmp_path, original_source):
+    module = load_script_module(tmp_path)
+    session_id = "clarify-original"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    question = "完整方案：只改本地；不重启、不提交、不推送。"
+    choices = ["同意", "暂不"]
+
+    def call(text):
+        return json.dumps([{"id": "call-card", "function": {
+            "name": "clarify", "arguments": json.dumps({"questions": [
+                {"question": text, "choices": choices}
+            ]}, ensure_ascii=False)
+        }}], ensure_ascii=False)
+
+    response = json.dumps({"responses": [{"question": question,
+        "choices_offered": choices, "user_response": "同意"}]}, ensure_ascii=False)
+    rows = [
+        (3, session_id, "assistant", "", None, None, call("缩短的方案"), 1001, 0, 1, 30),
+        (4, session_id, "tool", '[clarify] user responded: ["同意"]', "clarify", "call-card", None, 1002, 1, 0, 40),
+    ]
+    if original_source in {"both", "call"}:
+        rows.append((1, session_id, "assistant", "", None, None, call(question), 1001, 0, 0, 10))
+    if original_source in {"both", "result"}:
+        rows.append((2, session_id, "tool", response, "clarify", "call-card", None, 1002, 0, 0, 20))
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany("""INSERT INTO messages
+            (id,session_id,role,content,tool_name,tool_call_id,tool_calls,timestamp,active,compacted,display_order)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""", rows)
+    cutoff = datetime.fromtimestamp(1003, tz=timezone.utc)
+    state = module.load_state_reconciliation(session_id, state_db, cutoff_at=cutoff)
+    candidate = module.build_candidate_document(
+        {"session_id": session_id, "traces": []}, session_id,
+        state_reconciliation=state, cutoff_at=cutoff,
+    )
+    assert [message["content"] for turn in candidate["turns"] for message in turn] == [
+        f"Assistant: {question}\n\nChoices offered:\n- 同意\n- 暂不",
+        "User: 同意",
+    ]
+    assert candidate["audit"]["state_reconciliation"]["uncovered_event_count"] == 0
+
+
+@pytest.mark.parametrize("boundary", ["other_session", "other_call", "after_cutoff", "no_live_call"])
+def test_state_clarify_original_recovery_requires_retained_identity(tmp_path, boundary):
+    module = load_script_module(tmp_path)
+    state_db = tmp_path / "state.db"
+    session_id = "card-boundary"
+    _create_reconciliation_state_db(state_db, session_id)
+
+    def call(call_id, text):
+        return json.dumps([{"id": call_id, "function": {
+            "name": "clarify", "arguments": {"questions": [{"question": text}]}
+        }}])
+
+    original_session = "other-session" if boundary == "other_session" else session_id
+    original_id = "other-call" if boundary == "other_call" else "card"
+    original_time = 1010 if boundary == "after_cutoff" else 1000
+    with sqlite3.connect(state_db) as conn:
+        conn.executemany("""INSERT INTO messages
+            (id,session_id,role,content,tool_name,tool_call_id,tool_calls,timestamp,active,compacted)
+            VALUES (?,?,?,?,?,?,?,?,?,?)""", [
+                (1, original_session, "assistant", "", None, None, call(original_id, "不可恢复的历史原文"), original_time, 0, 0),
+                (2, original_session, "tool", json.dumps({"responses": [{"question": "不可恢复的历史原文", "user_response": "旧答复"}]}), "clarify", original_id, None, original_time, 0, 0),
+                (3, session_id, "assistant", "", None, None, call("card", "保留的确认问题"), 1001, 0, 0 if boundary == "no_live_call" else 1),
+                (4, session_id, "tool", '[clarify] user responded: ["当前答复"]', "clarify", "card", None, 1002, 1, 0),
+            ])
+    events = module.load_state_reconciliation(
+        session_id, state_db, cutoff_at=datetime.fromtimestamp(1003, tz=timezone.utc)
+    )["events"]
+    assert [event["content"] for event in events] == (
+        [] if boundary == "no_live_call" else ["保留的确认问题", "当前答复"]
+    )
+
+
+@pytest.mark.parametrize("answer", ["同意", "[user did not respond within 15m]"])
+def test_state_clarify_original_recovery_keeps_distinct_calls_and_question_order(tmp_path, answer):
+    module = load_script_module(tmp_path)
+    state_db = tmp_path / "state.db"
+    session_id = "repeated-cards"
+    _create_reconciliation_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        for i, call_id in enumerate(["card-one", "card-two"]):
+            original = json.dumps([{"id": call_id, "function": {"name": "clarify", "arguments": {
+                "questions": [{"question": "相同问题一"}, {"question": "相同问题二"}]
+            }}}])
+            response = json.dumps({"responses": [
+                {"question": "相同问题一", "user_response": answer},
+                {"question": "相同问题二", "user_response": "第二答复"},
+            ]})
+            conn.executemany("""INSERT INTO messages
+                (id,session_id,role,content,tool_name,tool_call_id,tool_calls,timestamp,active,compacted)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""", [
+                    (i * 4 + 1, session_id, "assistant", "", None, None, original, 1000 + i * 10, 0, 0),
+                    (i * 4 + 2, session_id, "tool", response, "clarify", call_id, None, 1001 + i * 10, 0, 0),
+                    (i * 4 + 3, session_id, "assistant", "", None, None, original, 1005 + i * 10, 0, 1),
+                    (i * 4 + 4, session_id, "tool", '[clarify] user responded: ["副本"]', "clarify", call_id, None, 1006 + i * 10, 0, 1),
+                ])
+    events = module.load_state_reconciliation(session_id, state_db)["events"]
+    expected = ["相同问题一"] + ([answer] if answer == "同意" else []) + ["相同问题二", "第二答复"]
+    assert [event["content"] for event in events] == expected * 2
+    assert len({event["source_key"] for event in events}) == len(events)
+    questions = [event for event in events if event["source_kind"] == "clarify_question"]
+    assert [event["timestamp"] for event in questions] == [
+        "1970-01-01T00:16:40+00:00", "1970-01-01T00:16:40+00:00",
+        "1970-01-01T00:16:50+00:00", "1970-01-01T00:16:50+00:00",
+    ]
+
+
 def test_state_reconciliation_drops_clarify_timeout_answer(tmp_path):
     """A timed-out clarify keeps its question; Hermes' placeholder is not a user reply."""
     module = load_script_module(tmp_path)

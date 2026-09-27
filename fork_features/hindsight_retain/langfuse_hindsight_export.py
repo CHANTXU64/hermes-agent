@@ -1262,6 +1262,48 @@ def _state_redirect_copy_ids(conn, session_id: str) -> dict[tuple, int]:
     return redirect_originals_by_copy
 
 
+def _state_clarify_originals(conn, session_id: str, rows: list, cutoff_seconds):
+    """Recover originals only for call identities still in the retained history.
+
+    Compaction parks original rows at active=0/compacted=0. Its carried copies
+    keep the tool call id but can shorten both arguments and results. That id,
+    scoped to this session and cutoff, is the join evidence; text similarity is
+    never used to recover a card or to resurrect a removed interaction.
+    """
+    call_ids = {
+        parsed[0]
+        for row in rows if row["role"] == "assistant"
+        for call in _decoded_tool_calls(row["tool_calls"])
+        if (parsed := _clarify_call_arguments(call)) is not None
+    }
+    calls, results = {}, {}
+    if not call_ids:
+        return calls, results
+    query = """
+        SELECT id, role, content, timestamp, display_order, tool_call_id, tool_calls
+        FROM messages
+        WHERE session_id = ? AND compacted = 0
+          AND ((role = 'assistant' AND tool_calls IS NOT NULL)
+               OR (role = 'tool' AND tool_name = 'clarify'))
+    """
+    parameters = [session_id]
+    if cutoff_seconds is not None:
+        query += " AND timestamp <= ?"
+        parameters.append(cutoff_seconds)
+    query += " ORDER BY id"
+    for row in conn.execute(query, parameters):
+        if row["role"] == "tool":
+            call_id = str(row["tool_call_id"] or "")
+            if call_id in call_ids:
+                results.setdefault(call_id, row)
+            continue
+        for call in _decoded_tool_calls(row["tool_calls"]):
+            parsed = _clarify_call_arguments(call)
+            if parsed is not None and parsed[0] in call_ids:
+                calls.setdefault(parsed[0], (row, parsed[1]))
+    return calls, results
+
+
 def load_state_reconciliation(
     session_id: str,
     state_db_path: Path,
@@ -1334,6 +1376,9 @@ def load_state_reconciliation(
             # so read platform-id rows in every state as identity evidence.
             platform_ids_by_copy = _state_platform_copy_ids(conn, session_id)
             redirect_originals_by_copy = _state_redirect_copy_ids(conn, session_id)
+            clarify_calls, clarify_original_results = _state_clarify_originals(
+                conn, session_id, rows, cutoff_seconds
+            )
     except (OSError, sqlite3.Error) as exc:
         result["reason"] = f"state_db_error:{type(exc).__name__}"
         return result
@@ -1420,6 +1465,7 @@ def load_state_reconciliation(
         and row["tool_name"] == "clarify"
         and str(row["tool_call_id"] or "")
     }
+    clarify_results.update(clarify_original_results)
     seen_clarify_calls: set[str] = set()
     for row in rows:
         if row["role"] != "assistant":
@@ -1432,6 +1478,7 @@ def load_state_reconciliation(
             if call_id in seen_clarify_calls:
                 continue
             seen_clarify_calls.add(call_id)
+            question_row, questions = clarify_calls.get(call_id, (row, questions))
             result_row = clarify_results.get(call_id)
             delivered, responses = _clarify_result(
                 result_row["content"] if result_row is not None else ""
@@ -1459,8 +1506,8 @@ def load_state_reconciliation(
                             "content": _external_safe_text(
                                 _render_clarify_question(question, choices)
                             ),
-                            "timestamp": _utc_timestamp(row["timestamp"]),
-                            "display_order": int(row["display_order"] or row["id"]),
+                            "timestamp": _utc_timestamp(question_row["timestamp"]),
+                            "display_order": int(question_row["display_order"] or question_row["id"]),
                         }
                     )
                 user_response = response_record.get("user_response")
