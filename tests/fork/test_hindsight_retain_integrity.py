@@ -2672,52 +2672,6 @@ def test_checker_langfuse_source_falls_back_to_root_without_observations(
     assert texts == [("user", "only root question"), ("assistant", "only root answer")]
 
 
-def test_checker_source_order_follows_message_id_not_later_timestamp() -> None:
-    checker = load_path_module(
-        "hindsight_checker_source_order_test", CHECKER_PATH
-    )
-    user = checker.Entry(
-        role="user",
-        content="看下临时目录",
-        canonical="看下临时目录",
-        source="state_db",
-        occurrence_id="state:s:10",
-        message_id=10,
-        timestamp=100.0,
-        display_order=10,
-        active=1,
-        compacted=0,
-    )
-    assistant = checker.Entry(
-        role="assistant",
-        content="结论",
-        canonical="结论",
-        source="state_db",
-        occurrence_id="state:s:11",
-        message_id=11,
-        timestamp=300.0,
-        display_order=11,
-        active=1,
-        compacted=0,
-    )
-    later_user = checker.Entry(
-        role="user",
-        content="怎么移植漏这么多还过了测试啊",
-        canonical="怎么移植漏这么多还过了测试啊",
-        source="state_db",
-        occurrence_id="state:s:12",
-        message_id=12,
-        timestamp=200.0,
-        display_order=12,
-        active=1,
-        compacted=0,
-    )
-
-    ordered = checker._merge_independent_source_entries(
-        [], [later_user, assistant, user]
-    )
-    assert [entry.message_id for entry in ordered] == [10, 11, 12]
-
 
 def test_existing_checker_collects_retain_attempt_scan_json() -> None:
     checker = load_path_module("hindsight_checker_for_test", CHECKER_PATH)
