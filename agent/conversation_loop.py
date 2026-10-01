@@ -1470,7 +1470,7 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
                         canonicalize_tool_calls=_canonicalize_api_tool_calls,
                     )
                     s.messages, s.active_system_prompt = agent._compress_context(
-                        s.messages, s.active_system_prompt,
+                        s.messages, s.system_message,
                         approx_tokens=s.request_pressure_tokens,
                         task_id=s.effective_task_id,
                         request_fork=frozen,
