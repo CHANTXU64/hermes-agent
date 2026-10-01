@@ -2323,6 +2323,11 @@ def _is_real_user_message(message: Any) -> bool:
         return False
     if any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS):
         return False
+    # Same predicate the compression input filter uses: a persisted runtime-context envelope is never
+    # human intent, or the anchor pass would clone a stale one next to the fresh commit-time row.
+    from agent.context_compressor import is_non_user_runtime_context_message
+    if is_non_user_runtime_context_message(message):
+        return False
     text = _real_user_message_text(message).strip()
     if not text or text.startswith(_SYNTHETIC_USER_PREFIXES):
         return False
