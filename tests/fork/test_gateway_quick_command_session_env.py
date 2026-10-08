@@ -110,7 +110,7 @@ async def test_session_env_requires_strict_boolean_opt_in(
         chat_id="5612546357",
         chat_type="dm",
         user_id="5612546357",
-        account_id="work",
+        thread_id="17",
     )
     key = build_session_key(source)
     runner = _runner(
@@ -135,7 +135,7 @@ async def test_session_env_requires_strict_boolean_opt_in(
 
 
 @pytest.mark.asyncio
-async def test_session_env_isolated_across_channels_threads_and_accounts(
+async def test_session_env_isolated_across_channels_and_threads(
     monkeypatch,
 ):
     sources = [
@@ -170,7 +170,7 @@ async def test_session_env_isolated_across_channels_threads_and_accounts(
             chat_id="5612546357",
             chat_type="dm",
             user_id="5612546357",
-            account_id="work",
+            thread_id="17",
         ),
     ]
     session_ids = {

@@ -1,250 +1,64 @@
-# Multi Telegram bots in one profile
+# Same-profile multi-Telegram bots — retired
 
-## Purpose
-
-Run multiple Telegram bot tokens under **one** Hermes profile. The bots share
-configuration, models, Skills, plugins, and long-term memory while keeping
-independent current conversations, exact return-bot routing, cross-bot resume,
-and independent reconnect ownership.
-
-Status: active; original feature 2026-07-13; Fork boundary refactored 2026-08-31.
-
+Status: obsolete, removed by explicit user decision on 2026-10-08.
 Stable maintenance ID: `F-telegram-multi-account`.
 
-## Difference From Upstream
+## Decision and supported replacement
 
-At fixed review point
-`upstream/main@a9c783f21995723c812dcb2f8ae58bc6a4323e2f`, upstream still expects one
-`TELEGRAM_BOT_TOKEN` per profile/gateway context. Official multi-profile
-gateways isolate profile configuration and memory, so they are not equivalent
-to this feature's same-profile shared-brain behavior.
+Use one Telegram Bot per independent Hermes Profile. The old Fork shared one
+Profile's configuration, credentials, Skills and memory among extra named bots.
+The user no longer uses that arrangement and chose to remove its core lifecycle
+and routing patches to reduce upstream-merge maintenance.
 
-This fork retains the feature and isolates its policy. It does **not** rename the
-account identity generically or introduce a reusable Adapter registry without a
-second real consumer.
+This deliberately removes `TELEGRAM_BOT_TOKEN_<ACCOUNT>` discovery, extra named
+adapters, account-specific session slots and reconnect queues, and cross-Bot
+`/resume` transfers. Normal Telegram, official Profiles and ordinary `/resume`
+within the active Profile remain supported. No new configuration or compatibility
+switch replaces the deleted feature.
 
-## Fork Boundary
+## Historical data
 
-The Fork-owned package has three explicit responsibilities:
+Existing Profile configuration, historical messages and retained memories remain
+intact. The primary Bot's session keys are unchanged. Old history stays in its
+original database; it is not imported into another Profile automatically.
+Ordinary explicit history access is not a transfer of the old Bot route.
 
-- `fork_features/multi_telegram_accounts/identity.py`
-  - account validation and normalization
-  - `TELEGRAM_BOT_TOKEN_<ACCOUNT>` discovery in the active secret scope
-  - `:account:<id>` session-key append/split rules
-- `fork_features/multi_telegram_accounts/runtime.py`
-  - live and failed named-adapter ownership
-  - exact named-adapter lookup and fail-closed routing
-  - named Bot startup, fatal handoff, independent reconnect, and shutdown
-  - replacement lookup for in-flight sends retaining a retired adapter
-- `fork_features/multi_telegram_accounts/session_routing.py`
-  - cross-bot `/resume` route discovery
-  - running-target rejection
-  - route transfer and detached-route cleanup
+The user explicitly rejected retaining account-aware compatibility checks. They
+are removed from session recovery, notifications, delivery and Kanban paths.
+Instead, an authorized one-time cleanup closes leftover old activity and removes
+its active routing entries and legacy mirror entries. It neither deletes chat
+content nor retries Retain. Old account-qualified routes are no longer supported
+runtime inputs; historical data alone does not justify restoring their handlers.
 
-Upstream-owned host files keep only the seams the feature genuinely needs:
+Existing text and local-file reconnect handoff is retained for the supported
+single-Bot path; only its named-account resolver is removed. These methods do not
+depend on the retired package. Independent Fork features such as
+literal-text progress, Quick Commands, and session-reset delivery retirement are
+unchanged (their isolation tests use current Profile/topic routes).
 
-- `gateway/config.py` supplies the active secret scope and stores discovered
-  named-account configs.
-- `gateway/session.py` keeps account provenance runtime-only and re-exports the
-  stable session-key helpers.
-- `gateway/platforms/base.py` carries account provenance through source creation.
-- `plugins/platforms/telegram/adapter.py` stamps account provenance before auth,
-  batching, observation persistence, and session-key computation. Its reconnect
-  handoff delegates replacement selection to the Fork runtime; text and native
-  local-file sends share the same bounded wait and same-Bot replacement.
-- `gateway/authz_mixin.py` asks the Fork runtime for the exact named adapter and
-  restores post-restart account provenance from the trusted durable session key.
-- `gateway/slash_commands.py` delegates cross-bot resume policy and preserves the
-  account route for restart notices.
-- `gateway/run.py` creates the runtime and keeps thin startup, fatal, reconnect,
-  shutdown, and status handoffs.
-- `gateway/run_notifications.py` reconstructs async-completion sources with the
-  account suffix and resolves the exact named adapter rather than the primary.
-  Restart notices share configuration and ACK checks, with serialized boot/reconnect consumers.
-- `gateway/run_startup.py` resolves ledger rows from their durable account suffix;
-  `gateway/delivery_ledger.py` accepts a live-route predicate before claims/timers.
-- `tools/kanban_tools.py` persists the creator account in existing delivery metadata;
-  `gateway/kanban_watchers_notifier.py` restores that account for both notify and wake.
-- `gateway/run_shutdown.py` restores the source identity and deduplicates per account.
+The extra per-session delivery-ledger predicate is removed too. Startup claims
+still use platform/Profile ownership, runtime claims still use process/Profile
+ownership, and the normal deadline scheduler can arm a retry while its adapter is
+offline. Actual delivery still requires that Profile's adapter; an unsent claim
+is released without spending its retry budget. Flood waits and the independent
+session-reset/superseded-obligation protection remain unchanged.
 
-## Configuration / Usage
+## Verification and maintenance
 
-```bash
-# Primary (legacy session key; required when named bots are used)
-TELEGRAM_BOT_TOKEN=111:AAA
+The authoritative retirement contract and touchpoints are in
+`docs/LOCAL_MODIFICATIONS.md`, entry `F-telegram-multi-account`. Removal tests:
+`tests/fork/test_telegram_account_retirement.py`. Standard Telegram, Profile,
+recovery, lifecycle and notifier suites verify the remaining supported behavior.
 
-# Extra bots in the same profile
-TELEGRAM_BOT_TOKEN_WORK=222:BBB
-TELEGRAM_BOT_TOKEN_ALERTS=333:CCC
-```
+Old implementation, behavior contracts and measured refactor results remain
+recoverable in Git before removal (Fork baseline `252be9b385`). Historical and
+new change/verification evidence is append-only in `changes.jsonl` beside this
+file. Do not restore old preservation rules during an upstream merge.
 
-Account IDs use `[A-Za-z0-9_-]`, start alphanumeric, are at most 32 characters,
-and are stored lowercase. Named tokens are ignored when the primary token is
-absent, so adding or renaming a named Bot cannot silently take ownership of
-legacy bare session keys.
+The user separately authorized one-time runtime-state cleanup and a restart of
+only the default Profile Gateway. Other Profile services and their configuration
+are outside that operational scope. No commit or push is authorized. Source
+verification and production activation remain separately evidenced in the ledger.
 
-Session keys remain:
-
-```text
-primary: agent:main:telegram:dm:<chat_id>
-work:    agent:main:telegram:dm:<chat_id>:account:work
-```
-
-## Behavior Contract
-
-- The primary Bot remains the default Telegram adapter and keeps its old key.
-- Each named Bot has its own current conversation; `/new` affects only that Bot's
-  slot.
-- Real Telegram `user_id` and `chat_id` remain unchanged, so session ownership
-  and `/resume` continue to identify the real human.
-- Resuming another Bot's idle session transfers the transcript to the current
-  Bot route and unbinds the old route. A running target is rejected instead of
-  becoming live on two routes.
-- Normal replies, streaming, typing, busy responses, voice/media, follow-ups,
-  background process/watch completion, authorization, and restart notices use
-  the originating Bot.
-- A configured named Bot that is temporarily unavailable fails closed; traffic
-  never falls back to the primary Bot.
-- This also holds after a fatal rebuild: a turn's retired adapter resolves only
-  its original account, whether the replacement is ready, arrives during the
-  bounded wait, or remains unavailable. Progress, background notices, and media
-  failure notices retain the same boundary as ordinary text.
-- Native local-file uploads resume through the same Bot's replacement, preserving
-  payload bytes and delivery metadata. Offline expiry is a retryable failure;
-  there is no new durable attachment retry queue or replay of old attachments.
-- Final-reply ledger recovery (boot, runtime retry, flood backoff) uses the saved
-  account suffix. An offline named account spends no attempt merely because
-  primary is online; named reconnect re-arms the existing recovery paths.
-- Kanban creator subscriptions preserve the originating account for notifications,
-  artifacts and wakes. Legacy subscriptions with no account provenance keep their
-  legacy primary route; missing historical identity is never guessed. This uses
-  existing metadata, without changing subscription uniqueness or database schema.
-- Restart notices honor the notification switch and require a successful send.
-  Offline/retryable named notices stay pending for reconnect; boot and reconnect
-  cannot concurrently send the same marker. This adds no timed notification queue.
-- Shutdown notices recover persisted account provenance, fail closed while that
-  bot is unavailable, and do not deduplicate two bots merely sharing a chat ID.
-- Database peer recovery requires the same account suffix and cannot reuse
-  another Bot's active session ID.
-- Each named Bot keeps its own fatal/reconnect state and its own token/config.
-  Failure of one named Bot does not replace, disconnect, or populate the primary
-  Telegram retry slot.
-- The Gateway stays alive when the primary Bot is down but a named Bot is still
-  live or queued for reconnect.
-- Skills, profile config, Hindsight bank, plugins, and model credentials remain
-  shared because all Bots run in the same profile.
-
-## Deliberate Non-goals
-
-- Dashboard multi-bot UI
-- Per-bot Home/default-model configuration
-- Account-qualified proactive `send_message` or Cron destination syntax; bare
-  proactive Telegram delivery continues to use primary
-- Named-bot Telegram DM Topics; Topic mode remains a primary-bot feature
-- Account-specific `/update` lifecycle routing and publish-oriented edge paths
-- A generic `instance_id` migration or public Adapter instance registry
-
-## Regression Protection
-
-Behavior and boundary tests:
-
-- `tests/fork/test_multi_telegram_accounts.py`
-- `tests/fork/test_telegram_account_reconnect_delivery.py`
-- `tests/fork/test_telegram_account_recovery_routes.py`
-- `tests/fork/test_telegram_account_kanban_routes.py`
-- `tests/fork/test_telegram_account_lifecycle_notices.py`
-- `tests/gateway/test_telegram_send_reconnect_wait.py`
-- `tests/fork_features/test_multi_telegram_accounts_identity.py`
-- `tests/fork_features/test_multi_telegram_accounts_runtime.py`
-- `tests/fork_features/test_multi_telegram_accounts_session_routing.py`
-- `tests/fork_features/test_multi_telegram_accounts_boundary.py`
-- `tests/gateway/test_background_process_notifications.py`
-- `tests/gateway/test_resume_command.py`
-- `tests/gateway/test_restart_notification.py`
-- `tests/gateway/test_runner_fatal_adapter.py`
-- `tests/gateway/test_platform_reconnect.py`
-- `tests/gateway/test_shutdown_cache_cleanup.py`
-- `tests/gateway/test_telegram_auth_check.py`
-- `tests/gateway/test_telegram_callback_auth_fail_closed.py`
-
-The input counterexamples cover blank, case-varied, invalid, duplicate-primary,
-and duplicate-named token forms plus valid and invalid existing key suffixes.
-The boundary test protects policy ownership without snapshotting implementation
-text.
-
-Canonical focused verification:
-
-```bash
-scripts/run_tests.sh tests/fork_features/test_multi_telegram_accounts_boundary.py tests/fork_features/test_multi_telegram_accounts_identity.py tests/fork_features/test_multi_telegram_accounts_runtime.py tests/fork_features/test_multi_telegram_accounts_session_routing.py tests/fork/test_multi_telegram_accounts.py tests/fork/test_telegram_account_reconnect_delivery.py tests/fork/test_telegram_account_recovery_routes.py tests/fork/test_telegram_account_kanban_routes.py tests/fork/test_telegram_account_lifecycle_notices.py tests/gateway/test_telegram_send_reconnect_wait.py tests/gateway/test_background_process_notifications.py tests/gateway/test_resume_command.py tests/gateway/test_restart_notification.py tests/gateway/test_runner_fatal_adapter.py tests/gateway/test_platform_reconnect.py tests/gateway/test_shutdown_cache_cleanup.py tests/gateway/test_telegram_auth_check.py tests/gateway/test_telegram_callback_auth_fail_closed.py -q -o 'addopts='
-```
-
-Refactor evidence before applying to the primary working tree:
-
-- pre-refactor focused baseline: `125 passed`
-- disposable sample focused suite: `148 passed`
-- final host-integrated canonical suite, including shutdown: `151 passed`
-- Python compilation, Ruff, diff-format check, and direct type check of the new
-  Fork package passed
-- broad type-check comparison: `399` baseline diagnostics, `398` candidate,
-  zero new unique diagnostics
-- same fixed upstream SHA: zero added conflict paths, conflict hunks, or
-  Telegram-policy conflict hunks
-- 2026-09-22 named-account completion regression: the combined canonical
-  delegation and multi-account suite reported `427 passed`; Ruff, Python
-  compilation, and `git diff --check` also passed
-
-The existing whole-file conflicts in `gateway/run.py` and
-`gateway/slash_commands.py` are unrelated Fork overlap and remain visible; this
-maintenance unit does not claim to remove them.
-
-## Merge Guidance
-
-Preserve these semantic contracts during every upstream sync:
-
-1. primary legacy session key and default adapter slot
-2. runtime-only `SessionSource.account_id`, with post-restart restoration from
-   the trusted `:account:<id>` session-key suffix
-3. account provenance before auth, batching, observation, and session selection
-4. exact named-adapter lookup with disconnected-account fail-closed behavior
-5. original-Bot routing for every reply and notification path, including async
-   delegation completion after persisted-source reconstruction
-6. cross-bot `/resume` ownership and running-target rejection
-7. per-named-Bot fatal/reconnect ownership and Gateway survival rules
-8. retired-adapter replacement selection for in-flight text and local-file sends;
-   a healthy primary must never satisfy a named account's reconnect wait
-
-If upstream changes a host seam, adapt only the thin handoff. Keep Telegram policy
-inside `fork_features/multi_telegram_accounts/`; do not copy it back into the
-Gateway host. If upstream introduces a different account or session model, stop
-and compare actual user behavior before choosing a migration.
-
-## Rollback / Deletion
-
-Roll back the Fork package, five host-policy edits, and related tests as one
-maintenance unit. Do not delete only the runtime handoff while leaving account
-provenance or session suffixes behind.
-
-Delete this feature only after upstream provides an equivalent same-profile,
-multi-Bot, shared-brain design with independent current sessions and independent
-reconnect, and the full behavior contract above passes against it.
-
-## Manual Verification (Optional)
-
-Requires two real Bot tokens and a user-controlled Gateway restart:
-
-1. Set primary plus `TELEGRAM_BOT_TOKEN_WORK`.
-2. Restart the Gateway when ready.
-3. Message both Bots and confirm independent current context.
-4. Title a session on one Bot, then `/resume` it from the other; confirm transfer
-   and original-route cleanup.
-5. Disconnect one named Bot and confirm the primary and other named Bots continue
-   while only that account enters reconnect.
-
-No Gateway restart or real-token test was performed by this 2026-08-31 source
-refactor.
-
-## LOCAL_MODIFICATIONS Entry
-
-Corresponding authoritative entry:
-`docs/LOCAL_MODIFICATIONS.md` →
-`### 13. Multi Telegram bots in one profile (account_id session slots)`.
+Rollback is a targeted reversal of the removal diff against the baseline. It must
+be authorized; do not reset the whole working tree or touch unrelated Fork work.

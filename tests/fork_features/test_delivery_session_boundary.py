@@ -28,7 +28,7 @@ def _isolated_delivery_ledger(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_named_telegram_account_boundary_only_retires_that_bot() -> None:
+async def test_telegram_profile_boundary_only_retires_that_profile() -> None:
     from fork_features.delivery_session_boundary import retire_session_deliveries
 
     primary_key = build_session_key(
@@ -45,8 +45,8 @@ async def test_named_telegram_account_boundary_only_retires_that_bot() -> None:
             chat_id="5612546357",
             chat_type="dm",
             user_id="5612546357",
-            account_id="work",
-        )
+        ),
+        profile="work",
     )
     for obligation_id, session_key in (
         ("primary-reply", primary_key),

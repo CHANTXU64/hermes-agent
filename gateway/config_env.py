@@ -23,7 +23,6 @@ from gateway.config import (
     _has_usable_api_server_key,
     SHARED_LISTENER_MIRROR_PLATFORMS,
 )
-from agent.secret_scope import current_secret_scope
 from utils import is_truthy_value
 
 # Logger name parity with the origin module: records stay under "gateway.config".
@@ -653,24 +652,3 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to *config* (see ``_ENV_STEPS``)."""
     for step in _ENV_STEPS:
         step(config)
-    try:
-        from fork_features.multi_telegram_accounts.identity import (
-            discover_named_telegram_accounts,
-        )
-
-        active_scope = current_secret_scope()
-        token_env = active_scope if active_scope is not None else os.environ
-        telegram_config = config.platforms.get(Platform.TELEGRAM)
-        accounts_map = discover_named_telegram_accounts(
-            token_env,
-            primary_token=(telegram_config.token if telegram_config else ""),
-        )
-        if accounts_map and telegram_config is not None:
-            telegram_config.extra["accounts"] = accounts_map
-            logger.info(
-                "Telegram multi-account env: %d extra bot(s): %s",
-                len(accounts_map),
-                ", ".join(sorted(accounts_map)),
-            )
-    except Exception as exc:
-        logger.warning("Telegram multi-account env discovery failed: %s", exc)

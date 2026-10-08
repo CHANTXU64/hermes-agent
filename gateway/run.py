@@ -39,12 +39,6 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance
-from fork_features.multi_telegram_accounts.runtime import (
-    TelegramAccountRuntime,
-    telegram_failed_accounts_property,
-    telegram_live_adapters_property,
-    telegram_runtime_property,
-)
 from fork_features.clarify_attachment_reply import resolve_pending_clarify_reply
 from fork_features.telegram_tool_progress import (
     tool_progress_delivery_metadata as _tool_progress_delivery_metadata,
@@ -2990,14 +2984,8 @@ def _parse_session_key(session_key: str) -> "dict | None":
     For group/channel sessions the suffix may be a user_id, not a thread_id, so ``thread_id``
     is omitted. Named profiles are reported as ``profile``; ``main`` keys keep their historical
     shape exactly (no ``profile`` key) so equality assertions on parsed dicts stay stable.
-    Fork multi-account keys append ``:account:<id>``; that suffix is stripped first.
     """
-    try:
-        from gateway.session import split_account_session_key
-        base_key, account_id = split_account_session_key(session_key)
-    except Exception:
-        base_key, account_id = session_key, None
-    parts = base_key.split(":")
+    parts = session_key.split(":")
     if (
         len(parts) >= 5
         and parts[0] == "agent"
@@ -3008,8 +2996,6 @@ def _parse_session_key(session_key: str) -> "dict | None":
             result["profile"] = profile_from_session_key_namespace(parts[1])
         if len(parts) > 5 and parts[3] in {"dm", "thread"}:
             result["thread_id"] = parts[5]
-        if account_id:
-            result["account_id"] = account_id
         return result
     return None
 
@@ -3456,9 +3442,6 @@ class GatewayRunner(
     _session_vc_last = legacy_dict_property("_session_vc_last")
     _pending_approvals = legacy_dict_property("_pending_approvals")
     _update_prompt_pending = legacy_dict_property("_update_prompt_pending")
-    _telegram_accounts = telegram_runtime_property()
-    _telegram_account_adapters = telegram_live_adapters_property()
-    _failed_telegram_accounts = telegram_failed_accounts_property()
 
     def _sessions_map(self) -> Dict[str, "SessionState"]:
         """Per-session state map; lazily created so bare ``object.__new__`` test runners work."""
@@ -3529,7 +3512,6 @@ class GatewayRunner(
         self._session_db_init_error: Optional[str] = None
         # Non-default profiles' adapters by profile then Platform; self.adapters stays the default's map.
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
-        self._telegram_accounts = TelegramAccountRuntime(self)
         # Each SERVED profile's gateway config, as loaded once by ``_load_secondary_profile_config``.
         # ``self.config`` is only the launch profile's: anything host-wide (restart notices) needs these.
         self._profile_configs: Dict[str, Any] = {}

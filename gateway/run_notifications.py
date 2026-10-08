@@ -794,21 +794,12 @@ class GatewayNotificationsMixin:
         return True
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
-        """Serialize boot/reconnect consumers of the single restart marker."""
-        lock = getattr(self, "_restart_notification_lock", None)
-        if lock is None:
-            lock = self._restart_notification_lock = asyncio.Lock()
-        async with lock:
-            return await self._send_restart_notification_once()
-
-    async def _send_restart_notification_once(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""
         from gateway.delivery import resolve_delivery_transport
         from gateway.run import _hermes_home, _non_conversational_metadata
         notify_path = _hermes_home / ".restart_notify.json"
         if not notify_path.exists():
             return None
-        cleanup = True
         try:
             data = json.loads(notify_path.read_text(encoding="utf-8"))
             platform_str = data.get("platform")
@@ -817,27 +808,18 @@ class GatewayNotificationsMixin:
             if not platform_str or not chat_id:
                 return None
             platform = Platform(platform_str)
-            account_id = data.get("account_id")
-            adapters = self._adapters_for_profile(self._marker_profile(data))
+            # Relay-aware transport over the REQUESTER'S profile adapter map; ``self.adapters`` is the
+            # default profile's, so a secondary's "restarted" notice would leave through the wrong bot.
+            transport = resolve_delivery_transport(
+                platform, self.config, self._adapters_for_profile(self._marker_profile(data)))
+            if transport is None:
+                logger.debug("Restart notification skipped: no live transport for %s", platform_str)
+                return None
             platform_cfg = self.config.platforms.get(platform)
             if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                 logger.info(
                     "Restart notification suppressed: %s has gateway_restart_notification=false", platform_str
                 )
-                return None
-            if account_id:
-                from fork_features.multi_telegram_accounts import normalize_account_id
-                if platform != Platform.TELEGRAM or normalize_account_id(account_id) is None:
-                    return None
-                named_adapter = self._telegram_accounts.adapter_for(account_id)
-                if named_adapter is None:
-                    cleanup = False  # the named reconnect callback retries this same marker
-                    return None
-                adapters = {platform: named_adapter}
-            # Both paths share suppression, metadata and delivery-success checks.
-            transport = resolve_delivery_transport(platform, self.config, adapters)
-            if transport is None:
-                logger.debug("Restart notification skipped: no live transport for %s", platform_str)
                 return None
             metadata = self._pending_marker_metadata(platform, chat_id, data, transport.adapter)
             if data.get("delivered_via_upstream_relay") is True:
@@ -852,7 +834,6 @@ class GatewayNotificationsMixin:
             # adapter.send() catches provider errors (e.g. "Chat not found") and returns
             # SendResult(success=False) rather than raising, so inspect the result before claiming success.
             if _send_failed(result):
-                cleanup = not (account_id and getattr(result, "retryable", False))
                 logger.warning(
                     "Restart notification to %s:%s was not delivered: %s", platform_str, chat_id, _send_error(result),
                 )
@@ -863,8 +844,7 @@ class GatewayNotificationsMixin:
             logger.warning("Restart notification failed: %s", e)
             return None
         finally:
-            if cleanup:
-                notify_path.unlink(missing_ok=True)
+            notify_path.unlink(missing_ok=True)
 
     def _home_channel_transports(self):
         """Yield ``(platform, platform_cfg, home, transport)`` for every home channel with a live transport."""
@@ -1179,7 +1159,6 @@ class GatewayNotificationsMixin:
         return SessionSource(
             platform=platform, chat_id=chat_id, chat_type=chat_type, thread_id=_opt("thread_id"),
             user_id=_opt("user_id"), user_name=_opt("user_name"), scope_id=scope_id, profile=profile,
-            account_id=derived.get("account_id"),
         )
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
@@ -1283,12 +1262,6 @@ class GatewayNotificationsMixin:
         Platform.RELAY adapter fronts N logical platforms; native wins), literal ``p.value`` scan as
         fallback for minimal runner stubs / exotic platform strings when the resolver can't run."""
         from gateway.delivery import resolve_delivery_transport
-        if source is not None and getattr(source, "account_id", None):
-            delivery_adapter_for = getattr(self, "_delivery_adapter_for", None)
-            adapter: Any = cast(Any, delivery_adapter_for(source) if callable(delivery_adapter_for) else None)
-            # A named Telegram account is an explicit transport boundary.  If
-            # that adapter is offline, fail closed instead of borrowing primary.
-            return adapter
         if source is not None:
             owner = self._transport_owner(source)
             if owner is not None:

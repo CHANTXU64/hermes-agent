@@ -19,13 +19,9 @@ from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
-from fork_features.multi_telegram_accounts.identity import (
-    append_account_session_key,
-    normalize_account_id,
-    split_account_session_key,
-)
 
 logger = logging.getLogger(__name__)
+
 
 
 # -- PII redaction helpers --------------------------------------------------------------------
@@ -98,8 +94,6 @@ class SessionSource:
     # Discord auto-thread continuity: the thread id a CHANNEL message WILL be delivered into, so
     # the initiating message and later in-thread follow-ups share ONE session.
     prospective_thread_id: Optional[str] = None
-    # Named Telegram bot in the same profile; runtime only, not a peer-forged wire field.
-    account_id: Optional[str] = None
     # Wire-INVISIBLE trust signal (never in to_dict/from_dict, so a peer cannot forge it): came
     # over the authenticated relay WebSocket. ``platform`` is the UNDERLYING platform, not
     # ``relay``, so authz must key upstream trust off THIS flag.
@@ -718,9 +712,7 @@ def build_session_key(
     user_part = [str(participant_id)] if isolate_user and participant_id else []
     thread_part = [thread_id] if thread_id else []
     parts += user_part + thread_part if is_dm else thread_part + user_part
-    session_key = ":".join(str(part) for part in parts)
-    from fork_features.multi_telegram_accounts.identity import append_account_session_key
-    return append_account_session_key(session_key, getattr(source, "account_id", None))
+    return ":".join(str(part) for part in parts)
 
 
 class _SessionFlight:
@@ -1246,52 +1238,6 @@ class SessionStore(
             )
         return new_entry
 
-    def transfer_session(
-        self,
-        session_key: str,
-        target_session_id: str,
-    ) -> tuple[Optional[SessionEntry], List[str]]:
-        """Move one persisted session to a single active routing key.
-
-        Unlike ``switch_session()``, this removes every other routing key that
-        currently points at ``target_session_id``.
-        """
-        detached_keys: List[str] = []
-        with self._lock:
-            old_entry = self._entry_locked(session_key)
-            if old_entry is None:
-                return None, detached_keys
-            detached_keys = sorted(
-                key
-                for key, entry in self._entries.items()
-                if key != session_key and entry.session_id == target_session_id
-            )
-            for key in detached_keys:
-                self._entries.pop(key, None)
-            if old_entry.session_id == target_session_id:
-                if detached_keys:
-                    self._save()
-                return old_entry, detached_keys
-            new_entry = self._replace_route_locked(
-                session_key, old_entry, target_session_id, _now(),
-                display_name=old_entry.display_name,
-            )
-
-        if self._db_for_key(session_key) and old_entry.session_id:
-            self._promote_session_reset(
-                session_key, old_entry.session_id, "session_switch",
-                log=lambda e: logger.debug("Session DB end_session failed: %s", e),
-            )
-        if self._db_for_key(session_key):
-            self._reopen_session_row(
-                session_key, target_session_id, log_prefix="Session DB reopen_session failed"
-            )
-            self._record_gateway_session_peer(
-                target_session_id, session_key, new_entry.origin,
-                display_name=new_entry.display_name, include_compression_ancestors=True,
-            )
-        return new_entry, detached_keys
-
     def list_sessions(self, active_minutes: Optional[int] = None) -> List[SessionEntry]:
         """List all sessions, optionally filtered by activity."""
         with self._lock:
@@ -1310,17 +1256,6 @@ class SessionStore(
         with self._lock:
             self._ensure_loaded_locked()
             return next((e for e in self._entries.values() if e.session_id == session_id), None)
-
-    def routing_keys_for_session_id(self, session_id: str) -> List[str]:
-        """Return every live route pointing at a session (used by Telegram /resume)."""
-        if not session_id:
-            return []
-        with self._lock:
-            self._ensure_loaded_locked()
-            return sorted(
-                key for key, entry in self._entries.items()
-                if entry.session_id == session_id
-            )
 
     def lookup_by_session_key(self, session_key: str) -> Optional[SessionEntry]:
         """Return the persisted routing entry for an exact session key."""

@@ -121,3 +121,50 @@ async def test_send_permanent_fatal_fails_immediately_without_wait():
     assert result.success is False
     assert result.error == "Not connected"
     assert result.retryable is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["ready", "during-wait", "offline"])
+async def test_document_reconnect_keeps_payload_and_metadata(tmp_path, state):
+    from types import SimpleNamespace
+    old, live = _make_adapter(), _make_adapter()
+    old._bot = None
+    old._RECONNECT_WAIT_SECONDS = 0.3 if state == "during-wait" else 0.03
+    old._RECONNECT_POLL_INTERVAL = 0.005
+    live._bot = _connected_bot()
+    uploads = []
+
+    async def upload(**kwargs):
+        uploads.append({**kwargs, "payload": kwargs["document"].read()})
+        return SimpleNamespace(message_id=43)
+
+    live._bot.send_document = AsyncMock(side_effect=upload)
+    runner = SimpleNamespace(adapters={old.platform: live} if state == "ready" else {})
+    old.gateway_runner = runner
+    artifact = tmp_path / "report.json"
+    artifact.write_bytes(b"preserved attachment")
+
+    async def reconnect():
+        await asyncio.sleep(0.01)
+        runner.adapters[old.platform] = live
+
+    task = asyncio.create_task(reconnect()) if state == "during-wait" else None
+    try:
+        result = await old.send_document("123", str(artifact), caption="report", file_name="download.json",
+                                         reply_to="7", metadata={"disable_notification": True})
+    finally:
+        if task is not None:
+            await task
+    assert result.success is (state != "offline")
+    if state == "offline":
+        assert result.retryable is True
+        assert uploads == []
+    else:
+        assert len(uploads) == 1
+        sent = uploads[0]
+        assert sent["payload"] == b"preserved attachment"
+        assert sent["filename"] == "download.json"
+        assert sent["caption"] == "report"
+        assert sent["chat_id"] == 123
+        assert sent["reply_to_message_id"] == 7
+        assert sent["disable_notification"] is True

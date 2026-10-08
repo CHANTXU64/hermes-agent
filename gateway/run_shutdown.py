@@ -141,10 +141,9 @@ def _send_error(result: Any) -> str:
     return getattr(result, "error", "send returned success=False")
 
 
-def _notice_target_key(platform_value: str, chat_id, thread_id, account_id=None) -> tuple:
-    """Dedup one transport/chat/thread destination; legacy primary keys remain unchanged."""
-    key = (platform_value, str(chat_id), str(thread_id) if thread_id else None)
-    return (*key, account_id) if account_id else key
+def _notice_target_key(platform_value: str, chat_id, thread_id) -> tuple:
+    """Dedup key for one notice destination: thread/topic platforms share a chat but route apart."""
+    return (platform_value, str(chat_id), str(thread_id) if thread_id else None)
 
 
 def _effective_watchdog_leash(runner: object) -> float:
@@ -975,21 +974,10 @@ class GatewayShutdownMixin:
         if source is None:
             source = self._get_cached_session_source(session_key)
         if source is not None:
-            from fork_features.multi_telegram_accounts import restore_account_session_source
-            source = restore_account_session_source(source, session_key)
-            if source is None:
-                return None
             return source, source.platform.value, str(source.chat_id), source.thread_id, getattr(source, "profile", None)
         _parsed = _parse_session_key(session_key)
         if not _parsed:
             return None
-        if _parsed.get("account_id"):
-            from gateway.session import SessionSource
-            source = SessionSource(
-                platform=Platform(_parsed["platform"]), chat_id=_parsed["chat_id"],
-                chat_type=_parsed["chat_type"], thread_id=_parsed.get("thread_id"),
-                profile=_parsed.get("profile"), account_id=_parsed["account_id"],
-            )
         return source, _parsed["platform"], _parsed["chat_id"], _parsed.get("thread_id"), _parsed.get("profile")
 
     async def _send_shutdown_notice(
@@ -1038,16 +1026,15 @@ class GatewayShutdownMixin:
         if restart_source is not None:
             with suppress(Exception):
                 restart_key = _notice_target_key(
-                    restart_source.platform.value, restart_source.chat_id, restart_source.thread_id,
-                    getattr(restart_source, "account_id", None),
+                    restart_source.platform.value, restart_source.chat_id, restart_source.thread_id
                 )
-        notified: set[tuple] = set()
+        notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in self._snapshot_running_agents():
             target = await self._shutdown_notification_target(session_key)
             if target is None:
                 continue
             source, platform_str, chat_id, thread_id, profile = target
-            dedup_key = _notice_target_key(platform_str, chat_id, thread_id, getattr(source, "account_id", None))
+            dedup_key = _notice_target_key(platform_str, chat_id, thread_id)
             if dedup_key in notified:
                 continue
             try:

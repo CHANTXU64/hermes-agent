@@ -911,39 +911,10 @@ class GatewaySessionCommandsMixin:
         current_entry = await self.async_session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
-        from fork_features.multi_telegram_accounts.session_routing import (
-            cleanup_detached_session_routes,
-            plan_cross_account_resume,
-            switch_resumed_session,
-        )
-        from gateway.config import Platform
-        cross_account_plan = None
-        if source.platform == Platform.TELEGRAM:
-            cross_account_plan = await plan_cross_account_resume(
-                self.async_session_store,
-                session_key=session_key,
-                target_id=target_id,
-                running_session_keys=(getattr(self, "_running_agents", {}) or {}),
-            )
-            if cross_account_plan.blocked_by_running:
-                return (
-                    "That session is still running in another Telegram bot. "
-                    "Wait for it to finish or stop it there, then resume again."
-                )
         self._release_running_agent_state(session_key)
-        detached_route_keys: list[str] = []
-        if cross_account_plan is not None:
-            new_entry, detached_route_keys = await switch_resumed_session(
-                self.async_session_store,
-                session_key=session_key,
-                target_id=target_id,
-                plan=cross_account_plan,
-            )
-        else:
-            new_entry = await self.async_session_store.switch_session(session_key, target_id)
+        new_entry = await self.async_session_store.switch_session(session_key, target_id)
         if not new_entry:
             return t("gateway.resume.switch_failed")
-        cleanup_detached_session_routes(self, detached_route_keys)
         # Conversation boundary: all conversation-scoped state + security state in one funnel call.
         # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
         # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security

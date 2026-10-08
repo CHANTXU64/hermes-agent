@@ -20,7 +20,6 @@ from gateway.shutdown_watchdog import (
     DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
 )
 from utils import fast_safe_load, is_truthy_value
-from fork_features.multi_telegram_accounts.identity import discover_named_telegram_accounts
 
 logger = logging.getLogger(__name__)
 

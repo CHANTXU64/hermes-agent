@@ -123,7 +123,6 @@ def _restart_notify_payload(event: MessageEvent) -> dict:
         data["delivered_via_upstream_relay"] = True
         data.update({k: getattr(source, k) for k in ("user_id", "scope_id") if getattr(source, k)})
     optional = (("thread_id", source.thread_id), ("message_id", event.message_id),
-                ("account_id", getattr(source, "account_id", None)),
                 ("profile", getattr(source, "profile", None)))
     data.update({k: v for k, v in optional if v})
     return data

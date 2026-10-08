@@ -259,13 +259,6 @@ class GatewayAdapterLifecycleMixin:
         self._ensure_reconnect_watcher_running()
         return True
 
-    def _queue_retryable_fatal_adapter(self, adapter: BasePlatformAdapter) -> bool:
-        """Named Telegram accounts use their own retry queue, never the primary slot."""
-        if self._telegram_accounts.queue_retryable(adapter):
-            self._ensure_reconnect_watcher_running()
-            return True
-        return self._queue_retryable_fatal_platform(adapter)
-
     async def _handle_adapter_fatal_error_detached(self, adapter: BasePlatformAdapter) -> None:
         """Run the fatal handler; a platform left stranded (not reconnected, not queued, not
         intentionally disabled) exits the gateway with failure so the service manager restarts it."""
@@ -302,24 +295,11 @@ class GatewayAdapterLifecycleMixin:
         finally:
             platform = adapter.platform
             shutdown_event = getattr(self, "_shutdown_event", None)
-            shutdown_requested = shutdown_event is not None and shutdown_event.is_set()
-            if self._telegram_accounts.account_id_for(adapter):
-                if self._telegram_accounts.is_stranded(
-                    adapter, shutdown_requested=shutdown_requested,
-                ):
-                    logger.error(
-                        "telegram[%s] adapter was lost without entering the reconnection queue",
-                        self._telegram_accounts.account_id_for(adapter),
-                    )
-                    self._exit_reason = "telegram named adapter lost without reconnection queue"
-                    self._exit_with_failure = True
-                    await self.stop()
-                return
             if (
                 adapter.fatal_error_retryable
                 and platform not in self.adapters
                 and platform not in getattr(self, "_failed_platforms", {})
-                and not shutdown_requested
+                and not (shutdown_event is not None and shutdown_event.is_set())
             ):
                 logger.error(
                     "%s adapter was lost without entering the reconnection "
@@ -337,8 +317,6 @@ class GatewayAdapterLifecycleMixin:
             self._queue_retryable_fatal_platform(adapter)
 
     async def _handle_adapter_fatal_error_impl(self, adapter: BasePlatformAdapter) -> None:
-        if await self._telegram_accounts.handle_fatal(adapter):
-            return
         # Snapshot the slot owner first: a stale notification must not touch a healthy platform.
         existing = self.adapters.get(adapter.platform)
         if existing is not None and existing is not adapter:
@@ -677,21 +655,17 @@ class GatewayAdapterLifecycleMixin:
             for _ in range(seconds):
                 if not self._running:
                     return False
-                if until_queued and (self._failed_platforms or self._telegram_accounts.has_failed()):
+                if until_queued and self._failed_platforms:
                     break
                 await asyncio.sleep(1)
             return True
 
         await asyncio.sleep(10)  # initial delay — let startup finish
         while self._running:
-            if not self._failed_platforms and not self._telegram_accounts.has_failed():
+            if not self._failed_platforms:
                 if not await _idle(30, until_queued=True):
                     return
                 continue
-            try:
-                await self._telegram_accounts.reconnect_failed()
-            except Exception:
-                logger.debug("telegram multi-account reconnect pass failed", exc_info=True)
             now = time.monotonic()
             for platform in list(self._failed_platforms.keys()):
                 if not self._running:

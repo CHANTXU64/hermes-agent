@@ -713,10 +713,11 @@ class TelegramAdapter(BasePlatformAdapter):
         return not bool(getattr(self, "_fatal_error_retryable", True))
 
     def _replacement_telegram_adapter(self) -> Optional["TelegramAdapter"]:
-        """Same-Bot replacement for in-flight sends that still hold a retired adapter."""
-        from fork_features.multi_telegram_accounts.runtime import replacement_adapter_for
-
-        live = replacement_adapter_for(getattr(self, "gateway_runner", None), self)
+        """Live adapter if the reconnect watcher replaced us in ``runner.adapters`` (an in-flight
+        ``send()`` still holds the old instance whose ``_bot`` stays None)."""
+        runner = getattr(self, "gateway_runner", None)
+        adapters = getattr(runner, "adapters", None) or {}
+        live = adapters.get(self.platform)
         if live is not None and live is not self and getattr(live, "_bot", None):
             return live
         return None
@@ -752,6 +753,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._is_permanent_fatal() or not await self._wait_for_reconnection():
             return None
         return self if self._bot else self._replacement_telegram_adapter()
+
 
     def _should_drop_delayed_delivery(self) -> bool:
         """True once teardown/fatal started: delayed flushes must not dispatch onto a torn-down session.
@@ -964,9 +966,7 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id = str(thread_id_raw)
         return SessionSource(
             platform=Platform.TELEGRAM, chat_id=chat_id or "", chat_type=chat_type, user_id=user_id,
-            user_name=user_name, thread_id=thread_id, is_bot=is_bot,
-            account_id=(getattr(self.config, "extra", {}) or {}).get("account_id"),
-        )
+            user_name=user_name, thread_id=thread_id, is_bot=is_bot)
 
     def _source_from_reaction_for_auth(self, update):
         """SessionSource for a ``message_reaction`` update's actor (``user`` or ``actor_chat``).
@@ -7136,9 +7136,6 @@ class TelegramAdapter(BasePlatformAdapter):
             user_id=(str(user.id) if user else (str(chat.id) if chat_type in {"dm", "channel"} else None)),
             user_name=user_name, thread_id=thread_id_str, chat_topic=chat_topic, message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False)
-        account_id = (getattr(self.config, "extra", {}) or {}).get("account_id")
-        if account_id:
-            source.account_id = account_id
         reply_to_id, reply_to_text = self._reply_context(message)
         from gateway.platforms.base import resolve_channel_prompt  # per-channel/topic ephemeral prompt
         from plugins.platforms.telegram.telegram_context import group_identity_prompt

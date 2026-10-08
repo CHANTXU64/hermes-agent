@@ -88,9 +88,6 @@ class SessionRecoveryMixin:
         recovered_profile = self._profile_from_session_key(recovered_key)
         if recovered_profile is None:
             return True
-        from fork_features.multi_telegram_accounts.identity import split_account_session_key
-        if split_account_session_key(recovered_key)[1] != split_account_session_key(requested_session_key)[1]:
-            return False
         if getattr(self.config, "multiplex_profiles", False):
             requested_profile = self._profile_from_session_key(requested_session_key)
             return requested_profile is None or recovered_profile == requested_profile
