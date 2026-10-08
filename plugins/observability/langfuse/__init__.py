@@ -13,12 +13,16 @@ import contextlib
 import functools
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+
+from agent.request_telemetry import service_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -608,16 +612,20 @@ def _start_child_observation(state: TraceState, *, name: str, as_type: str, inpu
 
 
 def _end_observation(observation: Any, *, output: Any = None, metadata: Optional[dict] = None,
-                     usage_details: Optional[dict] = None, cost_details: Optional[dict] = None) -> None:
+                     usage_details: Optional[dict] = None, cost_details: Optional[dict] = None,
+                     completion_start_time: Optional[datetime] = None, end_time: Optional[int] = None,
+                     model_parameters: Optional[dict] = None) -> None:
     if observation is None:
         return
     with _failsafe("end observation"):
         update_kwargs = {**({} if output is None else {"output": output}),
                          **{k: v for k, v in (("metadata", metadata), ("usage_details", usage_details),
-                                              ("cost_details", cost_details)) if v}}
+                                              ("cost_details", cost_details), ("model_parameters", model_parameters)) if v}}
         if update_kwargs:
+            if completion_start_time is not None:
+                update_kwargs["completion_start_time"] = completion_start_time
             observation.update(**update_kwargs)
-        observation.end()
+        observation.end(**({"end_time": end_time} if end_time is not None else {}))
 
 
 def _end_children(state: TraceState, *, include_subagents: bool = False) -> None:
@@ -781,12 +789,45 @@ def _emit_moa_reference_generations(state: TraceState, *, client: Langfuse, refe
                          cost_details=cost_details, metadata=metadata)
 
 
+def _fast_status(parameters: dict, *, requested: bool = False, api_mode: str = "") -> Optional[bool]:
+    """Absent response evidence is unknown, not the requested service level."""
+    speed, tier = parameters.get("speed"), parameters.get("service_tier")
+    if speed is not None:
+        return {"fast": True, "standard": False}.get(speed)
+    if api_mode == "anthropic_messages":
+        return False if requested else None  # Priority capacity is independent of Fast speed.
+    if tier is not None:
+        return {"priority": True, "default": False, "standard": False,
+                "flex": False, "auto": False if requested else None,
+                "standard_only": False}.get(tier)
+    return False if requested else None
+
+
+def _generation_timing(started_at: Any, ended_at: Any, first_token_at: Any) -> dict:
+    def valid(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+
+    if not (valid(started_at) and valid(ended_at) and ended_at >= started_at):
+        return {}
+    timing: Dict[str, Any] = {"end_time": int(ended_at * 1_000_000_000)}
+    # Lifecycle/role-only frames are TTFB, not TTFT; never substitute first_chunk_at.
+    if valid(first_token_at) and started_at <= first_token_at <= ended_at:
+        timing["completion_start_time"] = datetime.fromtimestamp(first_token_at, timezone.utc)
+    return timing
+
+
+def _request_service_metadata(parameters: Optional[dict], api_mode: str = "") -> dict:
+    return {"requested_service_tier": (parameters or {}).get("service_tier"),
+            "requested_speed": (parameters or {}).get("speed"),
+            "fast_requested": _fast_status(parameters, requested=True, api_mode=api_mode) if parameters is not None else None}
+
+
 def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str = "", model: str = "",
                        provider: str = "", base_url: str = "", api_mode: str = "", api_call_count: int = 0,
                        request_messages: Any = None, messages: Any = None, message_count: int = 0,
                        approx_input_tokens: int = 0, conversation_history: Any = None,
                        user_message: Any = None, turn_id: str = "", api_request_id: str = "",
-                       request: Any = None, system_prompt: Any = None, **_: Any) -> None:
+                       request: Any = None, system_prompt: Any = None, request_parameters: Any = None, **_: Any) -> None:
     client, task_key = _client_and_key(task_id, session_id, turn_id, api_request_id)
     if client is None:
         return
@@ -796,6 +837,11 @@ def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str
     body_model = request["body"].get("model") if isinstance(request, dict) and isinstance(request.get("body"), dict) else None
     if isinstance(body_model, str) and body_model:
         model = body_model
+
+    body = request.get("body") if isinstance(request, dict) else None
+    if isinstance(request_parameters, dict):
+        body = request_parameters  # Small structural evidence survives content truncation.
+    parameters = service_parameters(body, request=True)
 
     input_messages = _coerce_request_messages(request_messages=request_messages, messages=messages,
                                               conversation_history=conversation_history, user_message=user_message)
@@ -814,12 +860,14 @@ def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str
         gen_metadata = {
             "provider": provider, "platform": platform, "api_mode": api_mode, "base_url": base_url,
             "message_count": message_count, "approx_input_tokens": approx_input_tokens,
+            **_request_service_metadata(parameters if isinstance(body, dict) else None, api_mode),
+            "response_service_tier": None, "response_speed": None, "fast_confirmed": None,
             **({"system_prompt_chars": system_chars} if system_chars else {}),
         }
         state.generations[req_key] = _start_child_observation(
             state, name=f"LLM call {api_call_count}", as_type="generation",
             input_value=langfuse_input, metadata=gen_metadata, model=model,
-            model_parameters={"api_mode": api_mode, "provider": provider},
+            model_parameters={"api_mode": api_mode, "provider": provider, **parameters},
         )
 
 
@@ -828,7 +876,9 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                      response: Any = None, api_duration: float = 0.0, finish_reason: str = "", usage: Any = None,
                      assistant_content_chars: int = 0, assistant_tool_call_count: int = 0,
                      assistant_response: Any = None, turn_id: str = "", api_request_id: str = "",
-                     response_model: Any = None, moa_references: Any = None, **_: Any) -> None:
+                     response_model: Any = None, moa_references: Any = None,
+                     response_parameters: Any = None, request_parameters: Any = None, started_at: Any = None,
+                     ended_at: Any = None, first_token_at: Any = None, **_: Any) -> None:
     client, task_key = _client_and_key(task_id, session_id, turn_id, api_request_id)
     if client is None:
         return
@@ -868,7 +918,17 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
 
     gen_metadata = {"tool_call_count": len(output.get("tool_calls", [])) or assistant_tool_call_count,
                     **_duration_meta(api_duration), **({"finish_reason": finish_reason} if finish_reason else {})}
-    _end_observation(generation, output=output, usage_details=usage_details, cost_details=cost_details, metadata=gen_metadata)
+    parameters = service_parameters(response_parameters if isinstance(response_parameters, dict) else response)
+    gen_metadata.update(response_service_tier=parameters.get("service_tier"),
+                        response_speed=parameters.get("speed"), fast_confirmed=_fast_status(parameters, api_mode=api_mode))
+    generation_updates: Dict[str, Any] = _generation_timing(started_at, ended_at, first_token_at)
+    if isinstance(request_parameters, dict):
+        # Execution middleware / transport can rewrite the pre-hook request.
+        sent = service_parameters(request_parameters)
+        gen_metadata.update(_request_service_metadata(sent, api_mode))
+        generation_updates["model_parameters"] = {"api_mode": api_mode, "provider": provider, **sent}
+    _end_observation(generation, output=output, usage_details=usage_details, cost_details=cost_details, metadata=gen_metadata,
+                     **generation_updates)
 
     has_tools = bool(getattr(assistant_message, "tool_calls", None)) if assistant_message else assistant_tool_call_count > 0
     if not has_tools and output.get("content"):
@@ -929,7 +989,8 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
 def on_api_request_error(*, task_id: str = "", session_id: str = "", api_call_count: int = 0,
                          api_duration: float = 0.0, status_code: Any = None, retry_count: Any = None,
                          max_retries: Any = None, retryable: Any = None, reason: Any = None, error: Any = None,
-                         turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+                         turn_id: str = "", api_request_id: str = "", request_parameters: Any = None,
+                         provider: str = "", api_mode: str = "", **_: Any) -> None:
     """Close (as ERROR) the open generation for a failed API request so the turn
     doesn't look hung until eviction; a non-retryable failure also finishes the
     turn, since the agent loop is about to unwind."""
@@ -952,9 +1013,14 @@ def on_api_request_error(*, task_id: str = "", session_id: str = "", api_call_co
     }
 
     if generation is not None:
+        generation_updates: Dict[str, Any] = {}
+        if isinstance(request_parameters, dict):
+            sent = service_parameters(request_parameters)
+            error_metadata.update(_request_service_metadata(sent, api_mode))
+            generation_updates["model_parameters"] = {"api_mode": api_mode, "provider": provider, **sent}
         with _failsafe("error-level update"):
             generation.update(level="ERROR", status_message=(error_type or "api_request_error")[:200])
-        _end_observation(generation, metadata=error_metadata)
+        _end_observation(generation, metadata=error_metadata, **generation_updates)
 
     # A retryable failure is followed by another pre_api_request on the same
     # trace; keep the turn open. A terminal failure ends the turn.

@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 from agent.error_classifier import FailoverReason
 from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
 from agent.message_metadata import append_message
+from agent.request_telemetry import service_parameters
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
 from agent.turn_failure_copy import site_copy, stamp_failure
 
@@ -92,6 +93,7 @@ def perform_api_call(
 
     def _capture_physical_request(physical_api_kwargs):
         """Keep the exact post-middleware provider request for overflow recovery."""
+        agent._last_api_request_parameters = service_parameters(physical_api_kwargs, request=True)
         try:
             from agent.conversation_loop import _canonicalize_api_tool_calls
             from fork_features.request_fork.prepared_request import build_adopt_rematerializer

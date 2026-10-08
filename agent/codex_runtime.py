@@ -756,6 +756,7 @@ class _CodexResponseAssembler:
     active_summary_index: Any = None
     terminal_status: str = "completed"
     terminal_usage = terminal_response_id = terminal_response_model = None
+    terminal_service_tier = None
     terminal_incomplete_details = terminal_error = None
     # terminal_status defaults to "completed", so settlement needs an explicitly observed response.completed frame.
     saw_response_completed = False
@@ -879,6 +880,7 @@ class _CodexResponseAssembler:
         if resp_obj is not None:
             self.terminal_usage, self.terminal_response_id = _event_field(resp_obj, "usage"), _event_field(resp_obj, "id")
             self.terminal_response_model = _event_field(resp_obj, "model")
+            self.terminal_service_tier = _event_field(resp_obj, "service_tier")
             rstatus = _event_field(resp_obj, "status")
             if isinstance(rstatus, str):
                 self.terminal_status = rstatus
@@ -947,6 +949,7 @@ class _CodexResponseAssembler:
             output=output, output_text="".join(self.text_deltas), usage=self.terminal_usage, status=self.terminal_status,
             id=self.terminal_response_id, model=self.model,
             provider_reported_model=self.terminal_response_model,
+            service_tier=self.terminal_service_tier,
             incomplete_details=self.terminal_incomplete_details,
             error=self.terminal_error)
 
@@ -1066,6 +1069,8 @@ def run_codex_stream(
         if getattr(agent, "_last_api_first_chunk_at", None) is None:
             agent._last_api_first_chunk_at = now
         has_progress = _codex_event_has_content(event)
+        if has_progress and getattr(agent, "_last_api_first_token_at", None) is None:
+            agent._last_api_first_token_at = now
         if watchdog_state is not None:
             with watchdog_state.lock:
                 if watchdog_state.retry_started_ts is not None:
@@ -1182,6 +1187,7 @@ def run_codex_stream(
             raise TimeoutError("Codex Responses stream request retired before retry")
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
+        agent._last_api_first_token_at = None  # Only the successful physical attempt's output is counted.
         if attempt > 0 and watchdog_state is not None and watchdog_state.phase_aware:
             # A physical reconnect has its own no-event TTFB phase. Its first parsed
             # event clears this marker and starts a fresh model-progress phase.

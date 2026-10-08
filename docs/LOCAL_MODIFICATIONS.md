@@ -36,6 +36,42 @@ Validation after a merge:
 
 ## Active modifications
 
+### Langfuse per-request Fast evidence and native timing
+
+- ID: `langfuse-request-telemetry`
+- Status: active
+- Depends on: none
+- Source boundary: logical-only
+
+Files / touchpoints:
+- `agent/request_telemetry.py` — backend-neutral service-level extraction and stream-content classification.
+- `agent/api_request_hooks.py`, `agent/turn_api_request.py`, `agent/turn_response_intake.py` — additive observer fields independent of capped content payloads; first-token timestamp reset and forwarding.
+- `agent/turn_api_call.py` — existing physical-request callback captures final service parameters after execution middleware; success/error hooks reconcile prepared values to sent values.
+- `agent/codex_runtime.py`, `agent/chat_completion_helpers.py` — preserve streamed response tiers and distinguish content timing from transport liveness.
+- `plugins/observability/langfuse/__init__.py`, `plugins/observability/langfuse/README.md` — generation parameters, request/response evidence, native completion/end timestamps and user-facing semantics.
+- `tests/agent/test_request_telemetry.py`, `tests/plugins/test_langfuse_request_telemetry.py`, `tests/plugins/test_langfuse_sdk_telemetry.py` — hook/stream/retry contracts and local real-SDK export coverage.
+
+Intent / invariants:
+- Existing LLM generations expose per-request Fast intent separately from provider-reported service tier/speed. Unknown remains null; never infer response priority from the request, model name or static configuration. Extra-body overrides retain SDK precedence. Large payload truncation and metadata-only capture must not lose this evidence.
+- Preserve Responses and Chat Completions response tiers through stream assembly; read Anthropic speed from provider usage when present. Report first generated content separately from the existing first network event. Reset it per API attempt and Codex reconnect. Do not alter prompts, API behavior, usage/cost accounting, retry policy or opt-in tracing.
+- Use Langfuse native TTFT and output Tokens/second, with end timestamp excluding post-response processing. Native Tokens/second includes initial wait; no input-rate or custom decode-rate metric. Missing TTFT stays absent. Existing transport-internal reconnect and auxiliary coverage boundaries remain unchanged.
+
+Merge decision:
+- Preserve when: upstream loses service evidence during stream assembly/content truncation or does not bridge it and content timing to Langfuse.
+- Drop when: upstream behavior passes these contracts and the user accepts replacing the Fork implementation.
+- Ask user when: upstream changes generation/physical-attempt identity or speed metric semantics.
+
+Verification:
+```bash
+scripts/run_tests.sh tests/agent/test_request_telemetry.py tests/plugins/test_langfuse_request_telemetry.py tests/plugins/test_langfuse_plugin.py tests/agent/test_first_chunk_at_hook.py tests/agent/test_codex_first_event_timing.py tests/agent/test_streaming.py
+# With optional Langfuse SDK installed: local fixture HTTP + in-memory OTEL, no external calls.
+python -m pytest tests/plugins/test_langfuse_sdk_telemetry.py -q -o 'addopts='
+```
+
+- Upstream status: fork-only
+- Last validated: local upstream ref `a28a5d03a9fa60418db5f44f3436fa2aa029c8f2`; Fork base `5a8999a6c9985455bbbd22c482d1506fb597ab26` plus working changes. No upstream merge, commit, push or service restart.
+- Feature docs: `plugins/observability/langfuse/README.md`; change evidence: `docs/CHANTXU64/langfuse-request-telemetry/changes.jsonl`.
+
 ### Fixed-clock session heartbeats and incremental inbox scanner
 
 - ID: `daily-session-heartbeat`

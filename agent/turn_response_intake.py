@@ -13,6 +13,7 @@ import re
 from typing import Any, Dict, Optional
 
 from agent.provider_projection import splice_provider_projection
+from agent.request_telemetry import service_parameters
 from agent.trajectory import has_incomplete_scratchpad
 from agent.turn_truncation import (
     CODEX_FALLBACK_ACTIVATED, continue_codex_incomplete, normalize_response_for_agent, partial_result,
@@ -83,9 +84,12 @@ def _fire_post_api_request_hook(
                 # First stream chunk time (epoch s); None if not streamed / no chunk.
                 # TTFB = first_chunk_at - started_at.
                 first_chunk_at=getattr(agent, "_last_api_first_chunk_at", None),
+                first_token_at=getattr(agent, "_last_api_first_token_at", None),
                 finish_reason=finish_reason,
                 message_count=len(api_messages),
                 response_model=getattr(response, "model", None),
+                response_parameters=service_parameters(response),
+                request_parameters=getattr(agent, "_last_api_request_parameters", None),
                 response=agent._api_response_payload_for_hook(
                     response, assistant_message, finish_reason=finish_reason
                 ),

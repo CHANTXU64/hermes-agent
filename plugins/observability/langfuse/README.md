@@ -40,6 +40,42 @@ Generation observations include the Hermes system prompt when the provider
 uses a separate `system` param (Anthropic Messages API). Open an **LLM call**
 child span to inspect `role: system` (truncated via `HERMES_LANGFUSE_MAX_CHARS`).
 
+## Fast mode and native performance metrics
+
+Open an **LLM call** generation:
+
+- **Model parameters** includes explicit `service_tier` (for example OpenAI
+  `priority`) and/or `speed` (Anthropic `fast`). SDK `extra_body` overrides
+  top-level values. These are per-request values, not the agent's static mode.
+- **Metadata** separates `requested_service_tier` / `requested_speed` /
+  `fast_requested` from `response_service_tier` / `response_speed` /
+  `fast_confirmed`. Null means unknown. Missing response evidence never inherits
+  the request. `auto` is not an explicit Fast request. An unknown service-level
+  value is retained, without guessing its Fast meaning.
+  Anthropic priority capacity alone does not confirm Fast speed. When the existing
+  physical-request callback runs, success/error observations use its final values,
+  including execution-middleware rewrites; otherwise the prepared request is kept.
+- Fast evidence is structural: it survives all capture modes and truncation of
+  large request/response content. Error generations keep the requested values;
+  the next API attempt gets its own values.
+- **Time to first token (TTFT)** uses the first nonempty generated text,
+  reasoning or tool data from Responses, Chat Completions and Anthropic streams,
+  not a lifecycle/role-only/keepalive event. Non-streaming calls or streams with
+  no measured content leave `completionStartTime` absent. The separate Hermes
+  `first_chunk_at` hook field remains TTFB and is not repurposed.
+- **Tokens per second** is Langfuse's native output-token/request-latency metric
+  (including initial wait), not a custom decode-only rate. Enable its column in
+  the observations table if hidden. Token accounting is unchanged; cache usage
+  remains in the existing usage details. No input-rate metric is added.
+
+This extends the plugin's existing per-API-call generations, not its coverage
+to new auxiliary-call sources. The generation start is the SDK's instrumentation
+time; its end uses the API completion timestamp so post-response processing does
+not inflate latency. Transport-internal reconnects remain within the existing
+generation; TTFT takes content from the successful attempt, not a failed one.
+Existing traces are not backfilled. Running processes must load the new code
+before new traces contain these fields; changing files alone does not do that.
+
 ## Optional tuning
 
 ```bash

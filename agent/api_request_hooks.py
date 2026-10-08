@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 from agent.usage_pricing import normalize_usage
+from agent.request_telemetry import service_parameters
 
 _SENSITIVE_HOOK_KEYS = {"api_key", "authorization", "proxy_authorization", "cookie", "set_cookie"}
 
@@ -148,6 +149,7 @@ class ApiRequestHooksMixin:
         return self._sanitize_hook_payload(
             {
                 "model": getattr(response, "model", None),
+                **service_parameters(response),
                 "finish_reason": finish_reason,
                 "assistant_message": {
                     "role": getattr(assistant_message, "role", "assistant"),
@@ -193,4 +195,5 @@ class ApiRequestHooksMixin:
                 reason=reason,
                 error={"type": error_type, "message": error_message},
                 request=self._api_request_payload_for_hook(api_kwargs),
+                request_parameters=getattr(self, "_last_api_request_parameters", None),
             )

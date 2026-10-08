@@ -13,6 +13,7 @@ import logging
 from typing import Any
 
 from agent.message_sanitization import sanitize_outbound_kwargs, strip_images_for_rejecting_model
+from agent.request_telemetry import service_parameters
 from utils import env_var_enabled
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -84,6 +85,7 @@ def _fire_pre_api_request_hook(
                 started_at=api_start_time,
                 middleware_trace=list(_llm_middleware_trace),
                 request=agent._api_request_payload_for_hook(api_kwargs),
+                request_parameters=service_parameters(api_kwargs, request=True),
             )
     except Exception:
         pass
@@ -104,6 +106,8 @@ def build_api_request(
     agent._reset_stream_delivery_tracking()
     # Per-attempt first-chunk timestamp so a stale value never leaks into post_api_request.
     agent._last_api_first_chunk_at = None
+    agent._last_api_first_token_at = None
+    agent._last_api_request_parameters = None
     # api_messages was built for the primary; a fallback (DeepSeek / Kimi / MiMo) may
     # require reasoning_content — re-apply the echo-back pad (idempotent) and re-render
     # the prompt-cache decoration for the current provider.

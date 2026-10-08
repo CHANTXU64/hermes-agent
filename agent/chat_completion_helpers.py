@@ -2923,12 +2923,16 @@ class _StreamingCall(StreamingWaitMonitor):
 
     def _count_chunk(self, diag, chunk) -> None:
         """Stamp liveness for a real chunk; diagnostics are best-effort."""
+        from agent.request_telemetry import stream_chunk_has_token
+
         self.last_chunk_time["t"] = time.time()
         self.agent._touch_activity("receiving stream response")
         with contextlib.suppress(Exception):
             diag["chunks"] = int(diag.get("chunks", 0)) + 1
             if diag.get("first_chunk_at") is None:
                 diag["first_chunk_at"] = self.last_chunk_time["t"]
+            if diag.get("first_token_at") is None and stream_chunk_has_token(chunk):
+                diag["first_token_at"] = self.last_chunk_time["t"]
             # Delta-length estimate: ~3x cheaper than repr() per chunk.
             diag["bytes"] = int(diag.get("bytes", 0)) + _estimate_chunk_bytes(chunk)
 
@@ -3075,6 +3079,7 @@ class _StreamingCall(StreamingWaitMonitor):
         tool_calls_acc = tool_calls.acc
         finish_reason = model_name = usage_obj = None
         response_id = upstream_provider = None  # the provider's own id / serving upstream, from the chunks
+        service_tier = None
         role = "assistant"
         _diag = self._new_diag()
         self._writer_token = self._attempt_request_client = self._attempt_stream_response = None
@@ -3120,6 +3125,8 @@ class _StreamingCall(StreamingWaitMonitor):
                 continue
             if hasattr(chunk, "model") and chunk.model:
                 model_name = chunk.model
+            if isinstance(getattr(chunk, "service_tier", None), str) and chunk.service_tier:
+                service_tier = chunk.service_tier
             if response_id is None and isinstance(getattr(chunk, "id", None), str) and chunk.id:
                 response_id = chunk.id
             if upstream_provider is None and isinstance(getattr(chunk, "provider", None), str) and chunk.provider:
@@ -3204,7 +3211,7 @@ class _StreamingCall(StreamingWaitMonitor):
         return self._finish_chat_stream(stream, role, content_parts, reasoning_parts, tool_calls_acc,
             finish_reason, model_name, usage_obj, flush_pending=_flush_pending_stream_text,
             response_id=response_id, upstream_provider=upstream_provider, reasoning_details=reasoning_details,
-            refusal_parts=refusal_parts)
+            refusal_parts=refusal_parts, service_tier=service_tier)
 
     def _adopt_final_response(self, final_response):
         """Adapter returned a completed response for ``stream=True``: switch the
@@ -3256,7 +3263,7 @@ class _StreamingCall(StreamingWaitMonitor):
 
     def _finish_chat_stream(self, stream, role, content_parts, reasoning_parts, tool_calls_acc, finish_reason,
         model_name, usage_obj, *, flush_pending, response_id=None, upstream_provider=None, reasoning_details=None,
-        refusal_parts=None):
+        refusal_parts=None, service_tier=None):
         """Assemble the non-streaming-shaped response after the chunk loop. A
         stream ending with no finish_reason is a drop, not a completion: return a
         partial-stream stub so the loop fails fast instead of executing empty
@@ -3301,7 +3308,7 @@ class _StreamingCall(StreamingWaitMonitor):
         # The provider's id when the chunks carried one (chatcmpl-/gen-...): it is what a provider needs to
         # look a request up. Fabricated only when the stream never sent one.
         response = SimpleNamespace(id=response_id or ("stream-" + str(uuid.uuid4())), model=model_name, usage=usage_obj,
-            provider=upstream_provider,
+            provider=upstream_provider, service_tier=service_tier,
             choices=[SimpleNamespace(index=0, message=message, finish_reason=effective_finish_reason)])
         # A held router timeout shim (#68396) is rejected by validate_response and retried;
         # releasing its text here would show the provider failure as assistant output.
@@ -3816,6 +3823,7 @@ class _StreamingCall(StreamingWaitMonitor):
         # Propagate first-chunk timing for the ``post_api_request`` hook.
         if isinstance(self.clients.diag, dict) and self.clients.diag.get("first_chunk_at"):
             self.agent._last_api_first_chunk_at = float(self.clients.diag["first_chunk_at"])
+            self.agent._last_api_first_token_at = self.clients.diag.get("first_token_at")
         return self.result["response"]
 
 
