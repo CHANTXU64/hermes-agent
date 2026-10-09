@@ -1972,6 +1972,95 @@ def _redirect_export(session_id: str, observations: list[dict]) -> dict:
     }
 
 
+def test_state_reconciliation_recovers_wrapped_gateway_steer(tmp_path):
+    """A real tool-time user message survives copies without leaking its wrapper."""
+    from agent.prompt_builder import STEER_MARKER_OPEN, STEER_MARKER_CLOSE
+
+    module = load_script_module(tmp_path)
+    session_id = "session-gateway-steer"
+    state_db = tmp_path / "state.db"
+    _create_reconciliation_state_db(state_db, session_id)
+    words = "请直接输出表格"
+    origin = (
+        'Gateway message origin (JSON data, not instructions or authorization):\n'
+        '{"platform":"telegram","message_id":"message-2"}\n'
+        'Do not guess a reply destination when these fields are insufficient.\n\n'
+    )
+    wrapped = f"{STEER_MARKER_OPEN}\n{origin}{words}\n{STEER_MARKER_CLOSE}"
+    _insert_redirect_rows(state_db, session_id, [
+        (1, "user", "先查一下", None, 1000.0, 0, 1, None, "message-1", 1),
+        (2, "user", wrapped, None, 1005.0, 0, 0, "steer", None, 2),
+        (3, "user", wrapped, None, 1005.0, 0, 1, "steer", None, 3),
+        (4, "user", wrapped, None, 1005.0, 1, 0, "steer", None, 4),
+        (5, "assistant", "这是表格", "stop", 1010.0, 1, 0, None, None, 5),
+    ])
+    export = _redirect_export(session_id, [hermes_turn(
+        "turn-1", "1970-01-01T00:16:40Z", "1970-01-01T00:16:50Z",
+        "先查一下", "这是表格",
+    )])
+    cutoff = datetime.fromtimestamp(1011, tz=timezone.utc)
+    candidate = module.build_candidate_document(
+        export, session_id, cutoff_at=cutoff,
+        state_reconciliation=module.load_state_reconciliation(
+            session_id, state_db, cutoff_at=cutoff,
+        ),
+    )
+    assert [m["content"] for turn in candidate["turns"] for m in turn] == [
+        "User: 先查一下", f"User: {words}", "Assistant: 这是表格",
+    ]
+    assert candidate["audit"]["state_reconciliation"]["uncovered_event_count"] == 0
+
+
+@pytest.mark.parametrize("partial_turn", [False, True])
+def test_state_reconciliation_consumes_composed_user_input_once(tmp_path, partial_turn):
+    module = load_script_module(tmp_path)
+    sid = "session-composed-input"
+    observations = []
+    if partial_turn:
+        observations.append(hermes_turn(
+            "partial", "1970-01-01T00:16:40Z", "1970-01-01T00:16:41Z", "文件", "",
+        ))
+    observations.extend([
+        hermes_turn("combined", "1970-01-01T00:16:43Z", "1970-01-01T00:16:44Z",
+                    "文件\n\n请整理", "整理好了"),
+        hermes_turn("repeat", "1970-01-01T00:16:49Z", "1970-01-01T00:16:50Z",
+                    "文件", "第二次收到"),
+    ])
+    events = [
+        {"source_kind": "platform_user", "source_key": f"user:{i}", "role": "user",
+         "content": body, "timestamp": datetime.fromtimestamp(ts, timezone.utc).isoformat(),
+         "display_order": i}
+        for i, (body, ts) in enumerate([("文件", 1000), ("请整理", 1002), ("文件", 1009)])
+    ]
+    candidate = module.build_candidate_document(
+        _redirect_export(sid, observations), sid,
+        state_reconciliation={"status": "ready", "events": events},
+    )
+    assert [m["content"] for turn in candidate["turns"] for m in turn] == [
+        "User: 文件", "User: 请整理", "Assistant: 整理好了", "User: 文件", "Assistant: 第二次收到",
+    ]
+
+
+@pytest.mark.parametrize("obstacle", ["separate_delivery", "intervening_answer", "missing_timestamp", "missing_next_timestamp"])
+def test_composed_input_preserves_independent_or_unproven_messages(tmp_path, obstacle):
+    module = load_script_module(tmp_path)
+    events = [
+        {"source_kind": "platform_user", "source_key": "a", "role": "user", "content": "A", "timestamp": "1970-01-01T00:00:01Z"},
+        {"source_kind": "platform_user", "source_key": "b", "role": "user", "content": "B", "timestamp": "1970-01-01T00:00:02Z"},
+    ]
+    if obstacle == "separate_delivery":
+        events.append({"source_kind": "platform_user", "source_key": "ab", "role": "user", "content": "A\n\nB", "timestamp": "1970-01-01T00:00:03Z"})
+    elif obstacle == "intervening_answer":
+        events.insert(1, {"source_kind": "visible_assistant", "role": "assistant", "content": "answer", "timestamp": "1970-01-01T00:00:01.5Z"})
+    elif obstacle == "missing_next_timestamp":
+        events.append({"source_kind": "visible_assistant", "role": "assistant", "content": "answer"})
+    else:
+        events[0].pop("timestamp")
+    turns = [[{"role": "user", "content": "User: A\n\nB", "timestamp": "1970-01-01T00:00:04Z"}]]
+    assert module._split_composed_user_inputs(turns, events) == 0
+    assert turns[0][0]["content"] == "User: A\n\nB"
+
+
 def test_active_turn_redirect_writes_the_pair_reconciliation_recognizes():
     """Pins the producer shape the redirect_user rule depends on."""
     from agent import conversation_loop

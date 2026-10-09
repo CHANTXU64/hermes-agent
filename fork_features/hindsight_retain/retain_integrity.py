@@ -1305,6 +1305,7 @@ def fetch_hindsight_operation(
     operation_id: str,
     *,
     bank_id: str | None = None,
+    _resolve_children: bool = True,
 ) -> dict[str, Any]:
     """Read one async retain operation from the configured Bank."""
     operation_id = _safe_component(operation_id, "operation_id")
@@ -1357,19 +1358,64 @@ def fetch_hindsight_operation(
         or operation_type not in RETAIN_OPERATION_TYPES
     ):
         return {"status": "unavailable", "operation_id": operation_id}
-    return {
-        "status": "found",
-        "operation_id": operation_id,
-        "operation": {
-            "id": operation_id,
-            "task_type": operation_type,
-            "status": str(payload.get("status") or ""),
-            "document_id": document_id,
-            "items_count": items_count,
-            "unit_ids_count": unit_ids_count,
-            "extraction_errors_count": extraction_errors_count,
-        },
+    operation = {
+        "id": operation_id,
+        "task_type": operation_type,
+        "status": str(payload.get("status") or ""),
+        "document_id": document_id,
+        "items_count": items_count,
+        "unit_ids_count": unit_ids_count,
+        "extraction_errors_count": extraction_errors_count,
     }
+    if result_metadata.get("parent_operation_id"):
+        operation["parent_operation_id"] = result_metadata["parent_operation_id"]
+    if (_resolve_children and operation_type == "batch_retain"
+            and operation["status"] in {"cancelled", "failed"}):
+        children = _verified_completed_children(operation, payload, resolved_bank_id)
+        if children:
+            operation["completed_child_operations"] = children
+            operation["extraction_errors_count"] = 0
+    return {"status": "found", "operation_id": operation_id, "operation": operation}
+
+
+def _verified_completed_children(operation: dict, payload: dict, bank_id: str) -> list[str]:
+    """A cancelled parent is not evidence of child failure, nor is its summary success.
+
+    Read every declared child once, verify both directions of the relationship,
+    document identity, item total and explicit zero extraction errors. Never
+    follow grandchildren or allow a malformed/cyclic graph to drive recursion.
+    """
+    metadata = payload.get("result_metadata")
+    if not isinstance(metadata, dict):
+        return []
+    children = payload.get("child_operations")
+    expected = metadata.get("num_sub_batches")
+    if (metadata.get("is_parent") is not True or type(expected) is not int
+            or expected < 1 or not isinstance(children, list) or len(children) != expected):
+        return []
+    ids = [str(c.get("operation_id") or "") for c in children if isinstance(c, dict)]
+    if (len(ids) != expected or len(set(ids)) != expected or operation["id"] in ids):
+        return []
+    try:
+        if any(_safe_component(oid, "operation_id") != oid for oid in ids):
+            return []
+    except ValueError:
+        return []
+    item_total = 0
+    for child_id in ids:
+        result = fetch_hindsight_operation(child_id, bank_id=bank_id, _resolve_children=False)
+        child = result.get("operation") or {}
+        count = child.get("items_count")
+        errors = child.get("extraction_errors_count")
+        if (result.get("status") != "found" or child.get("task_type") != "retain"
+                or child.get("status") != "completed"
+                or child.get("parent_operation_id") != operation["id"]
+                or child.get("document_id") != operation["document_id"]
+                or type(count) is not int or count < 1
+                or type(errors) is not int or errors != 0):
+            return []
+        item_total += count
+    return ids if type(operation["items_count"]) is int and item_total == operation["items_count"] else []
 
 
 def _candidate_counts(candidate_path: Path, session_id: str) -> dict[str, int] | None:
@@ -2122,6 +2168,7 @@ def scan_attempts(
                 )
                 continue
             completed_operation_id: str | None = None
+            parent_state_inconsistent: dict | None = None
             remote_operation_event = next(
                 (
                     event
@@ -2204,6 +2251,13 @@ def scan_attempts(
                         )
                         continue
                     operation_status = str(operation.get("status") or "")
+                    if (operation_status in {"failed", "cancelled"}
+                            and operation.get("completed_child_operations")):
+                        parent_state_inconsistent = {
+                            "operation_status": operation_status,
+                            "completed_child_operations": operation["completed_child_operations"],
+                        }
+                        operation_status = "completed"
                     if operation_status in {"pending", "processing"}:
                         if age_seconds > operation_stall_seconds:
                             alerts.append(
@@ -2434,6 +2488,20 @@ def scan_attempts(
                                 "remote_document_matches_candidate": True,
                             }
                         )
+                    if parent_state_inconsistent is not None:
+                        alerts.append({
+                            "alert_key": f"retain:{attempt_id}:parent_state_inconsistent",
+                            "type": "retain_remote_parent_state_inconsistent",
+                            "severity": "info",
+                            "attempt_id": attempt_id,
+                            "session_id": session_id,
+                            "document_id": document_id,
+                            "operation_id": completed_operation_id,
+                            "started_at": started_at.isoformat(),
+                            "remote_document_matches_candidate": True,
+                            **parent_state_inconsistent,
+                            "message": "总任务仍标为失败或取消，但全部子任务已完成且无抽取错误；远端正文与提交候选一致。状态不一致，不应重跑旧任务。",
+                        })
                     remote_confirmed_attempts.append(
                         {
                             "attempt_id": attempt_id,

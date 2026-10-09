@@ -528,6 +528,15 @@ _PROCESS_HEARTBEAT_RE = re.compile(
 )
 
 
+# Literal copies: keep the standalone exporter independent of agent imports.
+# The producer-contract regression builds these frames using prompt_builder.
+_STEER_MARKER_OPEN = (
+    "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered "
+    "once at this position; not tool output and not a new delivery when replayed from conversation history]"
+)
+_STEER_MARKER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
+
+
 def _user_payload_after_framework(content: str) -> str:
     """Drop Hermes-authored blocks that precede the user's own words in one row.
 
@@ -547,6 +556,10 @@ def _user_payload_after_framework(content: str) -> str:
     if _PROCESS_HEARTBEAT_RE.match(text):
         index = text.find("\n\n" + _GATEWAY_ORIGIN_PREFIX)
         return text[index + 2 :] if index >= 0 else ""
+    if text.startswith(_STEER_MARKER_OPEN + "\n") and text.rstrip().endswith(
+        "\n" + _STEER_MARKER_CLOSE
+    ):
+        text = text.rstrip()[len(_STEER_MARKER_OPEN) + 1 : -len(_STEER_MARKER_CLOSE)].strip()
     return text
 
 
@@ -1644,6 +1657,69 @@ def _insert_state_event(turns: list[list[dict]], event: dict) -> None:
     turns[-1].append(message)
 
 
+def _split_composed_user_inputs(turns: list[list[dict]], events: list[dict]) -> int:
+    """Replace a trace's joined input only with proven adjacent source occurrences.
+
+    Never substring-dedupe: the entire input must equal at least two source
+    messages, with its timestamp after those messages and before the next event.
+    A separately delivered joined message therefore remains its own occurrence.
+    """
+    replaced = 0
+    earlier: list[dict] = []
+    for turn in turns:
+        expanded = []
+        for message in turn:
+            body = _state_event_key(message.get("role"), _document_message_body(message))[1]
+            when = _timestamp_seconds(message.get("timestamp"))
+            matches = []
+            if message.get("role") == "user" and when is not None:
+                for start in range(len(events)):
+                    parts = []
+                    for end in range(start, len(events)):
+                        part = events[end]
+                        part_time = _timestamp_seconds(part.get("timestamp"))
+                        if (part.get("source_kind") not in {"platform_user", "redirect_user"}
+                                or part.get("role") != "user" or part_time is None
+                                or part_time > when):
+                            break
+                        parts.append(part)
+                        joined = _state_event_key("user", "\n\n".join(p["content"] for p in parts))[1]
+                        if not body.startswith(joined):
+                            break
+                        next_time = (_timestamp_seconds(events[end + 1].get("timestamp"))
+                                     if end + 1 < len(events) else None)
+                        if joined == body and len(parts) > 1 and (
+                            end + 1 == len(events) or (next_time is not None and when < next_time)
+                        ):
+                            matches.append(list(parts))
+                            break
+            if len(matches) != 1:
+                expanded.append(message)
+                earlier.append(message)
+                continue
+            parts = matches[0]
+            available = list(earlier)
+            for index, part in enumerate(parts):
+                start_time = _timestamp_seconds(part["timestamp"])
+                end_time = (_timestamp_seconds(parts[index + 1]["timestamp"])
+                            if index + 1 < len(parts) else when)
+                assert start_time is not None and end_time is not None
+                existing = next((m for m in available
+                    if _state_event_key(m.get("role"), _document_message_body(m))
+                    == _state_event_key("user", part["content"])
+                    and (t := _timestamp_seconds(m.get("timestamp"))) is not None
+                    and start_time <= t <= end_time), None)
+                if existing is not None:
+                    available.remove(existing)
+                else:
+                    atomic = _document_message("user", part["content"], part["timestamp"])
+                    expanded.append(atomic)
+                    earlier.append(atomic)
+            replaced += 1
+        turn[:] = expanded
+    return replaced
+
+
 def _apply_state_reconciliation(
     turns: list[list[dict]], state_reconciliation: dict | None
 ) -> tuple[list[list[dict]], dict]:
@@ -1673,6 +1749,9 @@ def _apply_state_reconciliation(
         ),
     )
     audit["source_event_count"] = len(ordered_events)
+    composed_count = _split_composed_user_inputs(turns, ordered_events)
+    if composed_count:
+        audit["replaced_composed_user_count"] = composed_count
     candidate_inventory = _candidate_state_event_inventory(turns)
     for event in ordered_events:
         source_kind = str(event.get("source_kind") or "")

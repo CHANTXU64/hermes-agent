@@ -4781,6 +4781,54 @@ def test_expected_export_cli_reports_accepted_not_confirmed(tmp_path: Path) -> N
     }
 
 
+@pytest.mark.parametrize("child_case", ["complete", "failed", "wrong_parent", "wrong_document", "missing_count", "partial_children", "wrong_hash"])
+def test_cancelled_parent_requires_verified_children_and_exact_document(tmp_path, child_case):
+    module = load_module()
+    sid = "20261001_060000_abcdef12"
+    parent_id = "8199a407-45c5-4b7c-863e-1712e904b023"
+    child_id = "8199a407-45c5-4b7c-863e-1712e904b024"
+    started = datetime(2026, 10, 1, 6, tzinfo=timezone.utc)
+    state_db, journal, exported = create_accepted_attempt(
+        module, tmp_path, session_id=sid, attempt_id=parent_id, started_at=started,
+    )
+    candidate = json.loads((Path(exported["output_dir"]) / f"candidate_document_{sid}.json").read_text())
+    payloads = {
+        parent_id: {"id": parent_id, "task_type": "batch_retain", "status": "cancelled",
+                    "result_metadata": {"is_parent": True, "document_id": sid, "items_count": 1,
+                                        "num_sub_batches": 2 if child_case == "partial_children" else 1},
+                    "child_operations": [{"operation_id": child_id, "status": "completed"}]},
+        child_id: {"id": child_id, "task_type": "retain",
+                   "status": "failed" if child_case == "failed" else "completed",
+                   "result_metadata": {"parent_operation_id": "other" if child_case == "wrong_parent" else parent_id,
+                                       "document_id": "other" if child_case == "wrong_document" else sid,
+                                       "items_count": 1, "extraction_errors_count": 0}},
+    }
+    if child_case == "missing_count":
+        payloads[child_id]["result_metadata"].pop("extraction_errors_count")
+    class Response:
+        def __init__(self, payload): self.payload = payload
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def read(self): return json.dumps(self.payload).encode()
+    module.urlopen = lambda request, timeout: Response(payloads[request.full_url.rsplit("/", 1)[-1]])
+    result = module.scan_attempts(
+        journal_path=journal, state_db_path=state_db, now=started + timedelta(minutes=10),
+        operation_fetcher=lambda oid: module.fetch_hindsight_operation(oid, bank_id="Hermes"),
+        document_fetcher=lambda did: {"status": "found", "document": {
+            "id": did, "original_text": candidate["document_content"] if child_case != "wrong_hash" else "[]",
+        }},
+    )
+    if child_case == "complete":
+        assert result["remote_confirmed_count"] == 1
+        assert [a["type"] for a in result["alerts"]] == ["retain_remote_parent_state_inconsistent"]
+        assert result["alerts"][0]["operation_status"] == "cancelled"
+        assert result["alerts"][0]["severity"] == "info"
+    else:
+        assert result["remote_confirmed_count"] == 0
+        assert not any(a["type"] == "retain_remote_parent_state_inconsistent" for a in result["alerts"])
+        assert result["alerts"]
+
+
 def test_fetch_operation_uses_configured_bank_and_rejects_other_task_type(
     tmp_path: Path,
 ) -> None:
