@@ -1061,7 +1061,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             sanitized_env = build_subprocess_env()
             sanitized_env.pop("HERMES_SESSION_ID", None)
             if qcmd.get("session_env") is True:
-                key = build_session_key(source)
+                # Use the same profile namespace and group/thread policy as the
+                # routing store; bare build_session_key() defaults to the root bot.
+                key = self._session_key_for_source(source)
                 peek = getattr(self.session_store, "peek_session_id", None)
                 if peek is None:
                     peek = getattr(getattr(self, "async_session_store", None), "peek_session_id", None)

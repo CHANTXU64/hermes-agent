@@ -156,23 +156,22 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
     from tools.environments.local_pythonpath import (
         _strip_hermes_owned_pythonpath, _validated_runtime_venv, _same_path,
     )
-    _runtime_path = None
+    _runtime_paths = []
     if child_python == sys.executable:
+        from pathlib import Path
+        from pm.environments import activated_site_packages, site_packages
+        owned = list(activated_site_packages(Path(__file__).resolve().parents[1]))
         runtime_venv = _validated_runtime_venv(child_env)
         if runtime_venv is not None:
-            from pathlib import Path
-            from pm.environments import site_packages
-            candidate = site_packages(runtime_venv)
-            # Restore only a dependency path the launcher actually supplied, not a newly
-            # selected generation that this still-running interpreter has never loaded.
-            if any(_same_path(Path(entry), candidate)
-                   for entry in child_env.get("PYTHONPATH", "").split(os.pathsep) if entry):
-                _runtime_path = str(candidate)
+            owned.append(site_packages(runtime_venv))
+        # The same interpreter still needs its boot dependencies after a PM update.
+        # Restore only producer-owned paths actually inherited from the launcher;
+        # never inject a newly selected generation this process has not loaded.
+        _runtime_paths = [entry for entry in child_env.get("PYTHONPATH", "").split(os.pathsep)
+                          if entry and any(_same_path(Path(entry), path) for path in owned)]
     _strip_hermes_owned_pythonpath(child_env)
     _existing_pp = child_env.get("PYTHONPATH", "")
-    _pp_parts = [tmpdir]
-    if _runtime_path is not None:
-        _pp_parts.append(_runtime_path)
+    _pp_parts = [tmpdir, *_runtime_paths]
     if _uses_hermes_python_environment(child_python):
         _pp_parts.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     elif child_python not in _external_env_logged:

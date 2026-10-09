@@ -109,6 +109,11 @@ def _get_hermes_site_packages(env: dict) -> list[Path]:
         local._hermes_site_packages = list(result)
     result = list(local._hermes_site_packages)
 
+    # PM store Python keeps sys.prefix unchanged. Its boot generation is
+    # producer-owned even after an updater selects a different generation.
+    from pm.environments import activated_site_packages
+    result.extend(activated_site_packages(Path(__file__).resolve().parents[2]))
+
     runtime_venv = _validated_runtime_venv(env)
     if runtime_venv is not None:
         from pm.environments import site_packages

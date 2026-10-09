@@ -17,6 +17,20 @@ from pathlib import Path
 from hermes_constants import get_default_hermes_root, project_venv_dir
 
 
+# Producer-owned provenance, not the mutable on-disk selection. A long-lived
+# process keeps its boot generation after another process publishes an update.
+_ACTIVATED_SITE_PACKAGES: dict[Path, tuple[Path, ...]] = {}
+
+
+def activated_site_packages(project_root: Path) -> tuple[Path, ...]:
+    """Dependency paths this process actually activated for this checkout.
+
+    Child-environment scrubbers must still recognize them after PM's selection
+    changes. Never infer ownership from arbitrary sys.path/PYTHONPATH entries.
+    """
+    return _ACTIVATED_SITE_PACKAGES.get(Path(project_root).resolve(), ())
+
+
 def install_key(project_root: Path) -> str:
     canonical = str(Path(project_root).resolve())
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
@@ -494,6 +508,9 @@ def activate_dependencies(project_root: Path) -> None:
     site.addsitedir(str(selected))
     sys.path[:] = [str(project_root.resolve()), str(selected),
                    *[entry for entry in sys.path if Path(entry).resolve() != selected.resolve()]]
+    owner = project_root.resolve()
+    _ACTIVATED_SITE_PACKAGES[owner] = tuple(dict.fromkeys(
+        (*_ACTIVATED_SITE_PACKAGES.get(owner, ()), selected)))
     os.environ["PYTHONPATH"] = os.pathsep.join([str(project_root.resolve()), str(selected)])
     os.environ.pop("VIRTUAL_ENV", None)
     # The venv's own `hermes`/`hermes-acp` console scripts are editable installs bound to

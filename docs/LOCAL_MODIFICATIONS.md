@@ -36,6 +36,38 @@ Validation after a merge:
 
 ## Active modifications
 
+### Subprocess dependency isolation across PM updates
+
+- ID: `subprocess-runtime-isolation`
+- Status: active
+- Depends on: none
+- Source boundary: logical-only (existing PM activation and child-environment seams)
+
+Files / touchpoints:
+- `pm/environments.py` — record dependency paths actually activated by this process, scoped to the checkout.
+- `tools/environments/local_pythonpath.py` — strip activated dependencies as well as the current selection from external child environments.
+- `tools/code_execution_env.py` — preserve inherited boot dependencies when the code child uses the same interpreter; do not inject an unactivated generation.
+- `tests/tools/test_pythonpath_generation_rollover.py` — generation rollover, path preservation, launcher variants and real spawned-child imports.
+
+Intent / invariants:
+- A long-lived Gateway must not leak its previous PM generation into external Python children after another process publishes an update. Preserve unrelated user paths, order, duplicates and empty components; infer ownership from PM activation, not path-name or Python-version heuristics.
+- Same-interpreter code execution must retain its inherited boot dependencies. No Profile-specific branch, credential-policy change, retain-command rewrite or runtime restart is part of this fix.
+- Existing processes do not acquire the new activation record retroactively; they must load this code on a separately authorized restart before this protection applies.
+
+Merge decision:
+- Preserve when: upstream cleanup only recognizes the current on-disk generation.
+- Drop when: an upstream replacement satisfies the rollover and same-interpreter contracts and is accepted by the user.
+- Ask user when: upstream changes dependency activation ownership or child-interpreter selection semantics.
+
+Verification:
+```bash
+scripts/run_tests.sh tests/tools/test_pythonpath_generation_rollover.py tests/tools/test_local_env_blocklist.py tests/tools/test_build_subprocess_env.py tests/tools/test_hermes_subprocess_env.py tests/tools/test_code_execution.py tests/tools/test_code_execution_pm_runtime.py tests/pm/test_runtime_selection.py tests/fork/test_gateway_quick_command_session_env.py
+```
+
+- Upstream status: fork-only
+- Last validated: inspected upstream `73162b00eefde3794bed0afb53d84a19c0eed230`; Fork base `506318777b838e09bbbfe0d7618f601b385e0ea0` plus working changes. Focused 17-file suite: 242 passed, 7 platform skips; no full-suite or live-service validation. Installed-dependency contrast: both old generations fail before / pass after; current generation and same-interpreter children pass.
+- Feature docs: none — small existing-boundary patch; change and verification record: `docs/CHANTXU64/subprocess-runtime-isolation/changes.jsonl`.
+
 ### Langfuse per-request Fast evidence and native timing
 
 - ID: `langfuse-request-telemetry`
@@ -843,8 +875,9 @@ Upstream status: fork-only feature retired; official Hindsight tools and automat
 Files / touchpoints:
 
 - `fork_features/hindsight_retain/__init__.py` — package marker for the delayed-Retain feature.
-- `gateway/run.py` — upstream Gateway Quick Command exec seam
+- `gateway/run_inbound.py` — upstream Gateway Quick Command exec seam; reuses `GatewayRunner._session_key_for_source()` for the routing namespace and group/thread policy
 - `tests/fork/test_gateway_quick_command_session_env.py` — Fork-owned behavior and cross-route concurrency coverage
+- `tests/fork/test_quick_command_multiplex_routing.py` — real SessionStore and spawned-child coverage for one chat across profiles, missing mappings, group/thread policy and async lookup
 - `fork_features/hindsight_retain/retain_integrity.py` — Fork-owned delayed Retain scheduler, writer, receipt scanner, and remote verifier
 - `fork_features/hindsight_retain/langfuse_hindsight_export.py` — Fork-owned Langfuse candidate exporter with request-time cutoff filtering
 - `tests/fork/test_hindsight_retain_integrity.py` and `tests/fork/test_langfuse_hindsight_export.py` — Fork-owned Retain/exporter regression coverage
@@ -853,7 +886,7 @@ Files / touchpoints:
 Intent / invariants:
 
 - A config-defined Gateway `type: exec` Quick Command can opt in only with the strict boolean `session_env: true`; only that command receives the active durable Hermes session ID as `HERMES_SESSION_ID`. Strings, numbers, false, null, and an absent key do not opt in.
-- Gateway resolves the current message's complete route key through the existing `SessionStore` map; it must not create a session, choose a recent session, or fall back across platform, chat/thread/topic, or profile boundaries.
+- Gateway resolves the current message's complete route key through the existing `SessionStore` map; it must not create a session, choose a recent session, or fall back across platform, chat/thread/topic, or profile boundaries. Use the existing runner/store key resolver, not `build_session_key(source)` with defaults: default arguments discard the Profile namespace and configured group/thread policy.
 - Every Gateway Quick Command child env first drops any process-global `HERMES_SESSION_ID`; strict opt-in then adds the exact mapped session only to that child dictionary. The implementation must never mutate process-global `os.environ`, so concurrent channels and profiles cannot overwrite one another.
 - Commands without `session_env: true` receive no Hermes session ID and otherwise preserve upstream Quick Command behavior. A session-aware command with no current mapping fails before spawning its child process. CLI, TUI, and Desktop remain outside this Gateway-only unit and are not modified by it.
 - `/retain` calls the Fork-owned `schedule` command. It validates the configured Bank, records a lock-protected, append-only, fsynced `scheduled` receipt containing the exact triggering session, request-time cutoff, and `due_at=requested_at+1200s`, then starts a detached child with closed stdio and returns `status=scheduled` immediately. The CLI keeps JSON as its default machine-readable output; the profile-local Gateway Quick Command explicitly selects `--output-format text`, which turns schedule success or failure into a concise user-facing receipt instead of exposing raw JSON in chat. The user explicitly chose this simple non-durable worker: Gateway or machine shutdown can lose it; no Cron, replay, or restart recovery is added. The scanner reports a high alert when a scheduled attempt is past due plus grace and has no `started` receipt.
