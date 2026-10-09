@@ -63,7 +63,8 @@ def test_mutation_uses_public_store_transaction_after_audit_initialization() -> 
 
         def apply(self, operations, *, batch=False):
             events.append(("apply", operations))
-            return {"success": True, "message": "Entry replaced."}
+            return {"success": True, "message": "Entry replaced.",
+                    "replaced_entry": "old durable entry"}
 
         def entries(self):
             return ["new durable entry"]

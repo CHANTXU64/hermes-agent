@@ -30,6 +30,11 @@ def test_memory_alias_persists_with_content_precedence(tmp_path, monkeypatch):
     ctx = InlineToolContext(effective_task_id="task-1", tool_call_id="call-1")
 
     def call(**args):
+        audit = {"reason": "exercise inline memory writes", "evidence": "test fixture"}
+        if "operations" in args:
+            args["operations"] = [{**audit, **op} for op in args["operations"]]
+        else:
+            args = {**audit, **args}
         return json.loads(INLINE_TOOL_EXECUTORS["memory"](agent, args, ctx))
 
     assert call(action="add", target="user", content="Household owns an estate.")["success"]

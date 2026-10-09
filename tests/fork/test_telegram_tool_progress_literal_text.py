@@ -14,7 +14,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.run import _tool_progress_delivery_metadata
 from gateway.run_turn_runner import TurnRunner
 from plugins.platforms.telegram.adapter import TelegramAdapter
-import tools.terminal_tool  # noqa: F401 - register the terminal progress emoji
+import tools.terminal_tool  # register the terminal progress emoji
 
 
 RAW_PROGRESS = "```|code_block ||hidden||"
@@ -42,7 +42,7 @@ def _build_terminal_progress(command: str, *, mode: str = "all"):
         progress_mode=mode,
         progress_queue=queue.Queue(),
     )
-    runner = SimpleNamespace(_adapter_for_source=lambda _source: adapter)
+    runner = SimpleNamespace(_delivery_adapter_for=lambda _source: adapter)
     turn_runner = TurnRunner(cast(Any, runner), cast(Any, context))
     message = turn_runner._progress_build_message(
         "terminal", command, {"command": command}
@@ -53,10 +53,33 @@ def _build_terminal_progress(command: str, *, mode: str = "all"):
 def test_telegram_terminal_progress_is_one_compact_literal_line():
     message, context = _build_terminal_progress("printf one\nprintf two")
 
-    assert message == "💻 terminal: printf one printf two"
+    assert message == "💻 Running printf one printf two"
     assert "```" not in message
     assert "\n" not in message
     assert context.last_was_terminal_block == [False]
+
+
+@pytest.mark.parametrize("mode", ["all", "new"])
+@pytest.mark.parametrize("language,label", [("zh", "运行命令"), ("en", "Running")])
+def test_telegram_literal_terminal_uses_friendly_localized_label(monkeypatch, mode, language, label):
+    from agent.display import set_friendly_tool_labels
+
+    monkeypatch.setenv("HERMES_LANGUAGE", language)
+    set_friendly_tool_labels(True)
+    message, _ = _build_terminal_progress("printf '||literal||'", mode=mode)
+    assert message == f"💻 {label} printf '||literal||'"
+
+
+def test_telegram_literal_terminal_respects_disabled_friendly_labels(monkeypatch):
+    from agent.display import set_friendly_tool_labels
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+    set_friendly_tool_labels(False)
+    try:
+        message, _ = _build_terminal_progress("printf ok")
+        assert message == "💻 terminal: printf ok"
+    finally:
+        set_friendly_tool_labels(True)
 
 
 def test_telegram_terminal_progress_verbose_does_not_generate_a_fenced_block():

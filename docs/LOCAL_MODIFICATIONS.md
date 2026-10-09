@@ -913,7 +913,7 @@ Files / touchpoints:
 - `tests/fork/test_telegram_quick_command_menu.py` — config-to-menu and real adapter registration seam
 
 Intent / invariants:
-- Telegram menus include valid config-defined `exec` and `alias` Quick Commands without executing them. Only literal `[a-z0-9_]{1,32}` names are published: no sanitization/truncation that would break exact execution lookup. Malformed entries are skipped; descriptions use the configured text or a generic fallback, never the shell command or alias target.
+- Telegram menus include valid config-defined `exec` and `alias` Quick Commands without executing them. Only literal `[a-z0-9_]{1,32}` names are published: no sanitization/truncation that would break exact execution lookup. Malformed entries are skipped; descriptions preserve the configured text or reuse the existing localized `Run /{name}` fallback, never the shell command or alias target. User-authored descriptions are not automatically translated.
 - Built-in names and aliases retain precedence; same-name quick commands do not duplicate or replace their menu entry. Quick Commands precede colliding plugins/skills, matching dispatch. Explicit menu priorities and upstream common-command priorities remain first, then configured Quick Commands before unprioritized built-ins/plugins/skills. Existing menu cap and hidden-count behavior remain shared.
 - Default/private/group/forum registration all use the same generator. Discovery uses the current Hermes home's read-only config loader; no global bot registration, command execution, permission, restart, Retain, CLI/TUI/Desktop or other-platform behavior is changed. Menu refresh follows the existing adapter registration lifecycle, not a new hot-reload mechanism.
 
@@ -1427,9 +1427,11 @@ What changed:
 - A fork-protection test keeps the Telegram-only metadata contract and literal
   send/edit behavior visible during future upstream merges.
 - `TurnRunner` excludes Telegram from the generic fenced terminal-block path.
-  Telegram terminal command previews normalize whitespace while retaining the
-  `terminal` tool label, so multi-line shell commands remain one persistent
-  status line (for example, `💻 terminal: set -euo pipefail ...`).
+  Telegram terminal command previews normalize whitespace and use the shared
+  localized friendly label (for example, `💻 运行命令 set -euo pipefail ...`).
+  Disabling friendly labels retains `terminal:`, and multi-line shell commands
+  remain one persistent literal status line. This does not alter upstream-only
+  tools' fallback labels or the technical verbose-mode format.
 - Other Markdown-capable platforms retain their existing fenced terminal
   progress rendering, including full-command verbose mode and consecutive-call
   header collapsing.
@@ -1961,6 +1963,8 @@ Files:
 - `tests/agent/test_memory_write_bridge.py`
 - `tests/fork/test_memory_changelog_governance.py`
 - `tests/fork_features/test_memory_governance_boundary.py`
+- `tests/fork_features/test_memory_audit_store_receipts.py`
+- `tests/agent/test_inline_tool_executors_memory_args.py`
 - `tests/tools/test_memory_tool.py`
 - `tests/tools/test_memory_tool_schema.py`
 - `tests/tools/test_write_approval.py`
@@ -1998,6 +2002,11 @@ What changed:
   checked disk snapshot is required before mutation. Journal failures roll back
   the write; if a non-cooperating manual writer changed the file again, the newer
   bytes are preserved instead of being erased by a stale rollback.
+- Audit tracing consumes the Store's actual `replaced_entry` / `removed_entry`
+  or 1-based batch receipt maps, not an independent `old_text` search. Preserve
+  tolerant matching, whole-entry priority, approval-pinned targets, and sequential
+  batch receipts. Missing/inconsistent receipts or a reconstructed final state
+  different from the Store state enter the same audit-failure rollback path.
 - Sequential and concurrent live dispatch both forward single-operation
   governance metadata.
 - Background memory review receives only the latest on-disk `MEMORY.md` and

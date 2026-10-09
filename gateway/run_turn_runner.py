@@ -301,6 +301,9 @@ class TurnRunner:
                 cap = self._preview_cap()
                 if len(compact) > cap:
                     compact = compact[:cap - 3] + "..."
+                from agent.display import get_tool_verb, tool_verb_connector
+                if verb := get_tool_verb(tool_name):
+                    return f"{emoji} {verb}{tool_verb_connector(tool_name)}{compact}"
                 return f"{emoji} {tool_name}: {compact}"
         if not preview:
             return t("gateway.progress.tool_pending", emoji=emoji, tool=tool_name)

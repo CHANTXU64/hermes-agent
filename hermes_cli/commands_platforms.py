@@ -303,7 +303,7 @@ def _telegram_quick_command_entries() -> list[tuple[str, str]]:
             continue
         desc = meta.get("description")
         desc = " ".join(desc.split()) if isinstance(desc, str) else ""
-        entries.append((name, _truncate_desc(desc or "Custom quick command", 40)))
+        entries.append((name, _truncate_desc(desc or t("slash.shared.plugin_default_desc", name=name), 40)))
     return entries
 
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable
 
 from fork_features.memory_audit import MEMORY_HISTORY_MAX_CHARS, MemoryAuditSink
 
@@ -22,7 +22,7 @@ GOVERNANCE_METADATA_FIELDS = (
 )
 
 
-def forwarded_memory_kwargs(arguments: Dict[str, Any]) -> Dict[str, Any]:
+def forwarded_memory_kwargs(arguments: dict[str, Any]) -> dict[str, Any]:
     """Return the public governance kwargs shared by both live dispatch paths."""
     return {field: arguments.get(field) for field in GOVERNANCE_METADATA_FIELDS}
 
@@ -30,8 +30,8 @@ def forwarded_memory_kwargs(arguments: Dict[str, Any]) -> Dict[str, Any]:
 def build_review_context(
     memory_dir: Path,
     *,
-    read_entries_checked: Callable[[Path], tuple[List[str], bool]],
-    sanitize_entries: Callable[[List[str], str], List[str]],
+    read_entries_checked: Callable[[Path], tuple[list[str], bool]],
+    sanitize_entries: Callable[[list[str], str], list[str]],
 ) -> str:
     """Render sanitized live MEMORY/USER state as inert JSON data."""
 
@@ -66,13 +66,13 @@ class MemoryGovernance:
         self,
         audit: MemoryAuditSink,
         *,
-        read_failed_error: Callable[[Any], Dict[str, Any]],
+        read_failed_error: Callable[[Any], dict[str, Any]],
     ) -> None:
         self.audit = audit
         self._read_failed_error = read_failed_error
 
     @staticmethod
-    def normalize_operation(op: Dict[str, Any]) -> Dict[str, Any]:
+    def normalize_operation(op: dict[str, Any]) -> dict[str, Any]:
         """Normalize and validate audit metadata for one public mutation."""
         normalized = dict(op or {})
         action = str(normalized.get("action") or "").strip()
@@ -125,12 +125,12 @@ class MemoryGovernance:
 
     @classmethod
     def normalize_operations(
-        cls, operations: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+        cls, operations: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         return [cls.normalize_operation(operation) for operation in operations]
 
     @staticmethod
-    def metadata(operation: Dict[str, Any]) -> Dict[str, Any]:
+    def metadata(operation: dict[str, Any]) -> dict[str, Any]:
         return {
             field: operation.get(field)
             for field in GOVERNANCE_METADATA_FIELDS
@@ -139,15 +139,15 @@ class MemoryGovernance:
 
     @staticmethod
     def trace_changes(
-        before_entries: List[str], operations: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Recover exact before/after entries for successful operations."""
+        before_entries: list[str], operations: list[dict[str, Any]],
+        result: dict[str, Any], after_entries: list[str], *, batch: bool,
+    ) -> list[dict[str, Any]]:
+        """Journal Store-selected entries, never reimplement its matching rules."""
         working = list(before_entries)
-        traces: List[Dict[str, Any]] = []
-        for op in operations:
+        traces: list[dict[str, Any]] = []
+        for position, op in enumerate(operations, 1):
             action = op.get("action")
-            content = (op.get("content") or "").strip()
-            old_text = (op.get("old_text") or "").strip()
+            content = (op.get("content") or op.get("new_text") or "").strip()
             before = None
             after = None
             if action == "add":
@@ -156,27 +156,28 @@ class MemoryGovernance:
                 working.append(content)
                 after = content
             elif action in {"replace", "remove"}:
-                matches = [i for i, entry in enumerate(working) if old_text in entry]
-                if not matches:
-                    continue
-                index = matches[0]
-                before = working[index]
+                field = "replaced" if action == "replace" else "removed"
+                before = (result[f"{field}_entries"][position] if batch
+                          else result[f"{field}_entry"])
+                index = working.index(before)
                 if action == "replace":
                     working[index] = content
                     after = content
                 else:
                     working.pop(index)
             traces.append({**op, "before": before, "after": after})
+        if working != after_entries:
+            raise ValueError("Memory change receipts do not match the committed entries.")
         return traces
 
     def apply(
         self,
         store: Any,
         target: str,
-        operations: List[Dict[str, Any]],
+        operations: list[dict[str, Any]],
         *,
         batch: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Apply one Store transaction and journal its exact semantic delta.
 
         ``batch`` preserves the caller's request shape: a one-item ``operations``
@@ -217,8 +218,11 @@ class MemoryGovernance:
             after = list(transaction.entries())
             if before == after:
                 return result
-            traces = self.trace_changes(before, normalized)
             try:
+                traces = self.trace_changes(
+                    before, normalized, result, after,
+                    batch=batch or len(normalized) != 1,
+                )
                 self.audit.append(target, traces)
             except Exception as exc:
                 current, read_ok = transaction.read_current_checked()
@@ -255,7 +259,7 @@ class MemoryGovernance:
                 }
             return result
 
-    def history(self, store: Any, target: str, old_text: str) -> Dict[str, Any]:
+    def history(self, store: Any, target: str, old_text: str) -> dict[str, Any]:
         """Return only bounded audit lineage for one current Store entry."""
         old_text = old_text.strip()
         if not old_text:
@@ -281,7 +285,7 @@ class MemoryGovernance:
             history, matched_records, truncated = self.audit.history_for(
                 target, current_entry
             )
-        except (OSError, IOError, UnicodeDecodeError, ValueError) as exc:
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
             return {"success": False, "error": f"Could not read memory history: {exc}"}
         return {
             "success": True,
@@ -393,7 +397,7 @@ COMBINED_MEMORY_REVIEW_PREFIX = (
     "loss remains recoverable in the structured audit log.\n\n"
 )
 
-def build_memory_schema() -> Dict[str, Any]:
+def build_memory_schema() -> dict[str, Any]:
     """Return the exact Fork public schema for the built-in memory tool."""
     return {
         "name": "memory",

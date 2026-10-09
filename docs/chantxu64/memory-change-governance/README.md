@@ -47,6 +47,12 @@ memory autonomous while making every public memory mutation traceable.
   pre-load trigger may remain when it is needed to select the right Skill.
 - Both live tool-dispatch paths forward single-operation governance metadata;
   batch approval staging/replay retains the same metadata.
+- Tracing uses the Store's committed `replaced_entry` / `removed_entry` or
+  1-based `replaced_entries` / `removed_entries` results. It must not repeat
+  `old_text` matching: tolerant typography, exact-entry precedence, and approval
+  pinning belong to the Store. Replay these receipts in operation order and
+  compare with the final Store entries before appending; missing or inconsistent
+  receipts trigger the existing audit-failure rollback protection.
 - When a memory may duplicate a Skill, review must inspect the actual Skill with
   `skill_view`. A short pre-load trigger may remain in memory even when the full
   procedure lives in the Skill.
@@ -125,17 +131,19 @@ adds SOUL files to background memory context.
 ## Verification
 
 ```bash
-./venv/bin/python -m pytest -q -o 'addopts=' \
+scripts/run_tests.sh \
   tests/agent/test_prompt_builder.py \
   tests/agent/test_memory_write_bridge.py \
   tests/fork/test_memory_changelog_governance.py \
   tests/fork_features/test_memory_governance_boundary.py \
+  tests/fork_features/test_memory_audit_store_receipts.py \
+  tests/agent/test_inline_tool_executors_memory_args.py \
   tests/tools/test_memory_tool.py \
   tests/tools/test_memory_tool_schema.py \
   tests/tools/test_write_approval.py \
-  tests/run_agent/test_run_agent.py::TestExecuteToolCalls \
-  tests/run_agent/test_background_review_cache_parity.py \
-  tests/run_agent/test_background_review_toolset_restriction.py \
-  tests/test_background_review_list_shapes.py \
-  tests/test_background_review_session_isolation.py
+  tests/agent/test_run_agent.py \
+  tests/agent/test_background_review_cache_parity.py \
+  tests/agent/test_background_review_toolset_restriction.py \
+  tests/agent/test_background_review_list_shapes.py \
+  tests/hermes_state/test_background_review_session_isolation.py
 ```

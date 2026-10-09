@@ -63,12 +63,25 @@ def test_quick_menu_preserves_dispatch_names_and_core_precedence(tmp_path, monke
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({"quick_commands": quick}))
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_commands", lambda: {
         "valid_name": {"description": "Plugin must not replace the quick command"}})
-    monkeypatch.setattr("agent.skill_commands.get_skill_commands", lambda: {})
+    monkeypatch.setattr("agent.skill_commands.get_skill_commands", dict)
     menu, _ = menus.telegram_menu_commands(max_commands=100)
     names = [name for name, _ in menu]
     assert names.count("restart") == 1
     assert dict(menu)["restart"] != "Wrong"
     assert "reset" not in names
-    assert dict(menu)["valid_name"] == "Custom quick command"
+    assert dict(menu)["valid_name"] == "Run /valid_name"
     assert len(dict(menu)["long_desc"]) == 40
     assert not ({"bad_name", "upper", "x" * 32, "empty", "badtype", "malformed"} & set(names))
+
+
+@pytest.mark.parametrize("language,default", [("zh", "运行 /disk"), ("en", "Run /disk")])
+def test_quick_menu_localizes_fallback_but_preserves_user_description(tmp_path, monkeypatch, language, default):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_LANGUAGE", language)
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"quick_commands": {
+        "disk": {"type": "exec", "command": "exit 99"},
+        "retain": {"type": "exec", "command": "exit 99", "description": "20 分钟后保存会话到长期记忆"},
+    }}), encoding="utf-8")
+    menu = dict(menus._telegram_quick_command_entries())
+    assert menu["disk"] == default
+    assert menu["retain"] == "20 分钟后保存会话到长期记忆"
