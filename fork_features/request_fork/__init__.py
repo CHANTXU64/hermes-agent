@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextvars
 import copy
+import json
 import logging
 import os
 import time
@@ -187,10 +188,17 @@ class CurrentRequestFork:
         *,
         append_message: Mapping[str, Any],
         request_id: str,
+        prefer_fast: bool = False,
     ) -> RequestForkResult:
+        """Optionally request supported Fast pricing for this call, never the parent.
+
+        Eligibility uses the captured provider and the owned SDK client's actual
+        endpoint. Unsupported/unknown routes keep the frozen request unchanged.
+        """
         from agent.codex_runtime import run_codex_stream
         from agent.error_classifier import FailoverReason, classify_api_error
         from agent.retry_utils import jittered_backoff
+        from agent.request_telemetry import service_parameters
 
         retryable_reasons = {
             FailoverReason.timeout,
@@ -213,16 +221,74 @@ class CurrentRequestFork:
                 model=str(api_kwargs.get("model") or ""),
             )
             owned_client = self._template.client_factory()
+            service_evidence = {
+                "request_id": str(request_id or "request-fork"), "network_attempt": attempt,
+                "result": "failed", "fast_decision": "not_evaluated", "request_observed": False,
+                "requested_service_tier": None, "requested_speed": None,
+                "response_service_tier": None, "response_speed": None,
+            }
+
+            def observe_request(body: Mapping[str, Any]) -> None:
+                parameters = service_parameters(body, request=True)
+                service_evidence.update(
+                    request_observed=True,
+                    requested_service_tier=parameters.get("service_tier"),
+                    requested_speed=parameters.get("speed"),
+                )
+
             try:
+                if prefer_fast:
+                    from hermes_cli.models import resolve_fast_mode_overrides
+
+                    base_url = str(getattr(owned_client, "base_url", "") or "")
+                    overrides = resolve_fast_mode_overrides(
+                        api_kwargs.get("model"), provider=self._template.provider,
+                        base_url=base_url,
+                    ) if base_url else None
+                    service_evidence["fast_decision"] = "enabled" if overrides else "unsupported_or_unknown"
+                    if overrides:
+                        # extra_body wins at the SDK boundary; override both copies
+                        # without mutating the frozen request or parent settings.
+                        extra_body = api_kwargs.setdefault("extra_body", {})
+                        if "speed" in overrides:
+                            import httpx
+                            from agent.anthropic_adapter import _FAST_MODE_BETA
+
+                            extra_body.update(overrides)
+                            headers = httpx.Headers(api_kwargs.get("extra_headers") or {})
+                            default_headers = httpx.Headers(owned_client.default_headers)
+                            betas = [b.strip() for b in headers.get(
+                                "anthropic-beta", default_headers.get("anthropic-beta", ""),
+                            ).split(",") if b.strip()]
+                            if _FAST_MODE_BETA not in betas:
+                                betas.append(_FAST_MODE_BETA)
+                            headers["anthropic-beta"] = ",".join(betas)
+                            api_kwargs["extra_headers"] = dict(headers)
+                        else:
+                            api_kwargs.update(overrides)
+                            for name, value in overrides.items():
+                                if name in extra_body:
+                                    extra_body[name] = value
                 mode = self._template.frozen_request.api_mode
                 if mode == "codex_responses":
-                    response = run_codex_stream(runtime, api_kwargs, client=owned_client)
+                    response = run_codex_stream(
+                        runtime, api_kwargs, client=owned_client,
+                        **({"on_physical_request": observe_request} if prefer_fast else {}),
+                    )
                 else:
                     from .message_protocols import send_messages
 
+                    if prefer_fast:
+                        observe_request(api_kwargs)
                     response = send_messages(
                         owned_client, api_kwargs, mode=mode,
                         progress=self._template.progress_callback,
+                    )
+                if prefer_fast:
+                    parameters = service_parameters(response)
+                    service_evidence.update(
+                        result="returned", response_service_tier=parameters.get("service_tier"),
+                        response_speed=parameters.get("speed"),
                     )
                 normalized = self._template.normalize_response(response)
                 content = getattr(normalized, "content", None)
@@ -276,6 +342,8 @@ class CurrentRequestFork:
                 )
                 time.sleep(wait_time)
             finally:
+                if prefer_fast:
+                    logger.warning("request Fork service %s", json.dumps(service_evidence, ensure_ascii=True))
                 self._template.client_close(owned_client)
 
         raise RuntimeError("request Fork attempt loop exited without a result")

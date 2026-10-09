@@ -2765,6 +2765,7 @@ Files:
 - `hermes_cli/plugins.py`
 - `fork_features/hindsight_retain/langfuse_hindsight_export.py`
 - `tests/fork_features/test_current_request_fork.py`
+- `tests/fork_features/test_request_fork_fast.py` — request-local Fast eligibility, isolation, headers and retry contracts.
 - `tests/fork_features/test_compression_lifecycle.py`
 - `tests/fork_features/test_prepared_request.py`
 - `tests/fork_features/test_long_task_continuity_hooks.py`
@@ -2850,6 +2851,23 @@ What changed:
   rerun chat conversion, request build, transport preflight,
   plugin middleware, tools, transcript persistence, Memory, Retain, or normal
   parent-request hooks.
+- `CurrentRequestFork.call(prefer_fast=True)` opts only that isolated call into
+  Hermes' shared Fast eligibility gate, using the frozen provider and actual owned
+  SDK endpoint. The continuity plugin opts in on every checkpoint/validation retry;
+  ordinary callers retain the default `False`. Unsupported models, custom/proxy
+  routes and unknown endpoints keep their original request parameters. Eligible
+  requests override SDK `extra_body` tier conflicts; Anthropic adds the required
+  Fast beta without losing effective existing beta headers. Parent model, reasoning,
+  prefix, tools, settings and compression-summary requests remain unchanged. Fast
+  intent is not proof of provider-served tier. Opt-in calls emit one WARNING
+  `request Fork service {JSON}` per host attempt with the same request ID and
+  retry number. Reuse `agent.request_telemetry.service_parameters` for outgoing
+  SDK-boundary parameters (Codex physical-request callback) and raw SDK response
+  tier/speed. Keep missing response evidence null, record failed attempts, and
+  never log bodies, headers or credentials. Verify with
+  `tests/fork_features/test_request_fork_fast.py` and the standalone plugin's
+  `tests/test_fast_checkpoint.py` (registered hooks through all three native SDK
+  HTTP paths, including validation retry; offline only).
 - Automatic compression for these three protocols defers only the continuity-aware pending
   trigger until the parent request has completed normal request-only context,
   cache decoration, request build, sanitization, transport preflight, and
