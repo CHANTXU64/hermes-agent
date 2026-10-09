@@ -92,6 +92,7 @@ test('a local-STT turn submits the voice-origin marker, not the bare transcript'
   })
 
   expect(onSubmit).toHaveBeenCalledWith(
-    '[The user sent a voice message~ Here\'s what they said: "check the auth log"]'
+    '[The user sent a voice message~ Here\'s what they said: "check the auth log"]',
+    { voiceTurn: true }
   )
 })

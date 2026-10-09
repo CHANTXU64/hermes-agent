@@ -41,11 +41,6 @@ def _configure_smart_deny(monkeypatch, *, session_key: str, turn_id: str = "turn
         "detect_dangerous_command",
         lambda command: (True, "repeat-test-danger", f"risk:{command}"),
     )
-    monkeypatch.setattr(
-        "tools.tirith_security.check_command_security",
-        lambda _command: {"action": "allow", "findings": [], "summary": ""},
-        raising=False,
-    )
     session_token = approval_context.set_current_session_key(session_key)
     context_tokens = approval_context.set_current_observability_context(turn_id=turn_id)
     return session_token, context_tokens

@@ -406,7 +406,7 @@ class _MockHandler(BaseHTTPRequestHandler):
     captured_requests: list = []
     response_queue: list = []
 
-    def do_POST(self):  # noqa: N802 (http.server API)
+    def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(length).decode())
         type(self).captured_requests.append(req)
@@ -1062,7 +1062,7 @@ class TestMaxIterationsSummaryReplay:
             {"role": "assistant", "content": "a1"},
         ]
         with patch.object(
-            agent, "_ensure_primary_openai_client", return_value=client
+            agent, "_create_request_openai_client", return_value=client
         ):
             out = handle_max_iterations(agent, messages, 5)
 
@@ -1091,14 +1091,9 @@ class TestMaxIterationsSummaryReplay:
         agent._cached_system_prompt = "SYS"
         captured = {}
 
-        class _Completions:
-            def create(self, **kwargs):
-                captured.update(kwargs)
-                return "RAW-RESPONSE"
-
-        client = types.SimpleNamespace(
-            chat=types.SimpleNamespace(completions=_Completions())
-        )
+        def request(kwargs):
+            captured.update(kwargs)
+            return "RAW-RESPONSE"
         transport = types.SimpleNamespace(
             build_kwargs=lambda **kwargs: {"messages": kwargs["messages"]},
             normalize_response=lambda _r: types.SimpleNamespace(
@@ -1111,7 +1106,7 @@ class TestMaxIterationsSummaryReplay:
         ]
 
         with patch.object(
-            agent, "_ensure_primary_openai_client", return_value=client
+            agent, "_interruptible_api_call", side_effect=request
         ), patch.object(agent, "_get_transport", return_value=transport):
             out = handle_max_iterations(
                 agent,

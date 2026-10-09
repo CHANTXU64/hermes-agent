@@ -239,7 +239,7 @@ async def test_daily_restart_idle_wake_and_new_session_boundary(tmp_path, clock)
     runner._start_heartbeat_poller = lambda: None
     runner._run_in_executor_with_context = asyncio.to_thread
     adapter = LocalWire(PlatformConfig(enabled=True, typing_indicator=False), Platform("weixin"))
-    runner._adapter_for_source = lambda source: adapter
+    runner._delivery_adapter_for = lambda source: adapter
     received = []
 
     async def handler(event):

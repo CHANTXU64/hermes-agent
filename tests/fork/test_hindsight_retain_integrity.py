@@ -21,8 +21,25 @@ MODULE_PATH = (
     / "hindsight_retain"
     / "retain_integrity.py"
 )
-CHECKER_PATH = Path.home() / ".hermes" / "scripts" / "check-hermes-hindsight.py"
-HTML_MONITOR_PATH = Path.home() / ".hermes" / "scripts" / "hindsight_monitor_html.py"
+# Optional source-only snapshot of the local operational scripts. Preparing this
+# pytest cache keeps the canonical runner unchanged and does not copy live config.
+_SOURCE_FIXTURES = Path(__file__).resolve().parents[2] / ".pytest_cache" / "external-scripts"
+LOCAL_SCRIPTS_DIR = (
+    _SOURCE_FIXTURES if _SOURCE_FIXTURES.is_dir() else Path.home() / ".hermes" / "scripts"
+)
+CHECKER_PATH = LOCAL_SCRIPTS_DIR / "check-hermes-hindsight.py"
+HTML_MONITOR_PATH = LOCAL_SCRIPTS_DIR / "hindsight_monitor_html.py"
+
+
+@pytest.fixture(autouse=True)
+def isolated_legacy_home(tmp_path, monkeypatch):
+    """Legacy standalone scripts use HOME, not HERMES_HOME, for their defaults."""
+    home = tmp_path / "user-home"
+    config = home / ".hermes" / "hindsight" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"bank_id": "Hermes"}), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.syspath_prepend(str(LOCAL_SCRIPTS_DIR))
 
 
 def load_path_module(name: str, path: Path):

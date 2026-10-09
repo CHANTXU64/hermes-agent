@@ -489,6 +489,9 @@ _KANBAN_WAKE_GUIDANCE = (
     "不要重复创建已存在的任务或任务图。",
     "這是自動任務狀態通知，不是再次分解任務的請求。建立後續任務前請先檢查目前看板；"
     "不要重複建立已存在的任務或任務圖。",
+    "Ez egy automatikus feladatállapot-értesítés, nem kérés a feladat újbóli "
+    "felbontására. Nézd meg az aktuális táblát, mielőtt követő feladatokat hoznál "
+    "létre; ne hozz létre újra már létező feladatokat vagy gráfokat.",
 )
 _NON_USER_RUNTIME_CONTEXT_RE = re.compile(
     r"^<hermes-runtime-context\b"

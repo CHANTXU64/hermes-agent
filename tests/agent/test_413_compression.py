@@ -1742,7 +1742,7 @@ class TestToolResultPreflightCompression:
                 return_value=1_000,
             ),
             patch(
-                "agent.conversation_loop.estimate_messages_tokens_rough",
+                "agent.model_metadata.estimate_messages_tokens_rough",
                 side_effect=_estimate,
             ),
             patch(
@@ -1887,7 +1887,7 @@ class TestToolResultPreflightCompression:
                 return_value=1_000,
             ),
             patch(
-                "agent.conversation_loop.estimate_messages_tokens_rough",
+                "agent.model_metadata.estimate_messages_tokens_rough",
                 side_effect=_estimate,
             ),
             patch(

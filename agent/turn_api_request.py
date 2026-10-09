@@ -14,6 +14,7 @@ from typing import Any
 
 from agent.message_sanitization import sanitize_outbound_kwargs, strip_images_for_rejecting_model
 from agent.request_telemetry import service_parameters
+from hermes_cli.observability.shared_metrics_efficiency import observe_request_tools
 from utils import env_var_enabled
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -120,6 +121,7 @@ def build_api_request(
     )
     # A model that rejected image content gets text only; history keeps the images.
     strip_images_for_rejecting_model(agent, api_messages)
+    observe_request_tools(agent, tools_for_api)
     if tools_for_api == agent.tools:
         api_kwargs = agent._build_api_kwargs(api_messages)
     else:

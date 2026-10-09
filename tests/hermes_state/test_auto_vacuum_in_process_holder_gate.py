@@ -18,7 +18,15 @@ from __future__ import annotations
 
 import shutil
 
+import pytest
+
 import hermes_state_registry as registry
+
+
+@pytest.fixture(autouse=True)
+def isolated_foreign_processes(monkeypatch):
+    """Only in-process live/retired handles are under test in this module."""
+    monkeypatch.setattr("hermes_state_holders.foreign_state_db_holders", lambda _path: [])
 
 
 def _seed(path):

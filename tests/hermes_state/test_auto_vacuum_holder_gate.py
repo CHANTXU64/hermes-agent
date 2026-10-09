@@ -11,7 +11,7 @@ import sys
 
 import pytest
 
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="holder scan is unavailable on Windows")
+pytestmark = pytest.mark.platforms("posix")  # holder scan is unavailable on Windows
 
 _HOLDER = (
     "import sqlite3, sys\n"
@@ -40,11 +40,23 @@ def _auto_maintenance(db):
         min_vacuum_freelist_ratio=-1.0)
 
 
-def test_auto_vacuum_skips_while_a_foreign_process_holds_the_store(tmp_path):
+def test_auto_vacuum_skips_while_a_foreign_process_holds_the_store(tmp_path, monkeypatch):
     db = _seeded_db(tmp_path)
     holder = subprocess.Popen(
         [sys.executable, "-c", _HOLDER, str(db.db_path)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    # Keep the real holder scan and actual child descriptors, but do not enumerate
+    # unrelated developer processes whose open paths belong to the live Hermes home.
+    from types import SimpleNamespace
+    import hermes_state_holders
+    real_psutil = hermes_state_holders.psutil
+
+    def owned_processes(attrs):
+        if holder.poll() is None:
+            process = real_psutil.Process(holder.pid)
+            yield SimpleNamespace(info=process.as_dict(attrs=attrs))
+
+    monkeypatch.setattr(hermes_state_holders, "psutil", SimpleNamespace(process_iter=owned_processes))
     try:
         assert holder.stdout.readline().strip() == "ready"
         result = _auto_maintenance(db)

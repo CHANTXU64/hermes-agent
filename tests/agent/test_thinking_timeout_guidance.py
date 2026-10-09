@@ -25,16 +25,13 @@ from types import SimpleNamespace
 
 import pytest
 
-
 # ── helpers ──────────────────────────────────────────────────────────────
-
 
 class _TimeoutReason:
     """Minimal FailoverReason stand-in for unit tests."""
 
     def __init__(self, value: str = "timeout") -> None:
         self.value = value
-
 
 def _classified(reason: str = "timeout", **kwargs) -> SimpleNamespace:
     """Construct a ClassifiedError stand-in with the given reason."""
@@ -52,7 +49,6 @@ def _classified(reason: str = "timeout", **kwargs) -> SimpleNamespace:
 
 # ── Part 1: transport-disconnect classification ──
 
-
 def _make_session(disconnect_message: str, model: str, *, num_messages: int = 250):
     """Construct inputs to classify_api_error for a disconnect+large-session case."""
     e = Exception(disconnect_message)
@@ -65,7 +61,6 @@ def _make_session(disconnect_message: str, model: str, *, num_messages: int = 25
         "context_length": 200_000,
         "num_messages": num_messages,
     }
-
 
 class TestClassifierOverride:
     """Transport disconnect classification for reasoning and chat models.
@@ -169,7 +164,6 @@ class TestClassifierOverride:
 
 # ── Part 2: detection (agent/thinking_timeout_guidance.py:is_thinking_timeout) ──
 
-
 class TestIsThinkingTimeout:
 
     @pytest.mark.parametrize("model,msg", [
@@ -183,9 +177,6 @@ class TestIsThinkingTimeout:
         from agent.thinking_timeout_guidance import is_thinking_timeout
         classified = _classified(reason="timeout")
         assert is_thinking_timeout(classified, model, msg) is True
-
-
-
 
     def test_empty_error_msg_returns_false(self):
         from agent.thinking_timeout_guidance import is_thinking_timeout
@@ -201,9 +192,7 @@ class TestIsThinkingTimeout:
             classified, "nvidia/nemotron-3-ultra-550b-a55b", None,
         ) is False
 
-
 # ── Part 2: guidance text (agent/thinking_timeout_guidance.py:build_thinking_timeout_guidance) ──
-
 
 class TestBuildThinkingTimeoutGuidance:
     def test_guidance_mentions_config_path(self):
@@ -212,9 +201,3 @@ class TestBuildThinkingTimeoutGuidance:
             provider="nvidia", model="nvidia/nemotron-3-ultra-550b-a55b",
         )
         assert "providers.nvidia.models.nvidia/nemotron-3-ultra-550b-a55b.stale_timeout_seconds" in text
-
-
-
-
-
-

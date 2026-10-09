@@ -322,8 +322,6 @@ def test_real_guard_paths_use_separate_safety_findings(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
     monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr(approval_context, "_get_approval_config", lambda: {"mode": "smart"})
-    monkeypatch.setattr("tools.tirith_security.check_command_security",
-                        lambda _: {"action": "allow", "findings": [], "summary": ""})
     calls = []
     response = {}
 

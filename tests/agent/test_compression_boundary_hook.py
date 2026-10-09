@@ -167,7 +167,6 @@ class TestCompressionBoundaryHook:
 
             compressor.on_session_start.assert_not_called()
 
-
     def test_no_progress_does_not_notify(self):
         from hermes_state import SessionDB
 
@@ -188,7 +187,6 @@ class TestCompressionBoundaryHook:
 
             assert returned is messages
             compressor.on_session_start.assert_not_called()
-
 
     def test_no_hook_when_no_session_db(self):
         """Without session_db, session_id does not rotate and the hook is not fired."""
@@ -247,7 +245,6 @@ class TestCompressionBoundaryHook:
             def _raise_on_compression(*args, **kwargs):
                 if kwargs.get("boundary_reason") == "compression":
                     raise RuntimeError("plugin exploded")
-                return None
             compressor.on_session_start.side_effect = _raise_on_compression
             agent.context_compressor = compressor
 
@@ -261,7 +258,6 @@ class TestCompressionBoundaryHook:
             )
             assert compressed
             assert agent.session_id != original_sid
-
 
 class TestSessionCompressEvent:
     """The session:compress event_callback fires after a compression split."""

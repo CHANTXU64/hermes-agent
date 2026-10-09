@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.macos_only
+pytestmark = pytest.mark.platforms("macos")
 
 
 def watcher():
@@ -127,7 +127,6 @@ def test_failed_reads_pending_updates_and_missing_state_never_advance_silently(t
     state.write_bytes(before)
 
 
-@pytest.mark.macos_only
 def test_symlinks_are_not_traversed_and_missing_pending_can_be_recorded(tmp_path):
     module = watcher()
     root = tmp_path / "待办"

@@ -1,6 +1,6 @@
 """Quick-command discovery must agree with dispatch, without executing commands."""
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from hermes_cli import commands_platforms as menus
 

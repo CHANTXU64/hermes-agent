@@ -163,6 +163,14 @@ HERMES_AGENT_ROOT=<hermes checkout> HERMES_HOME=<temp dir> \
 Production ownership: normal Hindsight provider path; fork ownership is the
 Unicode behavior contract.
 
+PM compatibility boundary: the companion plugin declares its remote client/launcher
+requirements in `pyproject.toml` and prepares the complete dependency union through
+Hermes PM. A prepared environment is distinct from activation in the running process;
+report restart-needed rather than claiming that a running interpreter was upgraded.
+The old-Hermes installation fallback remains available. This migration covers the
+configured remote service only; full `local_embedded` server mode is not migrated or
+claimed compatible. Memory data, service address and Profile configuration are unchanged.
+
 ### 4. Safe command rewrite for terminal tool
 
 Date: 2026-04-21
@@ -1317,7 +1325,7 @@ replay; compatible upstream schema and content-addressed key hardening retained.
 ### 13. Multi Telegram bots in one profile (retired)
 
 - ID: `F-telegram-multi-account` (historical stable ID retained)
-- Status: obsolete
+Status: obsolete
 - Depends on: none
 - Source boundary: logical-only
 
@@ -1470,9 +1478,8 @@ Date: 2026-07-16; boundary refactored 2026-08-30
 
 Files:
 
-- `apps/desktop/src/store/clarify.ts` — choice validation (non-empty, <=200 chars after the
-  recommended-marker strip, no newlines) for the decision card.
-- `apps/desktop/src/components/assistant-ui/clarify-tool.tsx` — desktop rendering of the card.
+- `apps/desktop/src/store/clarify.ts` — upstream choice validation and recommendation metadata for the decision card.
+- `apps/desktop/src/components/assistant-ui/clarify/index.tsx` — desktop rendering of the card.
 - `fork_features/clarify_decision_card.py`
 - `tools/clarify_tool.py`
 - `gateway/run_turn_runner.py`
@@ -2377,6 +2384,15 @@ Status: active
 
 Date: 2026-08-16
 
+Current compatibility contract (fixed upstream `1e0c7730d791f5ce855c5c78935cfea6fb1e43a9`):
+- The user approved adopting the official approval architecture and retiring Tirith.
+  The removed scanner, its protocol resolver and its old tests must not be revived.
+- Preserve the Fork's current-real-user context, direct-script evidence, structured
+  Smart Approval decisions and denial/retry boundaries through the current official
+  approval entry points. Ordinary upstream approval modes and observer fields remain.
+- The original implementation and dated validation below document provenance; their
+  Tirith-specific statements are superseded by this contract, not current requirements.
+
 Files:
 
 - `pyproject.toml`
@@ -2394,7 +2410,6 @@ Files:
 - `tools/approval.py`
 - `tools/approval_context.py`
 - `tools/approval_smart.py`
-- `tools/tirith_security.py`
 - `tools/terminal_tool.py`
 - `tools/code_execution_tool.py`
 - `tests/fork_features/approval/test_policy_boundary.py`
@@ -2405,7 +2420,6 @@ Files:
 - `tests/tools/test_smart_approval_injection.py`
 - `tests/tools/test_smart_approval_policy.py`
 - `tests/tools/test_execute_code_approval_cluster.py`
-- `tests/tools/test_tirith_security.py`
 - `tests/fork_features/approval/test_script_evidence.py`
 - `tests/fork_features/approval/test_smart_review.py`
 - `tests/fork_features/approval/test_retry_policy.py`
@@ -3294,3 +3308,27 @@ Add future modifications above this summary, under either:
 - Active modifications
 - Historical / reverted modifications
 -->
+
+
+### 31. Explicit empty toolset selection
+
+Status: active
+
+ID: `explicit-empty-toolset`
+
+Files:
+- `toolsets.py`
+- `tui_gateway/server.py`
+- `tests/tools/test_toolsets.py`
+
+Intent / invariants:
+- `none` is a valid, empty toolset. An explicit `none` selection must remain an
+  explicit selection, rather than being rejected and falling back to default tools.
+- Use the native toolset table/resolver; other named toolsets and registry aliases
+  retain their normal behavior. This is an empty group, not an override of other
+  simultaneously selected groups.
+
+Verification:
+- `scripts/run_tests.sh tests/tools/test_toolsets.py` checks validation, empty
+  resolution and the real TUI explicit-selection entry point.
+- Preserve until upstream supplies the same valid-empty-selection contract.

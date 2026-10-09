@@ -3043,9 +3043,10 @@ def test_state_reconciliation_drops_clarify_timeout_answer(tmp_path):
 
 def test_clarify_cli_timeout_sentinel_is_not_rendered_as_user_response(tmp_path):
     module = load_script_module(tmp_path)
-    from tools import clarify_tool
+    # Persisted pre-batch CLI records retain this literal after the live API changes.
+    legacy_timeout = 'The user did not provide a response within the time limit. Use your best judgement to make the choice and proceed.'
 
-    assert module._CLARIFY_CLI_TIMEOUT_RESPONSE == clarify_tool.TIMEOUT_RESPONSE
+    assert module._CLARIFY_CLI_TIMEOUT_RESPONSE == legacy_timeout
     session_id = "session-clarify-cli-timeout"
     chain = hermes_turn(
         "turn-1",
@@ -3062,7 +3063,7 @@ def test_clarify_cli_timeout_sentinel_is_not_rendered_as_user_response(tmp_path)
         "startTime": "2026-08-24T01:00:30Z",
         "endTime": "2026-08-24T01:01:30Z",
         "input": {"question": "请选择", "choices": ["甲", "乙"]},
-        "output": {"user_response": clarify_tool.TIMEOUT_RESPONSE},
+        "output": {"user_response": legacy_timeout},
     }
     real = dict(
         clarify,
@@ -3081,17 +3082,19 @@ def test_clarify_cli_timeout_sentinel_is_not_rendered_as_user_response(tmp_path)
     candidate = module.build_candidate_document(export, session_id)
 
     contents = [message["content"] for turn in candidate["turns"] for message in turn]
-    assert all(clarify_tool.TIMEOUT_RESPONSE not in content for content in contents)
+    assert all(legacy_timeout not in content for content in contents)
     assert "User: The user did not respond within 15m, so I chose 甲" in contents
 
 
 def test_kanban_wake_guidance_literals_match_locales():
-    import yaml
+    import hermes_yaml as yaml
 
     locales = Path(__file__).resolve().parents[2] / "locales"
     module = load_script_module(Path("."))
     guidance = set()
     for path in locales.glob("*.yaml"):
+        if path.name.endswith(".tui.yaml"):
+            continue  # TUI-only resources do not define gateway wake messages.
         wake = yaml.safe_load(path.read_text(encoding="utf-8"))["gateway"]["kanban"]["wake"]
         assert wake["message"].startswith("[kanban] ")
         assert "{task_id}" in wake["message"].split("\n", 1)[0]

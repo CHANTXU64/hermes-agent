@@ -61,8 +61,8 @@ class OverflowVerdict:
     fields are the loop locals the handler may have rebound."""
 
     action: str
-    result: Optional[Dict[str, Any]]
-    messages: List[Dict[str, Any]]
+    result: Optional[dict[str, Any]]
+    messages: list[dict[str, Any]]
     active_system_prompt: Any
     conversation_history: Any
     approx_tokens: int
@@ -88,11 +88,11 @@ class _Recovery(OverflowVerdict):
     api_call_count: int
     max_compression_attempts: int
     action: str = "fallthrough"
-    result: Optional[Dict[str, Any]] = None
+    result: Optional[dict[str, Any]] = None
     provider_overflow_recovery_pending: bool = False
     is_context_length_error: bool = False
 
-    def done(self, action: str, result: Optional[Dict[str, Any]] = None) -> OverflowVerdict:
+    def done(self, action: str, result: Optional[dict[str, Any]] = None) -> OverflowVerdict:
         self.action, self.result = action, result
         return self
 
@@ -168,7 +168,7 @@ class _Recovery(OverflowVerdict):
         before = self.messages
         self.messages, self.active_system_prompt = agent._compress_context(
             before, self.system_message, approx_tokens=request_tokens,
-            task_id=self.effective_task_id, bypass_cooldown=True,
+            task_id=self.effective_task_id, bypass_cooldown=True, trigger="overflow",
             request_fork=self.request_fork,
             request_fork_rematerializer=self.request_fork_rematerializer,
         )
@@ -195,7 +195,7 @@ class _Recovery(OverflowVerdict):
 
     def compress_scored_by_tokens(
         self, request_tokens: int, *, fail_on_timeout: bool = False,
-    ) -> Tuple[Optional[OverflowVerdict], bool, int]:
+    ) -> tuple[Optional[OverflowVerdict], bool, int]:
         """``compress`` scored in message count / tokens (context-overflow errors ARE
         token-budget errors). Same-message-count compression (tool-result pruning,
         in-place summarization) can shrink the request, so re-estimate rather than trust

@@ -272,14 +272,11 @@ def test_standard_development_commands_bypass_smart_review_when_baseline_safe(
     ruff.chmod(0o755)
 
     with patch("tools.approval._get_approval_mode", return_value="smart"), patch(
-        "tools.tirith_security.check_command_security",
-        return_value={"action": "allow", "findings": [], "summary": ""},
-    ), patch(
         "tools.approval.detect_dangerous_command",
         return_value=(False, None, None),
     ), patch("tools.approval._invoke_smart_approve") as smart_review:
         pytest_result = check_all_command_guards(
-            "python -m pytest -q tests/tools/test_tirith_security.py",
+            "python -m pytest -q tests/tools/test_approval.py",
             "local",
             cwd=str(tmp_path),
         )
@@ -397,10 +394,6 @@ def test_command_guard_preserves_structured_review_and_observer_fields(monkeypat
     monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "smart")
     monkeypatch.setattr("tools.approval.is_approved", lambda *_args: False)
     monkeypatch.setattr(
-        "tools.approval._tirith_scan",
-        lambda _command: {"action": "allow", "findings": [], "summary": ""},
-    )
-    monkeypatch.setattr(
         "tools.approval.detect_dangerous_command",
         lambda _command: (True, "remote-write", "remote mutation"),
     )
@@ -452,10 +445,6 @@ def test_smart_escalation_reaches_human_with_localized_review_and_denial(
     monkeypatch.setattr(
         "tools.approval._presence",
         lambda _callback=None: (lambda *_args, **_kwargs: "deny", True, False, False),
-    )
-    monkeypatch.setattr(
-        "tools.approval._tirith_scan",
-        lambda _command: {"action": "allow", "findings": [], "summary": ""},
     )
     monkeypatch.setattr(
         "tools.approval.detect_dangerous_command",
@@ -691,8 +680,7 @@ def test_terminal_smart_review_reads_direct_script_once(monkeypatch, tmp_path: P
     monkeypatch.setattr("fork_features.approval.runtime.call_approval_llm", call_llm)
 
     with patch(
-        "tools.tirith_security.check_command_security",
-        return_value={"action": "allow", "findings": [], "summary": ""},
+        "tools.approval.detect_dangerous_command", return_value=(False, None, None),
     ):
         result = check_all_command_guards(
             "python entry.py",
@@ -1117,10 +1105,6 @@ def test_direct_script_is_smart_reviewed_even_when_shell_text_is_not_flagged(
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.setattr("tools.approval._YOLO_MODE_FROZEN", False)
     monkeypatch.setattr("tools.approval._get_approval_config", lambda: {"mode": "smart"})
-    monkeypatch.setattr(
-        "tools.tirith_security.check_command_security",
-        lambda _command: {"action": "allow", "findings": [], "summary": ""},
-    )
     review = SmartApprovalResult("approve", "low", "sufficient", "脚本内容与任务一致。")
 
     with patch("tools.approval._smart_approve", return_value=review) as smart_review:
