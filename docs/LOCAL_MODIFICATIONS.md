@@ -1585,70 +1585,66 @@ behavior contracts fully define the unchanged user-visible guidance.
 
 Upstream status: fork-only.
 
-### 18. First browser navigation opens a fresh tab
+### 18. Explicit browser tab selection (replaces first-navigation auto-new)
 
-Status: policy extracted to `fork_features` (2026-08-30)
+- ID: `browser-explicit-tabs` (first stable ID assigned to former entry 18)
+- Status: active
+- Depends on: none
+- Source boundary: logical-only
 
-Date: 2026-07-16; boundary refactored 2026-08-30
+Files / touchpoints:
+- `fork_features/browser_tabs.py` — tab identity, list/new/switch/close and per-task serialization.
+- `fork_features/browser_tabs_chrome.py` — read-only Chrome window selection observations.
+- `fork_features/browser_daemon.py` — real process/socket lifetime identity and no-respawn pinned Unix-socket commands.
+- `tools/browser_tool.py`, `toolsets.py` — schemas, registration and explicit navigation seam.
+- `tools/browser_tool_session.py` — optional command-generation guard; targeted mutations never replay on replacement sessions.
+- `tests/fork/test_browser_tabs.py` — focused behavioral contracts.
+- `tests/fork/test_browser_daemon_generation.py` — daemon-generation and connected-socket race contracts.
+- `tests/tools/test_browser_camofox.py` — existing navigation contract adapted to required tab IDs.
+- `tests/tools/test_browser_extension_router_wiring.py` — existing navigation contract adapted to required tab IDs.
+- `tests/tools/test_browser_lightpanda.py` — existing navigation contract adapted to required tab IDs.
+- `tests/tools/test_browser_open_timeout.py` — existing navigation contract adapted to required tab IDs.
+- `tests/tools/test_browser_secret_exfil.py` — existing navigation contract adapted to required tab IDs.
+- `tests/tools/test_browser_snapshot_threshold.py` — existing navigation contract adapted to required tab IDs.
+- `tests/tools/test_browser_ssrf_local.py` — existing navigation contract adapted to required tab IDs.
+- `fork_features/browser_first_navigation.py` and `tests/fork/test_browser_first_conversation_tab.py` — retired/deleted; do not restore.
 
-Files:
+Intent / invariants:
+- Target the user's existing agent-browser / Chrome CDP setup without upgrading the pinned 0.26.0 driver.
+- `browser_tabs` lists short IDs, titles, URLs, the task's selected target and Chrome's selected tab in each window. New, switch and close are explicit operations; switching does not reload the document.
+- IDs include both the Hermes session and actual daemon lifetime (PID, process birth time and socket identity). A same-name daemon restart invalidates every previous short ID. Only returned short IDs are accepted; CDP long IDs are not accepted by navigation. Missing, closed or expired IDs fail without choosing a substitute tab. After reconnect, list again.
+- `browser_navigate` requires `tab_id`; no navigation implicitly creates a tab. Its snapshot and later ordinary click/type/snapshot calls use the selected driver target. Selection plus navigation is serialized per task, not a cross-agent ownership lock.
+- Chrome selection is a best-effort read-only observation, distinct from the agent target and OS focus. Correlation is display-only and uses unique URLs; duplicate URLs, minimized/unreadable windows or missing CDP produce `null` (unknown). This correlation is never used to route an action.
+- The prior first-conversation-auto-new policy is obsolete by user decision. Do not revive its marker or `tab new` injection while merging upstream.
+- Targeted list/new/switch/close/navigation send the pinned 0.26.0 line-JSON protocol on a connected Unix socket, rechecking daemon identity after connect and before send. A disconnected socket cannot respawn or switch daemons; mutations are never replayed. Only a read may bootstrap a missing driver. Preserve the existing URL/redirect policies and Bot Desktop lease fence. This path is for the current macOS/Unix host, not a Windows named-pipe implementation.
+- This is not full shared-browser isolation or a fix for the upstream supervisor's separate target. Camofox does not implement this short-ID contract and fails closed rather than ignoring the ID.
 
-- `fork_features/browser_first_navigation.py`
-- `tools/browser_tool.py`
-- `tests/fork/test_browser_first_conversation_tab.py`
-- `docs/LOCAL_MODIFICATIONS.md`
+Temporary JS-tool limitation:
+- `browser_console(expression=...)` can still evaluate on its initial CDP-supervisor tab after the driver switches. Its tool description tells the model to locate the intended CDP target with `browser_cdp Target.getTargets`, then execute `Runtime.evaluate` with explicit `target_id`. Short tab IDs and CDP IDs are different namespaces.
+- Upstream candidate: https://github.com/NousResearch/hermes-agent/pull/123794 . An open PR or driver-version bump alone is not proof of a fix.
+- After merging an upstream target-synchronization fix, verify switching between real distinct tabs and reconnecting causes JS evaluation to follow the intended page. Then remove only the temporary JS warning and its description contract test. Keep explicit short-ID tab management unless separately retired.
 
-Summary:
-
-- The first `browser_navigate` call in each conversation opens and activates a
-  new tab before loading the requested URL; later calls keep their existing
-  navigation behavior.
-
-What changed:
-
-- `fork_features/browser_first_navigation.py` owns the conversation marker,
-  per-conversation locks, complete-navigation serializer, first-call `tab new`
-  policy, failure retry semantics, and model-visible description fragment.
-- `tools/browser_tool.py` retains URL safety, backend/session selection, command
-  execution, navigation result/snapshot handling, one decorator, and one
-  `ensure_first_conversation_tab` call. It no longer stores Fork navigation
-  state or implements the tab decision inline.
-- Calls for the same task/session ID remain serialized through the complete
-  `browser_navigate` result, while different conversations keep independent
-  locks. A failed `tab new` does not mark the conversation initialized.
-- On the first call only, the policy runs `tab new` before the existing
-  `open <url>` command. `agent-browser` activates the new tab as part of that
-  command, and the tool description still states the actual behavior.
-- This does not bind later backend reconnects to the created tab. Subsequent
-  target selection remains unchanged, matching the intentionally minimal scope.
-
-Why it matters:
-
-- The first navigation in a new conversation must not replace a useful page
-  that was already open in the connected browser.
-
-Merge protection:
-
-- Keep the marker, locks, serializer, description fragment, and first-tab
-  decision in `fork_features/browser_first_navigation.py`; do not move their
-  state or policy back into `tools/browser_tool.py`.
-- Preserve the one-time marker separately from backend session `_first_nav`
-  because Browser resources are cleaned after every agent turn.
-- Preserve the command order `tab new` then `open <url>` on the first call and
-  plain `open <url>` on later calls in the same conversation.
+Merge decision:
+- Preserve when: upstream lacks equivalent explicit tab management and required short-ID navigation.
+- Drop when: upstream behavior fully covers the confirmed contract and the user accepts replacing this unit; the temporary JS warning alone has the removal condition above.
+- Ask user when: replacing short IDs, changing driver/backend, introducing required IDs on other tools or cross-agent locks, or reducing the confirmed tab operations/selection display.
 
 Verification:
-
 ```bash
-.venv/bin/python -m pytest tests/fork/test_browser_first_conversation_tab.py -q -o 'addopts='
-.venv/bin/python -m py_compile fork_features/browser_first_navigation.py tools/browser_tool.py tests/fork/test_browser_first_conversation_tab.py
+HERMES_PYTHON=.venv/bin/python scripts/run_tests.sh tests/fork/test_browser_tabs.py tests/fork/test_browser_daemon_generation.py -q
+# Real smoke uses a disposable Chrome profile/CDP port, never business tabs:
+# list -> new -> navigate -> snapshot -> type/click -> switch -> close;
+# verify two independent driver targets, two Chrome windows, stale IDs after
+# cleanup/reconnect, and explicit-CDP JS execution versus the unchanged supervisor.
+# Also kill only the isolated daemon while preserving Chrome: every old ID must
+# reject navigate/switch/close, including navigation as the first post-crash call;
+# original target URLs stay unchanged; freshly listed IDs operate the intended page.
 git diff --check
 ```
 
-Feature docs: none — a Fork policy module, one Browser tool seam, and focused
-runtime contracts fully define this behavior.
-
-Upstream status: fork-only.
+- Upstream status: fork-only; target-sync candidate exists as linked above.
+- Last validated: upstream baseline `73162b00eefde3794bed0afb53d84a19c0eed230`; Fork working changes based on `3e93ce0daf1aacc35209e7f31f9e07bcffdcd066`. This does not claim a committed release or a reloaded Gateway.
+- Feature docs: none — this bounded contract and its focused tests define the unit.
 
 
 ### 19. Clarify attachment replies preserve media paths
@@ -3253,10 +3249,15 @@ deltas are expected in these areas:
   - `tests/fork/test_telegram_account_retirement.py`
   - `docs/chantxu64/multi-telegram-accounts/README.md`
   - `docs/LOCAL_MODIFICATIONS.md`
-- First browser navigation opens a fresh tab:
-  - `fork_features/browser_first_navigation.py`
+- Explicit browser tab selection (former first-navigation auto-new retired):
+  - `fork_features/browser_tabs.py`
+  - `fork_features/browser_tabs_chrome.py`
+  - `fork_features/browser_daemon.py`
   - `tools/browser_tool.py`
-  - `tests/fork/test_browser_first_conversation_tab.py`
+  - `tools/browser_tool_session.py`
+  - `toolsets.py`
+  - `tests/fork/test_browser_tabs.py`
+  - `tests/fork/test_browser_daemon_generation.py`
   - `docs/LOCAL_MODIFICATIONS.md`
 - Telegram tool-progress literal-text rendering:
   - `fork_features/telegram_tool_progress.py`

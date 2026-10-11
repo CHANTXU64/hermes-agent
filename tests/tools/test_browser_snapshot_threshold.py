@@ -145,6 +145,7 @@ def test_browser_navigation_applies_profile_threshold(
         browser_tool.browser_navigate(
             "https://example.com",
             task_id=task_id,
+            tab_id="fixture:t1",
         )
     )
     browser_tool._last_active_session_key.pop(task_id, None)
@@ -216,3 +217,9 @@ def test_camofox_snapshot_applies_same_profile_threshold(
 
     assert result["success"] is True
     assert len(result["snapshot"]) < len(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def _mock_explicit_tab_selection(monkeypatch):
+    """Keep these transport/policy tests independent of tab identity tests."""
+    monkeypatch.setattr("fork_features.browser_tabs.select_tab", lambda *a, **kw: {"success": True, "daemon_identity": "fixture-generation"})

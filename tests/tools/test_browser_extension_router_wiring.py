@@ -39,7 +39,7 @@ def _route_spy(monkeypatch):
     monkeypatch.setattr(
         browser_tool,
         "browser_navigate",
-        lambda url="", task_id=None, local_browser=False: "legacy-nav",
+        lambda url="", task_id=None, tab_id=None: "legacy-nav",
     )
     monkeypatch.setattr(browser_cdp_tool, "browser_cdp", lambda *a, **k: "legacy-cdp")
     return calls
@@ -63,7 +63,7 @@ def test_every_browser_registry_handler_routes_through_wrapper(_route_spy):
     for name in BROWSER_ACTIONS:
         _route_spy.clear()
         handler = registry.get_entry(name).handler
-        args = {"url": "https://example.test", "ref": "@e1", "text": "hi"}
+        args = {"url": "https://example.test", "ref": "@e1", "text": "hi", "tab_id": "fixture:t1"}
         result = handler(dict(args), task_id="task-fixture", session_id="session-fixture")
         assert result is not None
         assert len(_route_spy) == 1, f"{name} did not route through the wrapper"

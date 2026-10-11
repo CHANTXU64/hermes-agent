@@ -151,7 +151,7 @@ class TestBrowserNavigateOpenTimeout:
     def test_first_navigation_uses_first_open_timeout(self, monkeypatch):
         captured: dict = {}
 
-        def fake_run(task_id, command, args, timeout=None):
+        def fake_run(task_id, command, args, timeout=None, **kwargs):
             if command == "open":
                 captured["timeout"] = timeout
             return {"success": True, "data": {"title": "t", "url": args[0] if args else ""}}
@@ -168,5 +168,11 @@ class TestBrowserNavigateOpenTimeout:
         monkeypatch.setattr(bt, "_maybe_start_recording", lambda *a, **kw: None)
         monkeypatch.setattr(bt, "check_website_access", lambda url: None)
 
-        bt.browser_navigate("https://example.com", task_id="task-1")
+        bt.browser_navigate("https://example.com", task_id="task-1", tab_id="fixture:t1")
         assert captured["timeout"] == 120
+
+
+@pytest.fixture(autouse=True)
+def _mock_explicit_tab_selection(monkeypatch):
+    """Keep these transport/policy tests independent of tab identity tests."""
+    monkeypatch.setattr("fork_features.browser_tabs.select_tab", lambda *a, **kw: {"success": True, "daemon_identity": "fixture-generation"})

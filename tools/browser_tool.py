@@ -23,12 +23,8 @@ from agent.redact import redact_cdp_url
 from hermes_constants import get_hermes_home, hermes_home_key
 from utils import env_int
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
-from fork_features.browser_first_navigation import (
-    FIRST_NAVIGATION_DESCRIPTION,
-    ensure_first_conversation_tab,
-    serialize_conversation_navigation,
-)
 from hermes_cli.observability.shared_metrics_loop import record_browser_call
+from fork_features.browser_tabs import serialize_navigation
 
 
 # Env keys re-added to the agent-browser subprocess AFTER credential stripping.
@@ -479,16 +475,17 @@ atexit.register(_lifecycle._stop_browser_cleanup_thread)
 BROWSER_TOOL_SCHEMAS = [
     {
         "name": "browser_navigate",
-        "description": f"Navigate to a URL in the browser. Initializes the session and loads the page. {FIRST_NAVIGATION_DESCRIPTION} Must be called before other browser tools. For simple information retrieval, prefer a lightweight retrieval tool when one is available (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer an available text-extraction or terminal-fetch tool; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
+        "description": "Navigate to a URL in the explicitly selected tab. tab_id is required: use the exact short ID returned by browser_tabs. Never creates a tab implicitly; missing or expired IDs fail without navigating. Follow-up snapshots, clicks and typing use the selected tab. For simple information retrieval, prefer a lightweight retrieval tool when one is available (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer an available text-extraction or terminal-fetch tool; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
                     "description": "The URL to navigate to (e.g., 'https://example.com')"
-                }
+                },
+                "tab_id": {"type": "string", "description": "Required exact short ID from browser_tabs."}
             },
-            "required": ["url"]
+            "required": ["url", "tab_id"]
         }
     },
     {
@@ -599,7 +596,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_console",
-        "description": "Get browser console output and JavaScript errors from the current page. Returns console.log/warn/error/info messages and uncaught JS exceptions. Use this to detect silent JavaScript errors, failed API calls, and application warnings. Requires browser_navigate to be called first. When 'expression' is provided, evaluates JavaScript in the page context and returns the result — use this for DOM inspection, reading page state, or extracting data programmatically.",
+        "description": "Get browser console output and JavaScript errors from the current page. Returns console.log/warn/error/info messages and uncaught JS exceptions. Use this to detect silent JavaScript errors, failed API calls, and application warnings. Requires browser_navigate to be called first. When 'expression' is provided, evaluates JavaScript in the page context and returns the result — use this for DOM inspection, reading page state, or extracting data programmatically. Shared-Chrome CDP limitation: expression evaluation may still target the initial tab even after browser_navigate or browser_tabs switches tabs. For JavaScript on a specific tab, first locate its CDP ID with browser_cdp Target.getTargets, then use browser_cdp Runtime.evaluate with explicit target_id; short browser_tabs IDs are not CDP IDs. Do not assume a tab switch fixes this evaluation path.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -744,8 +741,8 @@ def _attach_auto_snapshot(response: dict[str, Any], nav_session_key: str) -> Non
         logger.debug("Auto-snapshot after navigate failed: %s", e)
 
 
-@serialize_conversation_navigation
-def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
+@serialize_navigation
+def browser_navigate(url: str, task_id: Optional[str] = None, tab_id: Optional[str] = None) -> str:
     """Navigate to ``url``; JSON with title, compact snapshot and, on first nav, stealth features.
     Hybrid routing decides BEFORE the safety checks whether this URL goes to a local sidecar
     (the cloud provider never sees it then, so the private-address checks are relaxed)."""
@@ -753,6 +750,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     if safety_error is not None:
         return json.dumps(safety_error)
 
+    if not isinstance(tab_id, str) or not tab_id:
+        return _dumps(_err("tab_id is required. List or create a tab with browser_tabs first."))
     effective_task_id = task_id or "default"
     nav_session_key = _navigation_session_key(effective_task_id, url)
     auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
@@ -762,7 +761,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         return json.dumps(safety_error)
 
     if _is_camofox_mode():
-        return _camofox("camofox_navigate", url, task_id)
+        return _dumps(_err("Explicit tab navigation requires the agent-browser backend; Camofox is not supported."))
 
     if auto_local_this_nav:
         logger.info("browser_navigate: auto-routing %s to local Chromium sidecar (cloud provider %s stays on "
@@ -775,17 +774,15 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         session_info["_first_nav"] = False
         _maybe_start_recording(nav_session_key)
 
-    tab_error = ensure_first_conversation_tab(
-        task_id=effective_task_id,
-        session_key=nav_session_key,
-        run_command=_session._run_browser_command,
-        timeout=_get_open_command_timeout(first_open=is_first_nav),
-    )
-    if tab_error is not None:
-        return _dumps(tab_error)
+    from fork_features.browser_tabs import select_tab
+    selection = select_tab(nav_session_key, tab_id)
+    if not selection.get("success"):
+        return _dumps(selection)
 
     result = _session._run_browser_command(nav_session_key, "open", [url],
-                                  timeout=_get_open_command_timeout(first_open=is_first_nav))
+                                  timeout=_get_open_command_timeout(first_open=is_first_nav),
+                                  expected_session_name=session_info.get("session_name"),
+                                  expected_daemon_identity=selection["daemon_identity"])
     if not result.get("success"):
         return _dumps(_err(result.get("error", "Navigation failed")))
 
@@ -1320,6 +1317,9 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
 from tools.registry import registry, tool_error
 from tools.browser_extension_router import extension_controller_available, routed_browser_handler
 
+from fork_features.browser_tabs import SCHEMA as _TAB_SCHEMA, browser_tabs
+
+BROWSER_TOOL_SCHEMAS.append(_TAB_SCHEMA)
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
 
@@ -1344,7 +1344,8 @@ def _fallback_call(fn_name: str, arg_defaults: dict[str, Any], extra_kw: tuple =
 # function is the module global of the same name. Routed-through-extension tools (gate None)
 # use the per-action gate; get_images/console/vision keep the plain requirement checks.
 _BROWSER_TOOL_TABLE = (
-    ("browser_navigate", "🌐", None, {"url": ""}),
+    ("browser_navigate", "🌐", None, {"url": "", "tab_id": None}),
+    ("browser_tabs", "🗂️", _install.check_browser_requirements, {"action": "list", "tab_id": None, "url": None}),
     ("browser_snapshot", "📸", None, {"full": False}, ("user_task",)),
     ("browser_click", "👆", None, {"ref": ""}),
     ("browser_type", "⌨️", None, {"ref": "", "text": ""}),
@@ -1367,6 +1368,8 @@ def _routed_check_fn(name: str):
 
 def _routed_handler(name: str, fallback):
     def handler(args, **kw):
+        if name == "browser_navigate" and (not isinstance(args.get("tab_id"), str) or not args["tab_id"]):
+            return _dumps(_err("tab_id is required. List or create a tab with browser_tabs first."))
         return record_browser_call(lambda legacy: routed_browser_handler(
             name, args, fallback=lambda: legacy(lambda: fallback(args, kw)),
             task_id=kw.get("task_id"), session_id=kw.get("session_id"),

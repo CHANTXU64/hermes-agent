@@ -244,7 +244,7 @@ class TestLightpandaFallbackWarning:
                  result,
                  {"success": True, "data": {"snapshot": "- heading \"Fallback OK\" [ref=e1]", "refs": {"e1": {}}}},
              ]):
-            response = json.loads(bt.browser_navigate("https://example.com", task_id="warn-test"))
+            response = json.loads(bt.browser_navigate("https://example.com", task_id="warn-test", tab_id="fixture:t1"))
 
         assert response["success"] is True
         assert response["browser_engine"] == "chrome"
@@ -716,3 +716,9 @@ class TestLightpandaSessionLifecycle:
         dead_owner.write_text(json.dumps({"owner_pid": 2**22 + 7}), encoding="utf-8")
         assert browser_lightpanda.reap_orphaned_lightpanda() == 0
         assert not bad.exists() and not dead_owner.exists()
+
+
+@pytest.fixture(autouse=True)
+def _mock_explicit_tab_selection(monkeypatch):
+    """Keep these transport/policy tests independent of tab identity tests."""
+    monkeypatch.setattr("fork_features.browser_tabs.select_tab", lambda *a, **kw: {"success": True, "daemon_identity": "fixture-generation"})

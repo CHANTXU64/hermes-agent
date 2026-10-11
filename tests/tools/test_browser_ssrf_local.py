@@ -61,7 +61,7 @@ class TestPreNavigationSsrf:
         monkeypatch.setattr(bt_cloud, "_allow_private_urls", lambda: False)
         monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: False)
 
-        result = json.loads(browser_tool.browser_navigate(self.PRIVATE_URL))
+        result = json.loads(browser_tool.browser_navigate(self.PRIVATE_URL, tab_id="fixture:t1"))
 
         assert result["success"] is False
         assert "private or internal address" in result["error"]
@@ -72,7 +72,7 @@ class TestPreNavigationSsrf:
         monkeypatch.setattr(bt_cloud, "_allow_private_urls", lambda: True)
         monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: False)
 
-        result = json.loads(browser_tool.browser_navigate(self.PRIVATE_URL))
+        result = json.loads(browser_tool.browser_navigate(self.PRIVATE_URL, tab_id="fixture:t1"))
 
         assert result["success"] is True
 
@@ -85,7 +85,7 @@ class TestPreNavigationSsrf:
         monkeypatch.setattr(bt_cloud, "_allow_private_urls", lambda: False)
         monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: False)
 
-        result = json.loads(browser_tool.browser_navigate(self.PRIVATE_URL))
+        result = json.loads(browser_tool.browser_navigate(self.PRIVATE_URL, tab_id="fixture:t1"))
 
         assert result["success"] is True
 
@@ -95,7 +95,7 @@ class TestPreNavigationSsrf:
         monkeypatch.setattr(bt_cloud, "_allow_private_urls", lambda: False)
         monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: True)
 
-        result = json.loads(browser_tool.browser_navigate("https://example.com"))
+        result = json.loads(browser_tool.browser_navigate("https://example.com", tab_id="fixture:t1"))
 
         assert result["success"] is True
 
@@ -131,7 +131,7 @@ class TestPreNavigationSsrf:
         # always-blocked floor as an independent gate.
         monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: True)
 
-        result = json.loads(browser_tool.browser_navigate(imds_url))
+        result = json.loads(browser_tool.browser_navigate(imds_url, tab_id="fixture:t1"))
 
         assert result["success"] is False
         assert "cloud metadata endpoint" in result["error"]
@@ -152,7 +152,7 @@ class TestPreNavigationSsrf:
             "http://10.0.0.5/",
             "http://myservice.local/",
         ):
-            result = json.loads(browser_tool.browser_navigate(private))
+            result = json.loads(browser_tool.browser_navigate(private, tab_id="fixture:t1"))
             assert result["success"] is True, f"Unexpected block for {private}: {result}"
 
 
@@ -227,7 +227,7 @@ class TestPostRedirectSsrf:
             lambda *a, **kw: _make_browser_result(url=self.PRIVATE_FINAL_URL),
         )
 
-        result = json.loads(browser_tool.browser_navigate(self.PUBLIC_URL))
+        result = json.loads(browser_tool.browser_navigate(self.PUBLIC_URL, tab_id="fixture:t1"))
 
         assert result["success"] is False
         assert "redirect landed on a private/internal address" in result["error"]
@@ -245,7 +245,7 @@ class TestPostRedirectSsrf:
             lambda *a, **kw: _make_browser_result(url=self.PRIVATE_FINAL_URL),
         )
 
-        result = json.loads(browser_tool.browser_navigate(self.PUBLIC_URL))
+        result = json.loads(browser_tool.browser_navigate(self.PUBLIC_URL, tab_id="fixture:t1"))
 
         assert result["success"] is True
         assert result["url"] == self.PRIVATE_FINAL_URL
@@ -265,7 +265,7 @@ class TestPostRedirectSsrf:
             lambda *a, **kw: _make_browser_result(url=final),
         )
 
-        result = json.loads(browser_tool.browser_navigate(self.PUBLIC_URL))
+        result = json.loads(browser_tool.browser_navigate(self.PUBLIC_URL, tab_id="fixture:t1"))
 
         assert result["success"] is True
         assert result["url"] == final
@@ -291,7 +291,7 @@ class TestPostRedirectSsrf:
             lambda *a, **kw: _make_browser_result(url=imds_final),
         )
 
-        result = json.loads(browser_tool.browser_navigate(self.PUBLIC_URL))
+        result = json.loads(browser_tool.browser_navigate(self.PUBLIC_URL, tab_id="fixture:t1"))
 
         assert result["success"] is False
         assert "cloud metadata endpoint" in result["error"]
@@ -350,3 +350,9 @@ class TestAllowPrivateUrlsConfig:
         expected = {"allowed": True, "blocked": False}
         for profile in profile_order:
             assert under_profile(homes[profile]) is expected[profile]
+
+
+@pytest.fixture(autouse=True)
+def _mock_explicit_tab_selection(monkeypatch):
+    """Keep these transport/policy tests independent of tab identity tests."""
+    monkeypatch.setattr("fork_features.browser_tabs.select_tab", lambda *a, **kw: {"success": True, "daemon_identity": "fixture-generation"})

@@ -892,6 +892,8 @@ def _run_browser_command(
     args: list[str] | None = None,
     timeout: Optional[int] = None,
     _engine_override: Optional[str] = None,
+    expected_session_name: Optional[str] = None,
+    expected_daemon_identity: Optional[str] = None,
 ) -> dict[str, Any]:
     """Run one agent-browser CLI command against the task's session; returns its parsed JSON.
     ``timeout=None`` reads ``browser.command_timeout``; ``_engine_override`` forces an engine
@@ -911,8 +913,18 @@ def _run_browser_command(
         except Exception as e:
             _bt.logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
             return {"success": False, "error": f"Failed to create browser session: {e!s}"}
+        if expected_session_name is not None and session_info.get("session_name") != expected_session_name:
+            return {"success": False, "error": "Browser control session changed; list browser_tabs again before retrying."}
+        if expected_daemon_identity is not None:
+            from fork_features.browser_daemon import run_pinned
+            return run_fenced(session_info, lambda: run_pinned(
+                session_info, command, args, expected_daemon_identity, timeout))
         engine, result = run_fenced_pair(session_info, lambda: _dispatch_browser_command(
             task_id, session_info, browser_cmd, command, args, timeout, _engine_override))
+        # Explicit tab IDs belong to this driver generation. Never replay a
+        # mutation on a replacement driver (including Lightpanda fallback).
+        if expected_session_name is not None:
+            return result
         if result.get("code") == "human_has_control":
             return result
         # #115184: a protocol-level failure (exit 101 on a stale session daemon, empty/non-JSON

