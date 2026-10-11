@@ -1432,18 +1432,22 @@ def _candidate_counts(candidate_path: Path, session_id: str) -> dict[str, int] |
 def _success_candidate_material(
     succeeded: dict[str, Any], session_id: str
 ) -> dict[str, Any] | None:
-    manifest_path = Path(str(succeeded.get("manifest_path") or ""))
     candidate_path = Path(str(succeeded.get("candidate_path") or ""))
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        # Older recovery writers issued a complete candidate receipt without a
+        # manifest. Validate the receipt/content either way; a manifest that WAS
+        # promised must still exist and match the session.
+        if "manifest_path" in succeeded:
+            manifest_path = Path(str(succeeded.get("manifest_path") or ""))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_session = (
+                (manifest.get("session_id") or manifest.get("document_id"))
+                if isinstance(manifest, dict)
+                else None
+            )
+            if manifest_session != session_id:
+                return None
         candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-        manifest_session = (
-            (manifest.get("session_id") or manifest.get("document_id"))
-            if isinstance(manifest, dict)
-            else None
-        )
-        if manifest_session != session_id:
-            return None
         expected_turn_count = _strict_nonnegative_int(
             succeeded.get("candidate_turn_count"), "success receipt turn count"
         )
@@ -1653,14 +1657,16 @@ def _annotate_recovered_export_failures(
     mere document existence. This proves a later save, not source completeness.
     """
     starts = {
-        attempt_id: event
+        attempt_id: next(
+            (event for event in events if event.get("event") == "started"),
+            next((event for event in events if event.get("event") == "scheduled"), {}),
+        )
         for attempt_id, events in attempts.items()
-        for event in events
-        if event.get("event") == "started"
     }
     confirmed_by_document = {item["document_id"]: item for item in confirmed}
     for alert in alerts:
-        if alert.get("type") != "retain_export_failed":
+        original_type = alert.get("type")
+        if original_type not in {"retain_export_failed", "retain_scheduled_worker_missing"}:
             continue
         recovery = confirmed_by_document.get(alert["document_id"])
         if recovery is None or recovery["session_id"] != alert["session_id"]:
@@ -1675,23 +1681,39 @@ def _annotate_recovered_export_failures(
         try:
             old_cutoff = _parse_time(old.get("cutoff_at") or old["recorded_at"])
             new_cutoff = _parse_time(new.get("cutoff_at") or new["recorded_at"])
-            failure_at = max(
-                _parse_time(event["recorded_at"])
-                for event in attempts[alert["attempt_id"]]
-                if event.get("event") == "export_failed"
+            failure_at = (
+                _parse_time(alert["due_at"])
+                if original_type == "retain_scheduled_worker_missing"
+                else max(
+                    _parse_time(event["recorded_at"])
+                    for event in attempts[alert["attempt_id"]]
+                    if event.get("event") == "export_failed"
+                )
             )
             recovery_started_at = _parse_time(new["recorded_at"])
         except (KeyError, TypeError, ValueError):
             continue
-        if recovery_started_at <= failure_at or new_cutoff < old_cutoff:
+        if new_cutoff < old_cutoff:
+            continue
+        # An earlier successful run can cover a duplicate delayed attempt, but
+        # only explicit request cutoffs prove that they saved the same scope.
+        if recovery_started_at <= failure_at and not (
+            old.get("cutoff_at") and new.get("cutoff_at")
+        ):
             continue
         original_key = alert["alert_key"]
+        covered = (
+            original_type == "retain_scheduled_worker_missing"
+            or recovery_started_at <= failure_at
+        )
         alert.update({
             "alert_key": (
-                f"retain:{alert['attempt_id']}:export_recovered:{recovery['attempt_id']}"
+                f"retain:{alert['attempt_id']}:"
+                f"{'save_covered' if covered else 'export_recovered'}:{recovery['attempt_id']}"
             ),
             "original_alert_key": original_key,
-            "type": "retain_export_recovered",
+            "original_type": original_type,
+            "type": "retain_save_covered" if covered else "retain_export_recovered",
             "severity": "info",
             "failed_at": failure_at.isoformat(),
             "recovered_by_attempt_id": recovery["attempt_id"],
@@ -1699,8 +1721,10 @@ def _annotate_recovered_export_failures(
             "operation_id": recovery["operation_id"],
             "remote_document_matches_candidate": True,
             "message": (
-                "历史本地候选生成失败；同一会话后来已完成保存，当前远端正文与后续候选一致。"
-                "这只证明后续保存成功，不代表原始会话完整性已全部验证。"
+                ("该次保存尝试异常仍保留；同一会话已有覆盖其保存范围的成功任务，当前远端正文与该候选一致。"
+                 if covered else
+                 "历史本地候选生成失败；同一会话后来已完成保存，当前远端正文与后续候选一致。")
+                + "这只证明保存成功，不代表原始会话完整性已全部验证。"
             ),
         })
 
