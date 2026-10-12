@@ -33,6 +33,8 @@ Model-only inference uses `hermes_cli.inventory.build_models_payload(...)` with 
 
 For explicit provider+model, a non-empty authenticated picker catalog is treated as authoritative for that known provider. A missing model is rejected. If the provider has no picker row or no catalog (common for some custom/direct endpoints), Hermes does not infer unavailability and lets the existing runtime-provider resolver decide.
 
+All three catalog consumers (explicit validation, model-only inference, and route suggestions) exclude rows marked `authenticated: false` or `source: configured-current`. These UI-only saved selections are not evidence of a complete model catalog or a usable route. Older real catalog rows that omit the authentication flag retain their existing behavior. Explicit routes still resolve target-model credentials first: excluding a placeholder neither clears a model cooldown nor bypasses credential checks. Model-only requests still fail closed when no real unique provider can be inferred.
+
 Errors keep `error_code` metadata but put retry suggestions in compact Markdown tables inside the error text instead of putting the full model catalog in the persistent tool schema:
 
 - `ambiguous_model` lists every current provider route matching the requested model.
@@ -195,3 +197,26 @@ Functional validation did not launch a live child or call a target route. One
 model subagent performed a separate read-only code review. No push or Gateway
 restart was performed, and the extraction was not committed as part of this
 validation.
+
+2026-10-12 placeholder-catalog correction (uncommitted):
+
+- Fork-specific suite: `13 passed`; the unchanged baseline route module failed
+  nine of those assertions, including the public entrypoint accepting an
+  explicit route after target-model credential resolution. Child execution was
+  mocked; this is not a live model result.
+- Canonical core delegation/control/async/request-override suite:
+  `140 passed, 53 failed`. Adjacent inventory/cooldown/request-builder suite:
+  `395 passed, 7 failed`. All 60 failed test IDs were reproduced with the
+  pre-change route module in isolated per-file subprocesses; both old and new
+  code failed on the same guarded read of the real installation's
+  `manifest.json`. No protection was disabled and no test-environment fix was
+  bundled into this correction. Broader acceptance therefore remains incomplete.
+- A read-only probe of the actual profile inventory still returned the
+  `configured-current`, unauthenticated Codex placeholder. The updated validator
+  no longer rejected the explicitly requested model on that evidence, and
+  recommendations excluded the placeholder. No model API call was made.
+- Ruff, Python compilation and `git diff --check` passed. Account cooldowns,
+  global model settings, Skills and upstream credential/inventory code were not
+  modified. No Gateway restart, commit or push was performed.
+- Gateway live-child acceptance and the browser comparison remain pending.
+  Scoped decisions, rollback boundary and evidence are in [changes.jsonl](changes.jsonl).

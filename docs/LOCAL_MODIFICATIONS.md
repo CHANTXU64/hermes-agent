@@ -2349,6 +2349,7 @@ What changed:
   background child-run paths.
 - Fork-specific route policy now lives in `fork_features/delegation_routing.py`: model/provider inference and catalog validation, bounded current-route suggestions, exact reasoning capability checks, target-route fallback, top-level/per-task precedence, repeated-route caching, full-batch prevalidation, safe route errors, and public child route metadata. `tools/delegate_tool.py` keeps model-facing input normalization, the single Fork resolver call, host-owned generic delegation config and credential/runtime resolution, child construction, execution, and aggregation. The Fork module receives `_resolve_delegation_credentials` through a callback; it does not import the host or duplicate provider credentials. `tools/async_delegation.py` continues owning async task persistence, recovery, and completion delivery.
 - Model-only calls infer a provider only when the authenticated curated inventory has one unique match; explicit provider/model calls resolve the target-model runtime route and reject known catalog mismatches before spawning.
+- UI-only inventory rows marked `authenticated: false` or `source: configured-current` are excluded from explicit catalog validation, model-only inference, and route suggestions. Their saved model is neither an authoritative catalog nor an available recommendation. Existing real catalog rows without an authentication flag remain supported. Target-model credential/cooldown checks still run; no model-specific bypass or credential reset is introduced.
 - Routed children resolve reasoning configuration against the target model. An explicit effort is used only when the production request builder preserves it exactly; otherwise Hermes keeps the selected provider/model and applies that target model's normal override/global/provider reasoning configuration without claiming that the requested value took effect.
 - Exact reasoning probes cover Chat Completions, Responses, and native Anthropic Messages routes. Anthropic Messages reuses the production request builder: `low`, `medium`, `high`, `xhigh`, and `max` are exact; `minimal -> low`, `ultra -> max`, and omission for `none` are not reported as exact and therefore keep the same-model automatic/default fallback contract.
 - Every batch task is route-validated before any child starts. Safe effective route metadata is present in child results, async status, SQLite task payloads, restart recovery, and completion events; secrets and raw request overrides are excluded.
@@ -2384,6 +2385,15 @@ Verification:
   subprocesses. The new regressions first failed on all observed defects, then
   passed after the fix; Ruff, Python compilation, and `git diff --check` passed.
   No Gateway restart, commit, or Push was performed.
+- 2026-10-12 placeholder-catalog correction: Fork-specific tests `13 passed`;
+  old route code failed nine of the same assertions. Canonical related suites
+  reported `535 passed, 60 failed`; all 60 failures reproduced with the pre-change
+  route module on the same protected real-installation manifest read, so broader
+  acceptance remains incomplete. A read-only actual-inventory probe confirmed
+  that the placeholder no longer rejects the explicit target or appears in
+  suggestions. Ruff, Python compilation and diff whitespace checks passed.
+  No live model call, Gateway restart, commit or push; see feature docs and its
+  `changes.jsonl` for the scoped correction and pending runtime acceptance.
 
 ```bash
 scripts/run_tests.sh \

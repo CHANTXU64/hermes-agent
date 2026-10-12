@@ -58,7 +58,7 @@ class DelegationRouteError(ValueError):
         self.details = details
 
 
-def _recent_delegation_route_usage(*, days: int = 30) -> List[Dict[str, Any]]:
+def _recent_delegation_route_usage(*, days: int = 30) -> list[dict[str, Any]]:
     """Read recent per-route usage from this profile's state DB, fail-open.
 
     This is a local, read-only analytics lookup. It never refreshes provider
@@ -144,16 +144,30 @@ def _recent_delegation_route_usage(*, days: int = 30) -> List[Dict[str, Any]]:
     return usage
 
 
+def _catalog_provider_rows(payload: dict) -> list[dict[str, Any]]:
+    """Exclude UI-only saved selections from delegation's catalog evidence.
+
+    Older authenticated inventory rows omit the authentication flag, so only
+    explicit negative evidence is excluded. A configured-current placeholder
+    is never a catalog, even when a caller omits its authentication flag.
+    """
+    return [
+        row
+        for row in payload.get("providers") or []
+        if isinstance(row, dict)
+        and row.get("authenticated") is not False
+        and row.get("source") != "configured-current"
+    ]
+
+
 def _available_catalog_routes(
     payload: dict, *, provider: Optional[str] = None
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     """Return stable, deduplicated provider/model routes from picker inventory."""
     provider_key = str(provider or "").strip().casefold()
-    routes: List[Dict[str, str]] = []
+    routes: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for row in payload.get("providers") or []:
-        if not isinstance(row, dict):
-            continue
+    for row in _catalog_provider_rows(payload):
         slug = str(row.get("slug") or "").strip()
         if not slug or (provider_key and slug.casefold() != provider_key):
             continue
@@ -179,7 +193,7 @@ def _model_name_similarity(requested_model: str, candidate_model: str) -> float:
 
 def _route_suggestion_groups(
     payload: dict, *, requested_model: str, provider: Optional[str] = None
-) -> tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Return available frequent and similar routes without stale history."""
     available = _available_catalog_routes(payload, provider=provider)
     available_by_key = {
@@ -187,7 +201,7 @@ def _route_suggestion_groups(
         for route in available
     }
 
-    frequent: List[Dict[str, str]] = []
+    frequent: list[dict[str, str]] = []
     used_keys: set[tuple[str, str]] = set()
     for row in _recent_delegation_route_usage():
         key = (
@@ -210,7 +224,7 @@ def _route_suggestion_groups(
             route["model"].casefold(),
         ),
     )
-    similar: List[Dict[str, str]] = []
+    similar: list[dict[str, str]] = []
     for route in ranked_similar:
         key = (route["provider"].casefold(), route["model"].casefold())
         if key in used_keys:
@@ -229,14 +243,14 @@ def _markdown_route_cell(value: Any) -> str:
 
 
 def _render_route_markdown_sections(
-    sections: List[tuple[str, List[Dict[str, str]]]],
+    sections: list[tuple[str, list[dict[str, str]]]],
 ) -> str:
     """Render route sections under one bounded Markdown budget."""
     bounded = [(title, list(routes)) for title, routes in sections if routes]
     if not bounded:
         return ""
 
-    def render(current: List[tuple[str, List[Dict[str, str]]]]) -> str:
+    def render(current: list[tuple[str, list[dict[str, str]]]]) -> str:
         blocks = []
         for title, routes in current:
             rows = [f"**{title}**", "| Provider | Model |", "|---|---|"]
@@ -269,7 +283,7 @@ def _route_suggestion_markdown(
     frequent, similar = _route_suggestion_groups(
         payload, requested_model=requested_model, provider=provider
     )
-    sections: List[tuple[str, List[Dict[str, str]]]] = []
+    sections: list[tuple[str, list[dict[str, str]]]] = []
     if frequent:
         sections.append(("Frequently used available models", frequent))
     if similar:
@@ -279,7 +293,7 @@ def _route_suggestion_markdown(
 
 def _provider_failure_candidate_details(
     *, provider: Optional[str], requested_model: str
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Return bounded authenticated routes that can repair a provider failure."""
     from hermes_cli.inventory import build_models_payload, load_picker_context
 
@@ -340,9 +354,7 @@ def _infer_delegation_provider_for_model(model: str) -> str:
 
     requested_key = requested.casefold()
     matches: list[str] = []
-    for row in payload.get("providers") or []:
-        if not isinstance(row, dict):
-            continue
+    for row in _catalog_provider_rows(payload):
         slug = str(row.get("slug") or "").strip()
         if not slug:
             continue
@@ -426,9 +438,7 @@ def _validate_explicit_provider_model_catalog(provider: str, model: str) -> None
     if provider_key in {"opencode-go", "opencode-zen"} and "/" in requested:
         requested_keys.add(requested.rsplit("/", 1)[-1].casefold())
 
-    for row in payload.get("providers") or []:
-        if not isinstance(row, dict):
-            continue
+    for row in _catalog_provider_rows(payload):
         if str(row.get("slug") or "").strip().casefold() != provider_key:
             continue
         catalog_models = [
@@ -749,20 +759,20 @@ def resolve_delegation_task_routes(
     *,
     cfg: dict,
     parent_agent: Any,
-    tasks: List[Dict[str, Any]],
+    tasks: list[dict[str, Any]],
     provider: Any = None,
     model: Any = None,
     reasoning_effort: Any = None,
     credential_resolver: CredentialResolver,
-) -> List[ResolvedDelegationRoute]:
+) -> list[ResolvedDelegationRoute]:
     """Resolve every task route before child construction.
 
     Top-level fields are defaults and task fields override them.  Repeated
     route requests are resolved once per invocation.  Any failure aborts the
     complete fan-out with the original task index attached.
     """
-    resolved: List[ResolvedDelegationRoute] = []
-    cache: Dict[
+    resolved: list[ResolvedDelegationRoute] = []
+    cache: dict[
         tuple[Optional[str], Optional[str], Optional[str]],
         ResolvedDelegationRoute,
     ] = {}
@@ -817,9 +827,9 @@ def delegation_route_tool_error(
 
 
 
-def child_route_metadata(child: Any) -> Dict[str, Any]:
+def child_route_metadata(child: Any) -> dict[str, Any]:
     """Return safe effective route metadata for results and async records."""
-    metadata: Dict[str, Any] = {}
+    metadata: dict[str, Any] = {}
     provider = getattr(child, "provider", None)
     model = getattr(child, "model", None)
     reasoning_config = getattr(child, "reasoning_config", None)
@@ -838,9 +848,9 @@ def child_route_metadata(child: Any) -> Dict[str, Any]:
 
 
 __all__ = [
+    "INHERIT_REASONING",
     "DelegationRouteError",
     "DelegationTaskRouteError",
-    "INHERIT_REASONING",
     "ResolvedDelegationRoute",
     "child_route_metadata",
     "delegation_route_tool_error",
