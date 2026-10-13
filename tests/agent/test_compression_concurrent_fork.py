@@ -2110,6 +2110,83 @@ def _runtime_context_rows(messages: list[dict]) -> list[dict]:
 
 
 @pytest.mark.parametrize("in_place", [True, False])
+@pytest.mark.parametrize("error_type", [RuntimeError, InterruptedError])
+@pytest.mark.parametrize("caller_owns_fence", [True, False])
+def test_summary_exception_preserves_complete_live_runtime_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    in_place: bool,
+    error_type: type[Exception],
+    caller_owns_fence: bool,
+) -> None:
+    """Summary-only filtering must never become a destructive live-history rollback."""
+    from hermes_cli import lifecycle
+    from fork_features.request_fork import FrozenRequest
+
+    db = SessionDB(db_path=tmp_path / "summary-failure.db")
+    session_id = f"SUMMARY_FAILURE_{in_place}_{error_type.__name__}"
+    db.create_session(session_id, source="telegram")
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = in_place
+    messages = [
+        {"role": "user", "content": "preserve the real user request"},
+        {"role": "assistant", "content": "previous answer"},
+        _runtime_context_message("revision=7; keep the pending acceptance conditions"),
+    ]
+    db.append_messages_batch(session_id, messages)
+    for message in messages:
+        message["_db_persisted"] = True
+    before = copy.deepcopy(messages)
+    durable_before = db.get_messages_as_conversation(session_id)
+    error = error_type("synthetic summary failure")
+    engine_inputs = []
+    hook_calls = []
+
+    def fail_summary(engine_messages, **_kwargs):
+        engine_inputs.append(copy.deepcopy(engine_messages))
+        # Even a summarizer mutating its private copy cannot change live history.
+        engine_messages[0]["content"] = "damaged private summary input"
+        raise error
+
+    agent.context_compressor.compress.side_effect = fail_summary
+    monkeypatch.setattr(
+        lifecycle, "has_hook",
+        lambda name: name in {"on_compression_start", "on_compression_finish"},
+    )
+    monkeypatch.setattr(
+        lifecycle, "invoke_hook",
+        lambda name, **payload: hook_calls.append((name, payload)),
+    )
+    request = FrozenRequest(
+        body={"model": "test/model", "input": copy.deepcopy(messages), "tools": []},
+        fidelity="prepared_parent", captured_session_id=session_id,
+    )
+    from agent.conversation_compression import CompressionCommitFence
+
+    # Session hygiene supplies its own fence and takes the direct live-list path.
+    # Ordinary callers use a private worker copy; retain coverage of both routes.
+    fence = CompressionCommitFence() if caller_owns_fence else None
+    with pytest.raises(error_type) as raised:
+        agent._compress_context(
+            messages, "sys", approx_tokens=120_000, force=True,
+            request_fork=request, commit_fence=fence,
+        )
+
+    assert raised.value is error
+    assert len(engine_inputs) == 1
+    assert _runtime_context_rows(engine_inputs[0]) == []
+    assert messages == before
+    assert _runtime_context_rows(messages) == [before[-1]]
+    assert db.get_messages_as_conversation(session_id) == durable_before
+    assert agent.session_id == session_id
+    assert db.find_live_compression_child(session_id) is None
+    assert db.get_compression_lock_holder(session_id) is None
+    finishes = [payload for name, payload in hook_calls if name == "on_compression_finish"]
+    assert len(finishes) == 1
+    assert finishes[0]["outcome"] == "failed"
+
+
+@pytest.mark.parametrize("in_place", [True, False])
 def test_compression_persists_one_runtime_context_from_common_commit_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

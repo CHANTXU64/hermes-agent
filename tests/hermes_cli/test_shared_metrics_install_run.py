@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -151,6 +151,7 @@ def test_real_install_sh_ladder_leaves_only_closed_tokens(tmp_path):
          "--dir", str(tmp_path / "checkout")],
         env={"HOME": str(tmp_path), "PATH": str(tools), "HERMES_REPO_URL": "https://example.invalid/x.git"},
         capture_output=True, text=True, encoding="utf-8", timeout=60,
+        check=False,
     )
     assert result.returncode == 1, result.stdout + result.stderr
     assert "git is required" in result.stderr
@@ -176,7 +177,9 @@ def test_receipt_is_recorded_only_on_a_day_the_sender_can_ever_send(marks, monke
     from hermes_cli.observability.shared_metrics_sender import CONSENT_GATE_SQL, reconcile_send_consent
     from hermes_cli.sqlite_util import write_txn
 
-    t0 = datetime(2026, 10, 6, tzinfo=timezone.utc)
+    # Anchored to the real date: the receipt-age cutoff (_stale) reads the real clock, so a fixed
+    # date here expires the receipt once it is more than MAX_RECEIPT_AGE_SECONDS in the past.
+    t0 = datetime.combine(datetime.now(UTC).date(), datetime.min.time(), tzinfo=UTC) - timedelta(days=1)
     clock = {"now": t0 + timedelta(hours=9)}
     monkeypatch.setattr(store_module, "_utc_now", lambda: clock["now"])
     monkeypatch.setattr("hermes_cli.config.read_raw_config_readonly",

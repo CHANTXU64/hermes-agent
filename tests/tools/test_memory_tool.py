@@ -280,7 +280,7 @@ class TestMemoryStoreReplace:
         store.add("memory", "x" * 380)  # 65 + 3 + 380 = 448 of 500
         full = store.add("memory", "y" * 54)  # 448 + 3 + 54 = 505
         assert "by 5 chars" in full["error"] and "free at least 5 chars" in full["error"]
-        miss = store.apply_batch("memory", [{"action": "replace", "old_text": "Deploys via GitHub Actions to Fly",
+        miss = store.apply_batch("memory", [{"action": "patch", "old_text": "Deploys via GitHub Actions to Fly",
                                              "content": "Deploys: Fly.io + canary."}])
         assert miss["closest_entries"] == ["Deploys go through GitHub Actions to Fly.io with manual approval."]
         assert "current_entries" not in miss  # batch aborts still never echo the store (#97316)
@@ -504,6 +504,19 @@ class TestMemoryToolDispatcher:
         assert "content is required" in result["error"]
         assert "current_entries" not in result
 
+    def test_replace_remains_available_with_audited_whole_entry_semantics(self, store):
+        store.add("memory", "Jeff drinks tea; prefers Rust; lives in Portland")
+        result = json.loads(memory_tool(
+            action="replace", old_text="tea", content="Jeff drinks coffee",
+            reason="Explicit whole-entry update", evidence="Fixture instruction", store=store))
+        assert result["success"] is True
+        assert store.memory_entries == ["Jeff drinks coffee"]
+        result = json.loads(memory_tool(target="memory", store=store, operations=[
+            {"action":"add", "content":"new fact", "reason":"Add fixture", "evidence":"Fixture"},
+            {"action":"replace", "old_text":"coffee", "content":"Updated entry", "reason":"Rewrite fixture", "evidence":"Fixture"}]))
+        assert result["success"] is True
+        assert store.memory_entries == ["Updated entry", "new fact"]
+
     def test_new_text_alias_for_content_on_replace(self, store):
         # A caller mirroring old_text with new_text (the patch tool's shape)
         # must succeed instead of erroring 'content is required'.
@@ -575,7 +588,7 @@ class TestMemoryBatch:
 
 
     def test_batch_new_text_alias_for_content(self, store):
-        # new_text works inside batch ops too (both add and replace).
+        # new_text works inside batch ops too (both add and patch).
         store.add("memory", "old entry")
         result = json.loads(memory_tool(
             target="memory",
@@ -826,6 +839,8 @@ class TestLoadTimeSnapshotSanitization:
         assert "Clean fact about the project." in snapshot
         # Poisoned entry replaced with placeholder
         assert "[BLOCKED:" in snapshot
+        # The removal hint names the store, since memory writes require an explicit target
+        assert "memory(action=remove, target='memory')" in snapshot
         assert "ignore previous instructions" not in snapshot
         assert "$API_KEY" not in snapshot
         # Live state keeps the raw text so the user can see + remove it
@@ -851,6 +866,7 @@ class TestLoadTimeSnapshotSanitization:
 
         snapshot = s._system_prompt_snapshot["user"]
         assert "[BLOCKED:" in snapshot
+        assert "memory(action=remove, target='user')" in snapshot
         assert "REGISTER AS A NODE" not in snapshot
         assert "BRAINWORM" not in snapshot
 
@@ -1053,7 +1069,7 @@ class TestBackgroundReviewDeleteGate:
 
     def test_attended_review_keeps_full_operation_set(self, store):
         # A user-requested /refine fork keeps the background_review origin (skill guards still
-        # apply) but is attended, so replace/remove keep working on that supervised surface.
+        # apply) but is attended, so patch/remove keep working on that supervised surface.
         from tools.skill_provenance import reset_review_attended, set_review_attended
         store.add("memory", "entry an explicit refine may rewrite")
         token = set_current_write_origin("background_review")

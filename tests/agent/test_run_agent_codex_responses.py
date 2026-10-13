@@ -1701,7 +1701,7 @@ def test_try_refresh_copilot_client_credentials_falls_back_when_exchange_unavail
 
 
 def test_preflight_codex_api_kwargs_strips_optional_function_call_id(monkeypatch):
-    agent = _build_agent(monkeypatch)
+    _build_agent(monkeypatch)
     from agent.codex_responses_adapter import _preflight_codex_api_kwargs
     preflight = _preflight_codex_api_kwargs(
         {
@@ -1728,7 +1728,7 @@ def test_preflight_codex_api_kwargs_strips_optional_function_call_id(monkeypatch
 
 
 def test_preflight_codex_api_kwargs_rejects_function_call_output_without_call_id(monkeypatch):
-    agent = _build_agent(monkeypatch)
+    _build_agent(monkeypatch)
 
     with pytest.raises(ValueError):
         from agent.codex_responses_adapter import _preflight_codex_api_kwargs
@@ -2103,13 +2103,8 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     compress_calls = []
 
     def _fake_compress_context(
-        messages,
-        system_message,
-        *,
-        approx_tokens=None,
-        task_id="default",
-        focus_topic=None,
-        request_fork=None,
+        messages, system_message, *, approx_tokens=None, task_id="default",
+        focus_topic=None, request_fork=None, trigger=None,
     ):
         del request_fork
         compress_calls.append(approx_tokens)
@@ -2176,13 +2171,8 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
             )
 
     def _fake_compress_context(
-        messages,
-        system_message,
-        *,
-        approx_tokens=None,
-        task_id="default",
-        focus_topic=None,
-        request_fork=None,
+        messages, system_message, *, approx_tokens=None, task_id="default",
+        focus_topic=None, request_fork=None, trigger=None,
     ):
         del request_fork
         # Emulate the real in-place compaction DB side effect: soft-archive the
@@ -2300,7 +2290,7 @@ def test_codex_incomplete_opaque_state_updated_in_place(monkeypatch):
 
 
 def test_normalize_codex_response_marks_commentary_only_message_as_incomplete(monkeypatch):
-    agent = _build_agent(monkeypatch)
+    _build_agent(monkeypatch)
     from agent.codex_responses_adapter import _normalize_codex_response
     assistant_message, finish_reason = _normalize_codex_response(
         _codex_commentary_message_response("I'll inspect the repository first.")
@@ -2315,7 +2305,7 @@ def test_normalize_codex_response_marks_commentary_only_message_as_incomplete(mo
 
 
 def test_normalize_codex_response_does_not_fallback_to_output_text_for_commentary_only(monkeypatch):
-    agent = _build_agent(monkeypatch)
+    _build_agent(monkeypatch)
     from agent.codex_responses_adapter import _normalize_codex_response
 
     response = _codex_commentary_message_response("I’ll call the tool now.")
@@ -2572,7 +2562,7 @@ def test_chat_messages_to_responses_input_reasoning_only_has_following_item(monk
     """When converting a reasoning-only interim message to Responses API input,
     the reasoning items must be followed by an assistant message (even if empty)
     to satisfy the API's 'required following item' constraint."""
-    agent = _build_agent(monkeypatch)
+    _build_agent(monkeypatch)
     messages = [
         {"role": "user", "content": "think hard"},
         {
@@ -2830,7 +2820,6 @@ def test_codex_compaction_only_continuation_gets_nudged_before_budget_runs_out(m
         _codex_message_response("Here is the answer."),
     ]
     sent_message_counts: list = []
-    original_call = agent._interruptible_api_call
 
     def _fake_call(api_kwargs):
         sent_message_counts.append(api_kwargs)

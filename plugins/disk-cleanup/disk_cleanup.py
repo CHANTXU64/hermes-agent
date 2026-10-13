@@ -14,7 +14,7 @@ import json
 import logging
 import shutil
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -62,7 +62,7 @@ def _log(message: str) -> None:
     with contextlib.suppress(OSError):
         log_file = _state_file("cleanup.log")
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {message}\n")
 
@@ -193,7 +193,7 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
     tracked = load_tracked()
     if any(item["path"] == str(path) for item in tracked):
         return False
-    tracked.append({"path": str(path), "timestamp": datetime.now(timezone.utc).isoformat(),
+    tracked.append({"path": str(path), "timestamp": datetime.now(UTC).isoformat(),
                     "category": category, "size": size})
     save_tracked(tracked)
     _log(f"TRACKED: {path} ({category}, {fmt_size(size)})")
@@ -261,7 +261,7 @@ _STALE_SKIP_NOTE = {"cron-output": "", "test": " — under protected tree"}
 def dry_run() -> tuple[list[dict], list[dict]]:
     """Return (auto_delete_list, needs_prompt_list) without touching files."""
     auto, prompt = [], []
-    for item, p, age in _live_items(load_tracked(), datetime.now(timezone.utc)):
+    for item, p, age in _live_items(load_tracked(), datetime.now(UTC)):
         cat = item["category"]
         # Stale cron-output entries and protected dirs are skipped by quick(); omit them here too.
         if (cat == "cron-output" and guess_category(p) != "cron-output") or _is_protected_dir(p):
@@ -278,7 +278,7 @@ def quick() -> dict[str, Any]:
     deleted = freed = 0
     new_tracked: list[dict] = []
     errors: list[str] = []
-    for item, p, age in _live_items(load_tracked(), datetime.now(timezone.utc), log_stale=True):
+    for item, p, age in _live_items(load_tracked(), datetime.now(UTC), log_stale=True):
         cat = item["category"]
         if cat in _STALE_SKIP_NOTE and (re_cat := guess_category(p)) != cat:
             # Misclassified stale entry — drop it rather than delete the file.

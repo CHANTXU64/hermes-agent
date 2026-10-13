@@ -110,6 +110,7 @@ class MemoryGovernance:
         ).strip()
         if normalized["change_type"] not in {
             "add",
+            "patch",
             "replace",
             "merge",
             "compress",
@@ -117,7 +118,7 @@ class MemoryGovernance:
             "delete",
         }:
             raise ValueError(
-                "change_type must be add, replace, merge, compress, migrate, or delete."
+                "change_type must be add, replace, patch, merge, compress, migrate, or delete."
             )
         normalized["reason"] = reason
         normalized["evidence"] = evidence
@@ -155,6 +156,10 @@ class MemoryGovernance:
                     continue
                 working.append(content)
                 after = content
+            elif action == "patch":
+                before = result["patched_entries"][position] if batch else result["patched_entry_before"]
+                after = result["patched_entries_after"][position] if batch else result["patched_entry_after"]
+                working[working.index(before)] = after
             elif action in {"replace", "remove"}:
                 field = "replaced" if action == "replace" else "removed"
                 before = (result[f"{field}_entries"][position] if batch
@@ -446,7 +451,7 @@ def build_memory_schema() -> dict[str, Any]:
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["add", "replace", "remove", "history"],
+                    "enum": ["add", "replace", "patch", "remove", "history"],
                     "description": "Mutation action, or read-only history lookup. Omit when using 'operations'."
                 },
                 "target": {
@@ -456,11 +461,11 @@ def build_memory_schema() -> dict[str, Any]:
                 },
                 "content": {
                     "type": "string",
-                    "description": "The entry content. Required for 'add' and 'replace' (single-op shape). For 'replace', this is the complete new entry; the whole matched entry is overwritten."
+                    "description": "The entry content. Required for 'add', 'replace', and 'patch' (single-op shape). For 'replace', this is the complete new entry; the whole matched entry is overwritten. For 'patch', only the exact old_text span is replaced; all other text is kept."
                 },
                 "old_text": {
                     "type": "string",
-                    "description": "REQUIRED for 'replace', 'remove', and 'history': a short unique substring identifying the existing entry. It locates the entry and is not patched in place. Omit only for 'add'."
+                    "description": "REQUIRED for 'replace', 'patch', 'remove', and 'history': a short unique substring identifying the existing entry. For 'replace', it only locates the whole entry. For 'patch', it is the exact span to edit and must occur once in that entry. Omit only for 'add'."
                 },
                 "reason": {
                     "type": "string",
@@ -472,7 +477,7 @@ def build_memory_schema() -> dict[str, Any]:
                 },
                 "change_type": {
                     "type": "string",
-                    "enum": ["add", "replace", "merge", "compress", "migrate", "delete"],
+                    "enum": ["add", "replace", "patch", "merge", "compress", "migrate", "delete"],
                     "description": "Semantic change kind. Defaults from action; set merge/compress/migrate when applicable."
                 },
                 "deletion_type": {
@@ -498,12 +503,12 @@ def build_memory_schema() -> dict[str, Any]:
                     "items": {
                         "type": "object",
                         "properties": {
-                            "action": {"type": "string", "enum": ["add", "replace", "remove"]},
-                            "content": {"type": "string", "description": "Entry content for add/replace. For replace, this is the complete new entry."},
-                            "old_text": {"type": "string", "description": "Substring identifying the entry for replace/remove."},
+                            "action": {"type": "string", "enum": ["add", "replace", "patch", "remove"]},
+                            "content": {"type": "string", "description": "Entry content for add/replace/patch. Replace overwrites the full entry; patch replaces only old_text."},
+                            "old_text": {"type": "string", "description": "Substring identifying the entry for replace/remove; exact unique span for patch."},
                             "reason": {"type": "string", "description": "Why this operation is justified."},
                             "evidence": {"type": "string", "description": "User statement or verified fact supporting it."},
-                            "change_type": {"type": "string", "enum": ["add", "replace", "merge", "compress", "migrate", "delete"]},
+                            "change_type": {"type": "string", "enum": ["add", "replace", "patch", "merge", "compress", "migrate", "delete"]},
                             "deletion_type": {"type": "string", "enum": ["safe", "expired", "forced_capacity"]},
                             "loss_note": {"type": "string", "description": "Required for forced_capacity removal."},
                             "related_skill": {"type": "string", "description": "Skill verified with skill_view, if applicable."},

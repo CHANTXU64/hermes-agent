@@ -222,7 +222,7 @@ class CompressionFacadeMixin:
         self, messages: list, system_message: str, *, approx_tokens: int | None = None, task_id: str = "default",
         focus_topic: str | None = None, force: bool = False, bypass_cooldown: bool = False,
         defer_context_engine_notification: bool = False, commit_fence=None, verbatim_tail: list | None = None,
-        trigger: str | None = None, snapshot_is_current=None,
+        trigger: str | None = None, snapshot_is_current=None, overflow_reason: str | None = None,
         request_fork=None, request_fork_rematerializer=None,
     ) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
@@ -285,6 +285,7 @@ class CompressionFacadeMixin:
                     defer_context_engine_notification=(defer_context_engine_notification), commit_fence=fence,
                     request_fork=request_fork, request_fork_rematerializer=request_fork_rematerializer,
                     verbatim_tail=verbatim_tail, trigger=trigger, snapshot_is_current=snapshot_is_current,
+                    overflow_reason=overflow_reason,
                 )
 
             # Callers that already own a progress-aware wait (gateway session

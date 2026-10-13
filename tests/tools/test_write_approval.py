@@ -173,6 +173,25 @@ def test_handle_approve_surfaces_overwritten_entry(hermes_home):
     assert store.memory_entries == ["RULE B: CI is per-head."]
 
 
+def test_handle_approve_lists_a_patch_as_the_entry_before_the_edit(hermes_home):
+    """An approved patch keeps the rest of its entry; the approve output called it an
+    overwrite and told the user to re-add text they had deliberately changed."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+    store = MemoryStore(); store.load_from_disk()
+    entry = "RULE A: gate merges. RULE B: ci per HEAD. RULE C: never squash."
+    store.add("memory", entry)
+    wa.stage_write("memory", {"action": "batch", "target": "memory", "operations": [
+        {"action": "patch", "old_text": "ci per HEAD", "content": "CI is per-head", "matched_entry": entry,
+         "reason": "Approved fixture correction", "evidence": "Fixture approval"}]},
+        summary="batch", origin="background_review")
+    out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
+    assert "Patched entry (as it was before the edit):" in out and entry in out
+    assert "Overwrote" not in out
+    assert store.memory_entries == ["RULE A: gate merges. RULE B: CI is per-head. RULE C: never squash."]
+
+
 _KEPT = "Repo lives in ~/src/app; tests via make test"
 _REVIEWED = "Staging DB: pg-staging-2 (old cluster, retiring)"
 
