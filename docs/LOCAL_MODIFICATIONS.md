@@ -36,6 +36,45 @@ Validation after a merge:
 
 ## Active modifications
 
+### Auxiliary Codex credential model scope
+
+- ID: `auxiliary-codex-credential-model-scope`
+- Status: active
+- Depends on: none
+- Source boundary: logical-only (existing auxiliary routing and credential-pool seams)
+
+Files / touchpoints:
+- `agent/auxiliary_client.py` — normalize Codex models before pooled selection/peeks and wire construction; bind cached transports to their actual credential and endpoint.
+- `agent/credential_pool.py` — optional model-scoped, non-selecting `peek`.
+- `tests/agent/test_auxiliary_codex_model_scope.py` — real-pool routing and cache regression cases.
+- `tests/agent/test_auxiliary_auto_model_scope.py` — auto override/inheritance, provider/model aliases, fast/MoA routes and unavailable-main fallback credential/cache/wire boundaries.
+- `tests/agent/test_auxiliary_codex_scope_review.py` — independent multi-account/alias regressions, interleaved sync/async selection, concurrent round-robin builds and rotation/route boundaries.
+- `tests/agent/test_auxiliary_client.py` — existing pooled-client fixtures assert model forwarding.
+- `tests/agent/test_codex_cloudflare_headers.py`, `tests/agent/test_codex_usage_attribution.py`, `tests/plugins/image_gen/test_openai_codex_provider.py` — existing header/wire/model-less caller fixtures accept the optional model argument; original behavioral assertions remain.
+
+Intent / invariants:
+- A restriction on one model must not hide a pooled account from an unrelated Codex auxiliary model. Adapted, raw, cached and configured-fallback Codex entry points share the same model-aware credential resolver.
+- Model-aware peeks reject a current account when it is restricted for the requested model. Peeks are lookup hints, not proof of which account construction selects: Codex cache storage uses a secret-safe digest of the actual client's token and effective endpoint, not a later peek. Peeks do not advance selection order or request counts.
+- Supported Codex aliases use the existing provider model normalizer for credential eligibility, cache model identity and the request model. No new model-name rules or model-specific exceptions are introduced.
+- Auto applies its compatible override before Codex credential selection, after fast-model/MoA substitution, including configured fallback routes. Preserve the existing slash-override guard (a slash-bearing override is dropped for a bare resolved default), no-override inheritance, provider/fallback order and the missing-main-model gate.
+- Auto Codex cache lookup uses that effective model; storage retains the actual credential/endpoint and resolved model. A Codex fallback must not be reused behind an unrelated main-provider hint; such lookups may re-resolve the configured chain rather than reuse an unsafe cached client.
+- Keep credential-wide failures, requested-model restrictions, endpoint/key pairing and legacy singleton fallback policy. No model allowlist, cooldown clearing, credential/config rewrite, or change to model-less diagnostics is introduced.
+- This does not redesign other providers' model discovery or their provider-specific authentication policy. The separate Hindsight plugin owns its explicit fallback exception boundary.
+
+Merge decision:
+- Preserve when: upstream auxiliary Codex selection or credential caching still loses model scope.
+- Drop when: an upstream equivalent passes the real-pool, cache and entry-point regressions.
+- Ask user when: changing account restrictions, routing defaults, credential fallback policy or provider discovery.
+
+Verification:
+```bash
+scripts/run_tests.sh tests/agent/test_auxiliary_codex_model_scope.py tests/agent/test_auxiliary_codex_scope_review.py tests/agent/test_auxiliary_auto_model_scope.py tests/agent/test_auxiliary_main_first.py tests/agent/test_auxiliary_auto_never_guesses_provider.py tests/agent/test_auxiliary_client.py tests/agent/test_auxiliary_client_cache_follows_credential.py tests/agent/test_auxiliary_runtime_cache_key.py tests/agent/test_credential_pool.py tests/agent/test_codex_cloudflare_headers.py tests/agent/test_codex_usage_attribution.py tests/plugins/image_gen/test_openai_codex_provider.py
+```
+
+- Upstream status: fork-only
+- Last validated: upstream `8172ebab6b4f11a42f5b3ab17bb625b78d2f57df`; working-tree change based on Fork `0b7f30defe6438fdc7b8ddc29dc8da2f0ceb56e2`.
+- Feature docs: none — behavior tests and inline comments specify this bounded correction; events are in `docs/chantxu64/auxiliary-codex-credential-model-scope/changes.jsonl`.
+
 ### Subprocess dependency isolation across PM updates
 
 - ID: `subprocess-runtime-isolation`

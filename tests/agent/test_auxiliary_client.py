@@ -768,15 +768,17 @@ class TestBuildCodexClient:
             def current(self):
                 return self.entry
 
-            def peek(self):
+            def peek(self, *, model=None):
+                assert model == "gpt-5.4"
                 return self.entry
 
-            def select(self):
+            def select(self, *, model=None):
+                assert model == "gpt-5.4"
                 return self.entry
 
         pool = _Pool()
-        client_a = MagicMock(name="codex-client-a")
-        client_b = MagicMock(name="codex-client-b")
+        client_a = MagicMock(name="codex-client-a", api_key="tok-a", base_url=pool.entry.runtime_base_url)
+        client_b = MagicMock(name="codex-client-b", api_key="tok-b", base_url=pool.entry.runtime_base_url)
 
         with (
             patch("agent.auxiliary_client.load_pool", return_value=pool),
@@ -1134,7 +1136,8 @@ class TestGetTextAuxiliaryClient:
             def has_credentials(self):
                 return True
 
-            def select(self):
+            def select(self, *, model=None):
+                assert model == "gpt-5.4"
                 return _Entry()
 
         with (

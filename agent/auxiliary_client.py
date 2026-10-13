@@ -1027,19 +1027,19 @@ def _load_pool_with_credentials(provider: str, note: str = "") -> Optional[Any]:
     return pool if pool and pool.has_credentials() else None
 
 
-def _select_pool_entry(provider: str) -> tuple[bool, Optional[Any]]:
+def _select_pool_entry(provider: str, model: Optional[str] = None) -> tuple[bool, Optional[Any]]:
     """Return (pool_exists_for_provider, selected_entry)."""
     pool = _load_pool_with_credentials(provider)
     if pool is None:
         return False, None
     try:
-        return True, pool.select()
+        return True, pool.select(model=model) if model else pool.select()
     except Exception as exc:
         logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
         return True, None
 
 
-def _peek_pool_entry(provider: str, pool: Any = None) -> Optional[Any]:
+def _peek_pool_entry(provider: str, pool: Any = None, *, model: Optional[str] = None) -> Optional[Any]:
     """Best-effort current/next pool entry without mutating selection order.
 
     ``pool`` skips the disk re-read when the caller already loaded it.
@@ -1049,6 +1049,10 @@ def _peek_pool_entry(provider: str, pool: Any = None) -> Optional[Any]:
     if pool is None:
         return None
     try:
+        if model:
+            if _normalize_aux_provider(provider) == "openai-codex":
+                model = _normalize_resolved_model(model, "openai-codex")
+            return pool.peek(model=model)
         current_fn = getattr(pool, "current", None)
         current = current_fn() if callable(current_fn) else None
         if current is not None:
@@ -2113,13 +2117,15 @@ def _resolve_xai_oauth_for_aux() -> Optional[tuple[str, str]]:
     return _creds_pair(creds)
 
 
-def _resolve_codex_credential_and_base() -> tuple[Optional[str], str]:
+def _resolve_codex_credential_and_base(model: Optional[str] = None) -> tuple[Optional[str], str]:
     """``(token, base_url)`` taken from ONE authority, so a Codex key is only ever sent to the host
     it belongs to (#121486): the profile-scoped ``HERMES_CODEX_BASE_URL`` wins; otherwise a pooled
     key goes where that pool entry routes (row URL / ``model.base_url``) and the auth.json OAuth
     token goes to the ChatGPT default. ``(None, <base>)`` without a usable token."""
     override = _codex_base_url_override()
-    pool_present, entry = _select_pool_entry("openai-codex")
+    # Cooldowns must be checked against the same canonical id sent on the wire.
+    model = _normalize_resolved_model(model, "openai-codex")
+    pool_present, entry = _select_pool_entry("openai-codex", model=model)
     if pool_present:
         token = _pool_runtime_api_key(entry)
         if token:
@@ -2975,13 +2981,14 @@ def _build_codex_client(model: str) -> tuple[Optional[Any], Optional[str]]:
 
     No auto-selected default: the Codex model allow-list is undocumented and drifts.
     """
+    model = _normalize_resolved_model(model, "openai-codex") or ""
     if not model:
         logger.warning(
             "Auxiliary client: openai-codex requested without a model; "
             "pass model explicitly (auxiliary.<task>.model in config.yaml)."
         )
         return None, None
-    codex_token, base_url = _resolve_codex_credential_and_base()
+    codex_token, base_url = _resolve_codex_credential_and_base(model=model)
     if not codex_token:
         return None, None
     logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", model)
@@ -3634,12 +3641,25 @@ def _pool_credential_digest(pool: Any, entry: Any = None) -> str:
     return digest.hexdigest()
 
 
-def _pool_cache_hint(provider: str, *, main_runtime: Optional[dict[str, Any]] = None) -> str:
+def _codex_credential_cache_hint(token: str, base_url: Any) -> str:
+    """Identity of the actual Codex transport, independent of mutable pool.current().
+
+    Include the destination as well as the secret-safe token digest: pool routes and
+    profile endpoint overrides can change without rotating the token. The SDK adds
+    a trailing slash to base_url, so match that representation on lookup and store.
+    """
+    payload = json.dumps([token, str(base_url).rstrip("/")]).encode("utf-8")
+    return "openai-codex:credential:" + hashlib.blake2b(payload, digest_size=16).hexdigest()
+
+
+def _pool_cache_hint(provider: str, *, main_runtime: Optional[dict[str, Any]] = None, model: Optional[str] = None) -> str:
     """Return a cache discriminator that follows the pooled credential, not just its entry id.
 
     ``<provider>:<entry id>:<digest of that entry's key>`` when ``peek()`` names an entry,
     ``<provider>::<digest of every entry's key>`` when every entry is filtered out (cooldown)
-    but keyed entries exist. A token rotated or
+    but keyed entries exist. Codex uses the token + effective destination instead of
+    the row id, so storage can bind to the constructed transport even if select and
+    peek disagree. A token rotated or
     refreshed by another process yields a new client instead of a 401 round trip on the cached
     one; the stale entry ages out through the non-closing FIFO cap (#113022).
     """
@@ -3652,7 +3672,13 @@ def _pool_cache_hint(provider: str, *, main_runtime: Optional[dict[str, Any]] = 
     pool = _load_pool_with_credentials(normalized, " (cache hint)")
     if pool is None:
         return ""
-    entry = _peek_pool_entry(normalized, pool)
+    entry = _peek_pool_entry(normalized, pool, model=model)
+    if normalized == "openai-codex" and entry is not None:
+        token = _pool_runtime_api_key(entry)
+        if token:
+            from hermes_cli.auth_codex import _codex_pool_route_base_url
+            base_url = _codex_base_url_override() or _codex_pool_route_base_url(_pool_runtime_base_url(entry))
+            return _codex_credential_cache_hint(token, base_url)
     digest = _pool_credential_digest(pool, entry)
     entry_id = str(getattr(entry, "id", "") or "").strip() if entry is not None else ""
     if not entry_id and not digest:
@@ -4406,7 +4432,7 @@ def _context_too_small(
 
 def _try_configured_fallback_chain(
     task: str, failed_provider: str, reason: str = "error", failed_model: Optional[str] = None, *,
-    failed_base_url: str = "", failure_scope: Any = None,
+    failed_base_url: str = "", failure_scope: Any = None, model_override: Optional[str] = None,
 ) -> tuple[Optional[Any], Optional[str], str]:
     """Try auxiliary.<task>.fallback_chain entries in order (each needs ``provider``; model/base_url/api_key optional).
     ``failed_model`` scoping per ``_failed_backend_skip`` (sibling models on the same provider still
@@ -4437,7 +4463,8 @@ def _try_configured_fallback_chain(
         fb_model = fb_model_raw or None
         label = f"fallback_chain[{i}]({fb_provider})"
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            fb_client, resolved_model = _resolve_fallback_entry(
+                entry, **({"model_override": model_override} if model_override else {}))
         except Exception:
             fb_client, resolved_model = None, None
         if fb_client is not None:
@@ -4473,12 +4500,16 @@ def _fallback_entry_api_key(entry: dict[str, Any]) -> Optional[str]:
     return resolve_entry_api_key(entry)
 
 
-def _resolve_fallback_entry(entry: dict[str, Any]) -> tuple[Optional[Any], Optional[str]]:
+def _resolve_fallback_entry(
+    entry: dict[str, Any], *, model_override: Optional[str] = None,
+) -> tuple[Optional[Any], Optional[str]]:
     """Resolve one fallback entry through the central provider router."""
     provider = str(entry.get("provider") or "").strip()
     model = str(entry.get("model") or "").strip() or None
     if not provider or not model:
         return None, None
+    if model_override:
+        model = _auto_route_model(model_override, model, provider)
     client, resolved_model = resolve_provider_client(
         provider, model=model, explicit_base_url=str(entry.get("base_url") or "").strip() or None,
         explicit_api_key=_fallback_entry_api_key(entry),
@@ -4493,6 +4524,7 @@ def _resolve_fallback_entry(entry: dict[str, Any]) -> tuple[Optional[Any], Optio
 def _try_main_fallback_chain(
     task: Optional[str], failed_provider: str = "", reason: str = "error", *,
     failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None,
+    model_override: Optional[str] = None,
 ) -> tuple[Optional[Any], Optional[str], str]:
     """Top-level main-agent fallback chain for a ``provider: auto`` auxiliary call: auto tasks honour the
     user's main fallback policy before the built-in discovery chain; read via ``get_fallback_chain`` so
@@ -4528,7 +4560,8 @@ def _try_main_fallback_chain(
             tried.append(f"{label} (unhealthy)")
             continue
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            fb_client, resolved_model = _resolve_fallback_entry(
+                entry, **({"model_override": model_override} if model_override else {}))
         except Exception as exc:
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
@@ -4680,8 +4713,27 @@ def _try_discovery_chain() -> tuple[Optional[OpenAI], Optional[str], str]:
     return None, None, ""
 
 
+def _auto_route_model(model: Optional[str], default: Optional[str], provider: str) -> Optional[str]:
+    """Apply auto's existing slash-override guard before choosing credentials.
+
+    A vendor/model override is still dropped when the selected route's normalized
+    default is bare. Do not turn auto into explicit-provider alias routing here.
+    """
+    provider = _normalize_aux_provider(provider)
+    default = _normalize_resolved_model(default, provider)
+    if model and "/" in model and default and "/" not in default:
+        logger.debug("Dropping OpenRouter-format model %r for non-OpenRouter "
+                     "auxiliary provider (using %r instead)", model, default)
+        model = None
+    # Only Codex eligibility/cache/wire identity is tightened here. Other auto
+    # providers retain their existing override spelling at the call boundary.
+    chosen = model or default
+    return _normalize_resolved_model(chosen, provider) if provider == "openai-codex" else chosen
+
+
 def _resolve_auto_route(
-    main_runtime: Optional[dict[str, Any]] = None, task: Optional[str] = None
+    main_runtime: Optional[dict[str, Any]] = None, task: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> tuple[Optional[OpenAI], Optional[str], str]:
     """Full auto-detection chain, including the selected provider identity. Priority: (1) main provider +
     main model, regardless of provider type ("auto" means "my main model for side tasks too"; explicit
@@ -4693,16 +4745,20 @@ def _resolve_auto_route(
     runtime = _normalize_main_runtime(main_runtime)
     _warn_stale_openai_base_url(runtime.get("provider", ""))
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
+    if main_model:
+        main_model = _auto_route_model(model, main_model, main_provider) or ""
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
         return routed
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-            task, main_provider or "auto", reason="main provider unavailable")
+            task, main_provider or "auto", reason="main provider unavailable",
+            **({"model_override": model} if model else {}))
         if fb_client is not None:
             return fb_client, fb_model, _fallback_provider_from_label(fb_label)
     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-        task, main_provider or "auto", reason="main provider unavailable")
+        task, main_provider or "auto", reason="main provider unavailable",
+        **({"model_override": model} if model else {}))
     if fb_client is not None:
         return fb_client, fb_model, fb_label
     if not _discovery_chain_allowed(main_provider, task):
@@ -5002,17 +5058,12 @@ def _route_or_warn(req: _ResolveRequest, client: Any, default: Optional[str], un
 
 def _resolve_auto_branch(req: _ResolveRequest) -> _ResolveResult:
     """Auto: try all providers in priority order; tag the client with the effective provider (survives cache reuse)."""
-    client, resolved, effective_provider = _resolve_auto_route(main_runtime=req.main_runtime, task=req.task)
+    client, resolved, effective_provider = _resolve_auto_route(
+        main_runtime=req.main_runtime, task=req.task, model=req.model)
     if client is None:
         return None, None
-    model = req.model
-    # An OpenRouter-format model override won't work on a non-OpenRouter provider (e.g. local
-    # server); drop it for the provider's default.
-    if model and "/" in model and resolved and "/" not in resolved:
-        logger.debug("Dropping OpenRouter-format model %r for non-OpenRouter "
-                     "auxiliary provider (using %r instead)", model, resolved)
-        model = None
-    routed_client, routed_model = _route_client(req, client, model or resolved)
+    model = _auto_route_model(req.model, resolved, effective_provider)
+    routed_client, routed_model = _route_client(req, client, model)
     if routed_client is not None and effective_provider:
         try:
             routed_client._hermes_aux_effective_provider = effective_provider
@@ -5055,7 +5106,7 @@ def _resolve_nous_branch(req: _ResolveRequest) -> _ResolveResult:
 
 def _resolve_openai_codex_branch(req: _ResolveRequest) -> _ResolveResult:
     """OpenAI Codex (OAuth → Responses API)."""
-    model = req.model
+    model = _normalize_resolved_model(req.model, req.provider)
     if not model:
         logger.warning("resolve_provider_client: openai-codex requested without a "
                        "model; pass model explicitly (e.g. model.model in config.yaml "
@@ -5064,7 +5115,7 @@ def _resolve_openai_codex_branch(req: _ResolveRequest) -> _ResolveResult:
     no_token_msg = "resolve_provider_client: openai-codex requested but no Codex OAuth token found (run: hermes model)"
     if req.raw_codex:
         # Raw OpenAI client for callers needing responses.stream() (main agent loop).
-        codex_token, base_url = _resolve_codex_credential_and_base()
+        codex_token, base_url = _resolve_codex_credential_and_base(model=model)
         if not codex_token:
             logger.warning(no_token_msg)
             return None, None
@@ -5808,10 +5859,18 @@ def _client_cache_key(
     # `auto` resolves through the main runtime and task-specific policy, so both join the key.
     runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
     task_key = (task or "", _task_prefers_fast_model(task)) if provider == "auto" else ""
-    pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
     # Model MUST be in the key: concurrent calls to the same endpoint with different models would
     # share an entry, and the second builder's _store_cached_client would close the first's client.
     model_key = model or runtime.get("model", "")
+    hint_provider = provider
+    if _normalize_aux_provider(provider) == "auto":
+        main_provider, main_model, *_ = _main_route_target(runtime, task)
+        if _normalize_aux_provider(main_provider) == "openai-codex":
+            hint_provider = "openai-codex"
+            model_key = _auto_route_model(model, main_model, main_provider)
+    elif _normalize_aux_provider(provider) == "openai-codex":
+        model_key = _normalize_resolved_model(model_key, "openai-codex")
+    pool_hint = _pool_cache_hint(hint_provider, main_runtime=main_runtime, model=model_key or None)
     api_key_key = _runtime_cache_discriminator("api_key", api_key or "")
     # Profile home leads the key: callers that omit api_key (pool / Nous auth.json paths) would
     # otherwise share one client across multiplex profiles holding different credentials.
@@ -6012,6 +6071,10 @@ def cleanup_stale_async_clients() -> None:
 def _compat_model(client: Any, model: Optional[str], cached_default: Optional[str]) -> Optional[str]:
     """Keep slash-bearing model IDs only for cached clients that accept ``vendor/model`` (OpenRouter
     or a slash-bearing default). Mirrors the resolve_provider_client() guard, which cache hits skip."""
+    if isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+        # The router already chose and normalized this model before authentication.
+        # Reapplying the raw auto override can undo its compatibility decision.
+        return cached_default
     if model and "/" in model:
         accepts_slash = any(
             obj and base_url_host_matches(str(getattr(obj, "base_url", "") or ""), "openrouter.ai")
@@ -6036,6 +6099,8 @@ def _get_cached_client(
     previously occurred in long-running gateways where recycled worker threads created unbounded entries
     (#10200).
     """
+    if _normalize_aux_provider(provider) == "openai-codex":
+        model = _normalize_resolved_model(model, "openai-codex")
     # A bare llama.cpp alias keys on the live local endpoint: a restarted server (new port/key)
     # must not be served the old client, and a stopped one resolves to nothing, not a cloud client.
     from agent.auxiliary_local_runtime import bare_llamacpp_endpoint
@@ -6067,7 +6132,7 @@ def _get_cached_client(
     # and retry an exhausted key.
     effective_api_key = api_key
     if not effective_api_key:
-        _pe = _peek_pool_entry(_normalize_aux_provider(provider))
+        _pe = _peek_pool_entry(_normalize_aux_provider(provider), model=model)
         if _pe is not None:
             effective_api_key = _pool_runtime_api_key(_pe) or api_key
     client, default_model = resolve_provider_client(
@@ -6082,6 +6147,16 @@ def _get_cached_client(
         # False and vision tools vanish for the process lifetime (#87654).
         return client, model or default_model
     if client is not None:
+        if (
+            cache_key[9].startswith("openai-codex:") or _normalize_aux_provider(provider) == "auto"
+        ) and isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+            # peek is only a lookup hint. Construction selects independently and may
+            # use another account (or a refreshed token). Bind storage to the client
+            # we actually built, never a second peek at concurrent mutable state.
+            # An auto fallback must not live behind an unrelated main-route hint;
+            # a later lookup may miss and re-resolve the configured chain instead.
+            cache_key = (*cache_key[:9], _codex_credential_cache_hint(client.api_key, client.base_url),
+                         default_model, *cache_key[11:])
         with _client_cache_lock:
             if cache_key not in _client_cache:
                 # FIFO safety-belt eviction. Do NOT close evicted clients: another caller may be

@@ -2201,12 +2201,21 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         self._current_id = entry.id
         return entry, pending_refresh
 
-    def peek(self) -> Optional[PooledCredential]:
+    def peek(self, *, model: Optional[str] = None) -> Optional[PooledCredential]:
+        """Inspect a usable entry without advancing selection or request counts.
+
+        Model-aware callers must not reuse a current entry restricted for that
+        model. Model-less inspection retains its existing current-entry behavior.
+        """
         with self._lock:
             current = self._current_unlocked()
-            if current is not None:
+            if current is not None and not model:
                 return current
-            available, _pending = self._available_entries()
+            available, _pending = self._available_entries(model=model)
+            if current is not None:
+                selected = next((entry for entry in available if entry.id == current.id), None)
+                if selected is not None:
+                    return selected
             return available[0] if available else None
 
     def reclaim(self, credential_id: str, *, model: Optional[str] = None) -> Optional[PooledCredential]:
