@@ -90,15 +90,23 @@ def list_tabs(task_id: str) -> dict[str, Any]:
     ]}
 
 
-def select_tab(task_id: str, tab_id: str | None) -> dict:
+def select_tab(task_id: str, tab_id: str | None, *, for_navigation: bool = False) -> dict:
+    """Resolve and pin the tab before selecting it.
+
+    Navigation callers must validate the destination before selecting and check
+    redirects afterwards. They are leaving the old document, not accessing it;
+    only a standalone switch applies policy to that document's current URL.
+    Identity, existence and daemon-generation checks apply to both operations.
+    """
     from tools import browser_tool as bt, browser_tool_session as session
     try:
         info, tabs = driver_tabs(task_id)
         native_id = resolve_id(tab_id, info, tabs)
-        target = next(t for t in tabs if t["tabId"] == native_id)
-        error = bt._url_policy_error(target.get("url", ""), auto_local=bt._is_local_sidecar_key(task_id))
-        if error:
-            return error
+        if not for_navigation:
+            target = next(t for t in tabs if t["tabId"] == native_id)
+            error = bt._url_policy_error(target.get("url", ""), auto_local=bt._is_local_sidecar_key(task_id))
+            if error:
+                return error
         result = session._run_browser_command(task_id, "tab", [native_id], expected_session_name=info["session_name"],
             expected_daemon_identity=info["_tab_daemon_identity"])
         if not result.get("success"):

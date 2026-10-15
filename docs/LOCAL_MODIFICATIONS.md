@@ -1656,6 +1656,7 @@ Intent / invariants:
 - `browser_tabs` lists short IDs, titles, URLs, the task's selected target and Chrome's selected tab in each window. New, switch and close are explicit operations; switching does not reload the document.
 - IDs include both the Hermes session and actual daemon lifetime (PID, process birth time and socket identity). A same-name daemon restart invalidates every previous short ID. Only returned short IDs are accepted; CDP long IDs are not accepted by navigation. Missing, closed or expired IDs fail without choosing a substitute tab. After reconnect, list again.
 - `browser_navigate` requires `tab_id`; no navigation implicitly creates a tab. Its snapshot and later ordinary click/type/snapshot calls use the selected driver target. Selection plus navigation is serialized per task, not a cross-agent ownership lock.
+- Selection distinguishes navigation from standalone switch: navigation validates its destination first, then checks the exact tab's identity/existence and daemon generation, selects and navigates it, and retains redirect checks. It does not apply access policy to the old document being left (including blank/internal/error pages). Standalone switch still checks that document's current URL. No protocol is globally exempted; normal snapshot/click/console access guards remain intact. Both `new(url)` and `new()` followed by explicit navigation must work with the real URL policy enabled.
 - Chrome selection is a best-effort read-only observation, distinct from the agent target and OS focus. Correlation is display-only and uses unique URLs; duplicate URLs, minimized/unreadable windows or missing CDP produce `null` (unknown). This correlation is never used to route an action.
 - The prior first-conversation-auto-new policy is obsolete by user decision. Do not revive its marker or `tab new` injection while merging upstream.
 - Targeted list/new/switch/close/navigation send the pinned 0.26.0 line-JSON protocol on a connected Unix socket, rechecking daemon identity after connect and before send. A disconnected socket cannot respawn or switch daemons; mutations are never replayed. Only a read may bootstrap a missing driver. Preserve the existing URL/redirect policies and Bot Desktop lease fence. This path is for the current macOS/Unix host, not a Windows named-pipe implementation.
@@ -1673,7 +1674,9 @@ Merge decision:
 
 Verification:
 ```bash
-HERMES_PYTHON=.venv/bin/python scripts/run_tests.sh tests/fork/test_browser_tabs.py tests/fork/test_browser_daemon_generation.py -q
+HERMES_PYTHON=.venv/bin/python scripts/run_tests.sh tests/fork/test_browser_tabs.py tests/fork/test_browser_daemon_generation.py tests/tools/test_browser_ssrf_local.py tests/tools/test_browser_private_page_action_guard.py tests/tools/test_browser_snapshot_ssrf.py tests/tools/test_browser_console_ssrf.py -q
+# Real-policy contracts cover new(url), blank/internal/error -> public navigation,
+# standalone switch restrictions, bad/stale IDs, unsafe targets and redirect checks.
 # Real smoke uses a disposable Chrome profile/CDP port, never business tabs:
 # list -> new -> navigate -> snapshot -> type/click -> switch -> close;
 # verify two independent driver targets, two Chrome windows, stale IDs after
@@ -1685,7 +1688,8 @@ git diff --check
 ```
 
 - Upstream status: fork-only; target-sync candidate exists as linked above.
-- Last validated: upstream baseline `73162b00eefde3794bed0afb53d84a19c0eed230`; Fork working changes based on `3e93ce0daf1aacc35209e7f31f9e07bcffdcd066`. This does not claim a committed release or a reloaded Gateway.
+- Last validated: upstream `8172ebab6b4f11a42f5b3ab17bb625b78d2f57df`; Fork navigation-policy changes based on `0c0451c971`. Real current-session browser tools passed both creation/navigation paths, bad/closed-ID rejection and metadata/file blocking; original business tabs were left unchanged. Isolated regressions preserve redirect and daemon-generation guards. No service restart was performed; unrelated Browser Use harness dependency failure reproduces on the baseline.
+- Change ledger: `docs/chantxu64/browser-explicit-tabs/changes.jsonl`.
 - Feature docs: none — this bounded contract and its focused tests define the unit.
 
 

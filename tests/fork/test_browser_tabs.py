@@ -37,7 +37,7 @@ def test_navigate_schema_requires_tab_id():
     assert 'tab_id' in schema['parameters']['required']
 
 
-def _driver(monkeypatch):
+def _driver(monkeypatch, *, real_policy=False):
     from fork_features import browser_tabs as tabs
     from tools import browser_tool_session as session
     pages = [{'tabId': 't1', 'title': 'Keep', 'url': 'https://one.example/', 'active': True},
@@ -67,10 +67,118 @@ def _driver(monkeypatch):
     monkeypatch.setattr(session, '_run_browser_command', run)
     monkeypatch.setattr(bt, '_is_camofox_mode', lambda: False)
     monkeypatch.setattr(bt, '_navigation_session_key', lambda key, url: key)
-    monkeypatch.setattr(bt, '_secret_url_error_normalized', lambda url: (url, None))
-    monkeypatch.setattr(bt, '_url_policy_error', lambda *a, **k: None)
+    if real_policy:
+        # Exercise real normalization, SSRF and website policy, not a blanket
+        # allow mock. Simulate transport, backend settings and public DNS only.
+        from tools import url_safety
+        resolve = url_safety._getaddrinfo
+        monkeypatch.setattr(url_safety, '_getaddrinfo', lambda host, *a, **kw:
+            [(2, 1, 6, '', ('93.184.216.34', 443))] if host == 'example.com'
+            else resolve(host, *a, **kw))
+        monkeypatch.setattr(bt._cloud, '_is_local_backend', lambda: False)
+        monkeypatch.setattr(bt._cloud, '_allow_private_urls', lambda: False)
+        monkeypatch.setattr(bt, '_is_local_sidecar_key', lambda key: False)
+    else:
+        monkeypatch.setattr(bt, '_secret_url_error_normalized', lambda url: (url, None))
+        monkeypatch.setattr(bt, '_url_policy_error', lambda *a, **k: None)
     monkeypatch.setattr(bt, '_maybe_start_recording', lambda *a: None)
     return tabs, pages, info, calls
+
+
+def test_new_blank_then_navigate_with_real_url_policy(monkeypatch):
+    _tabs, pages, _info, calls = _driver(monkeypatch, real_policy=True)
+    created = json.loads(bt.browser_tabs(action='new', task_id='blank-policy'))
+    assert created['success'] is True
+    assert pages[-1]['url'] == 'about:blank'
+    assert bt._url_policy_error('about:blank') is not None
+    result = json.loads(bt.browser_navigate('https://example.com/',
+        task_id='blank-policy', tab_id=created['tab_id']))
+    assert result['success'] is True, result
+    assert result['snapshot'] == 't3'
+    assert pages[-1]['url'] == 'https://example.com/'
+    assert [p['url'] for p in pages[:2]] == ['https://one.example/', 'https://two.example/']
+    assert calls.index(('tab', ['t3'])) < calls.index(('open', ['https://example.com/']))
+
+
+def test_new_with_url_uses_real_navigation_policy(monkeypatch):
+    _tabs, pages, _info, calls = _driver(monkeypatch, real_policy=True)
+    result = json.loads(bt.browser_tabs(action='new', url='https://example.com/', task_id='new-policy'))
+    assert result['success'] is True, result
+    assert result['snapshot'] == 't3'
+    assert pages[-1]['url'] == 'https://example.com/'
+    assert calls.count(('tab', ['new'])) == 1
+
+
+@pytest.mark.parametrize('old_url', [
+    'about:blank', 'chrome://newtab/', 'chrome-error://chromewebdata/',
+    'http://127.0.0.1/private', 'http://169.254.169.254/latest/meta-data/',
+])
+def test_navigation_leaves_blocked_document_but_switch_cannot_access_it(monkeypatch, old_url):
+    tabs, pages, info, calls = _driver(monkeypatch, real_policy=True)
+    pages[1]['url'] = old_url
+    tab_id = tabs.public_id(info, 't2')
+    switched = json.loads(bt.browser_tabs(action='switch', tab_id=tab_id, task_id='old-policy'))
+    assert switched['success'] is False
+    assert pages[0]['active'] is True
+    assert calls == [('tab', ['list'])]
+    calls.clear()
+    navigated = json.loads(bt.browser_navigate('https://example.com/', task_id='old-policy', tab_id=tab_id))
+    assert navigated['success'] is True, navigated
+    assert pages[0]['url'] == 'https://one.example/'
+    assert pages[1]['url'] == 'https://example.com/'
+    assert calls[:3] == [('tab', ['list']), ('tab', ['t2']), ('open', ['https://example.com/'])]
+
+
+@pytest.mark.parametrize('url', [
+    'about:blank', 'chrome://settings/', 'file:///etc/passwd', 'javascript:alert(1)',
+    'http://127.0.0.1/private', 'http://10.0.0.1/',
+    'http://169.254.169.254/latest/meta-data/', 'http://metadata.google.internal/',
+])
+@pytest.mark.parametrize('action', ['navigate', 'new'])
+def test_unsafe_destination_rejected_before_tab_mutation(monkeypatch, url, action):
+    tabs, pages, info, calls = _driver(monkeypatch, real_policy=True)
+    if action == 'new':
+        result = json.loads(bt.browser_tabs(action='new', url=url, task_id='unsafe-policy'))
+    else:
+        result = json.loads(bt.browser_navigate(url, task_id='unsafe-policy', tab_id=tabs.public_id(info, 't2')))
+    assert result['success'] is False, result
+    assert calls == []
+    assert pages[0]['active'] is True
+    assert pages[1]['url'] == 'https://two.example/'
+
+
+def test_closed_wrong_and_old_generation_ids_cannot_navigate_with_real_policy(monkeypatch):
+    tabs, pages, info, calls = _driver(monkeypatch, real_policy=True)
+    created = json.loads(bt.browser_tabs(action='new', task_id='expired-policy'))
+    assert json.loads(bt.browser_tabs(action='close', tab_id=created['tab_id'], task_id='expired-policy'))['success']
+    calls.clear()
+    before = [dict(p) for p in pages]
+    stale_generation = tabs.public_id(dict(info, _tab_daemon_identity='previous-generation'), 't2')
+    for tab_id in [created['tab_id'], 't2', 'wrong:t2', stale_generation, None, '']:
+        result = json.loads(bt.browser_navigate('https://example.com/', task_id='expired-policy', tab_id=tab_id))
+        assert result['success'] is False
+    assert pages == before
+    assert all(c == 'tab' and a == ['list'] for c, a in calls)
+
+
+@pytest.mark.parametrize('redirect_url', ['http://127.0.0.1/private', 'http://169.254.169.254/latest/meta-data/'])
+def test_redirect_policy_still_blocks_before_snapshot_after_blank_navigation(monkeypatch, redirect_url):
+    _tabs, pages, _info, calls = _driver(monkeypatch, real_policy=True)
+    created = json.loads(bt.browser_tabs(action='new', task_id='redirect-policy'))
+    run = session._run_browser_command
+    def redirect(key, command, args=None, **kw):
+        result = run(key, command, args, **kw)
+        if command == 'open' and args == ['https://example.com/']:
+            pages[-1]['url'] = redirect_url
+            result['data']['url'] = redirect_url
+        return result
+    monkeypatch.setattr(session, '_run_browser_command', redirect)
+    result = json.loads(bt.browser_navigate('https://example.com/', task_id='redirect-policy', tab_id=created['tab_id']))
+    assert result['success'] is False
+    assert 'redirect landed' in result['error']
+    assert pages[-1]['url'] == 'about:blank'
+    assert not any(c == 'snapshot' for c, _ in calls)
+    assert pages[0]['url'] == 'https://one.example/'
 
 
 def test_navigate_selects_requested_tab_before_open_without_new(monkeypatch):

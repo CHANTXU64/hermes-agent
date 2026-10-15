@@ -781,7 +781,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None, tab_id: Optional[s
         _maybe_start_recording(nav_session_key)
 
     from fork_features.browser_tabs import select_tab
-    selection = select_tab(nav_session_key, tab_id)
+    selection = select_tab(nav_session_key, tab_id, for_navigation=True)
     if not selection.get("success"):
         return _dumps(selection)
 
