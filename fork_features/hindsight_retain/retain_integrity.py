@@ -26,6 +26,20 @@ from urllib.request import Request, urlopen
 HINDSIGHT_API_URL = "https://hindsight-api.chantx.top"
 DEFAULT_HINDSIGHT_CONFIG_PATH = Path.home() / ".hermes" / "hindsight" / "config.json"
 DEFAULT_RETAIN_CONTEXT = "conversation between Hermes Agent and the User"
+
+
+def resolve_hindsight_config_path(config_path: Path | None = None) -> Path:
+    """Use the active profile config when a caller left the default path."""
+    path = Path(config_path) if config_path is not None else DEFAULT_HINDSIGHT_CONFIG_PATH
+    if path != DEFAULT_HINDSIGHT_CONFIG_PATH:
+        return path
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if not home:
+        return path
+    profile_config = Path(home) / "hindsight" / "config.json"
+    if profile_config.is_file():
+        return profile_config
+    return path
 DEFAULT_JOURNAL_PATH = Path.home() / ".hermes" / "hindsight" / "retain-attempts.jsonl"
 DEFAULT_STATE_DB_PATH = Path.home() / ".hermes" / "state.db"
 DEFAULT_EXPORT_SCRIPT = Path(__file__).resolve().with_name("langfuse_hindsight_export.py")
@@ -2643,6 +2657,8 @@ def main(argv: list[str] | None = None) -> int:
         default="not_expected_export_only",
     )
     args = parser.parse_args(argv)
+    if getattr(args, "hindsight_config", None) is not None:
+        args.hindsight_config = resolve_hindsight_config_path(args.hindsight_config)
 
     try:
         if args.command == "scan":

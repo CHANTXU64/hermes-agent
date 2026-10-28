@@ -3489,6 +3489,23 @@ def test_hindsight_retain_config_reads_bank_and_legacy_manual_context(tmp_path: 
     }
 
 
+def test_default_hindsight_config_uses_active_profile(tmp_path: Path, monkeypatch) -> None:
+    module = load_module()
+    profile = tmp_path / "profile"
+    profile_config = profile / "hindsight" / "config.json"
+    profile_config.parent.mkdir(parents=True)
+    profile_config.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    assert module.resolve_hindsight_config_path(module.DEFAULT_HINDSIGHT_CONFIG_PATH) == profile_config
+    explicit = tmp_path / "explicit.json"
+    explicit.write_text("{}", encoding="utf-8")
+    assert module.resolve_hindsight_config_path(explicit) == explicit
+
+    monkeypatch.delenv("HERMES_HOME")
+    assert module.resolve_hindsight_config_path(module.DEFAULT_HINDSIGHT_CONFIG_PATH) == module.DEFAULT_HINDSIGHT_CONFIG_PATH
+
+
 def test_expected_export_uses_bank_from_hindsight_config(tmp_path: Path) -> None:
     module = load_module()
     session_id = "20260826_033000_aabbccdd"
