@@ -581,7 +581,10 @@ class GatewaySessionCommandsMixin:
             from fork_features.request_fork import (
                 build_out_of_turn_compression_request_snapshot,
             )
-            request_fork = build_out_of_turn_compression_request_snapshot(tmp_agent, msgs)
+            request_fork = build_out_of_turn_compression_request_snapshot(
+                tmp_agent, msgs,
+                source_agent=self._cached_agent_for(session_key, lockless_fallback=True),
+            )
             result = await self._run_in_executor_with_context(
                 lambda: compress_now(tmp_agent, msgs, request, system_message="", skip_without_window=True,
                                      task_id=session_entry.session_id or "default",

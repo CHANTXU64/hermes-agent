@@ -75,6 +75,9 @@ def perform_api_call(
 ) -> ApiCallVerdict:
     """Issue the request (see ``_should_stream`` for the streaming decision)."""
     response = None
+    from fork_features.request_fork.manual import remember_manual_request
+
+    remember_manual_request(agent, None, [])
     if isinstance(_physical_request_capture, dict):
         _physical_request_capture.clear()
 
@@ -114,6 +117,7 @@ def perform_api_call(
                 request_fork=frozen,
                 request_fork_rematerializer=rematerializer,
             )
+            remember_manual_request(agent, frozen, messages)
         except Exception:
             _physical_request_capture.clear()
             logger.warning(

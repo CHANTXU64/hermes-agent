@@ -648,9 +648,21 @@ def materialize_request_for_compression(
 def build_out_of_turn_compression_request_snapshot(
     agent: Any,
     messages: Sequence[Mapping[str, Any]],
+    *,
+    source_agent: Any = None,
 ) -> FrozenRequest | None:
-    """Reconstruct a truthful provider-native manual-compression request."""
+    """Reuse an exact live parent when available; otherwise keep manual reconstruction."""
+    if not compression_request_fork_enabled(agent):
+        return None
+    if source_agent is not None:
+        from .manual import reuse_manual_request
 
+        try:
+            reused = reuse_manual_request(source_agent, agent, list(messages))
+            if reused is not None:
+                return reused
+        except Exception:
+            logger.warning("Manual checkpoint request reuse unavailable; reconstructing", exc_info=True)
     return materialize_request_for_compression(
         agent,
         messages,

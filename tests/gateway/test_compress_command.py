@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.run import GatewayRunner
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
@@ -59,6 +60,78 @@ def _make_runner(history: list[dict[str, str]]):
     runner.session_store._save = MagicMock()
     runner._session_db = None
     return runner
+
+
+@pytest.mark.asyncio
+async def test_real_manual_builder_reuses_real_cached_parent_after_store_reload(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from run_agent import AIAgent
+    from hermes_state import AsyncSessionDB, SessionDB
+    from gateway.session import SessionStore
+    from fork_features.request_fork import FrozenRequest
+    from fork_features.request_fork.manual import remember_manual_request
+
+    def tool_defs(**kwargs):
+        name = "memory" if kwargs.get("enabled_toolsets") == ["memory"] else "read_file"
+        return [{"type": "function", "function": {
+            "name": name, "description": "test tool", "parameters": {"type": "object", "properties": {}},
+        }}]
+
+    monkeypatch.setattr("model_tools.get_tool_definitions", tool_defs)
+    monkeypatch.setattr("model_tools.check_toolset_requirements", dict)
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: name == "on_compression_start")
+    runtime: dict = {"provider": "custom", "api_mode": "codex_responses", "api_key": "test",
+               "base_url": "https://api.example.test/v1"}
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: dict(runtime))
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda *a: "gpt-6.1-sol")
+    runner = _make_runner([])
+    runner.session_store = SessionStore(tmp_path / "sessions", runner.config)
+    entry = runner.session_store.get_or_create_session(_make_source())
+    db = runner.session_store._db
+    assert isinstance(db, SessionDB)
+    runner._session_db = AsyncSessionDB(db)
+    history = _make_history()
+    history[-2]["content"] = "  three\n "
+    db.append_messages_batch(entry.session_id, deepcopy(history))
+    parent = AIAgent(**runtime, model="gpt-6.1-sol", session_id=entry.session_id,
+                     session_db=db, platform="telegram", skip_memory=True,
+                     skip_context_files=True, quiet_mode=True, enabled_toolsets=["file"])
+    wire_rows = [{"role": "system", "content": "LIVE SYSTEM + REQUEST-ONLY CONTEXT"},
+                 *deepcopy(history[:-1])]
+    wire_rows[-1]["content"] += "\nCURRENT RECALL"
+    body = parent._build_api_kwargs(wire_rows)
+    frozen = FrozenRequest(body=body, api_mode=parent.api_mode, fidelity="failed_wire",
+                           captured_session_id=entry.session_id)
+    remember_manual_request(parent, frozen, history[:-1])
+    runner._agent_cache = {entry.session_key: (parent, "test-signature", 0.0)}
+    runner._agent_cache_lock = threading.Lock()
+    seen = []
+
+    def inspect_checkpoint(tmp, messages, request, **kwargs):
+        assert isinstance(tmp, AIAgent) and tmp is not parent
+        assert (tmp.session_id, tmp.provider, tmp.base_url, tmp.model, tmp.api_mode) == (
+            parent.session_id, parent.provider, parent.base_url, parent.model, parent.api_mode)
+        assert [t["function"]["name"] for t in tmp.tools] == ["memory"]
+        assert [t["function"]["name"] for t in parent.tools] == ["read_file"]
+        snapshot = kwargs["request_fork"]
+        assert snapshot is not None and snapshot.fidelity == "reused_out_of_turn"
+        fork = snapshot.clone_body()
+        assert fork["input"][:-1] == body["input"]
+        assert "four" in str(fork["input"][-1])
+        assert {k: v for k, v in fork.items() if k != "input"} == {
+            k: v for k, v in body.items() if k != "input"}
+        assert "CURRENT RECALL" not in str(messages)
+        seen.append(snapshot)
+        return SimpleNamespace(status="nothing_to_do")
+
+    monkeypatch.setattr("agent.conversation_compression_manual.compress_now", inspect_checkpoint)
+    try:
+        await runner._handle_compress_command(_make_event())
+        assert len(seen) == 1  # real Store load, cache lookup and temporary-agent construction all reached
+        assert frozen.clone_body() == body
+    finally:
+        parent.close()
+        db.close()
 
 
 @pytest.mark.asyncio
@@ -199,6 +272,70 @@ async def test_gateway_manual_compress_passes_full_request_fork_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_manual_checkpoint_uses_cached_wire_prefix_without_changing_summary_agent():
+    from copy import deepcopy
+    from agent.transports.codex import ResponsesApiTransport
+    from fork_features.request_fork import FrozenRequest
+    from fork_features.request_fork.manual import remember_manual_request
+
+    history = _make_history()
+    runner = _make_runner(history)
+    parent = SimpleNamespace(
+        session_id="sess-1", api_mode="codex_responses", provider="custom",
+        base_url="https://api.example.test/v1", model="test-model",
+        _is_copilot_url=lambda: False, _is_codex_backend=lambda: False,
+        _get_transport=lambda: ResponsesApiTransport(),
+    )
+    original = FrozenRequest(body={
+        "model": "test-model", "instructions": "LIVE SYSTEM + GATEWAY CONTEXT",
+        "input": [*deepcopy(history[:-2]),
+                  {"role": "user", "content": "three\nCURRENT-TURN RECALL"}],
+        "tools": [{"type": "function", "name": "read_file", "parameters": {}}],
+        "prompt_cache_key": "actual-parent-key", "extra_headers": {"x-test": "preserved"},
+    }, fidelity="failed_wire", captured_session_id="sess-1")
+    remember_manual_request(parent, original, history[:-1])
+    before = original.clone_body()
+    tmp = MagicMock()
+    tmp.session_id = "sess-1"
+    tmp.api_mode = "codex_responses"
+    tmp.provider = "custom"
+    tmp.base_url = "https://api.example.test/v1"
+    tmp.model = "test-model"
+    tmp.is_subagent = False
+    tmp._cached_system_prompt = "PERSISTED SYSTEM"
+    tmp.tools = [{"type": "function", "function": {"name": "memory"}}]
+    tmp._build_api_kwargs.side_effect = AssertionError("must not rebuild the checkpoint prefix")
+    tmp.context_compressor.has_content_to_compress.return_value = True
+    tmp._compression_skipped_due_to_lock = False
+    tmp.context_compressor._last_compress_aborted = False
+    tmp._compress_context.return_value = ([history[0], history[-1]], "")
+
+    with (
+        patch.object(runner, "_resolve_session_agent_runtime", return_value=("test-model", {"api_key": "test"})),
+        patch.object(runner, "_cached_agent_for", return_value=parent),
+        patch.object(runner, "_build_manual_compression_agent", AsyncMock(return_value=tmp)),
+        patch("hermes_cli.lifecycle.has_hook", return_value=True),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compressed:" in result
+    kwargs = tmp._compress_context.call_args.kwargs
+    fork = kwargs["request_fork"].clone_body()
+    assert fork["instructions"] == before["instructions"]
+    assert fork["tools"] == before["tools"]
+    assert fork["prompt_cache_key"] == before["prompt_cache_key"]
+    assert fork["extra_headers"] == before["extra_headers"]
+    assert fork["input"][:len(before["input"])] == before["input"]
+    assert "four" in str(fork["input"][len(before["input"]):])
+    assert original.clone_body() == before
+    assert tmp.tools[0]["function"]["name"] == "memory"
+    assert tmp._cached_system_prompt == "PERSISTED SYSTEM"
+    assert kwargs["force"] is True
+    assert history[-2]["content"] == "three"  # recall stays request-only
+
+
+@pytest.mark.asyncio
 async def test_gateway_manual_compress_aborts_lifecycle_when_outer_persist_fails():
     history = _make_history()
     compressed = [
@@ -207,11 +344,7 @@ async def test_gateway_manual_compress_aborts_lifecycle_when_outer_persist_fails
         history[-1],
     ]
     runner = _make_runner(history)
-    setattr(
-        runner.session_store,
-        "persist_rotated_compression_child",
-        MagicMock(return_value=False),
-    )
+    runner.session_store.persist_rotated_compression_child = MagicMock(return_value=False)
     agent_instance = MagicMock()
     agent_instance.shutdown_memory_provider = MagicMock()
     agent_instance.close = MagicMock()
@@ -247,10 +380,7 @@ async def test_gateway_manual_compress_aborts_lifecycle_when_outer_persist_fails
 
     assert "failed" in result.lower()
     assert finalized == [False]
-    session_entry = getattr(
-        runner.session_store.get_or_create_session,
-        "return_value",
-    )
+    session_entry = runner.session_store.get_or_create_session.return_value
     assert session_entry.session_id == "sess-1"
 
 

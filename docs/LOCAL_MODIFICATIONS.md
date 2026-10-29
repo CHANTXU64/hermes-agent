@@ -2795,6 +2795,9 @@ Files:
 - `fork_features/request_fork/__init__.py`
 - `fork_features/request_fork/compression_lifecycle.py`
 - `fork_features/request_fork/prepared_request.py`
+- `fork_features/request_fork/manual.py` — ephemeral last-physical-request retention, same-route/history validation and manual checkpoint prefix reuse; no normal-turn replay or persistence.
+- `gateway/slash_commands_session.py` — passes the cached parent only to the checkpoint snapshot builder; keeps the original manual summary agent and commit path.
+- `tests/fork_features/test_manual_request_fork.py` — prefix reuse, route/history rejection, disabled/missing source and two-turn request-only context isolation.
 - `fork_features/request_fork/session_recovery.py` — shared bounded recovery-envelope selection and verified reset-context persistence.
 - `gateway/run_turn.py` — thin exhaustion-reset call with exact old/new session IDs.
 - `tests/fork_features/test_session_recovery.py` — recovery acceptance, readback and disabled-plugin contracts.
@@ -2875,7 +2878,8 @@ What changed:
   shared by proactive and failed-wire compression. Its only loop-specific input
   is the explicit tool-call canonicalizer; it never imports the conversation loop.
   Callers in the loop, physical request capture and pre-capture error fallback must
-  all retain this binding. Manual out-of-turn reconstruction is unchanged.
+  all retain this binding. Manual out-of-turn fallback reconstruction remains
+  unchanged; a validated live-parent snapshot can now bypass only that rebuild.
 - After the official turn-loop split, the production call graph is explicit:
   `turn_preflight` and `turn_context_compaction` initiate ordinary compression;
   `turn_api_call` freezes the physically attempted request;
@@ -2950,10 +2954,25 @@ What changed:
   request-only body and inserts only a proven concurrent durable append before
   the complete live tail as `rematerialized_after_adopt`; it does not rerun
   middleware, context selection, vision, or provider calls. Gateway `/compress`
-  has no observed parent wire request and truthfully uses
-  `reconstructed_out_of_turn`; multimodal history that cannot be reconstructed
-  without vision side effects makes the Fork unavailable. Outer transcript
-  persistence/session transition still decides committed versus aborted.
+  reuses a cached main agent's latest frozen physical request only when session,
+  protocol, provider, endpoint, model and clean durable history still match; only
+  the terminal assistant reply is converted and appended. History identity uses
+  the same text projection as the DB loader and excludes live-only native
+  carriers; those original carriers remain intact inside the frozen request.
+  This preserves the
+  actual system/ephemeral context, tools, cache key and final headers as
+  `reused_out_of_turn`. The retained value is memory-only, replaced on the next
+  physical attempt, and is never read by ordinary turn reconstruction or saved
+  as `api_content`. Unavailable/stale sources keep the existing
+  `reconstructed_out_of_turn` fallback; multimodal history that cannot be
+  reconstructed without vision side effects makes the Fork unavailable. The
+  original manual summary agent, tail retention, outer transcript persistence
+  and session transition remain unchanged. This removes known client-side
+  prefix changes, not upstream cache eviction/routing. Verify with
+  `scripts/run_tests.sh tests/fork_features/test_manual_request_fork.py tests/gateway/test_compress_command.py -q`
+  plus adjacent automatic/overflow regressions; offline prefix equality does not
+  establish live provider cache hits. The change/verification record is
+  `docs/chantxu64/manual-continuity-cache/changes.jsonl`.
 - Compression recovery is persisted once at the common local
   `compress_context` commit boundary as one hidden synthetic `role=user` row
   wrapped in the generic `<hermes-runtime-context user-authored="false" ...>`
