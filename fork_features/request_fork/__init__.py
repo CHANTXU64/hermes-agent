@@ -198,7 +198,6 @@ class CurrentRequestFork:
         from agent.codex_runtime import run_codex_stream
         from agent.error_classifier import FailoverReason, classify_api_error
         from agent.retry_utils import jittered_backoff
-        from agent.request_telemetry import service_parameters
 
         retryable_reasons = {
             FailoverReason.timeout,
@@ -221,20 +220,6 @@ class CurrentRequestFork:
                 model=str(api_kwargs.get("model") or ""),
             )
             owned_client = self._template.client_factory()
-            service_evidence = {
-                "request_id": str(request_id or "request-fork"), "network_attempt": attempt,
-                "result": "failed", "fast_decision": "not_evaluated", "request_observed": False,
-                "requested_service_tier": None, "requested_speed": None,
-                "response_service_tier": None, "response_speed": None,
-            }
-
-            def observe_request(body: Mapping[str, Any]) -> None:
-                parameters = service_parameters(body, request=True)
-                service_evidence.update(
-                    request_observed=True,
-                    requested_service_tier=parameters.get("service_tier"),
-                    requested_speed=parameters.get("speed"),
-                )
 
             try:
                 if prefer_fast:
@@ -245,7 +230,6 @@ class CurrentRequestFork:
                         api_kwargs.get("model"), provider=self._template.provider,
                         base_url=base_url,
                     ) if base_url else None
-                    service_evidence["fast_decision"] = "enabled" if overrides else "unsupported_or_unknown"
                     if overrides:
                         # extra_body wins at the SDK boundary; override both copies
                         # without mutating the frozen request or parent settings.
@@ -273,22 +257,13 @@ class CurrentRequestFork:
                 if mode == "codex_responses":
                     response = run_codex_stream(
                         runtime, api_kwargs, client=owned_client,
-                        **({"on_physical_request": observe_request} if prefer_fast else {}),
                     )
                 else:
                     from .message_protocols import send_messages
 
-                    if prefer_fast:
-                        observe_request(api_kwargs)
                     response = send_messages(
                         owned_client, api_kwargs, mode=mode,
                         progress=self._template.progress_callback,
-                    )
-                if prefer_fast:
-                    parameters = service_parameters(response)
-                    service_evidence.update(
-                        result="returned", response_service_tier=parameters.get("service_tier"),
-                        response_speed=parameters.get("speed"),
                     )
                 normalized = self._template.normalize_response(response)
                 content = getattr(normalized, "content", None)
@@ -342,8 +317,6 @@ class CurrentRequestFork:
                 )
                 time.sleep(wait_time)
             finally:
-                if prefer_fast:
-                    logger.warning("request Fork service %s", json.dumps(service_evidence, ensure_ascii=True))
                 self._template.client_close(owned_client)
 
         raise RuntimeError("request Fork attempt loop exited without a result")
@@ -636,10 +609,12 @@ def materialize_request_for_compression(
     if bool(getattr(agent, "_force_ascii_payload", False)):
         _sanitize_structure_non_ascii(body)
     if str(getattr(agent, "api_mode", "codex_responses")) == "codex_responses":
+        from agent.codex_responses_adapter import drops_replay_item_ids
+
         body = agent._get_transport().preflight_kwargs(
             body,
             allow_stream=False,
-            is_github_responses=agent._is_copilot_url(),
+            drop_replay_item_ids=drops_replay_item_ids(agent.base_url),
             sanitize_harmony_tokens=agent._is_codex_backend(),
         )
     return freeze_request_for_compression(agent, body, fidelity=fidelity)

@@ -33,8 +33,6 @@ class _StubAgent(StatusOutputMixin):
 
     def __init__(self, *, raise_in):
         self._raise_in = set(raise_in)
-        self.trajectory_messages = None
-        self.persisted_messages = None
         self.max_iterations = 3
         self.iteration_budget = _StubBudget()
         self.context_compressor = _StubCompressor()
@@ -66,8 +64,7 @@ class _StubAgent(StatusOutputMixin):
         self.session_cost_source = "stub"
 
     # --- fallible cleanup surfaces -------------------------------------
-    def _save_trajectory(self, messages, *a, **k):
-        self.trajectory_messages = [dict(message) for message in messages]
+    def _save_trajectory(self, *a, **k):
         if "save_trajectory" in self._raise_in:
             raise RuntimeError("trajectory disk full")
 
@@ -78,8 +75,7 @@ class _StubAgent(StatusOutputMixin):
     def _drop_trailing_empty_response_scaffolding(self, *a, **k):
         pass
 
-    def _persist_session(self, messages, *a, **k):
-        self.persisted_messages = [dict(message) for message in messages]
+    def _persist_session(self, *a, **k):
         if "persist_session" in self._raise_in:
             raise RuntimeError("sqlite database is locked")
 
@@ -115,20 +111,18 @@ def _run(
     final_response=None,
     api_call_count=3,
     turn_exit_reason="unknown",
-    messages=None,
 ):
-    if messages is None:
-        messages = [
-            {"role": "user", "content": "do a thing"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}
-                ],
-            },
-            {"role": "tool", "tool_call_id": "c1", "content": "file contents"},
-        ]
+    messages = [
+        {"role": "user", "content": "do a thing"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "file contents"},
+    ]
     return finalize_turn(
         agent,
         final_response=final_response,
@@ -167,45 +161,21 @@ def test_single_cleanup_step_raises_does_not_skip_others(step):
     assert len(result["cleanup_errors"]) == 1
 
 
+def test_a_ticketed_steer_stays_out_of_the_leftover_follow_up():
+    """A gateway transfer still buffered when the turn ends is not this turn's leftover steer: the
+    finalizer hands back only ticketless steers, so settlement returns the transfer to its queue."""
+    agent = _StubAgent(raise_in=())
+    agent._drain_leftover_steer = lambda: "typed /steer"
+    agent._drain_pending_steer = lambda: "typed /steer\nqueued prompt"
+    assert _run(agent)["pending_steer"] == "typed /steer"
+
+
 def test_clean_turn_has_no_cleanup_errors_key():
     agent = _StubAgent(raise_in=())
     result = _run(agent)
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     assert result["completed"] is False
     assert "cleanup_errors" not in result
-
-
-def test_request_only_sidecars_are_stripped_before_post_turn_surfaces():
-    agent = _StubAgent(raise_in=())
-    messages = [
-        {
-            "role": "user",
-            "content": "clean correction",
-            "api_content": "provider-only redirect scaffold",
-            "_request_only_api_content": True,
-        },
-        {"role": "assistant", "content": "done"},
-    ]
-
-    result = _run(
-        agent,
-        final_response="done",
-        api_call_count=1,
-        turn_exit_reason="text_response(stop)",
-        messages=messages,
-    )
-
-    for surface in (
-        messages,
-        result["messages"],
-        agent.trajectory_messages,
-        agent.persisted_messages,
-    ):
-        assert surface is not None
-        assert all("api_content" not in message for message in surface)
-        assert all(
-            "_request_only_api_content" not in message for message in surface
-        )
 
 
 @pytest.mark.parametrize(

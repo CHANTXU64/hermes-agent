@@ -101,7 +101,6 @@ def reuse_manual_request(source: Any, target: Any, messages: list) -> FrozenRequ
         converted = transport.convert_messages(
             rows, model=str(body.get("model") or ""), base_url=saved.route[3],
             is_codex_backend=source._is_codex_backend(),
-            is_github_responses=source._is_copilot_url(),
             is_xai_responses=(saved.route[2] in {"xai", "xai-oauth"}
                               or base_url_host_matches(saved.route[3], "api.x.ai")),
             replay_encrypted_reasoning=bool(getattr(source, "_codex_reasoning_replay_enabled", True)),

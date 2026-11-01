@@ -136,11 +136,7 @@ def test_full_builder_to_responses_keeps_cross_turn_prefix(responses_agent, tmp_
     assert result["completed"]
     assert len(captured) == 3
     next_input = captured[2]["input"]
-    # Fork request context is deliberately volatile: replay restores the clean
-    # historical user turn while preserving provider-native continuation items.
-    expected_history = deepcopy(continuation)
-    expected_history[0]["content"] = current
-    assert next_input[:len(expected_history)] == expected_history
+    assert next_input[:len(continuation)] == continuation
     assert not any("api_content" in item or "timestamp" in item for item in next_input)
     assert any(item.get("encrypted_content") == "synthetic-reasoning" for item in next_input)
     assert any(item.get("phase") == "final_answer" for item in next_input)

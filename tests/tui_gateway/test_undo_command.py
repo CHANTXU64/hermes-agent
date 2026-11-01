@@ -4,7 +4,7 @@ The TUI routes ``/undo`` through ``command.dispatch`` (it's in
 ``_PENDING_INPUT_COMMANDS`` because the CLI handler queues input the
 slash-worker subprocess can't read). The server handles it directly,
 mutates SessionDB to soft-delete rows, refreshes the in-memory session
-history, fires the memory-provider hook with ``rewound=True``, and
+history, fires the dedicated memory rewind hook in the session profile, and
 returns ``{"type": "prefill", "message": <text>, "notice": ...}`` so
 the Ink client drops the message into the composer for editing.
 
@@ -184,3 +184,19 @@ def test_undo_errors_when_no_active_session(server):
 
 def test_undo_in_pending_input_commands(server):
     assert "undo" in server._PENDING_INPUT_COMMANDS
+
+
+def test_undo_notifies_memory_providers_from_the_session_profile(server, session_with_history):
+    # On a multiplexed process the memory manager refuses a hook whose caller names no profile, so a
+    # launch-profile session's /undo must enter the session's profile scope before notifying it.
+    from agent.memory_caller_scope import _explicit_caller_home
+    from agent.secret_scope import reset_multiplex_context, set_multiplex_context
+    sid, _session_key, _s, agent = session_with_history
+    callers = []
+    agent._memory_manager.on_session_rewind.side_effect = lambda *a, **k: callers.append(_explicit_caller_home())
+    token = set_multiplex_context(True)
+    try:
+        assert _call(server, "command.dispatch", session_id=sid, name="undo", arg="")["result"]["type"] == "prefill"
+    finally:
+        reset_multiplex_context(token)
+    assert len(callers) == 1 and callers[0] is not None, callers

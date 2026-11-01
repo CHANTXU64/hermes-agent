@@ -2,7 +2,7 @@
 
 import run_agent as run_agent_module
 from run_agent import AIAgent
-from tests.run_agent.test_background_review import (
+from tests.agent.test_background_review import (
     ImmediateThread,
     _bare_agent,
 )

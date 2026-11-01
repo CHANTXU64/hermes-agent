@@ -523,7 +523,7 @@ def test_out_of_turn_snapshot_uses_full_history_cached_system_and_final_tools(
         tools=tools,
         _build_api_kwargs=_build_api_kwargs,
         _get_transport=lambda: _Transport(),
-        _is_copilot_url=lambda: False,
+        base_url="https://chatgpt.com/backend-api/codex",
         _is_codex_backend=lambda: True,
     )
 

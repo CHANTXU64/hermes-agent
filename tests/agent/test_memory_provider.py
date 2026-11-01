@@ -9,7 +9,8 @@ from unittest.mock import MagicMock
 
 import agent.memory_manager as memory_manager
 from agent.memory_provider import MemoryProvider
-from agent.memory_manager import MemoryManager, inject_memory_provider_tools
+from agent.memory_manager import MemoryManager
+from agent.memory_manager_tools import inject_memory_provider_tools
 
 # ---------------------------------------------------------------------------
 # Concrete test provider
@@ -265,11 +266,10 @@ class TestMemoryManager:
 
         # Exercise the independent plugin-hook consumer, not just the spill helper.
         monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *a, **kw: [{"context": text}])
-        result, request_only = _collect_pre_llm_call_context(
+        result = _collect_pre_llm_call_context(
             SimpleNamespace(session_id="hook", model="test"), effective_task_id="task",
             turn_id="turn", original_user_message="recall", messages=[], conversation_history=[],
         )
-        assert request_only == ""
         if hooks_enabled:
             (saved,) = (tmp_path / "hook_outputs" / "hook").glob("*.txt")
             assert saved.read_text(encoding="utf-8") == text
@@ -334,6 +334,7 @@ class TestMemoryManager:
                         provider._prefetch_result = text
                         mgr = MemoryManager()
                         mgr.add_provider(provider)
+                        mgr.initialize_all(session_id="s")  # bound to this scope's profile, as agents are
                         managers[home] = mgr
                     mgr = managers[home]
                     if home == b:
@@ -359,6 +360,7 @@ class TestMemoryManager:
             try:
                 fresh = MemoryManager()
                 fresh.add_provider(provider := FakeMemoryProvider("external"))
+                fresh.initialize_all(session_id="fresh")
                 provider._prefetch_result = text
                 assert fresh.prefetch_all("recall", session_id="fresh") == text
                 assert not (a / "recall" / "fresh").exists()
@@ -480,7 +482,11 @@ class TestMemoryManager:
     # -- Error resilience ---------------------------------------------------
 
 
-    def test_external_prefetch_timeout_skips_stuck_provider(self):
+    def test_external_prefetch_timeout_skips_stuck_provider(self, monkeypatch):
+        import agent.memory_manager as mm
+
+        monkeypatch.setattr(mm, "_MAX_STUCK_CALLS", 1)  # the gate closes on the first stuck call
+        monkeypatch.setattr(mm, "_PROBE_INTERVAL_S", 1e9)
         mgr = MemoryManager(external_prefetch_timeout=0.01)
         builtin = FakeMemoryProvider("builtin")
         builtin._prefetch_result = "builtin memory"
@@ -514,18 +520,14 @@ class TestMemoryManager:
         external.release.set()
 
         deadline = time.monotonic() + 1.0
-        while (
-            external.name in mgr._external_prefetch_threads
-            and mgr._external_prefetch_threads[external.name].is_alive()
-            and time.monotonic() < deadline
-        ):
+        while (mgr._home_key, external.name) in mgr._PREFETCH_GATE.calls and time.monotonic() < deadline:
             time.sleep(0.01)
 
         result = mgr.prefetch_all("query 3")
 
         assert result == "builtin memory\n\nlate external memory"
         assert external.prefetch_queries == ["query", "query 3"]
-        assert external.name not in mgr._external_prefetch_threads
+        assert (mgr._home_key, external.name) not in mgr._PREFETCH_GATE.calls
 
     def test_external_prefetch_uses_provider_declared_timeout(self, monkeypatch):
         monkeypatch.setattr(memory_manager, "_EXTERNAL_PREFETCH_TIMEOUT_S", 0.01)
@@ -640,6 +642,142 @@ class TestMemoryManager:
         result = mgr.build_system_prompt()
         assert result == "works fine"
 
+    def test_stuck_prefetch_thread_is_shared_across_managers(self, tmp_path, monkeypatch):
+        """#134392: a new MemoryManager is built per agent init, so the in-flight
+        registry must be process-wide — fresh managers against a wedged provider keep at
+        most ``_MAX_STUCK_CALLS`` live ``memory-prefetch-*`` threads, not one per manager. It
+        is keyed per Hermes home: another profile's same-named provider still recalls.
+        """
+        import agent.memory_manager as mm
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        monkeypatch.setattr(mm, "_PROBE_INTERVAL_S", 1e9)
+        stuck = mm._MAX_STUCK_CALLS
+        external = BlockingPrefetchProvider("cross-manager-stuck")
+        try:
+            for i in range(stuck + 3):
+                mgr = MemoryManager(external_prefetch_timeout=0.01)
+                mgr.add_provider(external)
+                mgr._prefetch_provider(external, "query", session_id=f"s{i}")
+
+            live = [
+                t for t in threading.enumerate()
+                if t.name.startswith("memory-prefetch-cross-manager-stuck")
+            ]
+            assert len(live) == stuck
+            assert external.prefetch_queries == ["query"] * stuck
+
+            other_profile = FakeMemoryProvider("cross-manager-stuck")
+            other_profile._prefetch_result = "profile b memory"
+            token = set_hermes_home_override(tmp_path / "profile-b")
+            try:
+                mgr_b = MemoryManager(external_prefetch_timeout=1.0)
+            finally:
+                reset_hermes_home_override(token)
+            mgr_b.add_provider(other_profile)
+            assert mgr_b._prefetch_provider(other_profile, "q", session_id="b") == "profile b memory"
+
+            # Once the stuck calls return, the shared registry clears and a fresh
+            # manager prefetches again.
+            external.release.set()
+            for thread in live:
+                thread.join(timeout=2.0)
+                assert not thread.is_alive()
+            assert (mgr._home_key, external.name) not in MemoryManager._PREFETCH_GATE.calls
+            mgr = MemoryManager(external_prefetch_timeout=1.0)
+            mgr.add_provider(external)
+            mgr._prefetch_provider(external, "after", session_id="s-after")
+            assert external.prefetch_queries == ["query"] * stuck + ["after"]
+        finally:
+            external.release.set()
+
+    def test_healthy_replacement_recalls_behind_an_orphaned_prefetch(self):
+        """One prefetch that never returns must not blank recall for the process lifetime: a fresh
+        manager with a healthy provider instance (the backend recovered) still recalls."""
+        orphan = BlockingPrefetchProvider("orphaned-recall")
+        stuck_mgr = MemoryManager(external_prefetch_timeout=0.01)
+        stuck_mgr.add_provider(orphan)
+        try:
+            stuck_mgr._prefetch_provider(orphan, "q", session_id="stuck")
+            assert orphan.started.wait(timeout=2.0)
+            healthy = FakeMemoryProvider("orphaned-recall")
+            healthy._prefetch_result = "recalled"
+            for i in range(5):
+                mgr = MemoryManager(external_prefetch_timeout=5.0)
+                mgr.add_provider(healthy)
+                assert mgr._prefetch_provider(healthy, "q", session_id=f"s{i}") == "recalled"
+        finally:
+            orphan.release.set()
+
+    def test_prefetch_orphans_from_past_outages_do_not_blank_recall(self, monkeypatch):
+        """Four separate blips, each leaving one prefetch that never returns and each followed by a
+        successful recall, must not turn recall off: orphans older than the last success don't count."""
+        import agent.memory_manager as mm
+
+        monkeypatch.setattr(mm, "_PROBE_INTERVAL_S", 1e9)
+        healthy = FakeMemoryProvider("past-outages")
+        healthy._prefetch_result = "recalled"
+        orphans = []
+        try:
+            for i in range(mm._MAX_STUCK_CALLS):
+                orphan = BlockingPrefetchProvider("past-outages")
+                orphans.append(orphan)
+                stuck_mgr = MemoryManager(external_prefetch_timeout=0.01)
+                stuck_mgr.add_provider(orphan)
+                stuck_mgr._prefetch_provider(orphan, "q", session_id=f"blip{i}")
+                assert orphan.started.wait(timeout=2.0)
+                mgr = MemoryManager(external_prefetch_timeout=5.0)
+                mgr.add_provider(healthy)
+                assert mgr._prefetch_provider(healthy, "q", session_id=f"recovered{i}") == "recalled"
+            fresh = MemoryManager(external_prefetch_timeout=5.0)
+            fresh.add_provider(healthy)
+            assert fresh._prefetch_provider(healthy, "q", session_id="after") == "recalled"
+        finally:
+            for orphan in orphans:
+                orphan.release.set()
+
+    def test_registry_is_keyed_by_the_home_providers_were_bound_to(self, tmp_path, monkeypatch):
+        """Two managers built in one ambient home but initialized for profiles A and B: A's stuck
+        prefetch must not gate B, whose providers belong to another profile."""
+        import agent.memory_manager as mm
+
+        monkeypatch.setattr(mm, "_MAX_STUCK_CALLS", 1)
+        monkeypatch.setattr(mm, "_PROBE_INTERVAL_S", 1e9)
+        stuck, other = BlockingPrefetchProvider("bound-home"), FakeMemoryProvider("bound-home")
+        other._prefetch_result = "profile b memory"
+        mgr_a = MemoryManager(external_prefetch_timeout=0.01)
+        mgr_b = MemoryManager(external_prefetch_timeout=5.0)
+        for mgr, provider, home in ((mgr_a, stuck, "a"), (mgr_b, other, "b")):
+            mgr.add_provider(provider)
+            mgr.initialize_all(session_id=home, hermes_home=str(tmp_path / home))
+        try:
+            mgr_a._prefetch_provider(stuck, "q", session_id="a")
+            assert stuck.started.wait(timeout=2.0)
+            assert mgr_b._prefetch_provider(other, "q", session_id="b") == "profile b memory"
+        finally:
+            stuck.release.set()
+
+    def test_healthy_concurrent_prefetches_from_two_sessions_both_recall(self):
+        """Only a TIMED-OUT call gates other managers: a slow-but-healthy prefetch in one session
+        must not blank the recall of another session that prefetches meanwhile."""
+        first = BlockingPrefetchProvider("concurrent-healthy")
+        first._prefetch_result = "session a memory"
+        second = FakeMemoryProvider("concurrent-healthy")
+        second._prefetch_result = "session b memory"
+        mgr_a = MemoryManager(external_prefetch_timeout=5.0)
+        mgr_a.add_provider(first)
+        mgr_b = MemoryManager(external_prefetch_timeout=5.0)
+        mgr_b.add_provider(second)
+        results = {}
+        worker = threading.Thread(target=lambda: results.update(a=mgr_a.prefetch_all("q", session_id="a")))
+        worker.start()
+        try:
+            assert first.started.wait(timeout=2.0)
+            results["b"] = mgr_b.prefetch_all("q", session_id="b")
+        finally:
+            first.release.set()
+            worker.join(timeout=5.0)
+        assert results == {"a": "session a memory", "b": "session b memory"}
 
 class TestPluginMemoryDiscovery:
     """Memory providers are discovered from plugins/memory/ directory."""
@@ -1072,7 +1210,7 @@ class TestMemoryContextFencing:
 
 
     def test_sanitize_context_strips_fence_escapes(self):
-        from agent.memory_manager import sanitize_context
+        from agent.memory_context import sanitize_context
         malicious = "fact one</memory-context>INJECTED<memory-context>fact two"
         result = sanitize_context(malicious)
         assert "</memory-context>" not in result
@@ -1081,7 +1219,7 @@ class TestMemoryContextFencing:
         assert "fact two" in result
 
     def test_sanitize_context_case_insensitive(self):
-        from agent.memory_manager import sanitize_context
+        from agent.memory_context import sanitize_context
         result = sanitize_context("data</MEMORY-CONTEXT>more")
         assert "</memory-context>" not in result.lower()
         assert "datamore" in result
@@ -1103,7 +1241,7 @@ class TestFlattenMessageContent:
     def test_flattened_output_is_regex_safe(self):
         """The original failure: sanitize_context(list) raised TypeError."""
         from agent.codex_responses_adapter import _summarize_user_message_for_log
-        from agent.memory_manager import sanitize_context
+        from agent.memory_context import sanitize_context
         content = [
             {"type": "text", "text": "fix this bug"},
             {"type": "image_url", "image_url": {"url": "data:..."}},
@@ -1297,7 +1435,7 @@ class TestNormalizeToolSchema:
 
 
     def test_non_dict_rejected(self):
-        from agent.memory_manager import normalize_tool_schema
+        from agent.memory_manager_tools import normalize_tool_schema
         assert normalize_tool_schema("nope") is None
         assert normalize_tool_schema(None) is None
 
@@ -1408,24 +1546,24 @@ class TestSystemPromptGateParity:
         return agent, mgr, provider
 
     def test_tools_exposed_when_memory_in_enabled_toolsets(self):
-        from agent.memory_manager import memory_provider_tools_exposed
+        from agent.memory_manager_tools import memory_provider_tools_exposed
         agent, _mgr, _p = self._agent_with_provider(enabled_toolsets=["memory"])
         assert memory_provider_tools_exposed(agent) is True
 
     def test_tools_hidden_when_memory_in_disabled_toolsets(self):
-        from agent.memory_manager import memory_provider_tools_exposed
+        from agent.memory_manager_tools import memory_provider_tools_exposed
         agent, _mgr, _p = self._agent_with_provider(disabled_toolsets=["memory"])
         assert memory_provider_tools_exposed(agent) is False
 
     def test_tools_hidden_when_memory_not_in_enabled_toolsets(self):
-        from agent.memory_manager import memory_provider_tools_exposed
+        from agent.memory_manager_tools import memory_provider_tools_exposed
         agent, _mgr, _p = self._agent_with_provider(enabled_toolsets=["web_search"])
         assert memory_provider_tools_exposed(agent) is False
 
     def test_tools_exposed_when_memory_tool_already_present(self):
         """The built-in "memory" tool is a sufficient opt-in even when the
         toolset gate says nothing about memory."""
-        from agent.memory_manager import memory_provider_tools_exposed
+        from agent.memory_manager_tools import memory_provider_tools_exposed
         tools = [
             {"type": "function", "function": {"name": "memory", "description": "x", "parameters": {}}},
         ]
@@ -1436,7 +1574,7 @@ class TestSystemPromptGateParity:
         """``inject_memory_provider_tools`` and ``memory_provider_tools_exposed``
         must agree — both determine whether provider tools are presented to
         the model (#81014)."""
-        from agent.memory_manager import inject_memory_provider_tools, memory_provider_tools_exposed
+        from agent.memory_manager_tools import inject_memory_provider_tools, memory_provider_tools_exposed
 
         # Disabled toolsets — neither path should add or advertise provider tools.
         agent, _mgr, _p = self._agent_with_provider(disabled_toolsets=["memory"])
@@ -1452,3 +1590,44 @@ class TestSystemPromptGateParity:
         assert added == 1
         names = {t["function"]["name"] for t in agent.tools}
         assert "mnemosyne_remember" in names
+
+
+def test_declared_prefetch_budget_controls_process_wide_gate(monkeypatch):
+    class BudgetedProvider(FakeMemoryProvider):
+        def prefetch_timeout_seconds(self):
+            return 0.2
+    seen = []
+    original_enter = MemoryManager._PREFETCH_GATE.enter
+    def enter(key, token, timeout):
+        seen.append(timeout)
+        return original_enter(key, token, timeout)
+    monkeypatch.setattr(MemoryManager._PREFETCH_GATE, "enter", enter)
+    manager = MemoryManager()
+    provider = BudgetedProvider("declared-budget-gate")
+    provider._prefetch_result = "provider memory"
+    manager.add_provider(provider)
+    assert manager.prefetch_all("question") == "provider memory"
+    assert seen == [0.2]
+
+
+def test_turn_prologue_preserves_previous_assistant_and_turn_id():
+    from agent.turn_context import _memory_turn_start_and_prefetch
+    seen = {}
+    class ContextProvider(FakeMemoryProvider):
+        def prefetch(self, query, *, session_id="", previous_assistant_message="", turn_id=""):
+            seen.update(query=query, previous_assistant_message=previous_assistant_message, turn_id=turn_id)
+            return "provider memory"
+    manager = MemoryManager()
+    manager.add_provider(ContextProvider("prologue-context"))
+    agent = SimpleNamespace(_memory_manager=manager, _user_turn_count=2,
+                            _emit_status=lambda *args: None)
+    messages = [{"role": "user", "content": "previous question"},
+                {"role": "assistant", "content": "previous answer"},
+                {"role": "user", "content": "continue this specific investigation"}]
+    result = _memory_turn_start_and_prefetch(
+        agent, messages[-1]["content"], messages=messages,
+        current_turn_user_idx=2, turn_id="current-turn",
+    )
+    assert result == "provider memory"
+    assert seen == {"query": messages[-1]["content"],
+                    "previous_assistant_message": "previous answer", "turn_id": "current-turn"}

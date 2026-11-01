@@ -4,9 +4,8 @@ from unittest.mock import patch
 
 from tests.tools.test_skills_sync import (
     TestSyncSkills as _SyncSkillsHelpers,
-    _dir_hash,
 )
-from tools.skills_sync import sync_skills
+from tools.skills_sync import dir_hash as _dir_hash, sync_skills
 
 
 def test_fresh_install_can_auto_disable_new_bundled_skills(tmp_path):

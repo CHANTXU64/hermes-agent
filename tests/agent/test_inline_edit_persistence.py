@@ -130,8 +130,7 @@ def test_edit_preview_is_durable_before_emission_and_display_only(
             def wire(history):
                 return build_api_messages(
                     agent, history, current_turn_user_idx=0, ext_prefetch_cache="",
-                    plugin_user_context="", plugin_request_context="", moa_config=None,
-                    active_system_prompt="fixed prefix",
+                    plugin_user_context="", moa_config=None, active_system_prompt="fixed prefix",
                 )
             without_display = [{k: v for k, v in m.items() if k != "display_metadata"} for m in messages]
             assert wire(messages) == wire(without_display)

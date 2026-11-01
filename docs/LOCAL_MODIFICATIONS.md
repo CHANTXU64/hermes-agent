@@ -38,8 +38,10 @@ Validation after a merge:
 
 ### Auxiliary Codex credential model scope
 
+Retirement decision: The user retired this Codex model-scoped credential/cache patch during the current upstream sync. Use official selection and cache behavior; do not revive this historical contract. The separate provider-reported-model forwarding remains owned by the external-API integration. Source adoption is staged in the isolated candidate; behavior acceptance and deployment are still pending.
+
 - ID: `auxiliary-codex-credential-model-scope`
-- Status: active
+Status: obsolete
 - Depends on: none
 - Source boundary: logical-only (existing auxiliary routing and credential-pool seams)
 
@@ -109,8 +111,10 @@ scripts/run_tests.sh tests/tools/test_pythonpath_generation_rollover.py tests/to
 
 ### Langfuse per-request Fast evidence and native timing
 
+Retirement decision: The user retired the custom Langfuse Fast, TTFT and latency/rate extension and the checkpoint service-level evidence log. Restore the official Langfuse plugin and observer behavior; do not revive this historical contract. Actual checkpoint Fast eligibility and requests remain unchanged. Source adoption is staged in the isolated candidate; behavior acceptance and deployment are still pending.
+
 - ID: `langfuse-request-telemetry`
-- Status: active
+Status: obsolete
 - Depends on: none
 - Source boundary: logical-only
 
@@ -244,6 +248,10 @@ configured remote service only; full `local_embedded` server mode is not migrate
 claimed compatible. Memory data, service address and Profile configuration are unchanged.
 
 ### 4. Safe command rewrite for terminal tool
+
+Retirement decision: The user retired automatic rm/cp/mv rewriting for local and SSH commands because the original model-reliability workaround is no longer needed. Use native commands and ordinary approval; do not revive this historical contract. Source adoption is staged in the isolated candidate; behavior acceptance and deployment are still pending.
+
+Status: obsolete
 
 Date: 2026-04-21
 
@@ -505,6 +513,14 @@ Upstream status: intentional Fork divergence from upstream's every-turn
 `recall_sync` option.
 
 ### 9. Hindsight P5 recall preprocessor
+
+Status: preserve existing recall policy; adapt to fixed upstream memory interfaces (owner decision 2026-10-29).
+
+Current usage and merge boundary:
+- Recall completes before the current model response. Its internal worker is an outer-timeout boundary, not speculative recall for the next turn.
+- The installed provider's post-turn `queue_prefetch` is a no-op and `auto_retain` is disabled; the official background sync/prefetch protection is not a reason to enable either path.
+- Preserve previous-assistant/turn inputs, provider-declared full wait budgets, timeout invalidation and the memory auxiliary-task registration bridge. The official process-wide prefetch gate uses that same effective provider budget so an allowed slow call is not mislabeled as overdue.
+- Retain official generic lifecycle/stability fixes without changing the P5 prompt, configured models, recall-selection rules or current activation settings. Full plugin/host verification remains pending other functional merge decisions.
 
 Date: 2026-07-17; external-prefetch timeout compatibility fix 2026-07-19;
 configured model fallback 2026-08-09; orchestration boundary migrated 2026-08-30;
@@ -884,6 +900,7 @@ Retirement decision:
 - Preserve Unicode-safe official turn serialization (`json.dumps(..., ensure_ascii=False)`), normal Bank selection, Recall/P5/cache behavior, generic `MemoryProvider` / `MemoryManager` rewind lifecycle, SessionDB active-only rewind, and normal session switching.
 - Preserve shared `messages=` support in the generic memory pipeline because providers other than Hindsight use it; Hindsight no longer consumes it for a private ledger.
 - The active Langfuse candidate generator and delayed writer are Fork-owned under `fork_features/hindsight_retain/`. The separate config-defined Quick Command consumer below owns their Hindsight write/monitor contract and does not revive this retired provider-owned chain, the legacy SQLite ledger, `/new` integration, replay, or provider lifecycle hooks.
+- Current sync retirement decision: remove the leftover `get_messages_as_conversation` `include_timestamps` and `order_by` switches from the isolated candidate. Their former CLI/Gateway manual-Retain callers were removed in `b3041e0926`; current Retain/monitor readers use their own SQL. Adopt the fixed official reader unchanged: it retains original message timestamps and uses insertion order, including normal tool-call adjacency. Do not change the separate Retain/monitor SQL or revive the old chain. `tests/fork/test_hermes_state_transcript.py` retains the default timestamp/order regressions and verifies that the retired switches are rejected; merge-wide validation and deployment remain separate.
 
 Retirement verification:
 
@@ -905,19 +922,21 @@ Retirement verification:
 
 Upstream status: fork-only feature retired; official Hindsight tools and automatic Retain implementation retained.
 
-### 9a. Gateway session-aware exec Quick Commands
+### 9a. Session-bound Retain through the official command plugin
 
-- ID: `gateway-session-aware-quick-command`
-- Status: active
-- Depends on: none — reuses the existing Gateway `SessionStore` routing map
-- Source boundary: logical-only
+- ID: `gateway-session-aware-quick-command` (stable historical ID)
+- Status: active; legacy exec identity bridge retired in the current candidate
+- Depends on: official command-plugin session context and the existing Retain scheduler
+- Source boundary: independent opt-in directory plugin; no custom Gateway exec dispatch
 
 Files / touchpoints:
 
 - `fork_features/hindsight_retain/__init__.py` — package marker for the delayed-Retain feature.
-- `gateway/run_inbound.py` — upstream Gateway Quick Command exec seam; reuses `GatewayRunner._session_key_for_source()` for the routing namespace and group/thread policy
-- `tests/fork/test_gateway_quick_command_session_env.py` — Fork-owned behavior and cross-route concurrency coverage
-- `tests/fork/test_quick_command_multiplex_routing.py` — real SessionStore and spawned-child coverage for one chat across profiles, missing mappings, group/thread policy and async lookup
+- `plugins/hindsight-retain-command/plugin.yaml`, `plugins/hindsight-retain-command/__init__.py` — opt-in official command registration, scoped settings, existing slash policy, readable receipts and unchanged scheduler invocation.
+- `tests/fork/test_retain_command_plugin.py` — real plugin loader/discovery/settings and scheduler boundary tests; worker creation is intercepted.
+- `tests/fork/test_gateway_quick_command_session_env.py` — migrated official-parameter and messaging-source coverage; the obsolete exec boolean opt-in itself is retired.
+- `tests/fork/test_quick_command_multiplex_routing.py` — normal GatewayRunner/SessionStore tests for real cross-profile routes, missing mappings, group/thread policy, async lookup and concurrent chats/topics.
+- Historical touchpoint: `gateway/run_inbound.py`; the old overriding exec/plugin methods are removed, leaving the official inherited command entry unchanged. Other independent merge conflicts in that file are not covered by this decision.
 - `fork_features/hindsight_retain/retain_integrity.py` — Fork-owned delayed Retain scheduler, writer, receipt scanner, and remote verifier
 - `fork_features/hindsight_retain/langfuse_hindsight_export.py` — Fork-owned Langfuse candidate exporter with request-time cutoff filtering
 - `tests/fork/test_hindsight_retain_integrity.py` and `tests/fork/test_langfuse_hindsight_export.py` — Fork-owned Retain/exporter regression coverage
@@ -925,11 +944,12 @@ Files / touchpoints:
 
 Intent / invariants:
 
-- A config-defined Gateway `type: exec` Quick Command can opt in only with the strict boolean `session_env: true`; only that command receives the active durable Hermes session ID as `HERMES_SESSION_ID`. Strings, numbers, false, null, and an absent key do not opt in.
-- Gateway resolves the current message's complete route key through the existing `SessionStore` map; it must not create a session, choose a recent session, or fall back across platform, chat/thread/topic, or profile boundaries. Use the existing runner/store key resolver, not `build_session_key(source)` with defaults: default arguments discard the Profile namespace and configured group/thread policy.
-- Every Gateway Quick Command child env first drops any process-global `HERMES_SESSION_ID`; strict opt-in then adds the exact mapped session only to that child dictionary. The implementation must never mutate process-global `os.environ`, so concurrent channels and profiles cannot overwrite one another.
-- Commands without `session_env: true` receive no Hermes session ID and otherwise preserve upstream Quick Command behavior. A session-aware command with no current mapping fails before spawning its child process. CLI, TUI, and Desktop remain outside this Gateway-only unit and are not modified by it.
-- `/retain` calls the Fork-owned `schedule` command. It validates the configured Bank, records a lock-protected, append-only, fsynced `scheduled` receipt containing the exact triggering session, request-time cutoff, and `due_at=requested_at+1200s`, then starts a detached child with closed stdio and returns `status=scheduled` immediately. The CLI keeps JSON as its default machine-readable output; the profile-local Gateway Quick Command explicitly selects `--output-format text`, which turns schedule success or failure into a concise user-facing receipt instead of exposing raw JSON in chat. The user explicitly chose this simple non-durable worker: Gateway or machine shutdown can lose it; no Cron, replay, or restart recovery is added. The scanner reports a high alert when a scheduled attempt is past due plus grace and has no `started` receipt.
+- The official command-plugin API supplies the exact current durable `session_id`. The handler never chooses a recent session, creates one, reads a process-global session ID, or accepts a replacement ID in typed arguments. Missing session identity is refused with a user-visible receipt.
+- Each enabled profile owns its registration and settings. A handler invoked under another profile home refuses before scheduling. Explicit absolute `python_executable`, `output_root`, `journal_path`, `state_db_path` and `hindsight_config_path` settings preserve the existing launch choices without cross-profile fallbacks. Bank/content/remote-target behavior remains in the existing scheduler/writer.
+- The command remains messaging-only; local CLI/TUI/Desktop invocation is refused rather than extending the old Gateway-only feature. The existing official slash admin/user policy is rechecked in the calling profile. Scheduling/config errors return failure receipts and do not fall through into an agent turn or expose raw exception contents.
+- The old exec `session_env` switch and its private lookup/environment injection are retired. Ordinary exec commands inherit the official implementation, including cwd handling and timeout/cancellation process cleanup; no watcher or new scheduler is added.
+- Deployment must remove the same-name config-defined `quick_commands.retain` when enabling `hindsight-retain-command`, because quick commands take precedence over plugin commands. The current sync only prepares a default-profile switch preview; it does not change live config or other profiles. All other profiles still using the old opt-in must be separately migrated before deploying this core retirement.
+- `/retain` calls the existing Fork-owned `schedule_retain` function with the exact official session ID, explicit launch paths, `delay_seconds=1200` and `remote_expectation=expected`. It validates the configured Bank, writes the same lock-protected, append-only, fsynced `scheduled` receipt containing the exact triggering session, request-time cutoff and `due_at=requested_at+1200s`, starts the same detached child with closed stdio, and returns immediately. The plugin returns the existing concise Chinese success/failure receipt; the standalone CLI still defaults to JSON and retains its `--output-format text` option. The user-selected worker remains intentionally non-durable: Gateway or machine shutdown can lose it; no Cron, replay or restart recovery is added. The existing scanner alerts when a scheduled attempt is past due plus grace without a started receipt.
 - The detached child waits only until its fixed `due_at`, then records `started` and reads Langfuse. Candidate filtering is per message timestamp and includes only content at or before the request-time cutoff; waiting 20 minutes is solely for Langfuse synchronization and must not include later messages from the same session. Because sanitized Langfuse v4 exports can contain only `Hermes turn` chains, candidate construction also reads the exact session's StateDB in query-only mode: it supplements de-duplicated user rows carrying a direct `platform_message_id`, visible assistant replies from active or compacted history, and successful `clarify` question/choice/response events. Assistant tool calls, hidden/internal notifications, runtime wrappers, standalone compression summaries, empty rows, and physical active/compacted copies are excluded; externally submitted text is forcibly secret-redacted. Missing events are inserted by source order/timestamp without replacing Langfuse final-answer evidence. Artifacts live under `<session_id>/<attempt_id>` with directory mode `0700` and file mode `0600`, so repeated calls cannot overwrite evidence for an earlier attempt. Before `export_succeeded`, one validator proves session/Document identity, canonical UUID, `turns == json.loads(document_content)`, recomputed counts and SHA-256, fsyncs every manifest artifact and the directory, and binds that immutable hash into later receipts. Before any expected remote POST, the writer requires this StateDB reconciliation to consume each matching candidate occurrence at most once and to report every source event matched or added with zero uncovered events. An independent cutoff snapshot then enforces separate user/assistant lower bounds, including projected `clarify` replies/questions, so a single missing visible event blocks before submit; the conservative severe-total-gap rule remains as an additional guard. Each blocked case records its own receipt and returns without loading remote config or sending data; export-only runs still preserve the local candidate for investigation.
 - The verified writer targets the literal URL `https://hindsight-api.chantx.top`; it reads `bank_id` and optional `retain_context` from the active profile's `hindsight/config.json` when the caller left the default path and `HERMES_HOME` points at a directory containing that file. An explicit `--hindsight-config` still wins. Otherwise it reads `~/.hermes/hindsight/config.json`. This lookup happens before any remote-write receipt or POST. Missing, empty, wrong-type, or URL-unsafe Bank values fail closed with no environment-variable or hard-coded fallback. A missing `retain_context` uses the retired provider's default `conversation between Hermes Agent and the User`; null/empty omits it. The Hindsight item otherwise matches the retired manual `/retain` contract: `content`, optional configured `context`, `document_id=session_id`, and `update_mode=replace`; it sends no Retain `tags`, `metadata`, `timestamp`, or `occurred_at`. Attempt/schema/hash/count facts stay only in the local candidate, manifest, and journal. Submission remains asynchronous with `operation_id=attempt_id`.
 - The remote receipt sequence is `remote_write_started` before POST, then `remote_write_accepted` only after a matching Bank/item/async/operation response. Definite 4xx rejection and transport/response uncertainty are distinct receipts. An uncertain POST is never retried; the monitor queries the original deterministic operation. The Quick Command returns `scheduled`; later receipts separately prove extraction, acceptance, operation completion, and exact Document content.
@@ -953,14 +973,14 @@ Intent / invariants:
 
 Merge decision:
 
-- Preserve when: a local exec Quick Command needs the exact current Hermes session identity without a dedicated built-in command.
-- Drop when: upstream provides an equivalent opt-in child-process context that passes the same isolation, no-fallback, and concurrency tests on Gateway.
-- Ask user when: changing the environment variable, Bank, stable ID mapping, or replace semantics; adding route fallback/session creation, automatic retry/replay, other surfaces, or coupling to `/new` or memory-provider lifecycles.
+- Preserve when: explicit Retain still needs the exact current Hermes session identity and the independently managed delayed writer.
+- Drop the old core bridge: owner selected the official command-plugin session-parameter API as its replacement. Do not restore private exec methods or `session_env` injection during later merges.
+- Ask user when: changing the current-session contract, launch paths, Bank, stable ID mapping, or replace semantics; adding route fallback/session creation, automatic retry/replay, other surfaces, or coupling to `/new` or memory-provider lifecycles.
 
 Verification:
 
 ```bash
-.venv/bin/python -m pytest -q -o 'addopts=' tests/fork/test_gateway_quick_command_session_env.py tests/fork/test_hindsight_retain_integrity.py tests/fork/test_langfuse_hindsight_export.py tests/hermes_cli/test_quick_commands.py
+scripts/run_tests.sh tests/fork/test_retain_command_plugin.py tests/fork/test_gateway_quick_command_session_env.py tests/fork/test_quick_command_multiplex_routing.py tests/fork/test_hindsight_retain_integrity.py tests/fork/test_langfuse_hindsight_export.py tests/hermes_cli/test_quick_commands.py tests/hermes_cli/test_plugin_command_source.py tests/gateway/test_exec_quick_command_tree.py
 python3 -m py_compile gateway/run.py fork_features/hindsight_retain/retain_integrity.py fork_features/hindsight_retain/langfuse_hindsight_export.py tests/fork/test_gateway_quick_command_session_env.py tests/fork/test_hindsight_retain_integrity.py tests/fork/test_langfuse_hindsight_export.py /Users/robot/.hermes/scripts/check-hermes-hindsight.py /Users/robot/.hermes/scripts/hindsight_monitor_html.py
 git diff --check
 ```
@@ -974,6 +994,7 @@ git diff --check
 - Upstream status: fork-only
 - Last validated: Fork `748b3f9808584174c8fe98a82ec0214cbe724028` plus local Retain fixes; original-cutoff candidate replay, independent source monitor replay, live read-only parent/child/Document checks, and targeted regressions verified. Full-repository tests, actual remote writes and post-restart Gateway behavior were not exercised. Expanded machine-local tests have unrelated evaluator failures and test-environment assumptions; see the JSONL verification record.
 - Feature docs: this maintenance entry and [change/verification ledger](chantxu64/hindsight-retain/changes.jsonl); Fork-owned scripts expose `schedule`, internal `execute-scheduled`, legacy immediate `export`, and read-only `scan`
+- Current fixed-snapshot sync: owner explicitly selected the independent official command plugin. Candidate plugin loader/settings/scheduler and official-command-entry validation are separate from the complete GatewayRunner tests, which remain blocked until unrelated shared-source conflicts are resolved. No live plugin/config/service activation or real Retain/monitor execution is part of this change.
 
 ### Telegram quick-command menu discovery
 
@@ -1149,82 +1170,21 @@ Feature docs: none — historical removal is recorded here to prevent revival.
 Upstream status: reverted Fork-only feature.
 
 
-### 12. Request-only recall isolation and Codex prompt-cache routing
+### 12. Official context replay and retained Codex prompt-cache routing
 
-Status: active fork maintenance
+Status: placement/replay adopted from fixed upstream; independent Fork cache routing retained
 
 Date: 2026-06-16, restored 2026-07-22; upstream routing merged 2026-08-08;
 LCM request-context placement 2026-08-15
 
-Decision and behavior:
+Current owner decision (2026-10-29; supersedes historical isolation rules below):
 
-- Hindsight recall, `pre_llm_call` user-message context, explicit plugin request
-  context, and gateway turn notes are volatile additions for the current
-  provider request. Durable user history keeps the clean user-authored content
-  only.
-- A later turn replays historical `content`; it never substitutes an older
-  `messages.api_content` value. This intentionally accepts a prompt-cache
-  boundary miss when volatile recall changes rather than replaying stale recall
-  as if it were new user input.
-- OpenAI/Codex Responses places explicit plugin request context followed by the
-  current turn's recall in one request-only `developer` item immediately after
-  the clean current user item. That position is rebuilt for every same-turn tool
-  call, but the developer item is not replayed on the next user turn. Other
-  runtimes receive both on a copy of the current user content in the same order.
-  Ordinary plugin context and Gateway one-turn context remain on the current-user
-  request copy for all runtimes; only a plugin that explicitly selects request
-  context can use the provider-aware route.
-- MoA reference fan-out and its aggregator receive a provider-neutral request
-  copy containing explicit request context, current recall, and ordinary
-  plugin/Gateway context. The acting model still receives its normal
-  provider-specific shape; neither MoA auxiliary path mutates durable history.
-- The max-iteration forced-summary request receives the same current
-  `TurnContext` as the preceding tool loop. Chat-completions keeps explicit
-  request context followed by recall on the current-user request copy;
-  OpenAI/Codex Responses keeps both in that order in the request-only developer
-  item after the user. The synthetic summary request and all volatile context
-  remain absent from durable history.
-- String and multimodal composition never mutates the durable message object or
-  its content list.
-- New normal CLI, Gateway, branch, compression, and session-flush paths do not
-  write or forward `api_content`. The nullable SQLite column and low-level
-  reader/writer compatibility remain so existing databases require no unsafe
-  schema migration; legacy values are stripped before model requests. The one
-  live-only exception is active-turn redirect scaffolding: an in-memory marker
-  lets the same-turn provider copy consume its sidecar, while persistence and
-  later replay still keep only clean transcript content, including early
-  terminal-return paths and rich Gateway tool-call replay.
-- In-place compression does not backfill a sidecar. Max-iteration summaries and
-  Gateway replay also ignore legacy values.
-- `codex_app_server` remains separate: request-only recall is prefetched for the
-  normal memory lifecycle but is not injected into its persistent Codex thread,
-  because the protocol has no safe per-request volatile input slot.
-
-Fourth-batch responsibility boundary (2026-08-30):
-
-- The Fork-owned placement and legacy-sidecar policy now lives in
-  `fork_features/request_context.py`. The conversation loop, max-iteration
-  helper, and focused tests import that policy directly; `agent/turn_context.py`
-  only collects the current values and no longer defines or re-exports the
-  provider-specific placement rules.
-- The Fork-owned logical-scope priority, explicit-key precedence, and Codex
-  `session_id` / `thread-id` / `x-client-request-id` alignment now live in
-  `fork_features/prompt_cache_routing.py`. The Responses transport retains its
-  provider-neutral key hashing and delegates only the Fork routing decision.
-- `fork_features/request_fork` remains a separate compression-checkpoint service
-  for frozen provider-native requests. It is not the request-only Recall
-  container and must not absorb this policy.
-- Fixed upstream `66666f6e2eca0ae883195a34c66131985ea7dd06`
-  intentionally persists `api_content` and its own
-  `test_next_turn_replays_previous_turn_bytes` requires exact next-turn replay.
-  That is an upstream cache-first contract, not an accidental omission. This
-  Fork deliberately keeps the current-turn-only contract instead.
-- The same upstream snapshot has a reusable compression-lineage resolver, but
-  adopting it wholesale would change this Fork's real routing: upstream feeds
-  physical/root scope into content hashing, while the Fork gives Gateway keys
-  and compression roots explicit logical-key precedence and mirrors that key in
-  `thread-id`. Keep the exact existing Fork outputs until live evidence and a
-  separate user decision justify a cache-bucket migration.
+- Use fixed upstream `cf6623e43359ed87b145dd7f4db9596747535ef0` context placement and exact-content replay. Recalled memory and plugin context follow the user message; GPT does not receive a memory-specific `developer` item.
+- String turns retain clean display content plus the exact sent `api_content` for same-turn stability, persistence and later replay. Multimodal turns use upstream's durable appended context part. Gateway notes and plugin content continue through the official prologue; an old plugin `target=request_context` dictionary still contributes its context through the standard hook.
+- Main requests, max-iteration summaries, transcript flushing, Gateway history, rewrites and token estimation follow the same official replay contract. Do not restore current-turn-only stripping or rewrite-time exclusion. Keep upstream safeguards that discard a sidecar when the underlying content was deliberately rewritten.
+- `fork_features/request_context.py` and its exclusively request-only policy tests are retired. Provider-specific, long-task recovery and manual Request Fork tests now cover user suffix/replay; independent OOB steer tests are retained.
+- `fork_features/prompt_cache_routing.py` and the cache behavior described next are independent and remain unchanged by this decision. `fork_features/request_fork` is the separate provider-native compression-checkpoint service; preserve physical capture/freeze and prefix reuse rather than treating it as the retired recall-isolation container.
+- Hindsight's query preparation, previous-assistant and turn identifiers are preserved under the separate owner decision in entry 9. Context placement and recall strategy remain independent maintenance units.
 
 Codex Responses cache routing:
 
@@ -1258,12 +1218,10 @@ Primary files:
 - `hermes_state_messages.py`
 - `tests/agent/test_turn_finalizer_cleanup_guard.py`
 - `tests/hermes_state/test_hermes_state.py`
-- `fork_features/request_context.py` (Fork placement and sidecar policy)
 - `fork_features/prompt_cache_routing.py` (Fork scope/header policy)
 - `agent/turn_context.py` (`build_turn_context` collection and
   `build_api_messages` request-copy application seam)
-- `agent/conversation_loop.py` (active-redirect request marker, turn-state
-  propagation, and early-return cleanup)
+- `agent/conversation_loop.py` (official correction sidecars and independent request-freeze boundary)
 - `agent/turn_iteration_prep.py` (current-user index re-anchoring after repair)
 - `agent/turn_request_assembly.py` (MoA reference/aggregator request view)
 - `agent/codex_responses_adapter.py`
@@ -1277,8 +1235,7 @@ Primary files:
 - `gateway/session_transcript.py`
 - `gateway/slash_commands.py`
 - `hermes_cli/cli_commands_mixin.py`
-- `hermes_state.py` / `hermes_state_messages.py` (schema compatibility and
-  rewrite-time sidecar exclusion)
+- `hermes_state.py` / `hermes_state_messages.py` (official sidecar persistence/replay; independent transcript options decided separately)
 - `tests/agent/test_api_content_sidecar.py`
 - `tests/agent/test_model_metadata.py`
 - `tests/agent/test_gateway_turn_sidecar.py`
@@ -1289,36 +1246,17 @@ Primary files:
 - `tests/agent/test_run_agent_codex_responses.py`
 - `tests/agent/test_codex_app_server_integration.py`
 - `tests/agent/test_codex_request_only_memory_context.py`
-- `tests/fork_features/test_request_context_policy.py`
 - `tests/fork_features/test_long_task_continuity_recovery.py`
 
 Merge protection:
 
-- Upstream commit `7b3dcee92` introduced exact-wire `api_content` persistence
-  and replay. Preserve the fork's request-only isolation when syncing code that
-  touches that mechanism; an upstream nullable column is harmless, historical
-  sidecar substitution is not.
-- Preserve current-turn must-deliver gateway notes while keeping them out of
-  durable history, including multimodal turns.
-- Preserve the current-turn Codex `user → developer(request-context → recall)`
-  position across tool calls and max-iteration summaries. Ordinary plugin and
-  Gateway context must remain on the user request copy. Do not restore the
-  historical cross-turn replay of prior developer memory slots; that
-  cache-affinity workaround violates the current lifecycle contract.
-- Preserve current-turn explicit request context, recall, and ordinary
-  plugin/Gateway context in MoA reference and aggregator requests; building MoA
-  advice from the clean durable transcript alone silently drops current context.
-- Preserve Hindsight P5/synchronous recall, the model-visible `hindsight_retain`
-  tool, generic `/undo`, multi-Telegram account routing, and upstream Gateway
-  lifecycle improvements. Do not revive the retired built-in/provider-owned
-  `/retain` chain; the config-defined session-aware Quick Command is a separate
-  connector and must remain outside Hindsight, `/new`, and `/undo` lifecycles.
-- Do not merge delegate or branch cache scope merely because
-  `parent_session_id` is present.
-- Do not remove upstream content-addressed key hardening while restoring the
-  fork's logical/physical routing split.
+- Preserve upstream exact sent-content persistence and cross-turn/summary replay, including string, multimodal, active correction and early-result paths. No GPT memory-specific developer slot.
+- Preserve plugin recovery content collection and Hindsight recall preparation. Independent recall-policy and plugin-lifecycle conflicts require their own owner decision.
+- Keep MoA reference and aggregator context available through the current API-bound user view.
+- Do not merge delegate or branch cache scope merely because `parent_session_id` is present. Preserve the independent cache-routing priority, explicit-key rules, physical/logical split and upstream content-addressed key hardening until separately decided.
+- Preserve the model-visible `hindsight_retain` tool, generic `/undo`, multi-account routing and official lifecycle improvements. Do not revive the retired provider-owned `/retain` chain; the config-defined Quick Command remains independent.
 
-Historical implementation references:
+Historical implementation references (not current placement rules or candidate validation):
 
 - `ce52975c27` introduced the fork's Codex developer-item support for
   request-only memory context.
@@ -1473,6 +1411,7 @@ Files:
 - `fork_features/telegram_tool_progress.py`
 - `gateway/run.py`
 - `gateway/run_turn_runner.py`
+- `gateway/run_turn_progress.py` — fixed-official relocated progress owner; Fork terminal/literal formatting adaptation
 - `plugins/platforms/telegram/adapter.py`
 - `tests/fork/test_telegram_tool_progress_literal_text.py`
 - `tests/gateway/test_run_progress_topics.py`
@@ -1492,8 +1431,9 @@ What changed:
   returns every non-Telegram metadata object unchanged.
 - `GatewayRunner` and `TurnRunner` keep progress creation, accumulation, topics,
   reply metadata, edits, rollover, typing, approvals, and final replies. The
-  progress delivery call uses a thin alias imported from the Fork policy module;
-  the core no longer contains a Telegram platform branch for this behavior.
+  progress metadata boundary calls the Fork policy locally in `_run_agent_progress_threading`;
+  no global `gateway.run` alias or duplicated old progress methods are needed.
+- Current sync: follow the official relocated `GatewayTurnProgressMixin` rather than retaining old overriding methods on `TurnRunner`. Keep the official new lifecycle/status publication and non-Telegram formatting. Apply Telegram no-fence behavior to the new verbose argument formatter too.
 - The Telegram adapter bypasses both rich-message delivery and MarkdownV2
   conversion for that marker, including finalized accumulated bubbles and
   overflow continuations. Regexes, code fragments, URLs, backticks, pipes, and
@@ -1541,8 +1481,7 @@ scripts/run_tests.sh tests/fork/test_telegram_tool_progress_literal_text.py test
 git diff --check
 ```
 
-Feature docs: none — a Fork metadata policy, one Gateway alias, generic adapter
-rendering, and focused runtime contracts fully define this behavior.
+Feature docs: none — a Fork metadata policy, a local Gateway metadata call, relocated progress formatting, generic adapter rendering, and focused runtime contracts define this behavior. Current sync component tests exercise the actual new formatter and literal send/edit/UTF-16 overflow paths with fake API boundaries; the full GatewayRunner metadata/topic gate remains pending on an independent reset-command conflict.
 
 Upstream status: fork-only.
 
@@ -1625,77 +1564,59 @@ behavior contracts fully define the unchanged user-visible guidance.
 
 Upstream status: fork-only.
 
-### 18. Explicit browser tab selection (replaces first-navigation auto-new)
+### 18. Explicit browser tab selection (official browser_exec adaptation)
 
-- ID: `browser-explicit-tabs` (first stable ID assigned to former entry 18)
+- ID: `browser-explicit-tabs` (same maintenance unit as former entry 18)
 - Status: active
 - Depends on: none
 - Source boundary: logical-only
 
 Files / touchpoints:
-- `fork_features/browser_tabs.py` — tab identity, list/new/switch/close and per-task serialization.
-- `fork_features/browser_tabs_chrome.py` — read-only Chrome window selection observations.
-- `fork_features/browser_daemon.py` — real process/socket lifetime identity and no-respawn pinned Unix-socket commands.
-- `tools/browser_tool.py`, `toolsets.py` — schemas, registration and explicit navigation seam.
-- `tools/browser_tool_session.py` — optional command-generation guard; targeted mutations never replay on replacement sessions.
-- `tests/fork/test_browser_tabs.py` — focused behavioral contracts.
-- `tests/fork/test_browser_daemon_generation.py` — daemon-generation and connected-socket race contracts.
-- `tests/tools/test_browser_camofox.py` — existing navigation contract adapted to required tab IDs.
-- `tests/tools/test_browser_extension_router_wiring.py` — existing navigation contract adapted to required tab IDs.
-- `tests/tools/test_browser_lightpanda.py` — existing navigation contract adapted to required tab IDs.
-- `tests/tools/test_browser_open_timeout.py` — existing navigation contract adapted to required tab IDs.
-- `tests/tools/test_browser_secret_exfil.py` — existing navigation contract adapted to required tab IDs.
-- `tests/tools/test_browser_snapshot_threshold.py` — existing navigation contract adapted to required tab IDs.
-- `tests/tools/test_browser_ssrf_local.py` — existing navigation contract adapted to required tab IDs.
+- `fork_features/browser_target_selection.py` — prepare read-only tab listing or confirmed native-target execution for the official harness.
+- `tools/browser_use_cli.py` — optional `tab_id` schema, registry forwarding and shared-browser policy seam.
+- `tests/fork/test_browser_target_selection.py` — missing selection, existing/new targets, failure stops and real host-function/registry seams with isolated I/O.
+- `tests/tools/test_browser_use_cli.py` — official browser behavior and connected/shared routing regressions.
 
-Retired files:
-- `fork_features/browser_first_navigation.py` and `tests/fork/test_browser_first_conversation_tab.py` — retired/deleted; do not restore.
+Retired files / behavior:
+- `fork_features/browser_tabs.py`, `fork_features/browser_tabs_chrome.py`, `fork_features/browser_daemon.py` — legacy agent-browser driver, short IDs, daemon-generation tracking and Chrome-window display; do not restore.
+- `tests/fork/test_browser_tabs.py`, `tests/fork/test_browser_daemon_generation.py` — replaced for the confirmed page-protection intent, not claimed to be one-for-one coverage of retired driver internals.
+- `fork_features/browser_first_navigation.py`, `tests/fork/test_browser_first_conversation_tab.py` — previously retired; do not restore.
+- Old built-in navigation/click/snapshot/tab tools and their deleted upstream support modules are replaced by the official `browser_exec` implementation.
 
 Intent / invariants:
-- Target the user's existing agent-browser / Chrome CDP setup without upgrading the pinned 0.26.0 driver.
-- `browser_tabs` lists short IDs, titles, URLs, the task's selected target and Chrome's selected tab in each window. New, switch and close are explicit operations; switching does not reload the document.
-- IDs include both the Hermes session and actual daemon lifetime (PID, process birth time and socket identity). A same-name daemon restart invalidates every previous short ID. Only returned short IDs are accepted; CDP long IDs are not accepted by navigation. Missing, closed or expired IDs fail without choosing a substitute tab. After reconnect, list again.
-- `browser_navigate` requires `tab_id`; no navigation implicitly creates a tab. Its snapshot and later ordinary click/type/snapshot calls use the selected driver target. Selection plus navigation is serialized per task, not a cross-agent ownership lock.
-- Selection distinguishes navigation from standalone switch: navigation validates its destination first, then checks the exact tab's identity/existence and daemon generation, selects and navigates it, and retains redirect checks. It does not apply access policy to the old document being left (including blank/internal/error pages). Standalone switch still checks that document's current URL. No protocol is globally exempted; normal snapshot/click/console access guards remain intact. Both `new(url)` and `new()` followed by explicit navigation must work with the real URL policy enabled.
-- Chrome selection is a best-effort read-only observation, distinct from the agent target and OS focus. Correlation is display-only and uses unique URLs; duplicate URLs, minimized/unreadable windows or missing CDP produce `null` (unknown). This correlation is never used to route an action.
-- The prior first-conversation-auto-new policy is obsolete by user decision. Do not revive its marker or `tab new` injection while merging upstream.
-- Targeted list/new/switch/close/navigation send the pinned 0.26.0 line-JSON protocol on a connected Unix socket, rechecking daemon identity after connect and before send. A disconnected socket cannot respawn or switch daemons; mutations are never replayed. Only a read may bootstrap a missing driver. Preserve the existing URL/redirect policies and Bot Desktop lease fence. This path is for the current macOS/Unix host, not a Windows named-pipe implementation.
-- This is not full shared-browser isolation or a fix for the upstream supervisor's separate target. Camofox does not implement this short-ID contract and fails closed rather than ignoring the ID.
-
-Temporary JS-tool limitation:
-- `browser_console(expression=...)` can still evaluate on its initial CDP-supervisor tab after the driver switches. Its tool description tells the model to locate the intended CDP target with `browser_cdp Target.getTargets`, then execute `Runtime.evaluate` with explicit `target_id`. Short tab IDs and CDP IDs are different namespaces.
-- Upstream candidate: https://github.com/NousResearch/hermes-agent/pull/123794 . An open PR or driver-version bump alone is not proof of a fix.
-- After merging an upstream target-synchronization fix, verify switching between real distinct tabs and reconnecting causes JS evaluation to follow the intended page. Then remove only the temporary JS warning and its description contract test. Keep explicit short-ID tab management unless separately retired.
+- The original pain is an agent navigating without inspecting/selecting the browser target and overwriting a page the user needs to retain. Native IDs, short IDs and daemon generations are means, not acceptance goals.
+- Use the official browser-harness/Browser Use engine while retaining connection to the user's configured local Chrome CDP endpoint. Do not change the installed browser or live configuration during candidate preparation.
+- On a connected/shared browser, omitting `tab_id` sends only fixed read-only tab-list code to the harness; the supplied model payload is not executed. This applies to both default and named sessions.
+- An exact native `targetId` from the list selects that existing target before the payload. `tab_id="new"` explicitly creates a fresh blank target, never silently reusing an existing blank page.
+- Missing/closed targets, creation failure, switching failure or mismatched selection confirmation stop before the payload; there is no fallback to the current or first page.
+- Each batch states its intended target. Model code must not switch to an unrelated existing target inside the batch. This policy guards the normal tool entry, not arbitrary Python as a security sandbox or all raw CDP/terminal access.
+- Per-session private browsers keep the official default behavior when no target is supplied; explicit targets are still honored if supplied.
+- Keep official URL, credential, lease, backend routing, screenshot and lifecycle policies. Do not restore the old driver merely to keep obsolete tool signatures.
 
 Merge decision:
-- Preserve when: upstream lacks equivalent explicit tab management and required short-ID navigation.
-- Drop when: upstream behavior fully covers the confirmed contract and the user accepts replacing this unit; the temporary JS warning alone has the removal condition above.
-- Ask user when: replacing short IDs, changing driver/backend, introducing required IDs on other tools or cross-agent locks, or reducing the confirmed tab operations/selection display.
+- Preserve the explicit-selection barrier while upstream can execute against a shared existing page without one.
+- Drop the Fork seam only when upstream covers the page-protection behavior and the user accepts its replacement.
+- Ask before weakening page protection, changing the local Chrome connection or introducing a different user-visible browsing policy.
 
 Verification:
 ```bash
-HERMES_PYTHON=.venv/bin/python scripts/run_tests.sh tests/fork/test_browser_tabs.py tests/fork/test_browser_daemon_generation.py tests/tools/test_browser_ssrf_local.py tests/tools/test_browser_private_page_action_guard.py tests/tools/test_browser_snapshot_ssrf.py tests/tools/test_browser_console_ssrf.py -q
-# Real-policy contracts cover new(url), blank/internal/error -> public navigation,
-# standalone switch restrictions, bad/stale IDs, unsafe targets and redirect checks.
-# Real smoke uses a disposable Chrome profile/CDP port, never business tabs:
-# list -> new -> navigate -> snapshot -> type/click -> switch -> close;
-# verify two independent driver targets, two Chrome windows, stale IDs after
-# cleanup/reconnect, and explicit-CDP JS execution versus the unchanged supervisor.
-# Also kill only the isolated daemon while preserving Chrome: every old ID must
-# reject navigate/switch/close, including navigation as the first post-crash call;
-# original target URLs stay unchanged; freshly listed IDs operate the intended page.
-git diff --check
+python tests/fork/test_browser_target_selection.py
+# After the shared-core merge is resolved, run this file and the affected official
+# browser-use/CDP/routing/security tests through scripts/run_tests.sh.
+# Real smoke must use a disposable Chrome profile: seed retained pages, attempt
+# blind navigation, explicitly select/new, repeat across named/default sessions,
+# close a selected target and fail selection; retained page URLs must stay intact.
 ```
 
-- Upstream status: fork-only; target-sync candidate exists as linked above.
-- Last validated: upstream `8172ebab6b4f11a42f5b3ab17bb625b78d2f57df`; Fork navigation-policy changes based on `0c0451c971`. Real current-session browser tools passed both creation/navigation paths, bad/closed-ID rejection and metadata/file blocking; original business tabs were left unchanged. Isolated regressions preserve redirect and daemon-generation guards. No service restart was performed; unrelated Browser Use harness dependency failure reproduces on the baseline.
-- Change ledger: `docs/chantxu64/browser-explicit-tabs/changes.jsonl`.
-- Feature docs: none — this bounded contract and its focused tests define the unit.
+- Upstream status: partially upstreamed — `cf6623e43359ed87b145dd7f4db9596747535ef0` supplies the official browser replacement; its named/shared own-tab preamble excludes default sessions and continues after initialization failures.
+- Validation status: candidate stdlib policy and isolated real-host-function/registry seam tests pass. Normal package imports, affected pytest suites and actual harness/Chrome behavior are pending; do not claim deployment readiness.
+- Historical evidence: the previous legacy-driver contract was validated on `8172ebab6b4f11a42f5b3ab17bb625b78d2f57df`; that evidence does not validate the replacement engine.
+- Feature docs: none — this bounded contract and focused tests define the unit.
 
 
 ### 19. Clarify attachment replies preserve media paths
 
-Status: policy extracted to `fork_features` (2026-08-30)
+Status: policy extracted to `fork_features` (2026-08-30); owner confirmed preservation and new-host adaptation in the current isolated sync
 
 Date: 2026-07-28; boundary refactored 2026-08-30
 
@@ -1730,6 +1651,7 @@ What changed:
 - `ClarifyResponsePayload` carries the canonical response and optional context
   through the blocking callback. `clarify_tool` exposes that context as a
   separate `response_context` field only when an attachment was present.
+- Preserve official invalid-selection retry, prose-cancellation and native-card retirement behavior. A retiring native card displays only the canonical answer, never the attachment payload object or its internal representation; the model still receives the separate attachment context. The real call is local to `GatewayInboundMixin`; no unused `gateway.run` function alias is required.
 - Clarify media placeholders translate host cache paths with
   `to_agent_visible_cache_path()`, so Docker-backed agents receive mounted
   `/root/.hermes/cache/...` paths rather than unreadable host paths.
@@ -1770,6 +1692,8 @@ git diff --check
 
 Feature docs: none — a Fork policy module, two thin host seams, and runtime
 contracts define this narrow authenticated Gateway interception behavior.
+
+Current sync validation: policy/tool suites and a real inbound-method component test pass. The component test uses fake surrounding media/adapter boundaries and is not a full GatewayRunner busy-route proof; that host suite remains pending until the independent shared-source conflicts are resolved. The pre-existing regression nodeids are actually collected and retained.
 
 Upstream status: fork-only.
 
@@ -1845,89 +1769,54 @@ recorded at the time and is worth confirming with the author.
 
 ### 21. Delivery-ledger session-reset boundary
 
-Status: active fork maintenance
+Status: removed (retired in the current isolated upgrade candidate by explicit owner decision)
 
-Date: 2026-07-29
-Refactored: 2026-08-31
+First implemented: 2026-07-29 (`65821a722d`)
+Refactored: 2026-08-31 (`6eea446048`)
 
-Files:
+Original purpose:
 
-- `ui-tui/src/app/slash/commands/core.ts` — `/reset` is an alias of `/new` on the TUI surface and
-  takes the same fresh-session path (`startFreshSession`), so the boundary fires identically.
-- `ui-tui/src/app/submissionCore.ts` — `enqueue(text, display?)` carries a display override so a
-  queued submission renders the user's text, not the rewritten command.
-- `ui-tui/src/__tests__/createSlashHandler.test.ts`
-- `ui-tui/src/__tests__/submissionCore.test.ts`
-- `fork_features/delivery_session_boundary.py`
-- `gateway/delivery_ledger.py`
-- `gateway/slash_commands_session.py` (stable host seam only)
-- `tests/fork_features/test_delivery_session_boundary.py`
-- `tests/gateway/test_delivery_ledger.py`
-- `tests/gateway/test_session_model_reset.py`
-- `tests/fork/test_telegram_account_retirement.py`
-- `website/docs/user-guide/messaging/index.md`
-- `docs/LOCAL_MODIFICATIONS.md`
+- The owner reported that, after `/new` and a Gateway restart, a failed old answer
+  arrived with the `Recovered reply` banner. The Fork marked pending old-route
+  replies `superseded` at an explicit session reset, while preserving same-session
+  crash recovery. This was an actual reported bug, not an inferred preference.
 
-Summary:
+Current owner decision:
 
-- A successful explicit `/new` or `/reset` transitions undelivered final
-  responses for the replaced conversation route to terminal `superseded`
-  state. Gateway startup recovery cannot inject those old answers into the
-  fresh Hermes session.
-- Normal same-session crash/restart redelivery remains unchanged. The boundary
-  update uses the complete route-qualified `session_key`, leaves other chats
-  and Profiles untouched, and is terminal against late send
-  acknowledgements or failures from the old turn.
+- After reviewing the original conversation and commits, the owner explicitly
+  chose to drop this fix and follow the fixed official snapshot's recovery rules.
+- Remove `fork_features/delivery_session_boundary.py`, its host call, its exclusive
+  tests, `supersede_session_obligations`, and the Fork late-update guard.
+- `gateway/delivery_ledger.py` and its upstream tests follow the fixed official
+  implementation. The reset handler follows the official replacement-session
+  lifecycle; unrelated approved memory-rewind/compression changes remain intact.
+- Failed old answers are not specially retired by `/new` or `/reset` in this
+  candidate. Official recovery, retry limits, and ordinary account/profile routing
+  continue unchanged. No active ledger/database migration is performed.
 
-Responsibility boundary:
+Scope clarification:
 
-- `fork_features/delivery_session_boundary.py` owns the Fork policy entry
-  point, event-loop offload, best-effort failure handling, and boundary logs.
-- `gateway/delivery_ledger.py` continues to own the SQL state transition and
-  terminal-state protection. Moving private connections or SQL into
-  `fork_features` would only hide data-layer coupling and is not allowed.
-- The high-churn reset implementation calls the Fork policy once, only after a
-  replacement Session exists. It has no direct Delivery Ledger dependency.
-
-Why it matters:
-
-- Upstream's delivery ledger persists `session_key`, which identifies a stable
-  platform route, but not the Hermes Session generation behind that route.
-  `/new` intentionally reuses the route, so a failed old response could be
-  recovered after restart even though the user had explicitly started fresh.
-- At upstream SHA `4f22543509d1b91dc45bcb369447126c5eb14fb7`, the
-  maintenance profile counted one path touch per commit from
-  `git log --since=2026-05-01 --name-status --find-renames`: 178 touches to
-  `gateway/slash_commands.py` versus 6 to `gateway/delivery_ledger.py`. No
-  structured sync-conflict records exist for this unit, so the refactor is
-  justified as churn isolation rather than a measured conflict reduction.
-
-Merge protection:
-
-- Preserve the one host call after successful replacement-Session creation
-  until upstream associates delivery obligations with the originating Hermes
-  Session or provides an equivalent terminal supersession mechanism.
-- Do not disable ordinary startup redelivery or remove the recovered-reply
-  ambiguity marker as a substitute for this boundary check.
-- Do not reduce the boundary key to platform or chat id. Named Telegram Bots
-  require the existing `:account:<id>` suffix so `/new` on one Bot cannot
-  supersede another Bot's pending reply.
+- The TUI `/reset` alias and queued-display changes formerly listed here were
+  reviewed separately. The owner chose official catalog-based `/reset` recognition
+  and official legacy-busy display behavior too. Their two extra fallbacks are
+  retired; `submissionCore.ts` and its suite match the fixed official source.
+- The existing async new-session return is unchanged; neither UI choice authorizes
+  removing unrelated completion/queue handling. Normal `/reset` catalog routing,
+  titles, destination ownership and user-visible queue behavior are regression-tested.
+- Candidate-only TUI dependencies were installed without lifecycle scripts or
+  package/lockfile changes. The two temporary conformance probes were archived
+  and removed before the formal UI suite and typecheck passed.
+- Historical JSONL records remain append-only; they describe past verification,
+  not current policy. Do not revive this retired fix from those records.
 
 Verification:
 
-- TDD RED established three missing-policy-module failures, followed by two
-  host-boundary failures while the reset path still called the Ledger directly.
-- Canonical focused and adjacent suite: `70 passed, 0 failed`, covering Fork
-  policy, exact account-qualified Bot isolation, both `/new` and `/reset`,
-  route-scoped supersession, startup-sweep exclusion, late-state terminality,
-  reset cleanup, title handling, async delegation, and streaming.
-- Python compilation and `git diff --check` passed.
-
-Feature docs: none — this is a narrow lifecycle invariant covered by the
-Delivery documentation, regression tests, and this merge note.
-
-Upstream status: the durable delivery ledger is upstream; the explicit
-Session-reset boundary remains fork-only.
+- Temporary conformance probe first reproduced the remaining Fork API, then
+  exercised the actual Gateway reset method with temporary SQLite and a fake
+  session store for both `/new` and `/reset`: failed replies remain `failed`.
+- The initial official ledger/reset/probe run passed; final adjacent results and
+  intentional test retirements are recorded in the upgrade evidence/JSONL log.
+- This is candidate source verification only, not deployment or a live restart.
 
 
 ### 22. Transport disconnect classification stays out of context compression
@@ -2053,8 +1942,12 @@ Files:
 
 Summary:
 
-- Keep autonomous `MEMORY.md` / `USER.md` maintenance while recording the
-  evidence and exact semantic loss behind every public mutation.
+- Keep `MEMORY.md` / `USER.md` governance and exact per-change audit while
+  adapting official storage fixes. An over-budget add must return the current
+  on-disk entries, including facts committed by another session after the caller
+  loaded its snapshot; this applies to both single and one-item batch adds.
+- A refused over-budget add leaves memory bytes unchanged and creates no false
+  successful-change audit event. Preserve the existing background write gates.
 
 What changed:
 
@@ -2286,76 +2179,43 @@ Upstream status: historical fork-only behavior; intentionally removed. The
 auxiliary and direct non-stream timeout paths were validated against
 `upstream/main` at `91e867631e9d2eb9fbd69edd4459475d38070979`.
 
-### 26. Successful STT keeps an explicit voice-origin marker
+### 26. Successful STT voice-origin marker (retired; official default)
 
-Status: active
+Status: obsolete (retired per current owner decision; isolated candidate only, not deployed)
 
-Date: 2026-08-15
+Historical purpose:
 
-Files:
+- Wrapped successful STT output with an explicit voice-origin reminder so the model could account for recognition errors. The local-STT desktop submit path used the same wrapper; GPT-Live has an independent official out-of-band path.
+
+Current owner decision:
+
+- “删除吧，用官方默认的。” Successful Gateway STT uses the fixed official plain quoted transcript. Local-STT desktop submission uses the bare transcript with the official voice-turn flag. Do not restore this Fork wrapper or its old assertions during later merges.
+- Use `GatewayInboundTranscriptionMixin` through the official inheritance path. Remove the obsolete methods in `gateway/run_inbound.py` that shadow the relocated official flow, so continuous/merged-voice fixes are not bypassed.
+- Keep the fixed official empty/inaudible note, neutral failure note, configured provider and local fallback behavior unchanged. Do not change current STT config/services or the separate GPT-Live path.
+
+Historical / retirement touchpoints:
 
 - `gateway/run_inbound.py`
-- `apps/desktop/src/app/chat/composer/hooks/use-composer-voice.ts` — `submitVoiceTurn` wraps a
-  local-STT transcript in the same marker before submit, so the desktop's own STT button reaches
-  the model with voice provenance (added 2026-09-21). GPT-Live does NOT go through here: it passes
-  the marker out-of-band via `voiceContext`, keeping bubble and history clean.
-  Accepted costs on this surface, for parity with the gateway path: the marker IS the submitted
-  text, so the chat bubble renders it and the persisted row stores the wrapper rather than the bare
-  transcript. The gateway hides it behind a voice-message bubble; this surface has none.
-- `apps/desktop/src/app/chat/composer/hooks/use-composer-voice-stt-marker.test.tsx` — pins the wrap.
-- `tests/gateway/test_stt_config.py`
+- `gateway/run_inbound_transcription.py` — exact fixed-official module, no Fork wrapper
+- `apps/desktop/src/app/chat/composer/hooks/use-composer-voice.ts` — exact fixed-official file after retirement
+- `apps/desktop/src/app/chat/composer/hooks/use-composer-voice-stt-marker.test.tsx` — retained regression now asserts the owner-selected plain transcript
+- `tests/gateway/test_stt_config.py` — migrated success assertion; placeholder/empty coverage retained
 - `tests/gateway/test_telegram_audio_vs_voice.py`
 - `tests/gateway/test_telegram_voice_v0_regressions.py`
-- `docs/LOCAL_MODIFICATIONS.md`
+- `tests/fork/test_official_voice_transcription.py` — component behavior and no-shadow regression
 
-Summary:
+Validation boundary:
 
-- Successful Gateway STT enrichment identifies the quoted transcript as content from a user voice message.
+- The new no-shadow regression failed before the retirement and passed afterward. Component tests exercise real official transcription methods with local provider fakes; no real transcription API is called.
+- Complete GatewayRunner voice regressions remain pending on independent shared-source conflicts. Desktop runtime tests are not run because this isolated candidate has no frontend test dependencies. Exact source equality with the fixed official files is a source check, not runtime proof.
 
-What changed:
-
-- Successful non-empty transcripts are injected as `[The user sent a voice message~ Here's what they said: "<transcript>"]` instead of a bare quoted line.
-- The raw `successful_transcripts` list remains unchanged, so transcript echo formatting, ordering, and deduplication retain their existing behavior.
-- Empty/inaudible results, STT failures, disabled-STT notes, providers, downloads, and message routing are unchanged.
-
-Why it matters:
-
-- The model must know that the text came through speech recognition so it can account for possible recognition errors rather than treating every word as deliberately typed by the user.
-
-Merge protection:
-
-- Preserve the explicit voice-origin marker unless upstream provides equivalent source semantics for successful STT enrichment.
-- Do not revive the prefix by changing transcript echo text or platform-specific adapters; the protected behavior belongs to the common Gateway enrichment path.
-- Keep empty and failed transcription markers neutral and singular.
-
-Verification:
-
-- 2026-08-15: the three focused regression files reported `10 passed`; the broader Gateway voice/STT selection reported `124 passed, 1 skipped`. Ruff, `py_compile`, and `git diff --check` passed. Warnings were existing third-party deprecations plus two pre-existing unawaited-`AsyncMock` warnings in voice-channel tests.
-
-```bash
-./venv/bin/python -m pytest \
-  tests/gateway/test_stt_config.py \
-  tests/gateway/test_telegram_audio_vs_voice.py \
-  tests/gateway/test_telegram_voice_v0_regressions.py \
-  -q -o 'addopts='
-./venv/bin/python -m py_compile gateway/run_inbound.py \
-  tests/gateway/test_stt_config.py \
-  tests/gateway/test_telegram_audio_vs_voice.py \
-  tests/gateway/test_telegram_voice_v0_regressions.py
-./venv/bin/ruff check gateway/run_inbound.py \
-  tests/gateway/test_stt_config.py \
-  tests/gateway/test_telegram_audio_vs_voice.py \
-  tests/gateway/test_telegram_voice_v0_regressions.py
-git diff --check
-```
-
-Feature docs: none — this is a small message-enrichment compatibility rule fully described here and protected by focused regressions.
-
-Upstream status: fork-only.
+Upstream status: official successful-transcript default adopted; Fork marker retired.
 
 ### 27. Per-invocation delegation provider/model/reasoning routing
 
-Status: active
+Retirement decision: The user chose the official delegation implementation directly. Custom per-call routing, batch prevalidation, route suggestions and control/delivery additions in this unit are retired; do not port them into a routing plugin during this sync. Further enhancements are deferred until after merging. Source adoption is staged in the isolated candidate; behavior acceptance and deployment are still pending.
+
+Status: obsolete
 
 Date: 2026-08-15; native Anthropic reasoning probe fixed 2026-08-28;
 route-policy boundary refactored 2026-08-31; control/completion observability
@@ -2778,10 +2638,13 @@ Upstream status: fork-only.
 - ID: `provider-native-long-task-continuity-request-fork`
 - Source boundary: logical-only
 
-Status: active fork maintenance; current persistent compression-boundary delivery
-is locally verified but not yet loaded or live-verified in the default Gateway.
-The earlier request-local delivery was previously live-verified and is now
-superseded.
+Status: active fork maintenance; owner confirmed preservation in the isolated upgrade candidate on 2026-10-29. The candidate is not deployed; full upgraded host/plugin continuity verification remains pending.
+
+Current merge boundary:
+- Current sync follows the relocated official reset lifecycle in `gateway/run_turn_persistence.py`: restore persistent context with exact old/new physical identities before the fresh-session FIFO is released, including deferred authority resets. Preserve the immediate user-facing failure warning and the disabled-plugin no-warning case. The private rotate helper returns recovery status alongside the entry; all known callers are mapped. Do not retain the old overriding reset flow on `GatewayTurnMixin`, which would bypass upstream queued-message and deferred-reset safeguards.
+- Preserve exact pre-compression request capture, checkpoint preparation before commit, terminal cleanup for committed/failed/superseded attempts, and verified reset-context persistence/readback with exact old/new session identifiers.
+- Keep required `on_compression_start`, `on_compression_prepare_commit`, `on_compression_finish` and `on_session_reset_complete` hooks, RequestForkService and its plugin context property. Accept official `post_compaction` and `on_session_delete` notifications alongside them; an after-success observer cannot replace a before-commit directive or a failure receipt.
+- Do not rewrite the installed continuity plugin, weaken recovery guarantees, alter Fast requests or turn source tests into a deployment claim. Service-tier/timing log retirement follows the earlier separately confirmed scope.
 
 Date: 2026-08-28; persistent delivery redesign 2026-08-30
 
@@ -2797,7 +2660,7 @@ Files:
 - `fork_features/request_fork/prepared_request.py`
 - `fork_features/request_fork/manual.py` — ephemeral last-physical-request retention, same-route/history validation and manual checkpoint prefix reuse; no normal-turn replay or persistence.
 - `gateway/slash_commands_session.py` — passes the cached parent only to the checkpoint snapshot builder; keeps the original manual summary agent and commit path.
-- `tests/fork_features/test_manual_request_fork.py` — prefix reuse, route/history rejection, disabled/missing source and two-turn request-only context isolation.
+- `tests/fork_features/test_manual_request_fork.py` — prefix reuse, route/history rejection, disabled/missing source and official two-turn context replay.
 - `fork_features/request_fork/session_recovery.py` — shared bounded recovery-envelope selection and verified reset-context persistence.
 - `gateway/run_turn.py` — thin exhaustion-reset call with exact old/new session IDs.
 - `tests/fork_features/test_session_recovery.py` — recovery acceptance, readback and disabled-plugin contracts.
@@ -2919,15 +2782,7 @@ What changed:
   requests override SDK `extra_body` tier conflicts; Anthropic adds the required
   Fast beta without losing effective existing beta headers. Parent model, reasoning,
   prefix, tools, settings and compression-summary requests remain unchanged. Fast
-  intent is not proof of provider-served tier. Opt-in calls emit one WARNING
-  `request Fork service {JSON}` per host attempt with the same request ID and
-  retry number. Reuse `agent.request_telemetry.service_parameters` for outgoing
-  SDK-boundary parameters (Codex physical-request callback) and raw SDK response
-  tier/speed. Keep missing response evidence null, record failed attempts, and
-  never log bodies, headers or credentials. Verify with
-  `tests/fork_features/test_request_fork_fast.py` and the standalone plugin's
-  `tests/test_fast_checkpoint.py` (registered hooks through all three native SDK
-  HTTP paths, including validation retry; offline only).
+  intent is not proof of provider-served tier. Checkpoint service-level evidence logs and their shared extractor were explicitly retired; no request/response tier or speed log is required. Preserve actual Fast request behavior, transport retry and parent isolation.
 - Automatic compression for these three protocols defers only the continuity-aware pending
   trigger until the parent request has completed normal request-only context,
   cache decoration, request build, sanitization, transport preflight, and
@@ -3214,8 +3069,7 @@ deltas are expected in these areas:
   - `tests/fork/test_skills_auto_disable.py`
   - `tests/tools/test_skills_sync.py`
   - `docs/LOCAL_MODIFICATIONS.md`
-- Request-only recall isolation and Codex prompt-cache routing:
-  - `fork_features/request_context.py`
+- Official context replay and retained Codex prompt-cache routing:
   - `fork_features/prompt_cache_routing.py`
   - `agent/chat_completion_helpers.py`
   - `agent/transports/codex.py`
@@ -3233,7 +3087,6 @@ deltas are expected in these areas:
   - `hermes_state_messages.py`
   - `gateway/slash_commands.py`
   - `hermes_cli/cli_commands_mixin.py`
-  - `tests/fork_features/test_request_context_policy.py`
   - `tests/agent/test_api_content_sidecar.py`
   - `tests/agent/test_model_metadata.py`
   - `tests/agent/test_gateway_turn_sidecar.py`
@@ -3244,15 +3097,12 @@ deltas are expected in these areas:
   - `tests/agent/test_run_agent_codex_responses.py`
   - `tests/agent/test_codex_app_server_integration.py`
   - `tests/agent/test_codex_request_only_memory_context.py`
-- Delivery-ledger session-reset boundary:
-  - `fork_features/delivery_session_boundary.py`
-  - `gateway/delivery_ledger.py`
-  - `gateway/slash_commands_session.py`
-  - `tests/fork_features/test_delivery_session_boundary.py`
-  - `tests/gateway/test_delivery_ledger.py`
-  - `tests/gateway/test_session_model_reset.py`
-  - `tests/fork/test_telegram_account_retirement.py`
-  - `website/docs/user-guide/messaging/index.md`
+- Delivery-ledger session-reset boundary (retired by owner in this candidate):
+  - `gateway/delivery_ledger.py` — official implementation; old Fork supersession API removed
+  - `gateway/slash_commands_session.py` — official reset path, no Fork retirement call
+  - `tests/gateway/test_delivery_ledger.py` — official contract
+  - `tests/gateway/test_session_model_reset.py` — official contract
+  - Removed: `fork_features/delivery_session_boundary.py` and its exclusive test file
 - Transport disconnect classification:
   - `agent/error_classifier.py`
   - `agent/conversation_loop.py`
@@ -3452,23 +3302,36 @@ Add future modifications above this summary, under either:
 
 ### 31. Explicit empty toolset selection
 
-Status: active
+Status: removed (the Fork `none` name is retired by explicit owner decision)
 
 ID: `explicit-empty-toolset`
 
-Files:
+Historical files:
 - `toolsets.py`
-- `tui_gateway/server.py`
+- `tui_gateway/agent_factory.py`
 - `tests/tools/test_toolsets.py`
 
-Intent / invariants:
-- `none` is a valid, empty toolset. An explicit `none` selection must remain an
-  explicit selection, rather than being rejected and falling back to default tools.
-- Use the native toolset table/resolver; other named toolsets and registry aliases
-  retain their normal behavior. This is an empty group, not an override of other
-  simultaneously selected groups.
+Original purpose:
+- Register `none` as a valid empty toolset so an explicit use of that name did
+  not fall back to configured/default tools.
+
+Current decision:
+- The owner chose the official tool-selection rules and removal of this extra
+  name. `toolsets.py` and its original test file now match the fixed official
+  snapshot. The two exclusive name/selection cases are intentionally retired.
+- The default configuration, current Cron definitions and checked local scripts
+  have no discovered dependency on this name. This is a bounded usage check,
+  not a guarantee about all manually invoked or external scripts.
+- Old `none` inputs must no longer be treated as a no-tools guarantee: under
+  official invalid-name fallback they may select configured tools instead.
+- Official explicitly saved empty CLI selection with no enabled MCP servers
+  remains empty; this was exercised through the actual TUI server entry. No
+  live configuration was migrated and no running service was changed.
 
 Verification:
-- `scripts/run_tests.sh tests/tools/test_toolsets.py` checks validation, empty
-  resolution and the real TUI explicit-selection entry point.
-- Preserve until upstream supplies the same valid-empty-selection contract.
+- Name-retirement RED/GREEN and the native empty-selection probe passed after
+  using the real bound TUI entry rather than its unbound implementation module.
+- Original toolset tests and related TUI toolset-entry tests passed. The actual
+  frozen baseline/candidate node lists map both intentionally retired cases.
+- Temporary conformance probes are archived outside the candidate; no extra
+  permanent negative policy was added merely to enforce this retirement.

@@ -179,10 +179,9 @@ def test_new_capture_replaces_old_request_and_none_clears_it():
     assert reuse_manual_request(parent, target, history) is None
 
 
-def test_real_turn_then_manual_fork_does_not_replay_recall_on_next_turn(monkeypatch):
+def test_real_turn_then_manual_fork_preserves_official_recall_replay(monkeypatch):
     from run_agent import AIAgent
     from fork_features.request_fork import build_out_of_turn_compression_request_snapshot
-    from fork_features import request_context
 
     monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kw: [])
     monkeypatch.setattr("model_tools.check_toolset_requirements", dict)
@@ -199,12 +198,10 @@ def test_real_turn_then_manual_fork_does_not_replay_recall_on_next_turn(monkeypa
     agent._cached_system_prompt = "STABLE TEST SYSTEM"
     bodies = []
     injection = [True]
-    original_apply = request_context.apply_request_only_turn_context
-
-    def inject_once(*args, **kwargs):
-        if injection[0]:
-            kwargs["plugin_request_context"] = "CURRENT-RECALL-SENTINEL"
-        return original_apply(*args, **kwargs)
+    def hook(name, **kwargs):
+        if name == "pre_llm_call" and injection[0]:
+            return [{"context": "CURRENT-RECALL-SENTINEL"}]
+        return []
 
     def call(body):
         bodies.append(deepcopy(body))
@@ -214,12 +211,13 @@ def test_real_turn_then_manual_fork_does_not_replay_recall_on_next_turn(monkeypa
             status="completed", model="gpt-6.1-sol",
         )
 
-    monkeypatch.setattr(request_context, "apply_request_only_turn_context", inject_once)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", hook)
     monkeypatch.setattr(agent, "_interruptible_api_call", call)
     first = agent.run_conversation("first question")
     assert first["completed"] is True
     assert "CURRENT-RECALL-SENTINEL" in str(bodies[-1])
-    assert "CURRENT-RECALL-SENTINEL" not in str(first["messages"])
+    assert first["messages"][0]["content"] == "first question"
+    assert "CURRENT-RECALL-SENTINEL" in first["messages"][0]["api_content"]
     assert getattr(agent, "_continuity_manual_request", None) is not None
     target = SimpleNamespace(**{key: getattr(agent, key) for key in
                              ("session_id", "api_mode", "provider", "base_url", "model", "platform")})
@@ -234,8 +232,31 @@ def test_real_turn_then_manual_fork_does_not_replay_recall_on_next_turn(monkeypa
     injection[0] = False
     second = agent.run_conversation("second question", conversation_history=first["messages"])
     assert second["completed"] is True
-    assert "CURRENT-RECALL-SENTINEL" not in str(bodies[-1])
+    assert "CURRENT-RECALL-SENTINEL" in str(bodies[-1])
+    assert bodies[-1]["input"][:len(bodies[0]["input"])] == bodies[0]["input"]
     agent.close()
+
+
+def test_real_agent_manual_reconstruction_uses_current_preflight_api(monkeypatch):
+    from run_agent import AIAgent
+    from fork_features.request_fork import build_out_of_turn_compression_request_snapshot
+
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **kw: [])
+    monkeypatch.setattr("model_tools.check_toolset_requirements", dict)
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: name == "on_compression_start")
+    agent = AIAgent(
+        model="gpt-6.1-sol", provider="custom", api_mode="codex_responses",
+        base_url="https://api.example.test/v1", api_key="test", quiet_mode=True,
+        skip_context_files=True, skip_memory=True, platform="telegram",
+    )
+    try:
+        history = [{"role": "user", "content": "manual reconstruction sentinel"}]
+        snapshot = build_out_of_turn_compression_request_snapshot(agent, history)
+        assert snapshot is not None
+        assert snapshot.fidelity == "reconstructed_out_of_turn"
+        assert "manual reconstruction sentinel" in str(snapshot.clone_body()["input"])
+    finally:
+        agent.close()
 
 
 @pytest.mark.parametrize("mode", ["codex_responses", "anthropic_messages"])

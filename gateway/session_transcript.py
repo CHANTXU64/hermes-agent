@@ -9,6 +9,7 @@ import json
 import logging
 import threading
 import time
+from agent.turn_context import extract_api_content_sidecar
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -79,8 +80,9 @@ def transcript_append_kwargs(session_id: str, message: dict[str, Any], *, fallba
         "platform_message_id": message.get("platform_message_id") or message.get("message_id"),
         "observed": bool(message.get("observed")),
         "timestamp": fallback_ts if timestamp is None else timestamp,
-        # Fork volatile request context must not cross the transcript boundary.
-        "api_content": None,
+        # Exact bytes sent to the API (prompt-cache-stable replay); must survive every
+        # persistence path or the next replay diverges.
+        "api_content": extract_api_content_sidecar(message),
         # Presentation typing ("internal_notification" for self-injected async-delegation/background
         # notification turns, #82888). DB-only; stripped from provider-bound payloads.
         "display_kind": message.get("display_kind"),

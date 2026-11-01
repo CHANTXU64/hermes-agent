@@ -157,5 +157,5 @@ async def test_gateway_exec_quick_command_runs_after_generation_switch(activated
     command = shlex.join([sys.executable, "-c", "import quick_dep; print(quick_dep.VALUE)"])
     runner = GatewayRunner.__new__(GatewayRunner)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="synthetic", chat_type="dm")
-    result = await runner._hm_run_exec_quick_command("probe", command, {}, source)
+    result = await runner._hm_run_exec_quick_command("probe", command)
     assert result == "quick-command-ok"

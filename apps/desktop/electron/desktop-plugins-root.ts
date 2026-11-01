@@ -71,6 +71,30 @@ async function packageOrigin(packageDir: string): Promise<Pick<DesktopHalfMarker
   return {}
 }
 
+const rootWriters = new Map<string, Promise<unknown>>()
+
+/** Run `task` once every earlier writer of the same app root has settled.
+ *  Every writer of `<root>` (each window's 5 s disk poll and its Plugins page,
+ *  the install/uninstall IPC) runs in this one main process, and each one
+ *  decides "copy or keep" before it publishes with rm + rename. Two passes
+ *  that overlap both copy, one `rename` lands on the other's fresh folder
+ *  (ENOTEMPTY), and that pass then skips the package, so a same-named package
+ *  in a later profile overwrote the default home's copy. */
+export function withDesktopPluginsRoot<T>(root: string, task: () => Promise<T>): Promise<T> {
+  const key = path.resolve(root)
+  const run = (rootWriters.get(key) ?? Promise.resolve()).then(task, task)
+  const settled = run.catch(() => undefined)
+
+  rootWriters.set(key, settled)
+  void settled.then(() => {
+    if (rootWriters.get(key) === settled) {
+      rootWriters.delete(key)
+    }
+  })
+
+  return run
+}
+
 export async function ensureDir(dir: string): Promise<string> {
   try {
     await fs.promises.mkdir(dir, { recursive: true })
@@ -123,7 +147,11 @@ export async function localHomes(hermesHome: string): Promise<string[]> {
  *  id, so a duplicate is the same plugin installed twice); the profile copy is
  *  left in place for the user to delete rather than destroyed. Emptied profile
  *  roots are removed so the migration is a no-op on the next launch. */
-export async function migrateProfileScopedDesktopPlugins(hermesHome: string, appRoot: string): Promise<string[]> {
+export function migrateProfileScopedDesktopPlugins(hermesHome: string, appRoot: string): Promise<string[]> {
+  return withDesktopPluginsRoot(appRoot, () => migrateProfileScoped(hermesHome, appRoot))
+}
+
+async function migrateProfileScoped(hermesHome: string, appRoot: string): Promise<string[]> {
   const moved: string[] = []
 
   for (const profile of await listDirs(path.join(hermesHome, 'profiles'))) {
@@ -187,8 +215,104 @@ export async function writeDesktopHalfMarker(dir: string, marker: DesktopHalfMar
   await fs.promises.writeFile(path.join(dir, PACKAGE_MARKER), JSON.stringify(marker, null, 2) + '\n')
 }
 
-/** Copy one unified package's `desktop/` half into the app root as
- *  `<appRoot>/<packageName>/`, stamping the marker. Skips when the root copy is
+/** Where a package's desktop plugin lives, in the order every installer and
+ *  the install probe read it (the gateway's `desktop_source` and
+ *  `detect_components` agree): the package root when a `plugin.js` sits there,
+ *  else its `desktop/` folder. */
+const DESKTOP_SOURCE_DIRS = ['.', 'desktop'] as const
+
+/** The folder that is `packageDir`'s desktop plugin, or `null`. */
+export function desktopHalfSource(packageDir: string): null | string {
+  for (const subdir of DESKTOP_SOURCE_DIRS) {
+    try {
+      if (fs.statSync(path.join(packageDir, subdir, 'plugin.js')).isFile()) {
+        return path.join(packageDir, subdir)
+      }
+    } catch {
+      // Not this layout.
+    }
+  }
+
+  return null
+}
+
+/** `desktopHalfSource` with the entry's stat. A candidate the app may not stat
+ *  ends the search: falling through to the other layout would copy a half the
+ *  installer would not have picked. */
+async function desktopHalfEntry(
+  packageDir: string,
+  packageName: string
+): Promise<null | { sourceDir: string; stat: fs.Stats }> {
+  for (const subdir of DESKTOP_SOURCE_DIRS) {
+    const sourceDir = path.join(packageDir, subdir)
+
+    try {
+      const stat = await fs.promises.stat(path.join(sourceDir, 'plugin.js'))
+
+      if (stat.isFile()) {
+        return { sourceDir, stat }
+      }
+    } catch (error) {
+      if (!isMissing(error)) {
+        console.warn(`[desktop-plugins] cannot read ${packageName}: ${String(error)}`)
+
+        return null
+      }
+    }
+  }
+
+  return null
+}
+
+/** The whole published folder; the loader reads at most a 16 MB `plugin.js` from it. */
+const TREE_MAX_BYTES = 64 * 1024 * 1024
+
+/** A root-layout half publishes the package root, never its clone's `.git` or
+ *  the agent half's `__pycache__` (the gateway's `ROOT_LAYOUT_SKIP`). */
+const ROOT_LAYOUT_SKIP = new Set(['.git', '__pycache__'])
+
+const rootLayoutFilter = (src: string) => !ROOT_LAYOUT_SKIP.has(path.basename(src))
+
+/** Why `source` cannot be published as a desktop plugin, else `null`: it must
+ *  be a plain tree (a link could publish any folder of this machine) under
+ *  `TREE_MAX_BYTES` (the gateway's `check_desktop_tree`). `source` itself may
+ *  be a linked dev checkout; nothing inside it may be a link. */
+async function plainTreeRefusal(source: string): Promise<null | string> {
+  let total = 0
+
+  const walk = async (dir: string): Promise<null | string> => {
+    for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+
+      if (entry.isDirectory() && ROOT_LAYOUT_SKIP.has(entry.name)) {
+        continue
+      }
+
+      if (entry.isSymbolicLink()) {
+        return `The desktop plugin contains a link (${path.relative(source, full)}); links are not installed.`
+      }
+
+      if (entry.isDirectory()) {
+        const refused = await walk(full)
+
+        if (refused) {
+          return refused
+        }
+      } else if ((total += (await fs.promises.lstat(full)).size) > TREE_MAX_BYTES) {
+        return `The desktop plugin is larger than ${TREE_MAX_BYTES / (1024 * 1024)} MB.`
+      }
+    }
+
+    return null
+  }
+
+  return walk(source)
+}
+
+/** Copy one unified package's desktop half into the app root as
+ *  `<appRoot>/<packageName>/`, stamping the marker: its `desktop/` folder, or
+ *  the package root (minus `ROOT_LAYOUT_SKIP`) when `plugin.js` sits at the root, as the
+ *  installers publish a root-layout repository. Skips when the root copy is
  *  already current for this source; replaces it when the source is newer.
  *  Returns the target path when a copy (or an adoption) happened. */
 export async function materializeDesktopHalf(
@@ -196,28 +320,27 @@ export async function materializeDesktopHalf(
   appRoot: string,
   packageName = path.basename(packageDir)
 ): Promise<null | string> {
-  const sourceDir = path.join(packageDir, 'desktop')
+  const found = await desktopHalfEntry(packageDir, packageName)
+
+  if (!found) {
+    return null
+  }
+
+  const { sourceDir, stat } = found
   const entry = path.join(sourceDir, 'plugin.js')
-
-  let stat: fs.Stats
-
-  try {
-    stat = await fs.promises.stat(entry)
-  } catch (error) {
-    if (!isMissing(error)) {
-      console.warn(`[desktop-plugins] cannot read ${packageName}: ${String(error)}`)
-    }
-
-    return null
-  }
-
-  if (!stat.isFile()) {
-    return null
-  }
+  const rootLayout = sourceDir === path.join(packageDir, '.')
 
   const target = path.join(appRoot, packageName)
   const existing = await readMarker(target)
   const linked = (await fs.promises.lstat(packageDir)).isSymbolicLink()
+  // A link at `<appRoot>/<name>` is never a copy this pass may keep or stamp: a marker-less one is
+  // the user's own linked plugin, and one carrying a marker is an earlier copy of a linked checkout
+  // that kept the link instead of the files, whose marker sits inside that checkout.
+  const targetIsLink = await isLink(target)
+
+  if (targetIsLink && !existing) {
+    return null
+  }
 
   const marker: DesktopHalfMarker = {
     package: packageName,
@@ -259,6 +382,7 @@ export async function materializeDesktopHalf(
     // that lands an older timestamp, and the copy would stay stale silently.
     if (
       existing &&
+      !targetIsLink &&
       existing.source === sourceDir &&
       Boolean(existing.linked) === linked &&
       (linked ? await sameFile(path.join(target, 'plugin.js'), entry) : existing.sourceMtimeMs >= stat.mtimeMs)
@@ -267,7 +391,24 @@ export async function materializeDesktopHalf(
     }
   }
 
-  await publishDesktopTree(sourceDir, target, staged => writeDesktopHalfMarker(staged, marker))
+  if (rootLayout) {
+    // The whole package root is published, agent payload included: hold it to
+    // the installer's plain-tree rule.
+    const refused = await plainTreeRefusal(sourceDir)
+
+    if (refused) {
+      console.warn(`[desktop-plugins] not copying the desktop half of ${packageName}: ${refused}`)
+
+      return null
+    }
+  }
+
+  await publishDesktopTree(
+    sourceDir,
+    target,
+    staged => writeDesktopHalfMarker(staged, marker),
+    rootLayout ? rootLayoutFilter : undefined
+  )
 
   return target
 }
@@ -282,7 +423,8 @@ export async function materializeDesktopHalf(
 export async function publishDesktopTree(
   sourceDir: string,
   target: string,
-  finalize?: (staged: string) => Promise<void>
+  finalize?: (staged: string) => Promise<void>,
+  filter?: (src: string) => boolean
 ): Promise<void> {
   const parent = path.dirname(target)
   const name = path.basename(target)
@@ -292,13 +434,23 @@ export async function publishDesktopTree(
   const staged = path.join(stagingRoot, name)
 
   try {
-    await fs.promises.cp(sourceDir, staged, { force: true, recursive: true })
+    // From the resolved folder: `cp` keeps a source that is itself a link (a dev checkout linked into
+    // `plugins/`) as a link, so the published "copy" was the checkout and the marker landed in it.
+    await fs.promises.cp(await fs.promises.realpath(sourceDir), staged, { filter, force: true, recursive: true })
     await finalize?.(staged)
     // rename() refuses to replace a non-empty directory, so the old copy goes first.
     await fs.promises.rm(target, { force: true, recursive: true })
     await fs.promises.rename(staged, target)
   } finally {
     await fs.promises.rm(stagingRoot, { force: true, recursive: true })
+  }
+}
+
+async function isLink(target: string): Promise<boolean> {
+  try {
+    return (await fs.promises.lstat(target)).isSymbolicLink()
+  } catch {
+    return false
   }
 }
 
@@ -331,7 +483,11 @@ async function sourceGone(name: string, entry: string): Promise<boolean> {
  *  desktop half. First home wins for a name that appears in several profiles
  *  (the default home is first). Also drops root copies whose source package
  *  is gone — an uninstalled agent package must not leave a ghost pane. */
-export async function reconcileUnifiedDesktopHalves(hermesHome: string, appRoot: string): Promise<string[]> {
+export function reconcileUnifiedDesktopHalves(hermesHome: string, appRoot: string): Promise<string[]> {
+  return withDesktopPluginsRoot(appRoot, () => reconcilePass(hermesHome, appRoot))
+}
+
+async function reconcilePass(hermesHome: string, appRoot: string): Promise<string[]> {
   const touched: string[] = []
   const seen = new Set<string>()
 
@@ -356,7 +512,7 @@ export async function reconcileUnifiedDesktopHalves(hermesHome: string, appRoot:
         continue
       }
 
-      if (result || fs.existsSync(path.join(pluginsRoot, name, 'desktop', 'plugin.js'))) {
+      if (result || desktopHalfSource(path.join(pluginsRoot, name))) {
         seen.add(name)
       }
 
@@ -366,7 +522,9 @@ export async function reconcileUnifiedDesktopHalves(hermesHome: string, appRoot:
     }
   }
 
-  for (const name of await listDirs(appRoot)) {
+  // Links count too: a marker read through one is an earlier copy of a linked checkout that kept the
+  // link, and `rm` drops only the link, never the folder it points at.
+  for (const name of await listDirs(appRoot, true)) {
     const dir = path.join(appRoot, name)
     const marker = await readMarker(dir)
 

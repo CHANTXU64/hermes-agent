@@ -33,8 +33,8 @@ def test_load_gateway_config_bridges_stt_enabled_from_config_yaml(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_successful_transcription_keeps_voice_origin_marker():
-    """A successful STT result must remain identifiable as voice transcription."""
+async def test_successful_transcription_uses_official_plain_quote():
+    """Owner-selected official output keeps the transcript without the old wrapper."""
     from gateway.run import GatewayRunner
 
     runner = GatewayRunner.__new__(GatewayRunner)
@@ -54,10 +54,7 @@ async def test_successful_transcription_keeps_voice_origin_marker():
             ["/tmp/voice.ogg"],
         )
 
-    assert result == (
-        "[The user sent a voice message~ Here's what they said: "
-        '"帮我查一下今天天气"]'
-    )
+    assert result == '"帮我查一下今天天气"'
     assert transcripts == ["帮我查一下今天天气"]
 
 

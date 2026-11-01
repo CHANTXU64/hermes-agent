@@ -26,6 +26,33 @@ def change_records(tmp_path):
 
 @pytest.mark.parametrize("target", ["memory", "user"])
 @pytest.mark.parametrize("batch", [False, True])
+def test_over_budget_add_returns_latest_disk_entries_without_mutation(store, tmp_path, target, batch):
+    """A stale caller must receive a peer's committed facts on BOTH add paths."""
+    store.memory_char_limit = store.user_char_limit = 100
+    original = "Original durable fact"
+    concurrent = "A fact added by another session"
+    assert store.add(target, original)["success"]
+    assert store.read_target_entries_checked(target) == ([original], True)
+    peer = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    peer.load_from_disk()
+    assert peer.add(target, concurrent)["success"]
+    stale_entries = store.user_entries if target == "user" else store.memory_entries
+    assert stale_entries == [original]
+    filename = "USER.md" if target == "user" else "MEMORY.md"
+    before = (tmp_path / filename).read_bytes()
+    op = dict(action="add", content="x" * 120,
+              reason="Record verified fixture", evidence="Verified test input")
+    args: dict[str, Any] = {"operations": [op]} if batch else op
+    result = json.loads(memory_tool(store=store, target=target, **args))
+    assert result["success"] is False
+    assert result["current_entries"] == [original, concurrent]
+    assert (tmp_path / filename).read_bytes() == before
+    assert store.read_target_entries_checked(target) == ([original, concurrent], True)
+    assert change_records(tmp_path) == []
+
+
+@pytest.mark.parametrize("target", ["memory", "user"])
+@pytest.mark.parametrize("batch", [False, True])
 @pytest.mark.parametrize("action", ["replace", "remove"])
 @pytest.mark.parametrize("original,needle", [
     ('Project “Alpha” uses Python', 'Project "Alpha"'),

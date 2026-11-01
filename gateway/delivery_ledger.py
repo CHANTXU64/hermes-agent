@@ -319,21 +319,6 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
-def supersede_session_obligations(session_key: str) -> int:
-    """Mark undelivered obligations for one routing key as superseded."""
-    if not session_key:
-        return 0
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        cursor = conn.execute(
-            """UPDATE delivery_obligations
-               SET state=?, updated_at=?
-               WHERE session_key=? AND state IN ('pending', 'attempting', 'failed')""",
-            ("superseded", now, session_key),
-        )
-        return int(cursor.rowcount or 0)
-
-
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
     """Return an unsent runtime claim to ``failed`` without spending an attempt.
 
@@ -360,7 +345,7 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
         conn.execute(
             """UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?
-               WHERE obligation_id=? AND state!='superseded'""",
+               WHERE obligation_id=?""",
             (state, time.time(), error[:500] if error else None, obligation_id))
 
 

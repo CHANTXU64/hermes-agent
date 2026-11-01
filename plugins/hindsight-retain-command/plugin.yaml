@@ -1,0 +1,4 @@
+name: hindsight-retain-command
+version: "1.0.0"
+description: "Schedule the existing session-bound Retain flow through the official command plugin API."
+author: "CHANTXU64"

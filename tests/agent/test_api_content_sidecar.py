@@ -1,10 +1,17 @@
-"""Request-only context isolation plus legacy ``api_content`` compatibility.
+"""Tests for the ``api_content`` sidecar ("persist what you send").
 
-Memory-prefetch, plugin context, and gateway notes belong only to the current
-provider request. They must not mutate or persist into durable user history,
-and a legacy sidecar from an existing database must never replace clean
-historical content on a later request. The nullable column itself remains for
-safe schema compatibility.
+The first LLM call of every turn used to miss the provider prompt cache
+because the bytes sent to the API diverged from the bytes replayed from the
+persisted transcript: memory-prefetch / plugin context is injected into the
+API copy of the current turn's user message only, and the persist
+user-message override (#48677) writes cleaned content to the DB row. The fix
+persists the EXACT sent content in a nullable ``messages.api_content`` column
+and replays it verbatim (no sanitize, no strip).
+
+Covers: SessionDB round-trip and auto-migration, the shared composition
+helper, prologue stamping order, the flush-override sidecar, and the
+end-to-end wire invariant (turn N+1 replays turn N's bytes) against an
+in-process mock provider.
 """
 
 from __future__ import annotations
@@ -21,13 +28,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.memory_manager import build_memory_context_block
 from agent.turn_context import (
     _memory_query_text,
     build_turn_context,
     compose_multimodal_context_part,
+    compose_user_api_content,
 )
-from fork_features.request_context import compose_user_api_content
 from hermes_state import SessionDB
 
 
@@ -39,17 +45,7 @@ class TestComposeUserApiContent:
     def test_none_when_nothing_to_inject(self):
         assert compose_user_api_content("hello", "", "") is None
 
-    def test_multimodal_injection_uses_request_copy_only(self):
-        content = [{"type": "text", "text": "look"}]
-        composed = compose_user_api_content(content, "MEM", "PLUGIN")
-        assert composed == [
-            {"type": "text", "text": "look"},
-            {
-                "type": "text",
-                "text": "\n\n" + build_memory_context_block("MEM") + "\n\nPLUGIN",
-            },
-        ]
-        assert content == [{"type": "text", "text": "look"}]
+
 class TestComposeMultimodalContextPart:
     def test_is_the_string_sidecar_injection_tail(self):
         """Both content shapes inject byte-identical context (#71998): the text part a list
@@ -98,24 +94,6 @@ class TestSessionDbSidecar:
         finally:
             db.close()
 
-
-    def test_replace_messages_drops_legacy_sidecar(self, tmp_path):
-        """Compaction/rewrite flows carry clean content, not legacy context."""
-        db = self._open(tmp_path)
-        try:
-            db.replace_messages(
-                "s1",
-                [
-                    {"role": "user", "content": "hello", "api_content": "hello+ctx"},
-                    {"role": "assistant", "content": "hi"},
-                ],
-            )
-            msgs = db.get_messages_as_conversation("s1")
-            assert msgs[0]["content"] == "hello"
-            assert "api_content" not in msgs[0]
-            assert "api_content" not in msgs[1]
-        finally:
-            db.close()
 
 class TestAutoMigration:
     def test_reconciliation_adds_api_content_column(self, tmp_path):
@@ -275,8 +253,8 @@ def _stub_runtime_main():
         yield
 
 
-class TestPrologueRequestOnlyContext:
-    def test_plugin_context_is_not_stamped_or_persisted(self):
+class TestPrologueStamping:
+    def test_stamps_api_content_from_plugin_context(self):
         agent = _FakeAgent()
         with patch(
             "hermes_cli.plugins.invoke_hook",
@@ -285,11 +263,12 @@ class TestPrologueRequestOnlyContext:
             ctx = _build(agent)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"  # clean content untouched
-        assert "api_content" not in msg
-        assert compose_user_api_content(
+        assert msg["api_content"] == compose_user_api_content(
             "hello", ctx.ext_prefetch_cache, ctx.plugin_user_context
-        ) == "hello\n\nPLUGIN-CTX"
-        assert agent.api_content_at_persist is None
+        )
+        assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
+        # The early persist saw the stamped sidecar (written in one insert).
+        assert agent.api_content_at_persist == "hello\n\nPLUGIN-CTX"
 
     def test_no_stamp_without_injections(self):
         agent = _FakeAgent()
@@ -310,8 +289,13 @@ class TestPrologueRequestOnlyContext:
             ctx = _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
 
-    def test_multimodal_turn_stays_clean_and_composes_request_copy(self):
-        """Multimodal context belongs only to the provider request copy."""
+    def test_appends_context_part_for_multimodal_turn(self):
+        """#71998: pre_llm_call context must reach an image-only (multimodal)
+        turn as a durable text part, not silently drop.
+
+        The string api_content sidecar can't ride on list content, so the
+        context is appended to the content list (the gateway must-deliver-note
+        channel) — durable, so wire == persisted == replay."""
         agent = _FakeAgent()
         blocks = [{"type": "image_url", "image_url": {"url": "data:img"}}]
         with patch(
@@ -324,19 +308,19 @@ class TestPrologueRequestOnlyContext:
                 summarize_user_message_for_log=lambda _m: "[image]",
             )
         content = ctx.messages[ctx.current_turn_user_idx]["content"]
-        assert content == blocks
+        assert isinstance(content, list)
+        # Original image part preserved; plugin context appended as a text part.
+        assert content[0] == {"type": "image_url", "image_url": {"url": "data:img"}}
+        assert content[-1] == {"type": "text", "text": "PLUGIN-CTX"}
+        # Multimodal turns carry the context durably, not via the string sidecar.
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
-        assert compose_user_api_content(content, "", ctx.plugin_user_context) == [
-            *blocks,
-            {"type": "text", "text": "\n\nPLUGIN-CTX"},
-        ]
 
 
 # ---------------------------------------------------------------------------
 # Flush: persist-override rows keep the sent bytes in the sidecar (#48677)
 # ---------------------------------------------------------------------------
 
-class TestFlushOverrideCleanPersistence:
+class TestFlushOverrideSidecar:
     def _make_agent(self, db, sid):
         from run_agent import AIAgent
 
@@ -352,7 +336,7 @@ class TestFlushOverrideCleanPersistence:
         agent._session_db_created = True
         return agent
 
-    def test_override_persists_only_clean_content(self, tmp_path):
+    def test_override_moves_sent_bytes_to_sidecar(self, tmp_path):
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-ov"
         db.create_session(session_id=sid, source="cli")
@@ -367,13 +351,15 @@ class TestFlushOverrideCleanPersistence:
 
             msgs = db.get_messages_as_conversation(sid)
             assert msgs[0]["content"] == "actual question"
-            assert "api_content" not in msgs[0]
+            assert msgs[0]["api_content"] == live
             # The live dict is never mutated by the flush.
             assert messages[0]["content"] == live
         finally:
             db.close()
 
-    def test_legacy_sidecar_is_not_re_persisted(self, tmp_path):
+    def test_stamped_sidecar_wins_over_override_derivation(self, tmp_path):
+        """When the prologue already stamped api_content (injections), the
+        flush must keep those bytes — they are what actually went out."""
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-ov2"
         db.create_session(session_id=sid, source="cli")
@@ -393,7 +379,7 @@ class TestFlushOverrideCleanPersistence:
 
             msgs = db.get_messages_as_conversation(sid)
             assert msgs[0]["content"] == "clean text"
-            assert "api_content" not in msgs[0]
+            assert msgs[0]["api_content"] == "live text\n\nPLUGIN-CTX"
         finally:
             db.close()
 
@@ -535,7 +521,10 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
-    def test_injection_is_request_only_and_stable_within_turn(self, wire_env):
+    def test_injection_sent_stamped_and_stable_within_turn(self, wire_env):
+        """The current turn's user message goes out with the injected context,
+        the sidecar equals the sent bytes exactly, the field never reaches the
+        wire, and every pass within the turn sends identical bytes."""
         make_agent, handler, db, sid = wire_env
         agent = make_agent()
         # Two API calls in one turn: tool call, then final text.
@@ -556,25 +545,27 @@ class TestWireInvariant:
             for m in req.get("messages", []):
                 assert "api_content" not in m
 
-        # Persisted row stays clean and carries no replay sidecar.
+        # Persisted row: clean content + exact sent bytes in the sidecar.
         user_rows = [r for r in db.get_messages(sid) if r["role"] == "user"]
         assert user_rows[0]["content"] == "hello please"
-        assert user_rows[0]["api_content"] is None
+        assert user_rows[0]["api_content"] == sent_1
 
-    def test_next_turn_replays_clean_history_not_old_context(self, wire_env):
+    def test_next_turn_replays_previous_turn_bytes(self, wire_env):
+        """The cache invariant: the serialized user message replayed in turn
+        N+1 (history reloaded from the store) EQUALS the bytes turn N sent."""
         make_agent, handler, db, sid = wire_env
 
         # ── Turn N ──
         agent1 = make_agent()
         agent1.run_conversation("hello please", conversation_history=[], task_id="t1")
         turn_n_user = _user_messages(_chat_requests(handler)[0])[0]
-        assert turn_n_user["content"] == "hello please\n\nPLUGIN-CTX"
+        turn_n_bytes = json.dumps(turn_n_user, sort_keys=True)
 
         # ── Turn N+1: fresh agent, history reloaded from the store ──
         history = db.get_messages_as_conversation(sid)
-        # The stored history contains only the user's original text.
+        # The stored history carries the sidecar, not the injected content.
         assert history[0]["content"] == "hello please"
-        assert "api_content" not in history[0]
+        assert history[0]["api_content"] == turn_n_user["content"]
 
         handler.captured_requests = []
         agent2 = make_agent()
@@ -583,195 +574,37 @@ class TestWireInvariant:
         )
 
         replayed = _user_messages(_chat_requests(handler)[0])[0]
-        assert replayed["content"] == "hello please"
-        assert "PLUGIN-CTX" not in replayed["content"]
+        assert json.dumps(replayed, sort_keys=True) == turn_n_bytes
 
         # And the new current-turn message got its own injection + sidecar.
         current = _user_messages(_chat_requests(handler)[0])[-1]
         assert current["content"] == "second question\n\nPLUGIN-CTX"
 
-    def test_legacy_sidecar_is_stripped_not_replayed(self, wire_env):
-        make_agent, handler, _db, _sid = wire_env
-        history = [
-            {
-                "role": "user",
-                "content": "old question",
-                "api_content": "old question\n\nOLD-RECALL",
-            },
-            {"role": "assistant", "content": "old answer"},
-        ]
-
-        make_agent().run_conversation(
-            "new question", conversation_history=history, task_id="legacy"
-        )
-
-        users = _user_messages(_chat_requests(handler)[0])
-        assert users[0]["content"] == "old question"
-        assert "OLD-RECALL" not in json.dumps(users)
-        assert users[-1]["content"] == "new question\n\nPLUGIN-CTX"
-        assert all("api_content" not in message for message in users)
-
-    def test_moa_receives_current_recall_without_mutating_history(self, wire_env):
+    def test_multimodal_turn_sends_persists_and_replays_context_part(self, wire_env):
+        """#71998: on a list-content (image) turn the ``pre_llm_call`` context reaches the
+        wire as a text part, the persisted row carries it, and a resumed turn N+1 replays
+        the same view — same contract as the string sidecar path."""
         make_agent, handler, db, sid = wire_env
-        agent = make_agent()
+        from run_agent import AIAgent
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        turn = [{"type": "text", "text": "what is this"}, image]
 
-        class _MemoryManager:
-            def on_turn_start(self, *args, **kwargs):
-                pass
+        agent1 = make_agent()
+        with patch.object(AIAgent, "_model_supports_vision", return_value=True):  # keep native parts on the wire
+            agent1.run_conversation(list(turn), conversation_history=[], task_id="t1")
 
-            def prefetch_all(self, query, **kwargs):
-                return "MOA-RECALL-SENTINEL"
+        sent = _user_messages(_chat_requests(handler)[0])[0]["content"]
+        assert sent == [*turn, {"type": "text", "text": "PLUGIN-CTX"}]
 
-            def sync_all(self, *args, **kwargs):
-                pass
+        history = db.get_messages_as_conversation(sid)
+        assert "PLUGIN-CTX" in history[0]["content"]  # persisted with the turn, not dropped
 
-            def queue_prefetch_all(self, *args, **kwargs):
-                pass
-
-        agent._memory_manager = _MemoryManager()
-        captured = {}
-
-        def _run_references(_models, ref_messages, **_kwargs):
-            captured["reference_messages"] = ref_messages
-            return [("test/ref", "reference advice", None)]
-
-        def _call_aggregator(**kwargs):
-            captured["aggregator_messages"] = kwargs["messages"]
-            return types.SimpleNamespace(
-                choices=[
-                    types.SimpleNamespace(
-                        message=types.SimpleNamespace(content="aggregated advice")
-                    )
-                ]
-            )
-
-        with patch(
-            "hermes_cli.lifecycle.invoke_hook",
-            side_effect=lambda hook, **_kwargs: (
-                [
-                    {"context": "PLUGIN-CTX"},
-                    {
-                        "context": "MOA-LCM-POLICY-SENTINEL",
-                        "target": "request_context",
-                    },
-                ]
-                if hook == "pre_llm_call"
-                else []
-            ),
-        ), patch(
-            "agent.moa_loop._run_references_parallel",
-            side_effect=_run_references,
-        ), patch("agent.moa_loop.call_llm", side_effect=_call_aggregator):
-            result = agent.run_conversation(
-                "question for advisors",
-                conversation_history=[],
-                task_id="moa-memory",
-                moa_config={
-                    "reference_models": [{"provider": "test", "model": "ref"}],
-                    "aggregator": {"provider": "test", "model": "agg"},
-                },
-            )
-
-        # Execute the real aggregate_moa_context consumer path: reference
-        # shaping reads api_messages, while the aggregator synth prompt reads
-        # user_prompt. Both outbound requests must contain this turn's context.
-        reference_wire = json.dumps(captured["reference_messages"])
-        aggregator_wire = json.dumps(captured["aggregator_messages"])
-        assert "MOA-RECALL-SENTINEL" in reference_wire
-        assert "MOA-LCM-POLICY-SENTINEL" in reference_wire
-        assert "PLUGIN-CTX" in reference_wire
-        assert "MOA-RECALL-SENTINEL" in aggregator_wire
-        assert "MOA-LCM-POLICY-SENTINEL" in aggregator_wire
-        assert "PLUGIN-CTX" in aggregator_wire
-
-        # The acting-model request also sees current recall, while durable
-        # result/DB history remains the clean user-authored turn.
-        acting_user = _user_messages(_chat_requests(handler)[0])[-1]
-        assert acting_user["content"].index("MOA-LCM-POLICY-SENTINEL") < acting_user[
-            "content"
-        ].index("MOA-RECALL-SENTINEL")
-        assert "MOA-RECALL-SENTINEL" in acting_user["content"]
-        assert result["messages"][0]["content"] == "question for advisors"
-        assert "MOA-LCM-POLICY-SENTINEL" not in json.dumps(result["messages"])
-        assert "MOA-RECALL-SENTINEL" not in json.dumps(result["messages"])
-        user_rows = [row for row in db.get_messages(sid) if row["role"] == "user"]
-        assert user_rows[0]["content"] == "question for advisors"
-        assert user_rows[0]["api_content"] is None
-
-    def test_max_summary_receives_turn_context_through_finalizer(self, wire_env):
-        make_agent, handler, db, sid = wire_env
-        agent = make_agent()
-        agent.max_iterations = 1
-
-        class _MemoryManager:
-            def on_turn_start(self, *args, **kwargs):
-                pass
-
-            def prefetch_all(self, query, **kwargs):
-                return "FINALIZER-RECALL-SENTINEL"
-
-            def sync_all(self, *args, **kwargs):
-                pass
-
-            def queue_prefetch_all(self, *args, **kwargs):
-                pass
-
-            def has_tool(self, _name):
-                return False
-
-        agent._memory_manager = _MemoryManager()
-        setattr(
-            agent,
-            "_execute_tool_calls",
-            lambda _assistant, live_messages, *_args: live_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": "call_1",
-                    "content": "tool result before summary",
-                }
-            ),
-        )
-        handler.response_queue.append(
-            _tc_resp("read_file", '{"file_path": "/nonexistent-path"}')
-        )
-        handler.response_queue.append(_text_resp("forced summary"))
-
-        repair_calls = {"count": 0}
-
-        def _repair_and_shift_current_user(_agent, live_messages):
-            repair_calls["count"] += 1
-            if repair_calls["count"] == 1:
-                # Simulate the real repair/compression invariant: the working
-                # list is rebuilt and this turn's user moves from index 2 to 0.
-                del live_messages[:2]
-                return 1
-            return 0
-
-        with patch(
-            "agent.agent_runtime_helpers.repair_message_sequence_with_cursor",
-            side_effect=_repair_and_shift_current_user,
-        ):
-            result = agent.run_conversation(
-                "question before budget exhaustion",
-                conversation_history=[
-                    {"role": "user", "content": "old question"},
-                    {"role": "assistant", "content": "old answer"},
-                ],
-                task_id="max-summary-context",
-            )
-
-        requests = _chat_requests(handler)
-        assert len(requests) == 2
-        summary_users = _user_messages(requests[-1])
-        current_user = summary_users[0]["content"]
-        assert "FINALIZER-RECALL-SENTINEL" in current_user
-        assert "PLUGIN-CTX" in current_user
-        assert "maximum number of tool-calling iterations" in summary_users[-1]["content"]
-        assert result["final_response"].startswith("forced summary")
-        assert "FINALIZER-RECALL-SENTINEL" not in json.dumps(result["messages"])
-        user_rows = [row for row in db.get_messages(sid) if row["role"] == "user"]
-        assert user_rows[-1]["content"] == "question before budget exhaustion"
-        assert user_rows[-1]["api_content"] is None
+        handler.captured_requests = []
+        agent2 = make_agent()
+        with patch.object(AIAgent, "_model_supports_vision", return_value=True):
+            agent2.run_conversation("second question", conversation_history=history, task_id="t2")
+        replayed = _user_messages(_chat_requests(handler)[0])[0]["content"]
+        assert replayed == history[0]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -780,8 +613,24 @@ class TestWireInvariant:
 # ---------------------------------------------------------------------------
 
 
-class TestPrologueCompressionIsolation:
-    def test_inplace_compaction_does_not_backfill_sidecar(self):
+class TestPrologueMoaAndInPlaceBackfill:
+    def test_no_stamp_for_moa_turns(self):
+        """MoA appends per-call aggregated context to the API copy AFTER the
+        composition — a stamped sidecar would persist bytes that never match
+        the wire."""
+        agent = _FakeAgent()
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = _build(agent, moa_active=True)
+        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+
+    def test_inplace_compaction_backfills_sidecar_into_db(self):
+        """In-place preflight compaction inserts the current-turn user row
+        BEFORE the stamp (archive_and_compact), and the crash persist
+        identity-skips every compacted dict — the stamp must be pushed into
+        the existing row directly."""
         agent = _FakeAgent()
         agent.compression_enabled = True
         agent._session_db = MagicMock()
@@ -831,8 +680,10 @@ class TestPrologueCompressionIsolation:
 
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"
-        assert "api_content" not in msg
-        agent._session_db.set_latest_user_api_content.assert_not_called()
+        assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
+        agent._session_db.set_latest_user_api_content.assert_called_once_with(
+            "sess-1", "hello", "hello\n\nPLUGIN-CTX"
+        )
 
 
 class TestSetLatestUserApiContent:
@@ -973,7 +824,7 @@ class TestFlushCompressedSummaryOverrideGuard:
             db.close()
 
 
-class TestFlushSanitizeCleanPersistence:
+class TestFlushSanitizeDivergenceCapture:
     def _make_agent(self, db, sid):
         from run_agent import AIAgent
 
@@ -989,8 +840,11 @@ class TestFlushSanitizeCleanPersistence:
         agent._session_db_created = True
         return agent
 
-    def test_user_content_sanitize_does_not_create_replay_sidecar(self, tmp_path):
-        from agent.memory_manager import sanitize_context
+    def test_user_content_sanitize_would_rewrite_is_captured(self, tmp_path):
+        """get_messages_as_conversation strips <memory-context> fences on
+        load; the sent bytes must survive in the sidecar so a reloaded
+        session replays what was actually on the wire."""
+        from agent.memory_context import sanitize_context
 
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-fence"
@@ -1007,8 +861,10 @@ class TestFlushSanitizeCleanPersistence:
 
             msgs = db.get_messages_as_conversation(sid)
             assert msgs[0]["content"] == sanitize_context(raw).strip()
-            assert "api_content" not in msgs[0]
-            assert "api_content" not in msgs[1]
+            assert msgs[0]["api_content"] == raw
+            assert msgs[1]["api_content"] == (
+                "it fences recalled memory <memory-context>"
+            )
         finally:
             db.close()
 
@@ -1029,7 +885,11 @@ class TestFlushSanitizeCleanPersistence:
 
 
 class TestMaxIterationsSummaryReplay:
-    def test_summary_request_ignores_legacy_sidecar(self):
+    def test_summary_request_substitutes_sidecar_bytes(self):
+        """The forced-summary request must replay the same bytes every
+        main-loop call sent — popping the sidecar without substituting sends
+        CLEAN content and diverges the prefix at the earliest injected
+        message, exactly when the context is largest."""
         from run_agent import AIAgent
         from agent.chat_completion_helpers import handle_max_iterations
 
@@ -1070,70 +930,12 @@ class TestMaxIterationsSummaryReplay:
         sent_users = [
             m for m in captured["messages"] if m.get("role") == "user"
         ]
-        assert sent_users[0]["content"] == "q1"
+        assert sent_users[0]["content"] == "q1\n\nPLUGIN-CTX"
         for m in captured["messages"]:
             assert "api_content" not in m
         # The live history dict is never mutated.
         assert messages[0]["content"] == "q1"
         assert messages[0]["api_content"] == "q1\n\nPLUGIN-CTX"
-
-    def test_summary_request_receives_current_turn_ephemeral_context(self):
-        from run_agent import AIAgent
-        from agent.chat_completion_helpers import handle_max_iterations
-
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://openrouter.ai/api/v1",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-        agent._cached_system_prompt = "SYS"
-        captured = {}
-
-        def request(kwargs):
-            captured.update(kwargs)
-            return "RAW-RESPONSE"
-        transport = types.SimpleNamespace(
-            build_kwargs=lambda **kwargs: {"messages": kwargs["messages"]},
-            normalize_response=lambda _r: types.SimpleNamespace(
-                content="SUMMARY", tool_calls=[]
-            ),
-        )
-        messages = [
-            {"role": "user", "content": "current question"},
-            {"role": "assistant", "content": "working", "tool_calls": []},
-        ]
-
-        with patch.object(
-            agent, "_interruptible_api_call", side_effect=request
-        ), patch.object(agent, "_get_transport", return_value=transport):
-            out = handle_max_iterations(
-                agent,
-                messages,
-                5,
-                current_turn_user_idx=0,
-                ext_prefetch_cache="SUMMARY-RECALL-SENTINEL",
-                plugin_user_context=(
-                    "SUMMARY-PLUGIN-SENTINEL\n\nSUMMARY-GATEWAY-NOTE-SENTINEL"
-                ),
-            )
-
-        assert out == "SUMMARY"
-        sent_users = [
-            message
-            for message in captured["messages"]
-            if message.get("role") == "user"
-        ]
-        current_user = sent_users[0]["content"]
-        assert "SUMMARY-RECALL-SENTINEL" in current_user
-        assert "SUMMARY-PLUGIN-SENTINEL" in current_user
-        assert "SUMMARY-GATEWAY-NOTE-SENTINEL" in current_user
-        assert "maximum number of tool-calling iterations" in sent_users[-1]["content"]
-
-        # Request-only context must not alter the live transcript.
-        assert messages[0] == {"role": "user", "content": "current question"}
-        assert "SUMMARY-RECALL-SENTINEL" not in json.dumps(messages)
 
 
 class TestSessionRowExistsBeforePreflightCompaction:
@@ -1234,8 +1036,11 @@ class TestSessionRowExistsBeforePreflightCompaction:
         finally:
             db.close()
 
-    def test_in_place_compaction_multimodal_context_stays_request_only(self, tmp_path):
-        """In-place compaction keeps provider enrichment out of durable history."""
+    def test_in_place_compaction_multimodal_context_part_survives_reload(self, tmp_path):
+        """#71998 persistence: in-place ``archive_and_compact`` writes the current-turn user
+        row BEFORE the prologue appends the ``pre_llm_call`` text part, and the crash persist
+        identity-skips compacted dicts — the part must be pushed into that row, or a
+        resumed session replays a view the model never saw."""
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-inplace-mm"
         image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
@@ -1249,11 +1054,8 @@ class TestSessionRowExistsBeforePreflightCompaction:
                 )
             assert agent._last_compaction_in_place is True
             live = ctx.messages[ctx.current_turn_user_idx]["content"]
-            assert live == turn
-            assert compose_user_api_content(live, "", ctx.plugin_user_context) == [
-                *turn,
-                {"type": "text", "text": "\n\nPLUGIN-CTX"},
-            ]
+            assert live == [*turn, {"type": "text", "text": "PLUGIN-CTX"}]
+            # Reload: the durable row carries the same parts the model saw.
             reloaded = [m for m in db.get_messages_as_conversation(sid) if m["role"] == "user"]
             assert reloaded[-1]["content"] == live
         finally:

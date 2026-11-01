@@ -841,15 +841,6 @@ class TestPreflightCompression:
         status_messages = []
         agent.status_callback = lambda ev, msg: status_messages.append((ev, msg))
 
-        def _inject_request_only(_agent, request_messages, **_kwargs):
-            request_messages.append(
-                {
-                    "role": "developer",
-                    "content": "REQUEST-ONLY-CONTEXT-SENTINEL",
-                }
-            )
-            return 0
-
         with (
             # Keep the turn-prologue preflight quiet-by-size so only the
             # in-loop pre-API pressure gate fires.
@@ -858,10 +849,6 @@ class TestPreflightCompression:
             patch(
                 "agent.model_metadata.estimate_messages_tokens_rough",
                 return_value=144_669,
-            ),
-            patch(
-                "fork_features.request_context.apply_request_only_turn_context",
-                side_effect=_inject_request_only,
             ),
             patch.object(
                 agent,

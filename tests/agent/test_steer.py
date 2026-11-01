@@ -82,6 +82,55 @@ class TestSteerDrain:
         assert agent._drain_pending_steer() == "hello"
         assert agent._pending_steer is None
 
+    def test_withdraw_takes_back_one_unconsumed_ticket_and_keeps_the_rest(self):
+        agent = _bare_agent()
+        agent.steer("first")
+        agent.steer("  two\nlines  ", ticket="t2")
+        agent.steer("two")  # the same text as a line of t2, without a ticket
+        agent.steer("last", ticket="t4")
+        assert agent.withdraw_steer("t2") is True
+        assert agent._pending_steer == "first\ntwo\nlast"
+        assert agent.withdraw_steer("missing") is False
+        assert agent.withdraw_steer("t4") is True
+        assert agent._pending_steer == "first\ntwo"
+
+    def test_withdraw_after_a_drain_took_the_ticket_is_refused_even_if_its_text_is_buffered_again(self):
+        agent = _bare_agent()
+        agent.steer("alpha", ticket="a")
+        assert agent._drain_pending_steer() == "alpha"
+        agent.steer("alpha", ticket="b")
+        assert agent.withdraw_steer("a") is False, "a drain consumed a"
+        assert agent.withdraw_steer("b") is True
+        assert agent._pending_steer is None
+
+    def test_a_drained_steer_put_back_undelivered_keeps_its_ticket(self):
+        from agent.agent_runtime_helpers import _requeue_pending_steer
+        agent = _bare_agent()
+        agent.steer("note")
+        agent.steer("queued prompt", ticket="t")
+        drained = agent._drain_pending_steer() or ""
+        _requeue_pending_steer(agent, drained)  # no tool result took it
+        assert agent._pending_steer == "note\nqueued prompt"
+        assert agent.withdraw_steer("t") is True
+        assert agent._pending_steer == "note"
+
+    def test_the_leftover_drain_hands_back_only_ticketless_steers(self):
+        agent = _bare_agent()
+        agent.steer("typed /steer")
+        agent.steer("queued prompt", ticket="t")
+        assert agent._drain_leftover_steer() == "typed /steer"
+        assert agent._pending_steer == "queued prompt"
+        assert agent._drain_leftover_steer() is None
+        assert agent.withdraw_steer("t") is True
+        assert agent._pending_steer is None
+
+    def test_a_hard_stop_drops_a_ticket_unread(self):
+        agent = _bare_agent()
+        agent.steer("queued prompt", ticket="t")
+        agent.clear_interrupt(hard_cancel=True)
+        assert agent._pending_steer is None
+        assert agent.withdraw_steer("t") is True, "dropped unread: never delivered"
+
 
 
 class TestActiveTurnRedirect:
@@ -208,106 +257,7 @@ class TestActiveTurnRedirect:
 
 
 class TestActiveTurnRedirectCheckpoint:
-    def test_request_copy_consumes_live_sidecar_but_drops_legacy_sidecar(self):
-        """Only sidecars created by the active redirect reach the provider."""
-        from agent.conversation_loop import (
-            _apply_active_turn_redirect,
-            _clone_message_for_send,
-            _consume_request_only_api_content,
-            _strip_request_only_api_content,
-        )
 
-        agent = _bare_agent()
-        agent._current_streamed_assistant_text = "Visible draft."
-        messages = [
-            {
-                "role": "user",
-                "content": "historical clean text",
-                "api_content": "historical stale provider bytes",
-            },
-            {"role": "assistant", "content": "committed assistant item"},
-        ]
-
-        _apply_active_turn_redirect(agent, messages, "Use Postgres instead.")
-        api_messages = []
-        for message in messages:
-            api_message = cast(dict[str, Any], _clone_message_for_send(message))
-            _consume_request_only_api_content(api_message)
-            api_messages.append(api_message)
-
-        assert api_messages[0]["content"] == "historical clean text"
-        assert api_messages[-1]["content"].endswith("Use Postgres instead.")
-        assert "Visible draft." in api_messages[-1]["content"]
-        assert all("api_content" not in message for message in api_messages)
-        assert all(
-            "_request_only_api_content" not in message for message in api_messages
-        )
-
-        malformed = {
-            "role": "user",
-            "content": "clean malformed fallback",
-            "api_content": ["not", "redirect", "text"],
-            "_request_only_api_content": True,
-        }
-        _consume_request_only_api_content(malformed)
-        assert malformed == {
-            "role": "user",
-            "content": "clean malformed fallback",
-        }
-
-        # The other redirect shape uses a clean assistant placeholder for role
-        # alternation, then puts the interrupt scaffold only on the user
-        # correction's request-only api_content (#81841 + fork isolation).
-        agent._current_streamed_assistant_text = "Tool-loop draft."
-        tool_tail = [{"role": "user", "content": "start"}]
-        _apply_active_turn_redirect(agent, tool_tail, "Change course.")
-        tool_tail_api = []
-        for message in tool_tail:
-            api_message = cast(dict[str, Any], _clone_message_for_send(message))
-            _consume_request_only_api_content(api_message)
-            tool_tail_api.append(api_message)
-
-        assert tool_tail_api[-2]["content"] == "Tool-loop draft."
-        assert "Change course." in tool_tail_api[-1]["content"]
-        assert "Tool-loop draft." in tool_tail_api[-1]["content"]
-        assert "[This response was interrupted by a user correction.]" in tool_tail_api[-1]["content"]
-        assert "[This response was interrupted by a user correction.]" not in tool_tail_api[-2]["content"]
-        assert all("api_content" not in message for message in tool_tail_api)
-        assert all(
-            "_request_only_api_content" not in message for message in tool_tail_api
-        )
-
-        _strip_request_only_api_content(tool_tail)
-        assert tool_tail[-2]["content"] == "Tool-loop draft."
-        assert tool_tail[-1]["content"] == "Change course."
-        assert all("api_content" not in message for message in tool_tail)
-        assert all(
-            "_request_only_api_content" not in message for message in tool_tail
-        )
-
-    def test_early_turn_result_strips_request_only_sidecar(self):
-        from agent.conversation_loop import _content_policy_blocked_result
-
-        messages = [
-            {
-                "role": "user",
-                "content": "clean correction",
-                "api_content": "provider-only correction scaffold",
-                "_request_only_api_content": True,
-            }
-        ]
-
-        result = _content_policy_blocked_result(
-            messages,
-            1,
-            final_response="blocked",
-            error_detail="policy",
-        )
-
-        assert result["messages"] == [
-            {"role": "user", "content": "clean correction"}
-        ]
-        assert messages == result["messages"]
 
     def test_repetition_dominated_partial_is_not_replayed(self):
         """A looped partial must not seed the correction's next API request (#112764): neither

@@ -768,17 +768,15 @@ class TestBuildCodexClient:
             def current(self):
                 return self.entry
 
-            def peek(self, *, model=None):
-                assert model == "gpt-5.4"
+            def peek(self):
                 return self.entry
 
-            def select(self, *, model=None):
-                assert model == "gpt-5.4"
+            def select(self):
                 return self.entry
 
         pool = _Pool()
-        client_a = MagicMock(name="codex-client-a", api_key="tok-a", base_url=pool.entry.runtime_base_url)
-        client_b = MagicMock(name="codex-client-b", api_key="tok-b", base_url=pool.entry.runtime_base_url)
+        client_a = MagicMock(name="codex-client-a")
+        client_b = MagicMock(name="codex-client-b")
 
         with (
             patch("agent.auxiliary_client.load_pool", return_value=pool),
@@ -1136,8 +1134,7 @@ class TestGetTextAuxiliaryClient:
             def has_credentials(self):
                 return True
 
-            def select(self, *, model=None):
-                assert model == "gpt-5.4"
+            def select(self):
                 return _Entry()
 
         with (
@@ -2681,9 +2678,9 @@ class TestAuxiliaryTaskExtraBody:
         seen = {}
         real = aux._project_provider_profile
 
-        def spy(provider, provider_norm, model, effective_base, reasoning_config):
+        def spy(provider, provider_norm, model, effective_base, reasoning_config, *rest):
             seen["config"] = reasoning_config
-            return real(provider, provider_norm, model, effective_base, reasoning_config)
+            return real(provider, provider_norm, model, effective_base, reasoning_config, *rest)
 
         monkeypatch.setattr(aux, "_project_provider_profile", spy)
         kwargs = aux._build_call_kwargs(
@@ -3629,25 +3626,22 @@ class TestCodexAdapterGithubResponsesMessageIdDrop:
             {"role": "user", "content": "continue"},
         ]
 
-    def test_drops_message_id_for_github_copilot_host(self):
-        adapter, captured = self._build_adapter(base_url="https://api.githubcopilot.com")
-        adapter.create(messages=self._replay_messages())
-        message_item = next(
-            item for item in captured["input"] if item.get("type") == "message"
-        )
+    def test_drops_message_id_for_connection_scoped_id_host(self):
+        from providers.base import ProviderProfile
+        acme = ProviderProfile(name="acme-replay", hostnames=("api.acme-replay.test",), responses_replay_item_ids=False)
+        adapter, captured = self._build_adapter(base_url="https://api.acme-replay.test")
+        with patch("providers.profile_for_host", side_effect=lambda url, **_kw: acme if "acme-replay" in str(url) else None):
+            adapter.create(messages=self._replay_messages())
+        message_item = next(item for item in captured["input"] if item.get("type") == "message")
         assert "id" not in message_item
         assert message_item["phase"] == "final_answer"
         assert message_item["status"] == "in_progress"
         assert message_item["content"] == [{"type": "output_text", "text": "pong"}]
 
     def test_keeps_message_id_for_codex_backend_host(self):
-        adapter, captured = self._build_adapter(
-            base_url="https://chatgpt.com/backend-api/codex"
-        )
+        adapter, captured = self._build_adapter(base_url="https://chatgpt.com/backend-api/codex")
         adapter.create(messages=self._replay_messages())
-        message_item = next(
-            item for item in captured["input"] if item.get("type") == "message"
-        )
+        message_item = next(item for item in captured["input"] if item.get("type") == "message")
         assert message_item["id"] == "msg_short_but_connection_scoped"
 
 

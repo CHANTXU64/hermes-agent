@@ -71,13 +71,7 @@ def test_unsupported_route_or_model_keeps_original_request(monkeypatch, caplog, 
     fork.call(append_message=append, request_id="fast", prefer_fast=True)
     fork.call(append_message=append, request_id="ordinary")
     assert sent[0] == sent[1]
-    import json
-    records = [json.loads(r.getMessage().split("request Fork service ", 1)[1])
-               for r in caplog.records if r.getMessage().startswith("request Fork service ")]
-    assert len(records) == 1  # ordinary calls do not add opt-in telemetry
-    assert records[0]["fast_decision"] == "unsupported_or_unknown"
-    assert records[0]["requested_service_tier"] == "provider-custom-tier"
-    assert records[0]["response_service_tier"] is None
+    assert not any(r.getMessage().startswith("request Fork service ") for r in caplog.records)
 
 
 def test_fast_overrides_existing_sdk_extra_body_tier_only_in_fork(monkeypatch):
@@ -115,7 +109,6 @@ def test_network_retry_keeps_fast_and_does_not_accumulate_checkpoint_messages(mo
 
     def send(_runtime, kwargs, **options):
         sent.append(copy.deepcopy(kwargs))
-        options["on_physical_request"](kwargs)
         if len(sent) == 1:
             raise TimeoutError("offline retry test")
         return SimpleNamespace(content="ok", tool_calls=[], usage={})
@@ -129,31 +122,16 @@ def test_network_retry_keeps_fast_and_does_not_accumulate_checkpoint_messages(mo
     assert sent[1]["service_tier"] == "priority"
     assert len(sent[1]["input"]) == len(body["input"]) + 1
     assert frozen.clone_body() == body
-    import json
-    records = [json.loads(r.getMessage().split("request Fork service ", 1)[1])
-               for r in caplog.records if r.getMessage().startswith("request Fork service ")]
-    assert [r["network_attempt"] for r in records] == [1, 2]
-    assert [r["result"] for r in records] == ["failed", "returned"]
-    assert all(r["requested_service_tier"] == "priority" for r in records)
-    assert all(r["response_service_tier"] is None for r in records)
+    assert not any(r.getMessage().startswith("request Fork service ") for r in caplog.records)
 
 
 @pytest.mark.parametrize("served", ["priority", "default", None])
-def test_fast_log_separates_sent_tier_from_provider_evidence(monkeypatch, caplog, served):
-    import json
+def test_fast_call_does_not_log_service_parameters(monkeypatch, caplog, served):
     fork, _, _, _, _, _ = capture_fork(monkeypatch, mode="chat_completions",
         provider="openai", url="https://api.openai.com/v1")
     monkeypatch.setattr("fork_features.request_fork.message_protocols.send_messages",
         lambda *a, **kw: SimpleNamespace(content="ok", tool_calls=[], usage={}, service_tier=served))
     fork.call(append_message={"role": "user", "content": "PRIVATE MESSAGE"},
               request_id="continuity:log:attempt-1", prefer_fast=True)
-    records = [json.loads(r.getMessage().split("request Fork service ", 1)[1])
-               for r in caplog.records if r.getMessage().startswith("request Fork service ")]
-    assert len(records) == 1
-    assert records[0] == {
-        "request_id": "continuity:log:attempt-1", "network_attempt": 1,
-        "result": "returned", "fast_decision": "enabled", "request_observed": True,
-        "requested_service_tier": "priority", "requested_speed": None,
-        "response_service_tier": served, "response_speed": None,
-    }
+    assert not any(r.getMessage().startswith("request Fork service ") for r in caplog.records)
     assert "PRIVATE MESSAGE" not in caplog.text

@@ -45,7 +45,7 @@ def _append_moa_context(agent: Any, api_messages: Any, moa_config: Any, original
         from agent.moa_loop import _preset_temperature, aggregate_moa_context
 
         # MoA is a provider-neutral fan-out. Its reference requests already receive
-        # ``api_messages``; use the same request-only current-user view for the
+        # ``api_messages``; use the same API-bound current-user view for the
         # aggregator prompt rather than falling back to the clean durable text.
         user_prompt = (
             original_user_message
@@ -112,7 +112,7 @@ def _prepare_moa_request(agent: Any, api_messages: Any, pending_moa_prepared_req
 
 def assemble_api_request(
     agent: Any, *, messages: Any, current_turn_user_idx: Any, _ext_prefetch_cache: Any,
-    _plugin_user_context: Any, _plugin_request_context: Any, moa_config: Any, active_system_prompt: Any,
+    _plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
     original_user_message: Any, pending_moa_prepared_request: Any, request_logger: Any,
 ) -> AssembledRequest:
     """Assemble the request in the original order. ORDER IS LOAD-BEARING: cache breakpoints
@@ -130,7 +130,6 @@ def assemble_api_request(
     api_messages, effective_system = build_api_messages(
         agent, messages, current_turn_user_idx=current_turn_user_idx,
         ext_prefetch_cache=_ext_prefetch_cache, plugin_user_context=_plugin_user_context,
-        plugin_request_context=_plugin_request_context,
         moa_config=moa_config, active_system_prompt=active_system_prompt,
     )
 
@@ -168,8 +167,9 @@ def assemble_api_request(
     # OpenAI-style tool-result image_url parts. The per-call clone is rewritten in
     # place; persisted history is untouched.
     from agent.context_compressor import evict_stale_outbound_tool_images
+    from agent.image_eviction_policy import outbound_retired_image_ids
 
-    evict_stale_outbound_tool_images(api_messages)
+    evict_stale_outbound_tool_images(api_messages, outbound_retired_image_ids(agent))
 
     # One-time repeated-heal notice goes out via the status/warning callback, NEVER
     # appended to messages: the cached prompt prefix stays byte-identical.

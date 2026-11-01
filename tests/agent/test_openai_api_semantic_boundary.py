@@ -58,7 +58,9 @@ def test_generic_endpoint_ignores_codexmanager_private_models_extension():
         "models": [{"slug": "gpt-5.6-luna", "context_window": 272_000}],
     }
 
-    with patch("agent.model_metadata.requests.get", return_value=response):
+    stream = MagicMock()
+    stream.__enter__.return_value = response
+    with patch("agent.model_metadata.model_metadata_http.stream", return_value=stream):
         metadata = mm.fetch_endpoint_model_metadata(
             "https://generic.example.test/v1",
             api_key="test-key",

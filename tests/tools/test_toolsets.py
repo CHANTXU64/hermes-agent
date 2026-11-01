@@ -59,17 +59,6 @@ class TestGetToolset:
 
 class TestResolveToolset:
 
-    def test_none_toolset_is_valid_and_resolves_no_tools(self):
-        assert validate_toolset("none") is True
-        assert resolve_toolset("none") == []
-
-    def test_explicit_none_pin_does_not_fall_back_to_default_tools(self, monkeypatch):
-        from tui_gateway.server import _resolve_explicit_toolsets
-
-        monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: [])
-        assert _resolve_explicit_toolsets(["none"], validate_toolset) == ["none"]
-
-
     def test_cycle_detection(self):
         # Create a cycle: A includes B, B includes A
         TOOLSETS["_cycle_a"] = {"description": "test", "tools": ["t1"], "includes": ["_cycle_b"]}

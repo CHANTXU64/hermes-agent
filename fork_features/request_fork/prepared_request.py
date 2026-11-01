@@ -8,7 +8,6 @@ import copy
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.message_sanitization import _sanitize_messages_surrogates
-from utils import base_url_host_matches
 from fork_features.request_fork import rematerialize_request_after_adopt
 
 
@@ -47,17 +46,10 @@ def build_adopt_rematerializer(
     if current_user_item is None:
         return None
 
-    provider = str(getattr(agent, "provider", "") or "")
     base_url = str(getattr(agent, "base_url", "") or "")
-    is_github_responses = (
-        base_url_host_matches(base_url, "models.github.ai")
-        or base_url_host_matches(base_url, "githubcopilot.com")
-    )
-    is_codex_backend = bool(agent._is_codex_backend())
-    is_xai_responses = (
-        provider in {"xai", "xai-oauth"}
-        or base_url_host_matches(base_url, "api.x.ai")
-    )
+    from agent.codex_responses_adapter import classify_responses_route
+
+    is_codex_backend, is_xai_responses, endpoint = classify_responses_route(agent)
     replay_encrypted_reasoning = bool(
         getattr(agent, "_codex_reasoning_replay_enabled", True)
     )
@@ -71,9 +63,9 @@ def build_adopt_rematerializer(
 
     issuer = _classify_responses_issuer(
         is_xai_responses=is_xai_responses,
-        is_github_responses=is_github_responses,
         is_codex_backend=is_codex_backend,
         base_url=base_url,
+        endpoint=endpoint,
     )
 
     def _convert(messages: List[Dict[str, Any]]) -> list[dict[str, Any]]:
@@ -97,7 +89,7 @@ def build_adopt_rematerializer(
         return _chat_messages_to_responses_input(
             prepared,
             is_xai_responses=is_xai_responses,
-            is_github_responses=is_github_responses,
+            drop_replay_item_ids=not endpoint.replay_item_ids,
             replay_encrypted_reasoning=replay_encrypted_reasoning,
             current_issuer_kind=issuer,
         )

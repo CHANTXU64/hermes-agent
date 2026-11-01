@@ -54,9 +54,6 @@ class _LimitAgent:
     def _emit_status(self, *_args, **_kwargs):
         pass
 
-    def _emit_diagnostic_status(self, *_args, **_kwargs):
-        pass
-
     def _safe_print(self, *_args, **_kwargs):
         pass
 
@@ -88,9 +85,6 @@ class _LimitAgent:
         pass
 
     def _sync_external_memory_for_turn(self, **_kwargs):
-        pass
-
-    def _enrich_api_error(self, *_args, **_kwargs):
         pass
 
 
@@ -132,43 +126,6 @@ def _finalize(
 
 
 
-
-
-def test_budget_summary_receives_current_turn_request_context(monkeypatch):
-    """The real post-loop entry must carry one-turn context into its summary call."""
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-    agent = _LimitAgent()
-    agent._handle_max_iterations = MagicMock(return_value="summary from extra call")
-    messages = [{"role": "user", "content": "task"}]
-
-    finalize_turn(
-        agent,
-        final_response=None,
-        api_call_count=60,
-        interrupted=False,
-        failed=False,
-        messages=messages,
-        conversation_history=[],
-        effective_task_id="task",
-        turn_id="turn",
-        user_message="task",
-        original_user_message="task",
-        _should_review_memory=False,
-        _turn_exit_reason="unknown",
-        current_turn_user_idx=0,
-        _ext_prefetch_cache="recall sentinel",
-        _plugin_user_context="plugin sentinel",
-        _plugin_request_context="request sentinel",
-    )
-
-    agent._handle_max_iterations.assert_called_once_with(
-        messages,
-        60,
-        current_turn_user_idx=0,
-        ext_prefetch_cache="recall sentinel",
-        plugin_user_context="plugin sentinel",
-        plugin_request_context="request sentinel",
-    )
 
 
 @pytest.mark.parametrize(

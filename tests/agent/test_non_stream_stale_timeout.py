@@ -129,4 +129,5 @@ def test_direct_openai_codex_uses_upstream_context_ceiling(
     setattr(agent, "api_mode", "codex_responses")
 
     payload = {"model": "gpt-5.6-sol", "input": "x" * 220_000}
-    assert agent._compute_non_stream_stale_timeout(payload) == 150.0
+    # The fixed upstream model-based reasoning floor dominates this context tier.
+    assert agent._compute_non_stream_stale_timeout(payload) == 600.0

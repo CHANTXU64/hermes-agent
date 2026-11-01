@@ -104,23 +104,26 @@ class TestBuildReplayEntry:
         assert "tool_call_id" not in entry
 
 
-class TestReplayEntryLegacyApiContent:
-    """Legacy api_content must not enter model-fed Gateway history."""
+class TestReplayEntryApiContentSidecar:
+    """The api_content sidecar (persist-what-you-send) must survive the
+    gateway's transcript→agent_history rebuild, or the whole prompt-cache
+    fix is inert on gateway platforms — but only when this pipeline did not
+    rewrite the content (a rewrite means different bytes must replay)."""
 
-    def test_user_drops_api_content_when_content_unchanged(self):
+    def test_user_forwards_api_content_when_content_unchanged(self):
         msg = {"role": "user", "content": "hi", "api_content": "hi\n\nCTX"}
         entry = _build_replay_entry("user", "hi", msg)
-        assert "api_content" not in entry
+        assert entry["api_content"] == "hi\n\nCTX"
         assert entry["content"] == "hi"
 
-    def test_assistant_drops_api_content_when_content_unchanged(self):
+    def test_assistant_forwards_api_content_when_content_unchanged(self):
         msg = {"role": "assistant", "content": "a", "api_content": "a <memory-context>"}
         entry = _build_replay_entry("assistant", "a", msg)
-        assert "api_content" not in entry
+        assert entry["api_content"] == "a <memory-context>"
 
 
-class TestGatewayHistoryBuildDropsSidecar:
-    def test_end_to_end_history_build_drops_sidecar(self):
+class TestGatewayHistoryBuildForwardsSidecar:
+    def test_end_to_end_history_build_keeps_sidecar(self):
         from gateway.run import _build_gateway_agent_history
 
         history = [
@@ -128,53 +131,13 @@ class TestGatewayHistoryBuildDropsSidecar:
             {"role": "assistant", "content": "hello"},
         ]
         agent_history, _obs = _build_gateway_agent_history(history)
-        assert agent_history[0]["content"] == "hi"
-        assert "api_content" not in agent_history[0]
-
-    def test_rich_tool_sequence_drops_only_request_sidecar(self):
-        from gateway.run import _build_gateway_agent_history
-
-        history = [
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "call-1",
-                        "type": "function",
-                        "function": {"name": "terminal", "arguments": "{}"},
-                    }
-                ],
-                "api_content": "provider-only scaffold",
-                "_request_only_api_content": True,
-                "timestamp": 123.0,
-            },
-            {
-                "role": "tool",
-                "content": "done",
-                "tool_call_id": "call-1",
-                "name": "terminal",
-                "api_content": "provider-only tool sidecar",
-                "_request_only_api_content": True,
-                "observed": False,
-            },
-        ]
-
-        agent_history, _obs = _build_gateway_agent_history(history)
-
-        assert agent_history[0]["tool_calls"] == history[0]["tool_calls"]
-        assert agent_history[1]["tool_call_id"] == "call-1"
-        assert agent_history[1]["name"] == "terminal"
-        assert all("api_content" not in message for message in agent_history)
-        assert all(
-            "_request_only_api_content" not in message
-            for message in agent_history
-        )
+        assert agent_history[0]["api_content"] == "hi\n\nCTX"
 
 
 
-def test_gateway_history_drops_sidecar_without_dropping_assistant_row():
-    """Legacy ``api_content`` is request-only, while the durable assistant row and reasoning survive replay."""
+def test_gateway_history_keeps_sidecar_only_assistant_row():
+    """A reasoning-only clean stop persists content="" with the promoted reply in ``api_content``
+    (agent/turn_final_response.py); the gateway rebuild must replay it, not drop it (user->user)."""
     from gateway.run import _build_gateway_agent_history
 
     history = [
@@ -184,7 +147,7 @@ def test_gateway_history_drops_sidecar_without_dropping_assistant_row():
     ]
     agent_history, _ = _build_gateway_agent_history(history)
     assert [m["role"] for m in agent_history] == ["user", "assistant", "user"]
-    assert "api_content" not in agent_history[1]
+    assert agent_history[1]["api_content"] == "The answer is 4."
     assert agent_history[1]["reasoning"] == "The answer is 4."
 
 

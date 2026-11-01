@@ -457,6 +457,7 @@ class TestGenericCompressionLifecycleHooks:
                 assert [name for name, _ in lifecycle] == [
                     "on_compression_start",
                     "on_compression_prepare_commit",
+                    "post_compaction",
                 ]
                 finalize_context_engine_compression_notification(
                     agent,
@@ -466,6 +467,7 @@ class TestGenericCompressionLifecycleHooks:
         assert [name for name, _ in lifecycle] == [
             "on_compression_start",
             "on_compression_prepare_commit",
+            "post_compaction",
             "on_compression_finish",
         ]
         assert lifecycle[-1][1]["outcome"] == "committed"

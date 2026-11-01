@@ -9,9 +9,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fork_features import telegram_tool_progress
-import gateway.run as gateway_run
 from gateway.config import Platform, PlatformConfig
-from gateway.run import _tool_progress_delivery_metadata
+from fork_features.telegram_tool_progress import tool_progress_delivery_metadata as _tool_progress_delivery_metadata
 from gateway.run_turn_runner import TurnRunner
 from plugins.platforms.telegram.adapter import TelegramAdapter
 import tools.terminal_tool  # register the terminal progress emoji
@@ -105,13 +104,19 @@ def test_telegram_progress_metadata_preserves_topic_and_marks_literal_text():
 
 
 def test_gateway_uses_fork_owned_progress_metadata_policy():
-    assert (
-        gateway_run._tool_progress_delivery_metadata
-        is telegram_tool_progress.tool_progress_delivery_metadata
-    )
-    assert telegram_tool_progress.tool_progress_delivery_metadata(
-        platform="telegram"
-    ) == {"plain_text": True}
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    host = GatewayRunner.__new__(GatewayRunner)
+    original = {"thread_id": "17585"}
+    host._thread_metadata_for_progress = lambda *args: dict(original)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", thread_id="17585")
+    metadata, reply_to, status_metadata = host._run_agent_progress_threading(source, None, False)
+    assert metadata["plain_text"] is True
+    assert metadata["thread_id"] == "17585"
+    assert "plain_text" not in status_metadata
+    assert original == {"thread_id": "17585"}
+    assert reply_to is None
 
 
 @pytest.mark.asyncio

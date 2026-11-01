@@ -57,11 +57,8 @@ beforeEach(() => {
   mocks.useVoiceConversation.mockClear()
 })
 
-/** Fork: a local-STT turn must reach the model wrapped in the same voice-origin
- *  marker the platform gateway prepends, so speech-recognition errors read as
- *  mishearings rather than deliberate wording. GPT-Live is exempt — it carries
- *  the marker out-of-band through `voiceContext`. */
-test('a local-STT turn submits the voice-origin marker, not the bare transcript', async () => {
+/** Owner-selected official behavior: local STT submits the plain transcript. */
+test('a local-STT turn submits the bare transcript', async () => {
   const onSubmit = vi.fn(async () => true)
 
   renderHook(() =>
@@ -92,7 +89,7 @@ test('a local-STT turn submits the voice-origin marker, not the bare transcript'
   })
 
   expect(onSubmit).toHaveBeenCalledWith(
-    '[The user sent a voice message~ Here\'s what they said: "check the auth log"]',
+    'check the auth log',
     { voiceTurn: true }
   )
 })

@@ -115,18 +115,13 @@ class TestEstimateMessagesTokensRough:
     def test_api_content_substitutes_for_content_not_added_to_it(self):
         """``api_content`` replaces ``content`` on the wire, so count one.
 
-        ``conversation_loop._consume_request_only_api_content()`` pops the
-        marked sidecar and overwrites ``content`` on the provider copy. Counting
-        both doubled the estimate for an active redirect message.
+        ``turn_context.substitute_api_content()`` pops the sidecar and
+        overwrites ``content`` at every API-bound build site. Counting both
+        doubled the estimate for any message carrying a sidecar.
         """
         body = "cached prompt bytes " * 2000
         wire_shape = {"role": "user", "content": body}
-        persisted_shape = {
-            "role": "user",
-            "content": body,
-            "api_content": body,
-            "_request_only_api_content": True,
-        }
+        persisted_shape = {"role": "user", "content": body, "api_content": body}
 
         assert estimate_messages_tokens_rough([persisted_shape]) == \
             estimate_messages_tokens_rough([wire_shape])
@@ -134,12 +129,7 @@ class TestEstimateMessagesTokensRough:
     def test_api_content_is_counted_when_it_differs_from_content(self):
         """The sidecar is what's sent, so its size is the one that matters."""
         big_sidecar = "cached prompt bytes " * 2000
-        msg = {
-            "role": "user",
-            "content": "short",
-            "api_content": big_sidecar,
-            "_request_only_api_content": True,
-        }
+        msg = {"role": "user", "content": "short", "api_content": big_sidecar}
 
         result = estimate_messages_tokens_rough([msg])
 
@@ -147,20 +137,12 @@ class TestEstimateMessagesTokensRough:
         # substituted (which would undercount the real request).
         assert result >= (len(big_sidecar) // 4) * 0.9
 
-    def test_unmarked_legacy_api_content_does_not_replace_clean_content(self):
-        body = "clean stored content " * 2000
-        stale_sidecar = "stale provider-only bytes " * 8000
-        msg = {"role": "user", "content": body, "api_content": stale_sidecar}
-
-        assert estimate_messages_tokens_rough([msg]) == \
-            estimate_messages_tokens_rough([{"role": "user", "content": body}])
-
     def test_non_string_api_content_does_not_displace_content(self):
         """Only a sidecar shape the wire actually substitutes may displace content.
 
-        The request-copy consumer overwrites ``content`` only for a marked,
-        non-empty STRING sidecar on a user/assistant row; every other shape is
-        popped and discarded, leaving the clean ``content`` on the wire.
+        ``substitute_api_content()`` overwrites ``content`` only for a
+        non-empty STRING sidecar on a user/assistant row; every other shape
+        is popped and discarded, leaving the clean ``content`` on the wire.
         The shadow must mirror that guard — substituting unconditionally
         would drop the real content from the estimate and UNDERcount, which
         is the dangerous direction (compaction fires too late and the turn
@@ -170,21 +152,11 @@ class TestEstimateMessagesTokensRough:
         baseline = estimate_messages_tokens_rough([{"role": "user", "content": body}])
 
         for bad_sidecar in (None, "", 42, ["not", "a", "string"]):
-            msg = {
-                "role": "user",
-                "content": body,
-                "api_content": bad_sidecar,
-                "_request_only_api_content": True,
-            }
+            msg = {"role": "user", "content": body, "api_content": bad_sidecar}
             assert estimate_messages_tokens_rough([msg]) >= baseline, bad_sidecar
 
         # Same for a role the substitution never applies to.
-        tool_row = {
-            "role": "tool",
-            "content": body,
-            "api_content": "ignored",
-            "_request_only_api_content": True,
-        }
+        tool_row = {"role": "tool", "content": body, "api_content": "ignored"}
         assert estimate_messages_tokens_rough([tool_row]) >= baseline
 
     def test_image_stripping_survives_shadow_extraction(self):
