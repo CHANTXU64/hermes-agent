@@ -909,6 +909,8 @@ def schedule_retain(
         str(hindsight_config_path),
         "--remote-expectation",
         remote_expectation,
+        "--launcher",
+        str(python_executable),
     ]
     worker = process_spawner(
         command,
@@ -2654,6 +2656,11 @@ def main(argv: list[str] | None = None) -> int:
         "--hindsight-config", type=Path, default=DEFAULT_HINDSIGHT_CONFIG_PATH
     )
     execute_parser.add_argument(
+        "--launcher",
+        default=None,
+        help="launcher used for the exporter child; defaults to this interpreter",
+    )
+    execute_parser.add_argument(
         "--remote-expectation",
         choices=sorted(REMOTE_EXPECTATIONS),
         default="expected",
@@ -2702,7 +2709,7 @@ def main(argv: list[str] | None = None) -> int:
                 journal_path=args.journal,
                 state_db_path=args.state_db,
                 export_script=args.export_script,
-                python_executable=sys.executable,
+                python_executable=args.launcher or sys.executable,
                 remote_expectation=args.remote_expectation,
                 attempt_id=args.attempt_id,
                 cutoff_at=args.cutoff_at,

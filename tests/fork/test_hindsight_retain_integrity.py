@@ -5159,3 +5159,38 @@ def test_custom_export_script_or_other_launcher_keeps_script_form(tmp_path: Path
     assert module._module_command(
         sys.executable, module._EXPORT_MODULE, module.DEFAULT_EXPORT_SCRIPT
     ) == [sys.executable, str(module.DEFAULT_EXPORT_SCRIPT)]
+
+
+def test_worker_hands_the_original_launcher_to_the_exporter_child(tmp_path: Path) -> None:
+    """The worker runs under Hermes' own python3, not a file named ``hermes``; without the
+    launcher passed down, its exporter child would silently fall back to '<python> <script>'."""
+    module = load_module()
+    launcher = tmp_path / "hermes"
+    launcher.write_text("#!/bin/sh\n")
+
+    scheduled = {}
+    module.schedule_retain(
+        session_id="20261102_000000_aabbccdd",
+        output_root=tmp_path / "runs",
+        journal_path=tmp_path / "retain-attempts.jsonl",
+        state_db_path=tmp_path / "state.db",
+        python_executable=str(launcher),
+        attempt_id="b8c5a83a-5f7a-42a3-ad9e-41c23711d568",
+        process_spawner=lambda command, **kwargs: scheduled.update(command=command)
+        or type("P", (), {"pid": 1})(),
+    )
+    command = scheduled["command"]
+    assert command[command.index("--launcher") + 1] == str(launcher)
+
+    captured = {}
+    module.execute_scheduled_retain = lambda **kwargs: captured.update(kwargs) or {"status": "ok"}
+    argv = command[command.index("execute-scheduled"):]
+    with redirect_stdout(io.StringIO()):
+        assert module.main(argv) == 0
+    assert captured["python_executable"] == str(launcher)
+
+    captured.clear()
+    with redirect_stdout(io.StringIO()):
+        assert module.main([a for i, a in enumerate(argv)
+                            if a != "--launcher" and argv[i - 1] != "--launcher"]) == 0
+    assert captured["python_executable"] == sys.executable
