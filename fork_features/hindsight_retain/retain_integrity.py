@@ -43,6 +43,24 @@ def resolve_hindsight_config_path(config_path: Path | None = None) -> Path:
 DEFAULT_JOURNAL_PATH = Path.home() / ".hermes" / "hindsight" / "retain-attempts.jsonl"
 DEFAULT_STATE_DB_PATH = Path.home() / ".hermes" / "state.db"
 DEFAULT_EXPORT_SCRIPT = Path(__file__).resolve().with_name("langfuse_hindsight_export.py")
+_RETAIN_MODULE = "fork_features.hindsight_retain.retain_integrity"
+_EXPORT_MODULE = "fork_features.hindsight_retain.langfuse_hindsight_export"
+
+
+def _module_command(launcher: str, module: str, script: Path) -> list[str]:
+    """Start a Hermes-owned module the official way when the launcher is ``hermes``.
+
+    ``hermes --run-module`` selects Hermes' managed Python and dependency generation itself,
+    so the child neither relies on a hand-picked venv nor on the PYTHONPATH a long-running
+    Gateway passes down. A custom *script* (``--export-script``) or any other launcher keeps
+    the plain ``<python> <script>`` form, because a module name cannot carry a custom file.
+    """
+    default = {_RETAIN_MODULE: Path(__file__).resolve(), _EXPORT_MODULE: DEFAULT_EXPORT_SCRIPT}[module]
+    if Path(launcher).name == "hermes" and Path(script).resolve() == default.resolve():
+        return [str(launcher), "--run-module", module]
+    return [str(launcher), str(script)]
+
+
 REMOTE_EXPECTATIONS = {
     "not_expected_export_only",
     "expected",
@@ -869,8 +887,7 @@ def schedule_retain(
     }
     append_event_durable(Path(journal_path), event)
     command = [
-        str(python_executable),
-        str(Path(__file__).resolve()),
+        *_module_command(python_executable, _RETAIN_MODULE, Path(__file__).resolve()),
         "execute-scheduled",
         "--session-id",
         session_id,
@@ -968,8 +985,7 @@ def run_export(
     append_event_durable(Path(journal_path), started)
 
     command = [
-        str(python_executable),
-        str(export_script),
+        *_module_command(python_executable, _EXPORT_MODULE, export_script),
         "--session-id",
         session_id,
         "--skip-hindsight",

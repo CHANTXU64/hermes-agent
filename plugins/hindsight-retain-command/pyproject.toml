@@ -1,0 +1,8 @@
+[project]
+name = "hermes-hindsight-retain-command"
+version = "1.0.0"
+description = "Schedule the session-bound Retain flow; its exporter reads Langfuse."
+requires-python = ">=3.11"
+dependencies = [
+  "langfuse>=4.15,<5",
+]

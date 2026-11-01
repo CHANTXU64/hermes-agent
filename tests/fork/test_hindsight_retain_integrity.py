@@ -5120,3 +5120,42 @@ def test_expected_attempt_without_remote_write_started_is_high_alert(tmp_path: P
             "message": "Retain 本地候选已完成，但宽限期后仍没有 Hindsight 写入开始凭证",
         }
     ]
+
+
+def test_hermes_launcher_starts_children_through_run_module(tmp_path: Path) -> None:
+    """With the official launcher the worker and the exporter run as modules, so Hermes picks
+    its managed Python itself instead of a hand-picked venv plus an inherited PYTHONPATH."""
+    module = load_module()
+    launcher = tmp_path / "hermes"
+    launcher.write_text("#!/bin/sh\n")
+
+    scheduled = {}
+    module.schedule_retain(
+        session_id="20261102_000000_aabbccdd",
+        output_root=tmp_path / "runs",
+        journal_path=tmp_path / "retain-attempts.jsonl",
+        state_db_path=tmp_path / "state.db",
+        python_executable=str(launcher),
+        attempt_id="b8c5a83a-5f7a-42a3-ad9e-41c23711d568",
+        process_spawner=lambda command, **kwargs: scheduled.update(command=command)
+        or type("P", (), {"pid": 1})(),
+    )
+    assert scheduled["command"][:4] == [
+        str(launcher), "--run-module", "fork_features.hindsight_retain.retain_integrity",
+        "execute-scheduled",
+    ]
+
+    assert module._module_command(
+        str(launcher), module._EXPORT_MODULE, module.DEFAULT_EXPORT_SCRIPT
+    ) == [str(launcher), "--run-module", "fork_features.hindsight_retain.langfuse_hindsight_export"]
+
+
+def test_custom_export_script_or_other_launcher_keeps_script_form(tmp_path: Path) -> None:
+    module = load_module()
+    custom = tmp_path / "exporter.py"
+    custom.write_text("")
+    launcher = tmp_path / "hermes"
+    assert module._module_command(str(launcher), module._EXPORT_MODULE, custom) == [str(launcher), str(custom)]
+    assert module._module_command(
+        sys.executable, module._EXPORT_MODULE, module.DEFAULT_EXPORT_SCRIPT
+    ) == [sys.executable, str(module.DEFAULT_EXPORT_SCRIPT)]

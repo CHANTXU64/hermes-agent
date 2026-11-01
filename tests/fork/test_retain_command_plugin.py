@@ -216,3 +216,24 @@ def test_same_chat_different_profile_instances_keep_separate_settings_and_journa
             assert argv[argv.index("--hindsight-config") + 1] == expected["hindsight_config_path"]
     finally:
         manager.unload()
+
+
+def test_exporter_third_party_dependency_is_declared_for_pm():
+    """The exporter imports langfuse; PM must install it with the managed environment."""
+    import ast
+    import tomllib
+
+    from pm.plugin_declarations import read_python_declaration
+
+    declaration = read_python_declaration(PACKAGE)
+    assert declaration.installs_packages
+    names = {spec.split(">")[0].split("=")[0].split("<")[0].strip() for spec in declaration.install_requirements}
+    exporter = PACKAGE.parents[1] / "fork_features" / "hindsight_retain" / "langfuse_hindsight_export.py"
+    imported = {
+        (node.module or "").split(".")[0] if isinstance(node, ast.ImportFrom) else alias.name.split(".")[0]
+        for node in ast.walk(ast.parse(exporter.read_text(encoding="utf-8")))
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in (node.names if isinstance(node, ast.Import) else [None])
+    }
+    assert "langfuse" in imported and "langfuse" in names
+    assert tomllib.loads((PACKAGE / "pyproject.toml").read_text())["project"]["requires-python"] == ">=3.11"
