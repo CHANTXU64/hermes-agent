@@ -921,6 +921,106 @@ def test_interrupted_user_correction_is_clean_and_not_duplicated(tmp_path):
     assert user_messages == [f"User: {correction}"]
 
 
+def test_interrupted_gateway_correction_drops_routing_header(tmp_path):
+    module = load_script_module(tmp_path)
+    correction = "还没搞完吗？"
+    origin = json.dumps(
+        {"platform": "telegram", "chat_id": "1", "message_id": "9"}
+    )
+    wrapped = (
+        "[Context from the interrupted assistant response]\n"
+        "[This response was interrupted by a user correction.]\n\n"
+        + module._GATEWAY_ORIGIN_PREFIX
+        + origin
+        + module._GATEWAY_ORIGIN_SEPARATOR
+        + correction
+    )
+
+    assert module._clean_user_content(wrapped) == correction
+
+
+def test_heartbeat_wake_turn_and_notice_lines_are_excluded(tmp_path):
+    module = load_script_module(tmp_path)
+    session_id = "session-heartbeat"
+    wake = (
+        "⟦pulse o:w_abc/t:1792098879.05 a:1⟧ [HeartBeat 2.0 · wake w_abc · 巡视 · "
+        "armed by you 2h ago]\nLocal time: Thu 15 Oct 23:20 (Asia/Shanghai)\n"
+        'Contract: do what the note asks. Then call pulse(action="respond", ...)'
+    )
+    user_words = "Telegram 咋又变差了，顺便看下 /pulse 的状态"
+    with_notice = (
+        user_words
+        + "\n\nHeartBeat 2.0: 1 armed; /pulse shows status, /pulse off stops checks."
+        + "\nHeartBeat 2.0 limits changed outside /pulse; current bounds now apply."
+    )
+    export = {
+        "session_id": session_id,
+        "traces": [
+            {
+                "metadata": {"task_id": session_id},
+                "observations": [
+                    hermes_turn(
+                        "turn-wake",
+                        "2026-10-15T15:00:00Z",
+                        "2026-10-15T15:00:10Z",
+                        wake,
+                        "巡视发现代理节点掉线两次。",
+                    ),
+                    hermes_turn(
+                        "turn-user",
+                        "2026-10-15T15:01:00Z",
+                        "2026-10-15T15:01:10Z",
+                        with_notice,
+                        "已切换节点。",
+                    ),
+                ],
+            }
+        ],
+    }
+
+    candidate = module.build_candidate_document(export, session_id)
+
+    contents = [message["content"] for turn in candidate["turns"] for message in turn]
+    assert contents == [
+        "Assistant: 巡视发现代理节点掉线两次。",
+        f"User: {user_words}",
+        "Assistant: 已切换节点。",
+    ]
+    # A user paragraph that only quotes part of a notice is the user's own text.
+    quoted = "看看这句\n\nHeartBeat 2.0: 1 armed 是什么意思"
+    assert module._clean_user_content(quoted) == quoted
+    # Only the leading wake marker makes a row a wake turn.
+    mention = "为什么会收到 ⟦pulse o:w_abc a:1⟧ 这种消息？"
+    assert module._clean_user_content(mention) == mention
+
+
+def test_heartbeat_notice_patterns_cover_every_plugin_notice(tmp_path):
+    module = load_script_module(tmp_path)
+    # One rendered example per notice the heartbeat2 profile plugin appends
+    # (intake.py, poller.py, commands.py); the plugin lives outside this repo.
+    produced = (
+        "HeartBeat 2.0: 3 armed; /pulse shows status, /pulse off stops checks.",
+        "HeartBeat 2.0 limits changed outside /pulse; current bounds now apply.",
+        "2 wakes armed in your previous conversation were stopped; /pulse list",
+        "The scheduler was stalled; it is restarting. Some wakes may be late.",
+        "Wakes from the old conversation were orphaned after /new.",
+        "A wake was not acknowledged after three attempts.",
+        "Some wakes were late / scheduler was stalled.",
+        "A wake was too late after restart and was missed.",
+        "A paused wake (w_1) could not resume before it expires, so it ended.",
+        "A watcher (w_1) used an unsupported fire_on and could never fire, so it "
+        "was stopped. Ask me to set it up again.",
+        "日报 (w_1) paused (quiet): keep / slow / stop via /pulse; convert with "
+        "/pulse watch w_1.",
+        # governor.py stores ``rule · cache_line``; cache.py's line nests parens.
+        "日报 (w_1) paused (noop · Cache: custom TTL unknown (warm seen ≤5m, cold ≥9m)): "
+        "keep / slow / stop via /pulse; convert with /pulse watch w_1.",
+    )
+    for line in produced:
+        assert any(p.fullmatch(line) for p in module._HEARTBEAT_NOTICE_LINE_RES), line
+    assert module._clean_user_content("原话\n\n" + "\n".join(produced)) == "原话"
+
+
 def test_clean_user_content_unwraps_new_message_and_drops_runtime_only(tmp_path):
     module = load_script_module(tmp_path)
     wrapper = (

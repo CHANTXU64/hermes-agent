@@ -525,6 +525,31 @@ _INFLIGHT_TASK_REPLAY_HEADER = (
     "compaction boundary because it was not finished yet. Continue it; do not "
     "start over.]"
 )
+# HeartBeat 2.0 plugin (profile plugin ``heartbeat2``). A scheduled wake turn is
+# a whole Hermes-authored row headed by wake_text.py's ``⟦pulse o:<id> a:<n>⟧``
+# marker (intake.py::MARKER). Its pre_llm_call hook appends one-shot notice
+# lines after the user's own words; these are literal copies of intake.py,
+# poller.py and commands.py notices. Only paragraphs made entirely of these
+# lines are cut, so user text that merely mentions /pulse is kept.
+_HEARTBEAT_WAKE_RE = re.compile(r"\A⟦pulse o:\S+ a:\d+⟧(?:\s|\Z)")
+_HEARTBEAT_NOTICE_LINE_RES = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"HeartBeat 2\.0: \d+ armed; /pulse shows status, /pulse off stops checks\.",
+        r"HeartBeat 2\.0 limits changed outside /pulse; current bounds now apply\.",
+        r"\d+ wakes armed in your previous conversation were stopped; /pulse list",
+        r"The scheduler was stalled; it is restarting\. Some wakes may be late\.",
+        r"Wakes from the old conversation were orphaned after /new\.",
+        r"A wake was not acknowledged after three attempts\.",
+        r"Some wakes were late / scheduler was stalled\.",
+        r"A wake was too late after restart and was missed\.",
+        r"A paused wake \(\S+\) could not resume before it expires, so it ended\.",
+        r"A watcher \(\S+\) used an unsupported (?:event filter|fire_on) and could "
+        r"never fire, so it was stopped\. Ask me to set it up again\.",
+        r".* \((\S+)\) paused \(.*\): keep / slow / stop via /pulse; convert "
+        r"with /pulse watch \1\.",
+    )
+)
 # tools/process_registry_notifications.py::format_process_notification heartbeat.
 _PROCESS_HEARTBEAT_RE = re.compile(
     r"^\[Background process \S+ heartbeat #\S+ — still running after "
@@ -579,6 +604,22 @@ def _trailing_voice_block(content: str) -> str:
     return content[matches[first_index].start() : matches[-1].end()].strip()
 
 
+def _strip_heartbeat_notice_suffix(content: str) -> str:
+    """Cut trailing paragraphs made only of HeartBeat 2.0 per-turn notice lines."""
+    text = content.rstrip()
+    while True:
+        head, separator, tail = text.rpartition("\n\n")
+        if not separator or not head.strip():
+            return text
+        lines = [line.strip() for line in tail.split("\n") if line.strip()]
+        if not lines or not all(
+            any(pattern.fullmatch(line) for pattern in _HEARTBEAT_NOTICE_LINE_RES)
+            for line in lines
+        ):
+            return text
+        text = head.rstrip()
+
+
 def _is_kanban_wake_notice(content: str) -> bool:
     """True only for a whole automatic kanban wake turn (header + guidance ending)."""
     text = content.strip()
@@ -614,6 +655,10 @@ def _clean_user_content(value) -> str:
     else:
         return ""
     content = _user_payload_after_framework(content)
+    # The active-turn redirect wraps the provider-bound correction, so its
+    # scaffold sits in front of the gateway routing header; strip it first or
+    # the header survives and the row no longer dedupes against its clean copy.
+    content = _INTERRUPTED_USER_PREFIX_RE.sub("", content)
     gateway_split = _split_gateway_origin(content)
     if gateway_split is not None:
         content = gateway_split[1]
@@ -623,6 +668,8 @@ def _clean_user_content(value) -> str:
     content = _INTERRUPTED_USER_PREFIX_RE.sub("", content).strip()
     if _NON_USER_RUNTIME_CONTEXT_RE.match(content):
         return ""
+    if _HEARTBEAT_WAKE_RE.match(content):
+        return ""
     if any(content.startswith(prefix) for prefix in _SYNTHETIC_USER_PREFIXES):
         content = _trailing_voice_block(content)
         if not content:
@@ -631,6 +678,7 @@ def _clean_user_content(value) -> str:
         marker_index = content.find(marker)
         if marker_index >= 0:
             content = content[:marker_index].rstrip()
+    content = _strip_heartbeat_notice_suffix(content)
     if _is_kanban_wake_notice(content):
         return ""
     missing_image_markers = max(0, image_count - content.count(_IMAGE_SENT_MARKER))
