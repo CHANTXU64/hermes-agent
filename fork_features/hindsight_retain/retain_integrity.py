@@ -15,6 +15,7 @@ import sys
 import time
 import unicodedata
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -534,11 +535,120 @@ def _delegated_seed_copy_key(conn, session_id: str) -> tuple | None:
     return None
 
 
+def _normalize_visible_text(value: str) -> str:
+    return " ".join(
+        unicodedata.normalize("NFKC", str(value or ""))
+        .replace("\r\n", "\n")
+        .split()
+    )
+
+
+def _visible_logical_texts(
+    rows: list,
+    *,
+    export_rules: Any,
+    platform_ids_by_copy: dict,
+    redirect_ids_by_copy: dict,
+    joined_copy_ids: set,
+    delegated_seed_key: Any,
+) -> list[tuple[str, str]]:
+    """Return one normalized text per visible user or assistant the snapshot counts.
+
+    Identity-less rows stay in this list. Missing platform identity is not
+    evidence that a row is non-user content.
+    """
+    runtime_prefixes = (
+        "[ASYNC DELEGATION COMPLETE —",
+        "[ASYNC DELEGATION BATCH COMPLETE —",
+        "Operation interrupted: waiting for model response",
+        "Operation interrupted: retrying API call after error",
+        "You just executed tool calls but returned an empty response.",
+        "[IMPORTANT: Background process ",
+        "[IMPORTANT: Background task ",
+        "[kanban] ",
+        "[System: Your previous response contained only internal reasoning and never produced a visible answer or tool call.",
+    )
+    compression_prefixes = (
+        "[Session Arc Summary ",
+        "[Your active task list was preserved across context compression]",
+        "[Current user objective preserved from compacted history]",
+        "[Recent Summary (",
+        "[CONTEXT COMPACTION —",
+        "[Durable Summary (",
+    )
+    visible: list[tuple] = []
+    for row in rows:
+        role = str(row["role"] or "")
+        if role not in {"user", "assistant"} or row["id"] in joined_copy_ids:
+            continue
+        display_kind = str(row["display_kind"] or "")
+        if display_kind in {"hidden", "internal_notification"}:
+            continue
+        if role == "assistant" and (
+            bool(row["tool_calls"])
+            or str(row["finish_reason"] or "") == "tool_calls"
+        ):
+            continue
+        raw_content = str(row["content"] or "")
+        if (
+            role == "user"
+            and not row["platform_message_id"]
+            and (raw_content, row["timestamp"]) == delegated_seed_key
+        ):
+            continue
+        if role == "assistant":
+            if export_rules._is_failed_turn_boundary(display_kind, raw_content):
+                continue
+            carried = export_rules._merged_carrier_prior_content(raw_content.strip())
+            if carried is not None:
+                raw_content = carried
+        else:
+            raw_content = export_rules._clean_user_content(
+                export_rules._decode_state_content(raw_content)
+            )
+        content = _normalize_visible_text(raw_content)
+        if not content or any(content.startswith(prefix) for prefix in runtime_prefixes):
+            continue
+        if any(content.startswith(prefix) for prefix in compression_prefixes) or bool(
+            re.match(r"\[Depth-\d+ Summary \(", content)
+        ):
+            continue
+        if role == "assistant":
+            key = export_rules._state_assistant_logical_key(
+                content,
+                export_rules._utc_timestamp(row["timestamp"]),
+                row["display_identity"],
+                row["codex_message_items"],
+            )
+        else:
+            identity = export_rules._state_platform_user_id(
+                row, raw_content, platform_ids_by_copy
+            )
+            copy_key = (row["timestamp"], raw_content)
+            redirect_id = redirect_ids_by_copy.get(copy_key)
+            if identity:
+                key = ("platform_user", identity)
+            elif not platform_ids_by_copy.get(copy_key) and redirect_id is not None:
+                key = ("redirect_user", redirect_id)
+            else:
+                key = (content, row["timestamp"])
+        visible.append((role, key, content))
+    logical: list[tuple[str, str]] = []
+    seen: set = set()
+    for role, key, content in visible:
+        if key in seen:
+            continue
+        seen.add(key)
+        logical.append((role, content))
+    return logical
+
+
 def _state_snapshot(
     state_db_path: Path,
     session_id: str,
     *,
     cutoff_at: datetime | None = None,
+    include_texts: bool = False,
 ) -> dict[str, Any]:
     empty = {
         "session_found": False,
@@ -626,100 +736,19 @@ def _state_snapshot(
                 eligible_rows.append(row)
         rows = eligible_rows
 
-    runtime_prefixes = (
-        "[ASYNC DELEGATION COMPLETE —",
-        "[ASYNC DELEGATION BATCH COMPLETE —",
-        "Operation interrupted: waiting for model response",
-        "Operation interrupted: retrying API call after error",
-        "You just executed tool calls but returned an empty response.",
-        "[IMPORTANT: Background process ",
-        "[IMPORTANT: Background task ",
-        "[kanban] ",
-        "[System: Your previous response contained only internal reasoning and never produced a visible answer or tool call.",
-    )
-    compression_prefixes = (
-        "[Session Arc Summary ",
-        "[Your active task list was preserved across context compression]",
-        "[Current user objective preserved from compacted history]",
-        "[Recent Summary (",
-        "[CONTEXT COMPACTION —",
-        "[Durable Summary (",
-    )
     export_rules = _export_rules()
     joined_copy_ids = _joined_user_copy_ids(rows)
-    visible: list[tuple] = []
-    for row in rows:
-        role = str(row["role"] or "")
-        if role not in {"user", "assistant"} or row["id"] in joined_copy_ids:
-            continue
-        display_kind = str(row["display_kind"] or "")
-        if display_kind in {"hidden", "internal_notification"}:
-            continue
-        if role == "assistant" and (
-            bool(row["tool_calls"])
-            or str(row["finish_reason"] or "") == "tool_calls"
-        ):
-            continue
-        raw_content = str(row["content"] or "")
-        if (role == "user" and not row["platform_message_id"]
-                and (raw_content, row["timestamp"]) == delegated_seed_key):
-            continue
-        if role == "assistant":
-            # The failed-turn notice is a transcript boundary the exporter drops.
-            if export_rules._is_failed_turn_boundary(display_kind, raw_content):
-                continue
-            # A merged compaction row counts only for the reply it carries.
-            carried = export_rules._merged_carrier_prior_content(raw_content.strip())
-            if carried is not None:
-                raw_content = carried
-        else:
-            # The exporter's own user cleaning: drops heartbeats, surface-switch
-            # notes and routing wrappers, and keeps only the live words after a
-            # compaction summary, so both sides count the same user messages.
-            raw_content = export_rules._clean_user_content(
-                export_rules._decode_state_content(raw_content)
-            )
-        content = " ".join(
-            unicodedata.normalize("NFKC", raw_content)
-            .replace("\r\n", "\n")
-            .split()
-        )
-        if not content or any(content.startswith(prefix) for prefix in runtime_prefixes):
-            continue
-        if any(content.startswith(prefix) for prefix in compression_prefixes) or bool(
-            re.match(r"\[Depth-\d+ Summary \(", content)
-        ):
-            continue
-        if role == "assistant":
-            # Same logical key the exporter uses, so compaction clones count once.
-            key = export_rules._state_assistant_logical_key(
-                content,
-                export_rules._utc_timestamp(row["timestamp"]),
-                row["display_identity"],
-                row["codex_message_items"],
-            )
-            visible.append((role, key))
-        else:
-            identity = export_rules._state_platform_user_id(
-                row, raw_content, platform_ids_by_copy
-            )
-            copy_key = (row["timestamp"], raw_content)
-            redirect_id = redirect_ids_by_copy.get(copy_key)
-            if identity:
-                key = ("platform_user", identity)
-            elif not platform_ids_by_copy.get(copy_key) and redirect_id is not None:
-                key = ("redirect_user", redirect_id)
-            else:
-                key = (content, row["timestamp"])
-            visible.append((role, key))
-
-    # Known identities collapse physical compaction copies. Unproven user rows
-    # retain the conservative content/timestamp bound; they are not silently
-    # discarded just because the exporter cannot supplement them.
-    logical = list(dict.fromkeys(visible))
-    user_count = sum(1 for entry in logical if entry[0] == "user")
-    assistant_count = sum(1 for entry in logical if entry[0] == "assistant")
-    return {
+    logical_texts = _visible_logical_texts(
+        rows,
+        export_rules=export_rules,
+        platform_ids_by_copy=platform_ids_by_copy,
+        redirect_ids_by_copy=redirect_ids_by_copy,
+        joined_copy_ids=joined_copy_ids,
+        delegated_seed_key=delegated_seed_key,
+    )
+    user_count = sum(1 for role, _text in logical_texts if role == "user")
+    assistant_count = sum(1 for role, _text in logical_texts if role == "assistant")
+    result = {
         "session_found": session_found,
         "active_user_count": user_count,
         "active_assistant_count": assistant_count,
@@ -729,6 +758,9 @@ def _state_snapshot(
             default=None,
         ),
     }
+    if include_texts:
+        result["visible_texts"] = logical_texts
+    return result
 
 
 def append_event_durable(journal_path: Path, event: dict[str, Any]) -> None:
@@ -1678,6 +1710,222 @@ def _remote_gap_is_severe(candidate: dict[str, int], remote: dict[str, int]) -> 
     return missing >= 6 and remote["total"] < candidate["total"] * 0.85
 
 
+def _document_role_texts(content: str) -> Counter[tuple[str, str]] | None:
+    """Parse a candidate or remote document into normalized visible role texts."""
+    try:
+        turns = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(turns, list):
+        return None
+    texts: Counter[tuple[str, str]] = Counter()
+    export_rules = _export_rules()
+    for turn in turns:
+        if not isinstance(turn, list):
+            return None
+        for message in turn:
+            if not isinstance(message, dict):
+                return None
+            role = str(message.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            raw = str(message.get("content") or "").strip()
+            prefix = "User: " if role == "user" else "Assistant: "
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):].strip()
+            if role == "user":
+                raw = export_rules._clean_user_content(raw)
+            normalized = _normalize_visible_text(raw)
+            if normalized:
+                texts[(role, normalized)] += 1
+    return texts
+
+
+def _blocked_candidate_content(events: list[dict[str, Any]], session_id: str) -> str | None:
+    succeeded = next(
+        (event for event in reversed(events) if event.get("event") == "export_succeeded"),
+        None,
+    )
+    material = _success_candidate_material(succeeded, session_id) if succeeded else None
+    if material is None:
+        return None
+    content = material.get("content")
+    return content if isinstance(content, str) else None
+
+
+def _missing_visible_texts(
+    state_texts: list[tuple[str, str]],
+    candidate_texts: Counter[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    remaining = Counter(candidate_texts)
+    missing: list[tuple[str, str]] = []
+    for item in state_texts:
+        if remaining[item] > 0:
+            remaining[item] -= 1
+        else:
+            missing.append(item)
+    return missing
+
+
+def _later_save_covers_visible_gap(
+    *,
+    alert: dict[str, Any],
+    old_started: dict[str, Any],
+    recovery: dict[str, Any],
+    recovery_events: list[dict[str, Any]],
+    blocked_events: list[dict[str, Any]],
+    state_db_path: Path,
+) -> bool:
+    """True only when a verified later save contains the lines this block lacked.
+
+    The covering save must have started after the block receipt. Its cutoff must
+    cover the blocked request. The lines reconstructed from the blocked cutoff
+    must match the original receipt counts, not a later recount. Each missing
+    line must appear in the remote text at least as many times as the blocked
+    candidate already contained plus the missing occurrences, so an existing
+    copy cannot be reused as the fill.
+    """
+    if recovery.get("session_id") != alert.get("session_id"):
+        return False
+    if recovery.get("document_id") != alert.get("document_id"):
+        return False
+    if recovery.get("attempt_id") == alert.get("attempt_id"):
+        return False
+    if any(event.get("repair_scope") == "confirmed_missing_only" for event in recovery_events):
+        return False
+    verified_text = recovery.get("verified_text")
+    if not isinstance(verified_text, str):
+        return False
+    block = next(
+        (
+            event
+            for event in reversed(blocked_events)
+            if event.get("event") == "remote_write_blocked_visible_event_gap"
+        ),
+        None,
+    )
+    later_started = next(
+        (event for event in recovery_events if event.get("event") == "started"),
+        {},
+    )
+    if block is None:
+        return False
+    try:
+        old_cutoff = _parse_time(old_started["cutoff_at"])
+        new_cutoff = _parse_time(later_started["cutoff_at"])
+        blocked_at = _parse_time(block["recorded_at"])
+        recovery_started_at = _parse_time(later_started["recorded_at"])
+        recorded_user = _strict_nonnegative_int(
+            block.get("missing_user_count"), "recorded missing user count"
+        )
+        recorded_assistant = _strict_nonnegative_int(
+            block.get("missing_assistant_count"), "recorded missing assistant count"
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    if new_cutoff < old_cutoff or recovery_started_at <= blocked_at:
+        return False
+    old_content = _blocked_candidate_content(blocked_events, str(alert["session_id"]))
+    if old_content is None:
+        return False
+    old_texts = _document_role_texts(old_content)
+    later_texts = _document_role_texts(verified_text)
+    if old_texts is None or later_texts is None:
+        return False
+    snapshot = _state_snapshot(
+        state_db_path,
+        str(alert["session_id"]),
+        cutoff_at=old_cutoff,
+        include_texts=True,
+    )
+    if not snapshot.get("session_found"):
+        return False
+    state_texts = snapshot.get("visible_texts")
+    if not isinstance(state_texts, list):
+        return False
+    missing = _missing_visible_texts(state_texts, old_texts)
+    missing_user = [item for item in missing if item[0] == "user"]
+    missing_assistant = [item for item in missing if item[0] == "assistant"]
+    if len(missing_user) != recorded_user or len(missing_assistant) != recorded_assistant:
+        return False
+    if not missing:
+        return False
+    needed = Counter(missing)
+    for item, count in needed.items():
+        if later_texts[item] < old_texts[item] + count:
+            return False
+    return True
+
+
+def _annotate_recovered_visible_event_gaps(
+    alerts: list[dict[str, Any]],
+    attempts: dict[str, list[dict[str, Any]]],
+    confirmed: list[dict[str, Any]],
+    *,
+    state_db_path: Path,
+) -> None:
+    """Reclassify a blocked visible gap only when a later save contains its missing lines.
+
+    A later completed save whose remote text matches its own candidate is not
+    enough. The later cutoff must cover the blocked request, and every visible
+    line absent from the blocked candidate must be present in that remote text.
+    Identity-less rows remain required; omitting them does not recover the block.
+    """
+    starts = {
+        attempt_id: next(
+            (event for event in events if event.get("event") == "started"),
+            {},
+        )
+        for attempt_id, events in attempts.items()
+    }
+    for alert in alerts:
+        if alert.get("type") != "retain_candidate_visible_event_gap":
+            continue
+        blocked_events = attempts.get(str(alert.get("attempt_id") or ""), [])
+        old_started = starts.get(str(alert.get("attempt_id") or ""), {})
+        if old_started.get("remote_expectation") != "expected":
+            continue
+        for recovery in confirmed:
+            if not _later_save_covers_visible_gap(
+                alert=alert,
+                old_started=old_started,
+                recovery=recovery,
+                recovery_events=attempts.get(str(recovery.get("attempt_id") or ""), []),
+                blocked_events=blocked_events,
+                state_db_path=state_db_path,
+            ):
+                continue
+            later_started = next(
+                (
+                    event
+                    for event in attempts[str(recovery["attempt_id"])]
+                    if event.get("event") == "started"
+                ),
+                {},
+            )
+            original_key = alert["alert_key"]
+            alert.update({
+                "alert_key": (
+                    f"retain:{alert['attempt_id']}:visible_event_gap_recovered:"
+                    f"{recovery['attempt_id']}"
+                ),
+                "original_alert_key": original_key,
+                "original_type": "retain_candidate_visible_event_gap",
+                "type": "retain_visible_event_gap_recovered",
+                "severity": "info",
+                "recovered_by_attempt_id": recovery["attempt_id"],
+                "recovery_started_at": str(later_started.get("recorded_at") or ""),
+                "operation_id": recovery["operation_id"],
+                "remote_document_matches_candidate": True,
+                "message": (
+                    "历史提交前拦截仍保留；后续保存的截止时间覆盖该次请求，"
+                    "当时缺少的可见对话在当前远端正文中。"
+                    "这只证明那些缺少的句子后来已保存，不代表原始会话全部完整。"
+                ),
+            })
+            break
+
+
 def _annotate_recovered_export_failures(
     alerts: list[dict[str, Any]],
     attempts: dict[str, list[dict[str, Any]]],
@@ -2567,6 +2815,7 @@ def scan_attempts(
                             "candidate_sha256": str(
                                 candidate_material["sha256"]
                             ),
+                            "verified_text": remote_content,
                         }
                     )
                 elif candidate_material is not None:
@@ -2594,6 +2843,9 @@ def scan_attempts(
                     )
 
     _annotate_recovered_export_failures(alerts, attempts, remote_confirmed_attempts)
+    _annotate_recovered_visible_event_gaps(
+        alerts, attempts, remote_confirmed_attempts, state_db_path=Path(state_db_path),
+    )
     return {
         "status": "ok",
         "journal_torn_tail": torn_tail is not None,

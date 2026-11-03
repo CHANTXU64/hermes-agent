@@ -5194,3 +5194,286 @@ def test_worker_hands_the_original_launcher_to_the_exporter_child(tmp_path: Path
         assert module.main([a for i, a in enumerate(argv)
                             if a != "--launcher" and argv[i - 1] != "--launcher"]) == 0
     assert captured["python_executable"] == sys.executable
+
+
+def _write_visible_candidate(path: Path, session_id: str, users: list[str], assistants: list[str]) -> tuple[str, str]:
+    turns = [[
+        *[{"role": "user", "content": f"User: {text}"} for text in users],
+        *[{"role": "assistant", "content": f"Assistant: {text}"} for text in assistants],
+    ]]
+    content = json.dumps(turns, separators=(",", ":"))
+    digest = hashlib.sha256(content.encode()).hexdigest()
+    message_count = len(users) + len(assistants)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema_version": "hindsight-conversation-document-v1",
+        "session_id": session_id,
+        "document_id": session_id,
+        "turns": turns,
+        "document_content": content,
+        "document_content_sha256": digest,
+        "audit": {
+            "candidate_turn_count": 1,
+            "candidate_message_count": message_count,
+            "state_reconciliation": {
+                "status": "verified",
+                "source_event_count": message_count,
+                "matched_event_count": message_count,
+                "added_event_count": 0,
+                "uncovered_event_count": 0,
+                "clarify_question_event_count": 0,
+                "clarify_response_event_count": 0,
+            },
+        },
+    }), encoding="utf-8")
+    manifest = path.parent / "manifest.json"
+    manifest.write_text(json.dumps({"session_id": session_id}), encoding="utf-8")
+    return content, digest
+
+
+def _visible_gap_journal(
+    module,
+    tmp_path: Path,
+    *,
+    later_users: list[str],
+    old_users: list[str] | None = None,
+    extra_state_users: list[tuple[str, float]] | None = None,
+    receipt_missing_user: int = 1,
+    remote_matches: bool = True,
+    later_cutoff: datetime | None = None,
+    later_started_at: datetime | None = None,
+    drop_old_candidate: bool = False,
+):
+    session_id = "20261001_200355_a0292e29"
+    blocked_id = "ddbafa1e-50eb-4a6b-89df-95be64b4975d"
+    later_id = "a8a8fa71-45fb-4c99-bd5b-da799f397240"
+    old_at = datetime(2026, 10, 1, 14, 14, tzinfo=timezone.utc)
+    later_at = datetime(2026, 10, 9, 0, 48, tzinfo=timezone.utc)
+    missing = "压缩后仍是真用户话"
+    state_db = tmp_path / "state.db"
+    create_state_db(state_db, session_id)
+    with sqlite3.connect(state_db) as conn:
+        conn.execute(
+            "INSERT INTO messages VALUES (?, ?, 'user', ?, ?, 0, 1, NULL)",
+            (3, session_id, missing, 1001.5),
+        )
+        for index, (text, timestamp) in enumerate(extra_state_users or [], start=4):
+            conn.execute(
+                "INSERT INTO messages VALUES (?, ?, 'user', ?, ?, 0, 1, NULL)",
+                (index, session_id, text, timestamp),
+            )
+    old_user_texts = ["first request"] if old_users is None else old_users
+    old_dir = tmp_path / "runs" / session_id / blocked_id
+    later_dir = tmp_path / "runs" / session_id / later_id
+    _old_content, old_sha = _write_visible_candidate(
+        old_dir / f"candidate_document_{session_id}.json",
+        session_id,
+        old_user_texts,
+        ["first answer"],
+    )
+    later_content, later_sha = _write_visible_candidate(
+        later_dir / f"candidate_document_{session_id}.json",
+        session_id,
+        later_users,
+        ["first answer"],
+    )
+    if drop_old_candidate:
+        (old_dir / f"candidate_document_{session_id}.json").unlink()
+    cutoff = (later_cutoff or later_at).isoformat()
+    later_started = later_started_at or later_at
+    events = [
+        {
+            "attempt_id": blocked_id, "event": "started",
+            "recorded_at": old_at.isoformat(), "session_id": session_id,
+            "document_id": session_id, "remote_expectation": "expected",
+            "cutoff_at": old_at.isoformat(),
+        },
+        {
+            "attempt_id": blocked_id, "event": "export_succeeded",
+            "recorded_at": (old_at + timedelta(seconds=1)).isoformat(),
+            "session_id": session_id, "document_id": session_id,
+            "candidate_path": str(old_dir / f"candidate_document_{session_id}.json"),
+            "manifest_path": str(old_dir / "manifest.json"),
+            "candidate_sha256": old_sha, "candidate_turn_count": 1,
+            "candidate_message_count": 1 + len(old_user_texts),
+        },
+        {
+            "attempt_id": blocked_id, "event": "remote_write_blocked_visible_event_gap",
+            "recorded_at": (old_at + timedelta(seconds=2)).isoformat(),
+            "session_id": session_id, "document_id": session_id,
+            "missing_user_count": receipt_missing_user, "missing_assistant_count": 0,
+        },
+        {
+            "attempt_id": later_id, "event": "started",
+            "recorded_at": later_started.isoformat(), "session_id": session_id,
+            "document_id": session_id, "remote_expectation": "expected",
+            "cutoff_at": cutoff,
+        },
+        {
+            "attempt_id": later_id, "event": "export_succeeded",
+            "recorded_at": (later_started + timedelta(seconds=1)).isoformat(),
+            "session_id": session_id, "document_id": session_id,
+            "candidate_path": str(later_dir / f"candidate_document_{session_id}.json"),
+            "manifest_path": str(later_dir / "manifest.json"),
+            "candidate_sha256": later_sha, "candidate_turn_count": 1,
+            "candidate_message_count": 1 + len(later_users),
+        },
+        {
+            "attempt_id": later_id, "event": "remote_write_started",
+            "recorded_at": (later_started + timedelta(seconds=2)).isoformat(),
+            "session_id": session_id, "document_id": session_id,
+            "operation_id": later_id,
+        },
+        {
+            "attempt_id": later_id, "event": "remote_write_accepted",
+            "recorded_at": (later_started + timedelta(seconds=3)).isoformat(),
+            "session_id": session_id, "document_id": session_id,
+            "operation_id": later_id,
+        },
+    ]
+    journal = tmp_path / "retain-attempts.jsonl"
+    journal.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    remote_text = later_content if remote_matches else later_content + " different"
+    return module, state_db, journal, session_id, blocked_id, later_id, missing, remote_text
+
+
+def _scan_visible_gap(module, state_db, journal, session_id, remote_text, *, operation_status="completed"):
+    operation: dict = {
+        "status": "found",
+        "operation": {
+            "id": "a8a8fa71-45fb-4c99-bd5b-da799f397240",
+            "task_type": "batch_retain",
+            "status": "completed" if operation_status == "document_missing" else operation_status,
+            "document_id": session_id,
+            "extraction_errors_count": 0,
+        },
+    }
+    document: dict = {
+        "status": "missing" if operation_status == "document_missing" else "found",
+        "document": {"id": session_id, "original_text": remote_text},
+    }
+    return module.scan_attempts(
+        journal_path=journal,
+        state_db_path=state_db,
+        now=datetime(2026, 11, 3, 3, 0, tzinfo=timezone.utc),
+        operation_fetcher=lambda _operation_id: operation,
+        document_fetcher=lambda _document_id: document,
+    )
+
+
+def test_identityless_compacted_user_still_blocks_when_later_save_omits_it(tmp_path: Path) -> None:
+    module = load_module()
+    module, state_db, journal, session_id, blocked_id, _later_id, missing, remote_text = _visible_gap_journal(
+        module, tmp_path, later_users=["first request", "另一句替代话"],
+    )
+    scan = _scan_visible_gap(module, state_db, journal, session_id, remote_text)
+    blocked = [item for item in scan["alerts"] if item.get("attempt_id") == blocked_id]
+    assert [item["type"] for item in blocked] == ["retain_candidate_visible_event_gap"]
+    assert blocked[0]["missing_user_count"] == 1
+    assert missing not in remote_text
+    assert not any(item["type"] == "retain_visible_event_gap_recovered" for item in scan["alerts"])
+
+
+def test_visible_gap_recovers_only_when_later_remote_contains_missing_lines(tmp_path: Path) -> None:
+    module = load_module()
+    missing_text = "压缩后仍是真用户话"
+    module, state_db, journal, session_id, blocked_id, later_id, _missing, remote_text = _visible_gap_journal(
+        module, tmp_path, later_users=["first request", missing_text],
+    )
+    scan = _scan_visible_gap(module, state_db, journal, session_id, remote_text)
+    notice = next(item for item in scan["alerts"] if item.get("attempt_id") == blocked_id)
+    assert notice["type"] == "retain_visible_event_gap_recovered"
+    assert notice["severity"] == "info"
+    assert notice["original_alert_key"] == f"retain:{blocked_id}:candidate_visible_event_gap"
+    assert notice["original_type"] == "retain_candidate_visible_event_gap"
+    assert notice["recovered_by_attempt_id"] == later_id
+    assert notice["remote_document_matches_candidate"] is True
+    assert "全部完整" in notice["message"]
+
+
+@pytest.mark.parametrize("case", ["remote_mismatch", "document_missing", "cutoff_too_early"])
+def test_visible_gap_stays_current_without_covering_later_save(tmp_path: Path, case: str) -> None:
+    module = load_module()
+    missing = "压缩后仍是真用户话"
+    later_cutoff = datetime(2026, 9, 30, tzinfo=timezone.utc) if case == "cutoff_too_early" else None
+    module, state_db, journal, session_id, blocked_id, _later_id, _missing, remote_text = _visible_gap_journal(
+        module,
+        tmp_path,
+        later_users=["first request", missing],
+        remote_matches=case != "remote_mismatch",
+        later_cutoff=later_cutoff,
+    )
+    scan = _scan_visible_gap(
+        module, state_db, journal, session_id, remote_text,
+        operation_status="document_missing" if case == "document_missing" else "completed",
+    )
+    blocked = [item for item in scan["alerts"] if item.get("attempt_id") == blocked_id]
+    assert [item["type"] for item in blocked] == ["retain_candidate_visible_event_gap"]
+    assert not any(item["type"] == "retain_visible_event_gap_recovered" for item in scan["alerts"])
+
+
+def test_same_text_already_in_blocked_candidate_cannot_fill_another_occurrence(tmp_path: Path) -> None:
+    module = load_module()
+    repeated = "继续"
+    module, state_db, journal, session_id, blocked_id, _later_id, _missing, remote_text = _visible_gap_journal(
+        module,
+        tmp_path,
+        old_users=["first request", repeated],
+        later_users=["first request", repeated],
+        extra_state_users=[(repeated, 1001.7)],
+        receipt_missing_user=1,
+    )
+    journal.write_text(journal.read_text().replace("压缩后仍是真用户话", repeated), encoding="utf-8")
+    with sqlite3.connect(state_db) as conn:
+        conn.execute("UPDATE messages SET content = ? WHERE id = 3", (repeated,))
+    scan = _scan_visible_gap(module, state_db, journal, session_id, remote_text.replace("压缩后仍是真用户话", repeated))
+    blocked = [item for item in scan["alerts"] if item.get("attempt_id") == blocked_id]
+    assert [item["type"] for item in blocked] == ["retain_candidate_visible_event_gap"]
+
+
+def test_same_text_recovers_only_when_later_remote_has_every_occurrence(tmp_path: Path) -> None:
+    module = load_module()
+    repeated = "继续"
+    module, state_db, journal, session_id, blocked_id, _later_id, _missing, remote_text = _visible_gap_journal(
+        module,
+        tmp_path,
+        old_users=["first request", repeated],
+        later_users=["first request", repeated, repeated],
+        extra_state_users=[(repeated, 1001.7)],
+        receipt_missing_user=1,
+    )
+    with sqlite3.connect(state_db) as conn:
+        conn.execute("UPDATE messages SET content = ? WHERE id = 3", (repeated,))
+    scan = _scan_visible_gap(module, state_db, journal, session_id, remote_text)
+    notice = next(item for item in scan["alerts"] if item.get("attempt_id") == blocked_id)
+    assert notice["type"] == "retain_visible_event_gap_recovered"
+
+
+def test_earlier_save_does_not_recover_a_later_block(tmp_path: Path) -> None:
+    module = load_module()
+    missing = "压缩后仍是真用户话"
+    earlier = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    module, state_db, journal, session_id, blocked_id, _later_id, _missing, remote_text = _visible_gap_journal(
+        module,
+        tmp_path,
+        later_users=["first request", missing],
+        later_cutoff=datetime(2026, 10, 1, 14, 14, tzinfo=timezone.utc),
+        later_started_at=earlier,
+    )
+    scan = _scan_visible_gap(module, state_db, journal, session_id, remote_text)
+    blocked = [item for item in scan["alerts"] if item.get("attempt_id") == blocked_id]
+    assert [item["type"] for item in blocked] == ["retain_candidate_visible_event_gap"]
+
+
+def test_shrunk_live_recount_cannot_recover_historical_gap(tmp_path: Path) -> None:
+    module = load_module()
+    missing = "压缩后仍是真用户话"
+    module, state_db, journal, session_id, blocked_id, _later_id, _missing, remote_text = _visible_gap_journal(
+        module,
+        tmp_path,
+        later_users=["first request", missing],
+        receipt_missing_user=2,
+    )
+    scan = _scan_visible_gap(module, state_db, journal, session_id, remote_text)
+    blocked = [item for item in scan["alerts"] if item.get("attempt_id") == blocked_id]
+    assert [item["type"] for item in blocked] == ["retain_candidate_visible_event_gap"]
