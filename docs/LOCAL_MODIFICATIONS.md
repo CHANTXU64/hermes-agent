@@ -2353,6 +2353,31 @@ Current compatibility contract (fixed upstream `1e0c7730d791f5ce855c5c78935cfea6
 - The original implementation and dated validation below document provenance; their
   Tirith-specific statements are superseded by this contract, not current requirements.
 
+Current context contract (2026-11-05, supersedes the latest-turn-only context below):
+- Authorization evidence is a chronological history built from the messages still in
+  the agent's current context window: real user messages, completed Clarify
+  question/answer pairs (including multi-question results), and non-Clarify agent
+  tool calls with full arguments. Assistant prose, reasoning, tool outputs, and
+  Clarify invocations themselves are excluded. Only user messages and Clarify
+  answers can authorize or prohibit; tool calls are untrusted reference context.
+- Known limitation, not fixed: this is not an independent session transcript. After
+  context compression, earlier user prohibitions and tool calls folded into the
+  summary no longer reach the reviewer, and the provider cache restarts from the
+  rewritten point. In-flight replay after compression keeps the previous contract's
+  behavior (a duplicate user entry with the runtime header, or the merged form
+  filtered out).
+- The 2026-11-04/05 replay comparison (603 unique cases, 14 sessions, 9 profiles;
+  manual escalations 14 -> 1, none stricter) read full SessionDB transcripts without
+  compression, so it reflects pre-compression behavior only.
+- The history has no size cap by user decision; full tool arguments are sent to the
+  approval provider, and over-long requests fail closed into manual approval.
+- The reviewer's prohibition output is `violated_prohibition` (legacy `prohibition`
+  still parsed). It must be empty unless the visible action violates a direct
+  prohibition, and a non-empty value always denies.
+- Accepted known behavior: a docker-group remote container query is approved, and an
+  overwrite of an existing Nextcloud business ledger may be approved; see the feature
+  README for details.
+
 Files:
 
 - `pyproject.toml`
@@ -2458,7 +2483,7 @@ What changed:
   skipped. Workflow prerequisites remain main-agent obligations even when
   phrased as `must`, `must not`, `only after`, or `do not continue`; they do not
   become approval prohibitions.
-- The reviewer returns `decision`, `risk_level`, `risk_evidence`, `prohibition`,
+- The reviewer returns `decision`, `risk_level`, `risk_evidence`, `violated_prohibition` (legacy `prohibition`),
   `authorization`, and a short semantic `reason`. User context may scope or
   authorize an identified risky side effect, or enforce a direct prohibition
   against the visible action or target. Critical risk is denied; an approval
@@ -2552,8 +2577,8 @@ Why it matters:
 
 Merge protection:
 
-- Preserve when upstream Smart Approval cannot consume the latest-turn/Clarify
-  authorization boundary, structured risk and authorization fields, bounded
+- Preserve when upstream Smart Approval cannot consume the session-history
+  authorization boundary (user messages, Clarify, and untrusted tool calls only), structured risk and authorization fields, bounded
   direct-script evidence across terminal and `execute_code`, localized approval
   presentation, first-Smart-denial/legal-release priority/second-denial
   text-similar one-shot fallback, repeat-card-only same-turn denial latching, the
@@ -2564,7 +2589,7 @@ Merge protection:
   handling, structured outcomes, language-aware presentation, compatible-scanner
   selection, text-only denial retry/repeat-card-denial semantics, and
   one-operation persistence behavior with matching regressions.
-- Ask the user when upstream uses broader conversation history, omits Clarify
+- Ask the user when upstream uses a different conversation-history scope, omits Clarify
   question scope, treats all high risk as denial, or recursively analyzes a
   materially larger dependency surface.
 
@@ -2584,6 +2609,7 @@ Verification:
 - `py_compile`, Ruff, and `git diff --check` passed for this correction. No configuration change or Gateway restart was performed, and the Hermes Agent Fork remains uncommitted. The only commit is the local scripts-repository snapshot of `nc_report.py`; nothing was pushed.
 - 2026-08-31 Fork Policy boundary validation: focused Policy/Host coverage `60 passed`; full approval/Gateway command `430 passed, 9 failed`; fresh-process isolation gave `7 passed` for approval-mode parity and `2 passed` for redaction, while the unchanged macOS `/tmp` alias remained `1 failed`; adjacent Terminal/code-execution/Tirith/i18n `167 passed, 7 subtests passed`; compression/real-user provenance `197 passed`.
 - The reviewer, script-evidence, and retry-policy files were byte-identical to baseline `63f75f3b6d8c7d54d411e88990b400743d474fc5`; six fixed context samples matched the baseline builder. Ruff, `py_compile`, and `git diff --check` passed. No paid model replay, configuration change, Gateway restart, commit, or push was performed.
+- 2026-11-05 session-history context and `violated_prohibition`: approval and adjacent regression `688 passed`, `1 skipped`; the 36-file wider set kept the same 15 baseline failures. Serial live replay of 603 flagged commands from 14 real sessions with `chantx-gpt / gpt-6-luna` cut escalations from 14 to 1 with none stricter than before. No configuration change, Gateway restart, commit, or push was performed.
 - The following 2026-08-16 results remain historical evidence for the original
   latest-turn context, Tirith, and language-aware implementation.
 - Approval, terminal, `execute_code`, and Tirith regression coverage:

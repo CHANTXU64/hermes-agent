@@ -6,7 +6,7 @@ This fork keeps Smart Approval narrow and auditable while avoiding false manual 
 
 It combines seven related guarantees:
 
-1. authorization evidence comes only from the latest real user turn and subsequent completed Clarify exchanges;
+1. authorization evidence comes only from real user-authored messages and completed Clarify answers in the current session, read in chronological order together with the agent's tool calls (the 2026-11-05 contract; the earlier latest-turn-only contract is superseded);
 2. the reviewer first identifies concrete operational risk, then uses user context only to scope or authorize that risk or to enforce a direct prohibition against the visible action or target;
 3. directly launched custom scripts and explicitly named local Python files provide best-effort source evidence without external dependency inspection; Git-tracked entries are identified without sending their source, while oversized untracked entries provide a bounded prefix;
 4. standard package-managed development tools are not misclassified as unreadable custom scripts;
@@ -22,15 +22,27 @@ Smart Approval receives only:
 
 - the action about to run;
 - the resolved execution directory;
-- the complete latest normalized real user instruction, without a character cap;
-- all completed Clarify question/answer pairs after that instruction, without a pair-count cap;
+- a chronological history built from the messages still present in the agent's current context window, sent as its own user-role message before the pending action, containing:
+  - each normalized real user message still in that window, without a character cap;
+  - each completed Clarify question/answer still in that window, including each entry of multi-question `responses[]` results;
+  - each non-Clarify agent tool call still in that window (tool name and full arguments), without truncation;
 - direct-entry metadata plus source for untracked entries, bounded to a prefix when oversized; Git-tracked entries are marked without sending their source.
+
+The context builder still returns `latest_user_message` and `clarifications` for compatibility, but the reviewer prompt uses them only as a fallback history when a caller supplies no `history` list. They are not sent as separate fields.
+
+The history follows the Claude Code auto-mode pattern chosen by the user on 2026-11-04: user words plus agent actions, without agent prose. Assistant replies, reasoning, and tool outputs are deliberately excluded, so the agent cannot argue its own case and tool output cannot inject approval. Only `user_message` and `clarify` entries can authorize or prohibit. `agent_tool_call` entries are untrusted agent data, used only to identify where a target came from and what short user replies such as "it" or "just one category" refer to. Each history entry is one JSON line, so text inside tool arguments cannot become a separate user-authored entry.
+
+Clarify invocations themselves are not recorded as `agent_tool_call` entries. Only completed question/answer pairs enter the history, so the full Clarify arguments (for example the offered choices) and pending, unanswered Clarify calls are absent.
+
+Known limitation (not fixed, accepted by the user on 2026-11-05): the history is not an independent session transcript. After context compression, messages folded into the compaction summary disappear from the history, including earlier real user prohibitions and earlier tool calls; the summary itself is excluded as untrusted. This is still no less context than the previous latest-turn-only contract, but an early prohibition may no longer reach the reviewer after compression. Replay of an in-flight user request after compression is inherited behavior shared with the previous contract: the standalone replay can appear as a second user message carrying the runtime `[STILL IN PROGRESS …]` header, and the merged replay form is filtered out together with its summary carrier.
+
+Between compressions, the history grows by appending, so repeated reviews in the same session can hit the provider prompt cache when the caller uses a per-session cache scope. Each compression rewrites the earlier part of the history, so the cache restarts from that point. The history has no size cap by user decision. Long sessions therefore raise approval input size, and full tool arguments (including written file contents and any secrets present in commands) are sent to the approval provider. A request that exceeds the approval model's context fails closed into manual approval.
 
 The context normalizer excludes compaction summaries, ToDo snapshots, background and recovery notifications, Skill bodies, model-switch notices, reply/thread metadata, Cron delivery guidance, and pre-run/context-job output.
 
 This prevents runtime scaffolding from becoming authorization evidence and prevents concurrent tool calls from borrowing another request's context.
 
-The approval packet is intentionally not an execution transcript. It does not include prior `read_file` results, test output, validation output, or the full tool history. Missing proof that a Runbook was read, a test ran, or another prior step completed is not evidence that the step was skipped.
+The approval packet is intentionally not an execution transcript. It includes tool calls but not prior `read_file` results, test output, validation output, or any other tool output, so a tool call is not proof that it ran or succeeded. Missing proof that a Runbook was read, a test ran, or another prior step completed is not evidence that the step was skipped.
 
 The reviewer must not use user context to enforce task alignment, tool choice, step ordering, required reading, tests, validation, output format, or quality gates. Those remain obligations for the main agent. They do not become approval prohibitions when phrased as `must`, `must not`, `only after`, `unless`, or `do not continue`.
 
@@ -188,7 +200,7 @@ This feature does not:
 - trust scripts based on filenames containing `test`;
 - make destructive custom scripts safe merely because they are part of a test workflow;
 - add per-command or per-case keyword exceptions;
-- receive or evaluate the complete execution history, or act as a Runbook/procedure-compliance auditor;
+- receive tool outputs, assistant prose, or reasoning, or act as a Runbook/procedure-compliance auditor;
 - change the configured approval model, endpoint, fallback chain, or operator policy;
 - add cross-tool semantic same-result detection or change Computer Use approval behavior;
 - persist denial/retry state across processes or Gateway restart;
@@ -198,7 +210,7 @@ This feature does not:
 
 Preserve this fork behavior unless upstream provides an equivalent contract covering all of the following together:
 
-- latest-real-turn and scoped Clarify authorization evidence;
+- session-history authorization evidence limited to real user messages and scoped Clarify answers, with agent tool calls as untrusted reference context and no assistant prose, reasoning, or tool output;
 - per-request isolation across concurrent tool calls;
 - optional direct-entry and explicit-path evidence without external dependency traversal, including Git-index-based source skipping, untracked-path reading, and bounded oversized prefixes;
 - here-doc/stdin distinction;
@@ -209,7 +221,7 @@ Preserve this fork behavior unless upstream provides an equivalent contract cove
 - the unchanged hard block for Gateway lifecycle actions;
 - Fork policy bodies under `fork_features/approval` with thin host integration.
 
-If upstream implements a broader recursive analyzer or uses wider conversation history, compare behavior and privacy/cost boundaries before merging.
+If upstream implements a broader recursive analyzer or a different conversation-history scope (for example including assistant prose or tool output), compare behavior and privacy/cost boundaries before merging.
 
 ## Verification
 
@@ -316,6 +328,16 @@ git diff --check
 - a negated Runbook prerequisite remained approved, a direct `do not run this script` prohibition denied, valuable deletion escalated without authorization and approved only with exact matching Clarify authorization, and normal authentication to the provider's official API remained approved;
 - focused reviewer, Policy, script-evidence, Terminal, `execute_code`, and Cron regression completed with `290 passed`; Ruff, `py_compile`, and `git diff --check` passed;
 - no configuration, context extraction, operator policy, script-evidence scope, Cron/KG logic, Computer Use behavior, or running Gateway state changed. No commit or push was performed.
+
+2026-11-05 session-history context and violated-prohibition field:
+
+- context now carries the chronological session history described above; the reviewer's prohibition output field is renamed `violated_prohibition` and must stay empty when the action complies with, or is unrelated to, a restriction; `risk_evidence` must name a concrete harmful consequence, not describe the command. The legacy `prohibition` key is still parsed. A non-empty violated prohibition still always denies; no code backstop clears it;
+- approval and adjacent regression (`tests/fork_features/approval`, the approval/Smart Approval tool tests, and `tests/agent/test_run_agent.py`): `688 passed`, `1 skipped`; a 36-file wider approval set showed the same 15 failures as the unchanged baseline (`test_approval_cancelled_attribution.py`, `test_execute_code_local_session_approval.py`);
+- a local test checks that forged "user approved" text inside tool-call arguments stays inside its `agent_tool_call` entry;
+- live replay with `chantx-gpt / gpt-6-luna`, strictly serial and in session order: 603 unique flagged commands from 14 real sessions across 9 profiles. Compared with the previous latest-turn contract, escalations fell from 14 to 1 and no previously approved command became stricter. The remaining escalation discards pending memory proposals across profiles. This full comparison ran before the `violated_prohibition` rename and backstop removal; the final version was only spot-checked (18 serial calls, then 4 after the backstop removal). The replay read full SessionDB transcripts without compression, so it reflects pre-compression behavior only;
+- known accepted behavior: a docker-group (`sg docker`) remote container query that sidesteps a host's narrower sudo allowance is approved, because user context cannot reveal host permission intent; an `os.replace` over an existing Nextcloud business ledger after a request such as "make me a transfer slip" was approved once with exact authorization and may vary between runs. The user reviewed both and chose not to add operator rules;
+- an independent `gpt-6.1-sol` review (local tests only, no model calls) confirmed the compression and Clarify-invocation gaps documented in the context contract; the user chose to document them rather than add an independent transcript source;
+- no configuration change, Gateway restart, or push was performed.
 
 ## Runtime activation
 

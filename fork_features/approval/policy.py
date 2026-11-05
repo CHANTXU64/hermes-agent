@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Optional
@@ -40,6 +41,70 @@ def get_smart_approval_context() -> dict[str, Any]:
     return dict(_smart_approval_context.get() or {})
 
 
+_INJECTED_CONTEXT_SPANS = re.compile(
+    r'<hermes-runtime-context user-authored="false" [\s\S]*?</hermes-runtime-context>'
+    r'|<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>',
+    re.IGNORECASE,
+)
+
+
+def _tool_call_parts(tool_call: Any) -> tuple[str, str, Any]:
+    if isinstance(tool_call, dict):
+        function = tool_call.get("function") or {}
+        return (
+            str(tool_call.get("id") or ""),
+            str(function.get("name") or ""),
+            function.get("arguments"),
+        )
+    function = getattr(tool_call, "function", None)
+    return (
+        str(getattr(tool_call, "id", "") or ""),
+        str(getattr(function, "name", "") or ""),
+        getattr(function, "arguments", None),
+    )
+
+
+def _answer_text(answer: Any) -> str:
+    if isinstance(answer, list):
+        return json.dumps(answer, ensure_ascii=False)
+    return "" if answer is None else str(answer)
+
+
+def _clarify_entries(raw_args: Any, content: Any) -> list[dict[str, str]]:
+    """Return question/answer pairs from a completed Clarify result."""
+    try:
+        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        payload = json.loads(content) if isinstance(content, str) else content
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    args = args if isinstance(args, dict) else {}
+    if isinstance(payload.get("responses"), list):
+        asked = args.get("questions") if isinstance(args.get("questions"), list) else []
+        entries = []
+        for index, row in enumerate(payload["responses"]):
+            if not isinstance(row, dict):
+                continue
+            question = row.get("question")
+            if not question and index < len(asked) and isinstance(asked[index], dict):
+                question = asked[index].get("question")
+            if not isinstance(question, str) or not question.strip():
+                continue
+            entry = {
+                "question": question.strip(),
+                "answer": _answer_text(row.get("user_response")),
+            }
+            if row.get("status"):
+                entry["status"] = str(row["status"])
+            entries.append(entry)
+        return entries
+    question = args.get("question")
+    if "user_response" not in payload or not isinstance(question, str) or not question.strip():
+        return []
+    return [{"question": question.strip(), "answer": _answer_text(payload.get("user_response"))}]
+
+
 def build_smart_approval_context(
     messages: list,
     *,
@@ -47,81 +112,71 @@ def build_smart_approval_context(
     real_user_message_text: Callable[[dict[str, Any]], str],
     strip_stale_todo_snapshot: Callable[[Any], Any],
 ) -> dict[str, Any]:
-    """Return the latest real user message and following completed clarifies."""
+    """Return the session's user messages, Clarify answers and agent tool calls.
+
+    ``history`` keeps them in conversation order. Assistant prose, reasoning and
+    tool outputs are never included. ``latest_user_message`` and
+    ``clarifications`` (answers after that message) stay for the retry brief.
+    """
     if not isinstance(messages, list):
-        return {"latest_user_message": "", "clarifications": []}
+        return {"latest_user_message": "", "clarifications": [], "history": []}
 
-    latest_user_index = -1
-    latest_user_message = ""
-    for index, message in enumerate(messages):
-        if not is_real_user_message(message):
-            continue
-        normalized = dict(message)
-        normalized["content"] = strip_stale_todo_snapshot(
-            message.get("content", "")
-        )
-        candidate = real_user_message_text(normalized).strip()
-        if (
-            candidate.startswith('<hermes-runtime-context user-authored="false" ')
-            and candidate.endswith("</hermes-runtime-context>")
-        ):
-            continue
-        latest_user_index = index
-        latest_user_message = candidate
-
-    clarify_questions: dict[str, str] = {}
-    clarifications: list[dict[str, str]] = []
-    for message in messages[latest_user_index + 1 :]:
+    history: list[dict[str, str]] = []
+    clarify_calls: dict[str, Any] = {}
+    latest_user_position = -1
+    for message in messages:
         if not isinstance(message, dict):
             continue
-        if message.get("role") == "assistant":
+        role = message.get("role")
+        if role == "user":
+            if not is_real_user_message(message):
+                continue
+            normalized = dict(message)
+            normalized["content"] = strip_stale_todo_snapshot(message.get("content", ""))
+            text = _INJECTED_CONTEXT_SPANS.sub("", real_user_message_text(normalized)).strip()
+            if not text:
+                continue
+            latest_user_position = len(history)
+            history.append({"type": "user_message", "text": text})
+        elif role == "assistant":
             for tool_call in message.get("tool_calls") or []:
                 try:
-                    if isinstance(tool_call, dict):
-                        call_id = str(tool_call.get("id") or "")
-                        function = tool_call.get("function") or {}
-                        name = function.get("name")
-                        raw_args = function.get("arguments")
-                    else:
-                        call_id = str(getattr(tool_call, "id", "") or "")
-                        function = getattr(tool_call, "function", None)
-                        name = getattr(function, "name", None)
-                        raw_args = getattr(function, "arguments", None)
-                    if name != "clarify" or not call_id:
-                        continue
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    if not isinstance(args, dict):
-                        continue
-                    question = args.get("question")
-                    if isinstance(question, str) and question.strip():
-                        clarify_questions[call_id] = question.strip()
+                    call_id, name, raw_args = _tool_call_parts(tool_call)
                 except Exception:
                     continue
-        elif message.get("role") == "tool":
-            call_id = str(message.get("tool_call_id") or "")
-            question = clarify_questions.get(call_id)
-            if not question:
-                continue
-            try:
-                payload = message.get("content", "")
-                if isinstance(payload, str):
-                    payload = json.loads(payload)
-                if not isinstance(payload, dict) or "user_response" not in payload:
+                if name == "clarify":
+                    if call_id:
+                        clarify_calls[call_id] = raw_args
                     continue
-                answer = payload.get("user_response")
-                if isinstance(answer, list):
-                    answer_text = json.dumps(answer, ensure_ascii=False)
-                else:
-                    answer_text = "" if answer is None else str(answer)
-                clarifications.append(
-                    {"question": question, "answer": answer_text}
+                if not name:
+                    continue
+                arguments = (
+                    raw_args
+                    if isinstance(raw_args, str)
+                    else json.dumps(raw_args, ensure_ascii=False, sort_keys=True)
                 )
-            except Exception:
+                history.append(
+                    {"type": "agent_tool_call", "name": name, "arguments": arguments}
+                )
+        elif role == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            if call_id not in clarify_calls:
                 continue
+            for entry in _clarify_entries(clarify_calls.pop(call_id), message.get("content", "")):
+                history.append({"type": "clarify", **entry})
 
+    latest_user_message = (
+        history[latest_user_position]["text"] if latest_user_position >= 0 else ""
+    )
+    clarifications = [
+        {key: value for key, value in item.items() if key != "type"}
+        for item in history[latest_user_position + 1 :]
+        if item["type"] == "clarify"
+    ]
     return {
         "latest_user_message": latest_user_message,
         "clarifications": clarifications,
+        "history": history,
     }
 
 
@@ -143,7 +198,7 @@ class ApprovalPolicy:
     def prefers_chinese(self) -> bool:
         return self.interface_language in {"zh", "zh-hant"}
 
-    def with_context(self, context: dict[str, Any]) -> "ApprovalPolicy":
+    def with_context(self, context: dict[str, Any]) -> ApprovalPolicy:
         return replace(self, approval_context=dict(context))
 
     def collect_script_evidence(

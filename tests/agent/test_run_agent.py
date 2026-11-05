@@ -1528,7 +1528,11 @@ class TestExecuteToolCalls:
             agent._execute_tool_calls_sequential(assistant_msg, messages, "task-seq")
 
         assert observed == [
-            {"latest_user_message": "授权发送本次报告", "clarifications": []}
+            {
+                "latest_user_message": "授权发送本次报告",
+                "clarifications": [],
+                "history": [{"type": "user_message", "text": "授权发送本次报告"}],
+            }
         ]
         assert get_smart_approval_context() == {}
 
@@ -1553,10 +1557,12 @@ class TestExecuteToolCalls:
         with patch("model_tools.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls_concurrent(assistant_msg, messages, "task-concurrent")
 
-        assert observed == [
-            {"latest_user_message": "授权并行查询当前资料", "clarifications": []},
-            {"latest_user_message": "授权并行查询当前资料", "clarifications": []},
-        ]
+        expected = {
+            "latest_user_message": "授权并行查询当前资料",
+            "clarifications": [],
+            "history": [{"type": "user_message", "text": "授权并行查询当前资料"}],
+        }
+        assert observed == [expected, expected]
         assert get_smart_approval_context() == {}
 
     def test_sequential_tool_calls_run_without_delay(self, agent):

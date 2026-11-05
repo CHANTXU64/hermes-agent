@@ -63,7 +63,13 @@ def test_policy_builds_latest_real_user_and_scoped_clarify_context() -> None:
     assert context == {
         "latest_user_message": "delete cache",
         "clarifications": [{"question": "Delete only cache A?", "answer": "yes"}],
+        "history": [
+            {"type": "user_message", "text": "old"},
+            {"type": "user_message", "text": "delete cache"},
+            {"type": "clarify", "question": "Delete only cache A?", "answer": "yes"},
+        ],
     }
+    assert "runtime" not in json.dumps(context)
 
 
 def test_policy_ignores_persisted_non_user_runtime_context() -> None:
@@ -89,6 +95,7 @@ def test_policy_ignores_persisted_non_user_runtime_context() -> None:
     assert context == {
         "latest_user_message": "比较 DeepSeek 和 Terra",
         "clarifications": [],
+        "history": [{"type": "user_message", "text": "比较 DeepSeek 和 Terra"}],
     }
 
 
