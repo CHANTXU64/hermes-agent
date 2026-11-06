@@ -3037,6 +3037,7 @@ print(json.dumps({"session_id": args.session_id}))
             "document_id": session_id,
             "operation_id": "4c3ef8f4-8e1d-4507-9a43-f471655344be",
             "candidate_sha256": candidate["document_content_sha256"],
+            "verified_text": candidate["document_content"],
         }
     ]
 
