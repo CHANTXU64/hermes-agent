@@ -139,6 +139,7 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
         subprocess.Popen(
             [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path),
              sys.executable, "-m", "hermes_cli.main", "update", "--gateway"],
+            # detached-spawn: ok — /update runs `hermes update`, which must outlive the gateway it restarts
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
         return
     hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
@@ -154,6 +155,7 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     # calls os.setsid() in the child.
     setsid_bin = shutil.which("setsid")
     argv = [setsid_bin, "bash", "-c", update_cmd] if setsid_bin else ["bash", "-c", update_cmd]
+    # detached-spawn: ok — /update runs `hermes update`, which must outlive the gateway it restarts
     subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
@@ -756,15 +758,12 @@ class GatewaySlashCommandsMixin(
         if not checkpoints:
             return t("gateway.rollback.none_found", cwd=cwd)
 
-        # Restore by number or hash
+        # Restore by number or hash (a short hash can be all digits)
+        from tools.checkpoint_refs import resolve_checkpoint_ref
         try:
-            idx = int(arg) - 1
+            target_hash = resolve_checkpoint_ref(checkpoints, arg)
         except ValueError:
-            target_hash = arg
-        else:
-            if not 0 <= idx < len(checkpoints):
-                return t("gateway.rollback.invalid_number", max=len(checkpoints))
-            target_hash = checkpoints[idx]["hash"]
+            return t("gateway.rollback.invalid_number", max=len(checkpoints))
         result = mgr.restore(cwd, target_hash, safe=not restore_all)
         if not result["success"]:
             return t("gateway.rollback.restore_failed", error=result["error"])
