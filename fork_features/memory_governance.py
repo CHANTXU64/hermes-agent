@@ -345,6 +345,17 @@ MAIN_AGENT_MEMORY_GUIDANCE = (
     "workflows belong in skills, not memory."
 )
 
+# Upstream evidence-grounding rule (adopted on owner decision, upstream 90d6b98 sync): both
+# memory-bearing review prompts carry it verbatim; the skill-only prompt does not.
+MEMORY_GROUNDING_RULE = (
+    "Save only facts GROUNDED in this conversation — a user message or tool result you can point "
+    "to. Never infer the user's traits, skill level, role, mood or preferences from topic, tone or "
+    "tools used, and never turn a one-off request into a standing preference (in either store) "
+    "unless the user marked it general ('always', 'from now on', 'remember') or stated a standing "
+    "like/dislike ('I hate X', 'stop doing Y'). If unsure, leave it "
+    "out — a wrong fact misleads every future session.\n\n"
+)
+
 MEMORY_REVIEW_PROMPT = (
     "Review the conversation and autonomously maintain built-in memory. Use the live "
     "MEMORY.md and USER.md supplied below; the cached system copy may be older. "
@@ -367,6 +378,7 @@ MEMORY_REVIEW_PROMPT = (
     "content. Remove the duplicate as deletion_type='safe' only when that Skill "
     "normally loads for the relevant task; keep a short trigger when it is needed "
     "before Skill loading.\n\n"
+    + MEMORY_GROUNDING_RULE +
     "When capacity is tight: preserve distinct causes and boundaries while merging or "
     "compressing; then remove proven safe duplicates or expired facts. Only when no "
     "safe/expired candidate remains and a new fact is more valuable than every remaining "
@@ -400,6 +412,7 @@ COMBINED_MEMORY_REVIEW_PREFIX = (
     "deletion_type='forced_capacity' only as the final resort when the new fact is more "
     "valuable than all remaining candidates, and provide loss_note so the possible "
     "loss remains recoverable in the structured audit log.\n\n"
+    + MEMORY_GROUNDING_RULE
 )
 
 def build_memory_schema() -> dict[str, Any]:

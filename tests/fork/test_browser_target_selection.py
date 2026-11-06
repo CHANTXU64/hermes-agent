@@ -140,6 +140,9 @@ class TestBrowserTargetSelection(unittest.TestCase):
                  is_legacy_browser_use_cloud_config=lambda cfg: False, _clamp_timeout=int,
                  _attach_vault_supervisor=lambda *a: None, _driven_daemons_lock=threading.RLock(),
                  _driven_daemons={}, daemon_identity=lambda env: ("isolated",), hermes_home_key=lambda: "isolated",
+                 fit_default_socket_dir=lambda env: None, _OWN_DURING_CALL_S=0.5,
+                 _own_harness_daemon=lambda env: None, _own_harness_daemon_until_owned=lambda env: None,
+                 _native_screenshot_result=lambda result, shot: None,
                  _run_cli_killing_process_group=run_cli, _reload_if_republished=lambda *a: None,
                  _take_real_profile_note=lambda key: {}, _find_screenshot=lambda *a: None,
                  _OWN_TAB_PREAMBLE="")
@@ -147,8 +150,10 @@ class TestBrowserTargetSelection(unittest.TestCase):
         kwargs = {"session": session}
         if tab_id is not None:
             kwargs["tab_id"] = tab_id
+        scheduler = ModuleType("agent.periodic_scheduler")
+        scheduler.__dict__["schedule"] = lambda fn, interval: SimpleNamespace(cancel=lambda wait=None: None)
         with patch.dict(sys.modules, {"agent.redact": redactor, "tools.registry": registry,
-                                      "tools.browser_use_shot": shot}):
+                                      "tools.browser_use_shot": shot, "agent.periodic_scheduler": scheduler}):
             result = g["browser_exec"](payload, **kwargs)
         return result, ns
 
