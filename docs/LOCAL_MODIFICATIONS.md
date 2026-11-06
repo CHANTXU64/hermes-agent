@@ -1566,6 +1566,16 @@ behavior contracts fully define the unchanged user-visible guidance.
 
 Upstream status: fork-only.
 
+Upstream sync `90d6b98fd86d20981ee06ddd5b7d93e4320f26a4` (2026-11-06): upstream
+now passes a prose display copy (bidi/padding surfaced via
+`redact_approval_display`) to every surface and maps the picked display choice
+back to the raw choice. The merged `clarify_tool` keeps that display copy and
+mapping but leaves `choices` unlabelled; renderers still add "(Recommended)"
+from `recommended_index`, so the label is never doubled.
+`tests/agent/test_approval_display_sanitize.py` asserts this Fork contract.
+`_result` combines upstream display mapping with entry 19's
+`ClarifyResponsePayload` unwrapping and the optional question `id`.
+
 ### 18. Explicit browser tab selection (official browser_exec adaptation)
 
 - ID: `browser-explicit-tabs` (same maintenance unit as former entry 18)
@@ -1613,6 +1623,7 @@ python tests/fork/test_browser_target_selection.py
 - Upstream status: partially upstreamed — `cf6623e43359ed87b145dd7f4db9596747535ef0` supplies the official browser replacement; its named/shared own-tab preamble excludes default sessions and continues after initialization failures.
 - Validation status: candidate stdlib policy and isolated real-host-function/registry seam tests pass. Normal package imports, affected pytest suites and actual harness/Chrome behavior are pending; do not claim deployment readiness.
 - Historical evidence: the previous legacy-driver contract was validated on `8172ebab6b4f11a42f5b3ab17bb625b78d2f57df`; that evidence does not validate the replacement engine.
+- Upstream sync `90d6b98fd86d20981ee06ddd5b7d93e4320f26a4` (2026-11-06): upstream `browser_exec` gained a fitted default socket dir, a periodic owned-daemon heartbeat (`agent.periodic_scheduler`) and native screenshot results. The Fork AST-extracted test fixture stubs those helpers; the Fork target-selection behavior itself was unchanged.
 - Feature docs: none — this bounded contract and focused tests define the unit.
 
 
@@ -2046,6 +2057,16 @@ Token evidence was available.
 
 Upstream status: policy/audit behavior remains fork-only at the fixed upstream
 SHA above.
+
+Upstream sync `90d6b98fd86d20981ee06ddd5b7d93e4320f26a4` (2026-11-06): upstream
+added an evidence-grounding rule (save only conversation-grounded facts; no
+trait inference; a one-off request is not a standing preference unless marked
+general; if unsure leave it out) to its own `_MEMORY_ROUTING_BLOCK`, which the
+Fork prompts do not use. By owner decision the rule is adopted verbatim as
+`fork_features.memory_governance.MEMORY_GROUNDING_RULE` and appended to both
+`MEMORY_REVIEW_PROMPT` and `COMBINED_MEMORY_REVIEW_PREFIX`; the skill-only
+prompt does not carry it (`tests/agent/test_memory_review_grounding.py`).
+The upstream `_MEMORY_ROUTING_BLOCK` text stays out of `agent/background_review.py`.
 
 
 ### 24. Launchd gateway open-file ceiling
@@ -2656,6 +2677,17 @@ Verification:
   passed. No configuration, context extraction, operator policy, script-evidence
   scope, Cron/KG logic, Computer Use behavior, Gateway restart, commit, or push
   was included.
+
+Upstream sync `90d6b98fd86d20981ee06ddd5b7d93e4320f26a4` (2026-11-06):
+`check_all_command_guards` now starts from upstream `_command_findings` (first
+dangerous match plus every content-rule key such as credential upload and
+invisible Unicode) and per-key `_approval_scope`; unapproved findings and Fork
+smart-mode direct-script warnings form one combined prompt. Fully pre-approved
+commands return upstream provenance (`pre_approved`), which `terminal_tool`
+renders after the Fork localized user/smart approval notes. `_run_approval_gate`
+accepts both upstream `pattern_keys` and Fork `one_shot_only` /
+`denial_source_kind`. `execute_code` uses upstream `redact_approval_display` for
+the pending body while keeping Fork script evidence.
 
 Feature docs: `docs/chantxu64/current-turn-smart-approval/README.md`
 
