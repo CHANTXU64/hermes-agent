@@ -472,7 +472,9 @@ class GatewayStartupMixin:
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
-            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+            from gateway.delivery_ledger import (
+                RECOVERED_MARKER, is_reconnect_only, mark_delivered, mark_failed,
+            )
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
@@ -503,9 +505,18 @@ class GatewayStartupMixin:
                         row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
                     )
                 else:
-                    await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
-                    )
+                    error = str(getattr(result, "error", "") or "send failed")
+                    if row.get("runtime_recovery") and is_reconnect_only(error):
+                        # The send contract for this error proves the platform never saw the request,
+                        # so a runtime replay refused again before dispatch spent no real attempt:
+                        # refund it. Otherwise repeated recover->refuse cycles (a flapping Telegram
+                        # path) burn the budget to 'abandoned', which the boot sweep never recovers.
+                        await self._release_runtime_claim_quiet(
+                            row["obligation_id"], "failed to release refused runtime claim %s",
+                            error=error,
+                        )
+                    else:
+                        await asyncio.to_thread(mark_failed, row["obligation_id"], error)
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
         with _log_suppressed(logging.DEBUG, "arming flood redelivery timers failed", exc_info=True):
