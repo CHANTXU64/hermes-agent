@@ -3269,6 +3269,14 @@ deltas are expected in these areas:
   `runtime.nofile_soft_limit`; fork keeps emission regression only):
   - `tests/fork/test_launchd_open_file_limit.py`
   - `docs/LOCAL_MODIFICATIONS.md`
+- Telegram in-place polling recovery replays failed final replies (candidate PR
+  NousResearch/hermes-agent#146731 plus one Fork refund):
+  - `gateway/platforms/base.py`
+  - `gateway/run_startup.py`
+  - `plugins/platforms/telegram/adapter.py`
+  - `tests/gateway/test_delivery_ledger.py`
+  - `tests/gateway/test_telegram_polling_health_confirmation.py`
+  - `docs/LOCAL_MODIFICATIONS.md`
 
 
 ### 30. disk-cleanup never deletes authored work
@@ -3344,9 +3352,9 @@ Feature docs: none — the two guards are self-contained and documented inline.
 
 ## Summary statistics
 
-Documented entries: 30 major entries.
+Documented entries: 31 major entries.
 
-Active / current entries: 22.
+Active / current entries: 23.
 
 Historical reverted / abandoned / superseded areas: 8.
 
@@ -3395,3 +3403,90 @@ Verification:
   frozen baseline/candidate node lists map both intentionally retired cases.
 - Temporary conformance probes are archived outside the candidate; no extra
   permanent negative policy was added merely to enforce this retirement.
+
+
+### 32. Telegram in-place polling recovery replays failed final replies
+
+ID: `telegram-polling-recovery-replay`
+
+Status: active
+
+Date: 2026-11-07
+
+Depends on: none (reuses the official Delivery Ledger; entry 21's retired reset boundary is not revived)
+
+Source boundary: logical-only
+
+Files:
+
+- `plugins/platforms/telegram/adapter.py` — upstream seam in `_record_polling_progress`: when the first
+  `getUpdates` round trip of a polling generation clears a degraded send path, schedules the existing
+  `_redeliver_failed_obligations_for_platform` through the Gateway's `_retain_background_task`, logging failures.
+- `gateway/platforms/base.py` — upstream seam in `_finalize_delivery_obligation`: replays once after a late
+  `mark_failed` when that health edge beat the write, for the same adapter only if it is Telegram, not
+  degraded, and its current polling progress event is set.
+- `gateway/run_startup.py` — Fork addition in `_redeliver_claimed_obligations`: a runtime replay refused
+  again with a reconnect-only error releases its claim (attempt refunded) instead of `mark_failed`.
+- `tests/gateway/test_delivery_ledger.py` — upstream real-SQLite race test and Discord negative test, plus
+  two Fork tests for the refund.
+- `tests/gateway/test_telegram_polling_health_confirmation.py` — upstream tests appended to the official file.
+
+Intent / invariants:
+
+Before this unit a final reply rejected with `send_path_degraded` stayed `failed` until the next Gateway
+restart whenever Telegram recovered without the adapter object being replaced, because the runtime
+redelivery sweep was wired only to adapter replacement. Reported case: a reply failed at 15:57 and was
+delivered at 20:34 by the boot sweep, with the "gateway restarted" banner.
+
+- Replay happens only after a confirmed getUpdates round trip of the current polling generation, only for
+  Telegram on the same adapter; other platforms keep the replacement-adapter rule (a disconnected Discord
+  client must not replay).
+- Claims stay atomic and scoped by (platform, profile): `_owner_profile=None` and ledger `'default'` are
+  equivalent; each Bot claims only its own rows. No duplicate send. Every runtime replay still carries a
+  visible "may be a duplicate" marker.
+- The replay task is owned by the Gateway background-task set and its failure is logged, never silent.
+- Fork refund: a replay refused again with `send_path_degraded` (platform never saw the request) must not
+  spend an attempt, otherwise a flapping path reaches `abandoned` after 3 cycles, which the boot sweep
+  never recovers. Any other error still spends the attempt; the 3-attempt cap and 24h expiry are unchanged.
+- Replayed replies are not tied to the current session. `/new` / `/reset` do not retire them (entry 21's
+  owner decision to follow official behavior stands). Replay now happens within minutes instead of at the
+  next restart, so such a reply can appear after a reset more often.
+- Known gaps, not fixed: no timestamp is added to the replayed reply; polling recovery does not prove the
+  send path works (the refund covers the refusal case); live behavior against a real network outage was not
+  reproduced.
+
+Merge decision:
+
+- Preserve when: upstream has not merged #146731 or an equivalent fix for NousResearch/hermes-agent#123898 /
+  #146794.
+- Drop when: upstream merges #146731 or an equivalent and its behavior covers every invariant above. Then
+  drop the two seams and keep only what upstream does not cover (the refund, if still missing); re-run the
+  verification below.
+- Ask user when: upstream's fix differs in trigger point, platform scope, attempt-refund rule or profile
+  normalisation (`retry_not_before`, `sweep_failed_for_runtime`), or changes the replay marker.
+
+Verification:
+
+```bash
+# Use the checkout's .venv Python with an isolated HERMES_HOME; scripts/run_tests.sh rebuilds the
+# environment on this machine and trips the real-home guard, so it was not used for this entry.
+cd ~/.hermes/hermes-agent && env -u HERMES_HOME TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0 \
+  .venv/bin/python -m pytest tests/gateway/test_delivery_ledger.py \
+  tests/gateway/test_telegram_polling_health_confirmation.py \
+  tests/gateway/test_telegram_polling_progress.py tests/gateway/test_telegram_send_path_health.py \
+  tests/gateway/test_telegram_network_reconnect.py tests/gateway/test_queued_final_ledger.py \
+  tests/gateway/test_restart_redelivery_dedup.py -q -p no:cacheprovider
+```
+
+Result at entry time: 18 ledger / Telegram-recovery files, baseline 159 passed / 3 skipped / 0 failed;
+with this unit 166 passed / 3 skipped / 0 failed. The refund test was confirmed RED by disabling only the
+refund branch. A read-only independent review (Opus 5.5) found no blocking issue in the upstream patch and
+raised the abandoned-attempt case, which the refund addresses. Candidate source verification only: takes
+effect after a Gateway restart.
+
+Upstream status: candidate exists `NousResearch/hermes-agent#146731` (open, community-authored, no
+maintainer approval; head `208ea188529a972b049cc2202e02ad44e13c9110`); issues #123898 and #146794 open.
+
+Last validated: upstream `122fc40fb0` (fetched 2026-11-07, 476 commits ahead of the Fork base); Fork `ec29d77328`.
+
+Feature docs: none — the behavior is small and the invariants are recorded here.
