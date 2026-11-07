@@ -110,6 +110,12 @@ def parse_smart_approval_result(
         risk_level = str(payload.get("risk_level", "")).lower()
         authorization = str(payload.get("authorization", "")).lower()
         reason = str(payload.get("reason", "")).strip()
+        if "decision" not in payload and "risk_evidence" in payload and (
+            "violated_prohibition" in payload or "prohibition" in payload
+        ):
+            # The structured contract derives the outcome from risk, evidence, prohibition and
+            # authorization; a missing decision field alone is not a format failure.
+            decision = "escalate"
         if decision not in {"approve", "deny", "escalate"}:
             raise ValueError("invalid decision")
         if risk_level not in {"low", "medium", "high", "critical"}:

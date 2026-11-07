@@ -97,6 +97,15 @@ Structured machine fields remain English enums:
 - `risk_level`: `low`, `medium`, `high`, `critical`;
 - `authorization`: `exact`, `sufficient`, `unclear`, `none`.
 
+The final outcome of the six-field reply is computed from `risk_level`,
+`risk_evidence`, `violated_prohibition` and `authorization`; the model's own
+`decision` does not change it. A reply that carries `risk_evidence` and the
+prohibition field but omits `decision` is therefore still evaluated by those
+rules instead of being treated as an invalid format. Since 2026-11-07 the
+approval model is DeepSeek v4.1 Flash, which omitted `decision` in about 1% of
+607 replayed reviews while filling every other field. A reply missing those
+structured fields, or one that is not JSON, still escalates as invalid.
+
 The reviewer receives Hermes' resolved interface-language code for `reason`.
 Fixed smart-review presentation uses Chinese for `zh`/`zh-hant` and otherwise
 retains its English fallback. Chinese interfaces localize:

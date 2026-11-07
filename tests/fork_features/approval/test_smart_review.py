@@ -302,6 +302,33 @@ def test_invalid_response_escalates_with_chinese_reason(tmp_path):
     assert "格式无效" in result.reason
 
 
+def test_structured_assessment_without_decision_field_is_derived_by_contract(tmp_path):
+    import json
+
+    cases = [
+        ("low", "", "", "sufficient", "approve"),
+        ("medium", "覆盖现有台账文件", "", "exact", "approve"),
+        ("medium", "覆盖现有台账文件", "", "none", "escalate"),
+        ("low", "", "用户说‘只查，不要修改’，当前命令修改文件。", "none", "deny"),
+        ("critical", "rm -rf / 删除系统", "", "exact", "deny"),
+    ]
+    for risk, evidence, prohibition, authorization, expected in cases:
+        result = _review(tmp_path, response=_response(json.dumps({
+            "risk_level": risk, "risk_evidence": evidence, "violated_prohibition": prohibition,
+            "authorization": authorization, "reason": "评估说明。",
+        })))
+        assert result.decision == expected, (risk, authorization, result)
+        assert "格式无效" not in result.reason
+
+
+def test_missing_decision_without_structured_fields_stays_invalid(tmp_path):
+    result = _review(tmp_path, response=_response(
+        '{"risk_level":"low","authorization":"sufficient","reason":"安全读取。"}'
+    ))
+
+    assert result.decision == "escalate"
+    assert "格式无效" in result.reason
+
 def test_critical_model_approval_is_forced_to_deny(tmp_path):
     result = _review(
         tmp_path,
